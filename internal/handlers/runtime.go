@@ -19,6 +19,7 @@ type RuntimeMetrics struct {
 	ClusterDep     ClusterDepInfo  `json:"cluster_dep"`
 	WatchEvents    WatchEventsInfo `json:"watch_events"`
 	WorkQueues     WorkQueuesInfo  `json:"work_queues"`
+	L2             L2Info          `json:"l2"`
 }
 
 // WorkQueueLens is the read-side observability surface of the priority
@@ -46,6 +47,31 @@ type WatchEventsInfo struct {
 	Update          int64 `json:"update"`
 	Delete          int64 `json:"delete"`
 	DeleteTombstone int64 `json:"delete_tombstone"`
+}
+
+// L2Info exposes the L2 post-refilter cache (Q-RBACC-L2-1) counters at
+// /metrics/runtime so canary observers can compute hit ratio + budget
+// utilisation without needing /metrics/cache. All fields are sampled
+// from cache.GlobalMetrics.Snapshot() (atomic loads) — safe under
+// concurrent /metrics/runtime requests.
+//
+// Hits/Misses/Writes/Skipped/Evictions are monotonic counters (compute
+// rate via successive samples). HitRate is the cumulative percentage
+// (0–100) computed in the snapshot. ResidentBytes/Count are gauge
+// snapshots of the current L2 budget consumption.
+type L2Info struct {
+	Hits                int64   `json:"hits"`
+	Misses              int64   `json:"misses"`
+	Writes              int64   `json:"writes"`
+	SkippedHighRatio    int64   `json:"skipped_high_ratio"`
+	SkippedSizeCap      int64   `json:"skipped_size_cap"`
+	EvictionsL1Delete   int64   `json:"evictions_l1_delete"`
+	EvictionsIdentity   int64   `json:"evictions_identity"`
+	EvictionsRA         int64   `json:"evictions_ra"`
+	EvictionsTotal      int64   `json:"evictions_total"`
+	HitRate             float64 `json:"hit_rate"`
+	ResidentBytes       int64   `json:"resident_bytes"`
+	EntryCount          int64   `json:"entry_count"`
 }
 
 // ClusterDepInfo mirrors the cluster-wide dep instrumentation counters from
@@ -125,6 +151,20 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
 				DeleteTombstone: snap.WatchEventsDeleteTombstone,
 			},
 			WorkQueues: wqInfo,
+			L2: L2Info{
+				Hits:              snap.L2Hits,
+				Misses:            snap.L2Misses,
+				Writes:            snap.L2Writes,
+				SkippedHighRatio:  snap.L2SkippedHighRatio,
+				SkippedSizeCap:    snap.L2SkippedSizeCap,
+				EvictionsL1Delete: snap.L2EvictionsL1Delete,
+				EvictionsIdentity: snap.L2EvictionsIdentity,
+				EvictionsRA:       snap.L2EvictionsRA,
+				EvictionsTotal:    snap.L2EvictionsTotal,
+				HitRate:           snap.L2HitRate,
+				ResidentBytes:     snap.L2ResidentBytes,
+				EntryCount:        snap.L2ResidentCount,
+			},
 		}
 
 		w.Header().Set("Content-Type", "application/json")
