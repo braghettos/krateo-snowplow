@@ -22,7 +22,7 @@ type gvrNotifyFunc = func(context.Context, schema.GroupVersionResource)
 const (
 	DefaultResourceTTL = time.Hour
 	ResolvedCacheTTL   = time.Hour
-	APIResultCacheTTL  = 60 * time.Second
+	APIResultCacheTTL  = 5 * time.Minute
 	ReverseIndexTTL    = 2 * time.Hour
 	notFoundTTL        = 30 * time.Second
 )
