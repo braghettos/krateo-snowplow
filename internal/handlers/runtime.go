@@ -6,20 +6,34 @@ import (
 	"runtime"
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 )
 
 // RuntimeMetrics holds the JSON structure returned by /metrics/runtime.
 type RuntimeMetrics struct {
-	HeapAllocMB    float64         `json:"heap_alloc_mb"`
-	HeapSysMB      float64         `json:"heap_sys_mb"`
-	GoroutineCount int             `json:"goroutine_count"`
-	NumGC          uint32          `json:"num_gc"`
-	ActiveUsers    int             `json:"active_users"`
-	CacheKeyCount  int64           `json:"cache_key_count"`
-	ClusterDep     ClusterDepInfo  `json:"cluster_dep"`
-	WatchEvents    WatchEventsInfo `json:"watch_events"`
-	WorkQueues     WorkQueuesInfo  `json:"work_queues"`
-	L2             L2Info          `json:"l2"`
+	HeapAllocMB    float64          `json:"heap_alloc_mb"`
+	HeapSysMB      float64          `json:"heap_sys_mb"`
+	GoroutineCount int              `json:"goroutine_count"`
+	NumGC          uint32           `json:"num_gc"`
+	ActiveUsers    int              `json:"active_users"`
+	CacheKeyCount  int64            `json:"cache_key_count"`
+	ClusterDep     ClusterDepInfo   `json:"cluster_dep"`
+	WatchEvents    WatchEventsInfo  `json:"watch_events"`
+	WorkQueues     WorkQueuesInfo   `json:"work_queues"`
+	L2             L2Info           `json:"l2"`
+	Prewarm        *PrewarmInfo     `json:"prewarm,omitempty"`
+}
+
+// PrewarmInfo exposes the heap-alloc trajectory of the most recent
+// WarmL1FromEntryPoints run (Lever A peak-alloc instrumentation,
+// Q-COLD-1 PM gate G3, 2026-05-07). Nil when prewarm has not yet
+// completed. All sizes in MB, duration in ms.
+type PrewarmInfo struct {
+	HeapStartMB float64 `json:"heap_start_mb"`
+	HeapPeakMB  float64 `json:"heap_peak_mb"`
+	HeapEndMB   float64 `json:"heap_end_mb"`
+	HeapDeltaMB float64 `json:"heap_delta_mb"`
+	DurationMs  int64   `json:"duration_ms"`
 }
 
 // WorkQueueLens is the read-side observability surface of the priority
@@ -124,6 +138,20 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
 		}
 
 		snap := cache.GlobalMetrics.Snapshot()
+
+		// Lever A peak-alloc instrumentation (Q-COLD-1 PM gate G3).
+		var prewarmInfo *PrewarmInfo
+		if ps := dispatchers.LoadPrewarmHeapStats(); ps != nil {
+			deltaBytes := float64(int64(ps.HeapPeakBytes) - int64(ps.HeapStartBytes))
+			prewarmInfo = &PrewarmInfo{
+				HeapStartMB: float64(ps.HeapStartBytes) / (1024 * 1024),
+				HeapPeakMB:  float64(ps.HeapPeakBytes) / (1024 * 1024),
+				HeapEndMB:   float64(ps.HeapEndBytes) / (1024 * 1024),
+				HeapDeltaMB: deltaBytes / (1024 * 1024),
+				DurationMs:  ps.DurationMs,
+			}
+		}
+
 		m := RuntimeMetrics{
 			HeapAllocMB:    float64(ms.HeapAlloc) / (1024 * 1024),
 			HeapSysMB:      float64(ms.HeapSys) / (1024 * 1024),
@@ -165,6 +193,7 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
 				ResidentBytes:     snap.L2ResidentBytes,
 				EntryCount:        snap.L2ResidentCount,
 			},
+			Prewarm: prewarmInfo,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

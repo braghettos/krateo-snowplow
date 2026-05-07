@@ -15,6 +15,7 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
@@ -99,9 +100,45 @@ const (
 	// page of paginated widgets (e.g., the compositions DataGrid shows 5 panels
 	// initially). Without this bound, the prewarm resolves ALL 50K compositions
 	// and recurses into every panel's children.
-	prewarmPerPage = 5
-	prewarmPage    = 1
+	prewarmPerPage     = 5
+	prewarmStartPage   = 1
+	// prewarmPage retained as alias for prewarmStartPage; older sites read
+	// the constant name. New code uses prewarmStartPage for clarity.
+	prewarmPage = prewarmStartPage
 )
+
+// maxPagesPerWidget caps the page-loop in resolveL1RefsCollect (Lever A,
+// Q-COLD-1, 2026-05-07). The loop terminates earlier when the resolved
+// widget's status.resourcesRefs.slice.continue is false; the cap is the
+// hard ceiling for paginating widgets whose data source extends past the
+// frontend's first-paint relevance window. At perPage=5, 64 pages cover
+// the first ~16s of frontend auto-pagination — past first-paint by a
+// wide margin. Tunable via SNOWPLOW_PREWARM_MAX_PAGES so operators can
+// raise/lower without rebuilding the image (per PM modification 1,
+// 2026-05-07).
+var maxPagesPerWidget = env.Int("SNOWPLOW_PREWARM_MAX_PAGES", 64)
+
+// prewarmHeapStats captures the heap-alloc trajectory of WarmL1FromEntryPoints
+// (Lever A peak-alloc instrumentation, Q-COLD-1 PM gate G3, 2026-05-07).
+// Updated atomically once per prewarm run; read by /metrics/runtime so a
+// canary observer can verify the +500 MB peak-alloc gate without needing
+// to scrape pod logs. Zero-valued before the first prewarm completes.
+var prewarmHeapStats atomic.Pointer[PrewarmHeapStats]
+
+// PrewarmHeapStats holds a single snapshot of the heap delta caused by
+// WarmL1FromEntryPoints. All sizes in bytes (HeapAlloc); duration in ms.
+type PrewarmHeapStats struct {
+	HeapStartBytes  uint64 `json:"heap_start_bytes"`
+	HeapPeakBytes   uint64 `json:"heap_peak_bytes"`
+	HeapEndBytes    uint64 `json:"heap_end_bytes"`
+	DurationMs      int64  `json:"duration_ms"`
+}
+
+// LoadPrewarmHeapStats returns the most recent snapshot or nil if prewarm
+// has not yet completed. Callers must not mutate the returned pointer.
+func LoadPrewarmHeapStats() *PrewarmHeapStats {
+	return prewarmHeapStats.Load()
+}
 
 // ---------------------------------------------------------------------------
 // Pre-warm lifecycle control
@@ -412,6 +449,42 @@ func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
 		slog.Int("entryPoints", len(entryPoints)),
 	)
 
+	// Lever A peak-alloc instrumentation (Q-COLD-1 PM gate G3, 2026-05-07).
+	// Capture HeapAlloc at start, sample peak via a 200ms-tick goroutine
+	// for the duration of prewarm, capture HeapAlloc at end, and publish
+	// the snapshot via /metrics/runtime so canary observers can validate
+	// the +500 MB peak-delta gate without log scraping.
+	var startMs runtime.MemStats
+	runtime.ReadMemStats(&startMs)
+	heapStart := startMs.HeapAlloc
+	heapPeak := atomic.Uint64{}
+	heapPeak.Store(heapStart)
+	prewarmDone := make(chan struct{})
+	prewarmStart := time.Now()
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		var ms runtime.MemStats
+		for {
+			select {
+			case <-prewarmDone:
+				return
+			case <-ticker.C:
+				runtime.ReadMemStats(&ms)
+				cur := ms.HeapAlloc
+				for {
+					prev := heapPeak.Load()
+					if cur <= prev {
+						break
+					}
+					if heapPeak.CompareAndSwap(prev, cur) {
+						break
+					}
+				}
+			}
+		}
+	}()
+
 	// Convert entry points to l1Refs.
 	var epRefs []l1Ref
 	for _, ep := range entryPoints {
@@ -444,10 +517,34 @@ func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
 		)
 	}
 
+	// Stop the peak-tracking goroutine and capture the end state.
+	close(prewarmDone)
+	var endMs runtime.MemStats
+	runtime.ReadMemStats(&endMs)
+	heapEnd := endMs.HeapAlloc
+	durationMs := time.Since(prewarmStart).Milliseconds()
+	peak := heapPeak.Load()
+	if peak < heapEnd {
+		// Final read after goroutine close may exceed last sample.
+		peak = heapEnd
+	}
+	stats := &PrewarmHeapStats{
+		HeapStartBytes: heapStart,
+		HeapPeakBytes:  peak,
+		HeapEndBytes:   heapEnd,
+		DurationMs:     durationMs,
+	}
+	prewarmHeapStats.Store(stats)
+
 	log.Info("L1 entry-point warmup: completed",
 		slog.Int("users", len(users)),
 		slog.Int("bindingGroups", len(groups)),
 		slog.Int64("totalWarmed", totalWarmed),
+		slog.Int64("prewarm_duration_ms", durationMs),
+		slog.Float64("prewarm_heap_alloc_start_mb", float64(heapStart)/(1024*1024)),
+		slog.Float64("prewarm_heap_alloc_peak_mb", float64(peak)/(1024*1024)),
+		slog.Float64("prewarm_heap_alloc_end_mb", float64(heapEnd)/(1024*1024)),
+		slog.Float64("prewarm_heap_delta_mb", float64(int64(peak)-int64(heapStart))/(1024*1024)),
 	)
 
 	preWarmComplete.Store(true)
@@ -758,6 +855,24 @@ func extractActionRefIDs(obj map[string]interface{}) map[string]bool {
 	return ids
 }
 
+// sliceContinues reads status.resourcesRefs.slice.continue from a resolved
+// widget. Returns true only if the field exists AND is true. Absent slice
+// block (non-paginating widgets) returns false → page-loop terminates after
+// the current page. Mirrors the frontend's auto-pagination signal at
+// useWidgetQuery.ts:75 so prewarm walks exactly the pages the frontend will
+// walk.
+func sliceContinues(w *unstructured.Unstructured) bool {
+	if w == nil {
+		return false
+	}
+	cont, found, err := unstructured.NestedBool(w.Object,
+		"status", "resourcesRefs", "slice", "continue")
+	if err != nil || !found {
+		return false
+	}
+	return cont
+}
+
 // resolveL1RefsForUser resolves a batch of L1 refs (widgets or RESTActions) for
 // a specific user and stores them in L1 cache. Returns the number successfully
 // warmed. The caller provides the context (with its own deadline).
@@ -817,46 +932,98 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				return
 			}
 
+			// Page-loop prewarm (Lever A, Q-COLD-1, 2026-05-07): walk
+			// every page the frontend will walk via auto-pagination,
+			// using the same termination signal as useWidgetQuery.ts:75
+			// (status.resourcesRefs.slice.continue). Page 1 also writes
+			// the unpaginated widget L1 key so the frontend's first
+			// paint (no page params) hits L1; pages 2..N each write
+			// their `:p<N>-pp<perPage>` key so the auto-pagination
+			// fetches also hit L1. Bound by maxPagesPerWidget (env
+			// SNOWPLOW_PREWARM_MAX_PAGES, default 64) as a safety
+			// ceiling for widgets whose data source extends past the
+			// first-paint relevance window.
+			//
+			// Widgets without pagination signal (no slice.continue or
+			// continue=false) terminate the loop after page 1, byte-
+			// identical to pre-Lever-A behaviour.
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
-			// Use bounded pagination during prewarm: resolve only page 1
-			// with a small page size (matching the frontend default). This
-			// prevents the prewarm from resolving ALL 50K compositions and
-			// recursing into every panel's children. Widgets without
-			// pagination are unaffected (PerPage/Page are ignored when the
-			// widget has no apiRef or the apiRef has no .slice usage).
-			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
-				In:      cached,
-				AuthnNS: authnNS,
-				PerPage: prewarmPerPage,
-				Page:    prewarmPage,
-			})
-			if resolveErr != nil {
-				return
-			}
-			raw, err := json.Marshal(res)
-			if err != nil {
-				return
-			}
-
-			_ = c.SetResolvedRaw(rctx, rKey, raw)
-			// Touch the key so prewarm-resolved keys start HOT.
-			if rki, ok := cache.ParseResolvedKey(rKey); ok {
-				cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
-			}
-			// Register cascade deps: widget → RESTAction (from tracker refs).
-			// Same logic as widgets.go:244-255.
-			if refs := tracker.ResourceRefs(); len(refs) > 0 {
-				for _, ref := range refs {
-					key := cache.L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
-					_ = c.SAddWithTTL(rctx, key, rKey, cache.ReverseIndexTTL)
+			pageCount := 0
+			for page := prewarmStartPage; page <= maxPagesPerWidget; page++ {
+				res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
+					In:      cached,
+					AuthnNS: authnNS,
+					PerPage: prewarmPerPage,
+					Page:    page,
+				})
+				if resolveErr != nil {
+					return
 				}
+				raw, err := json.Marshal(res)
+				if err != nil {
+					return
+				}
+
+				// Per-page L1 write (page > 0 produces `:p<N>-pp<perPage>`).
+				perPageKey := cache.ResolvedKey(identity, r.gvr, r.ns, r.name, page, prewarmPerPage)
+				_ = c.SetResolvedRaw(rctx, perPageKey, raw)
+				if rki, ok := cache.ParseResolvedKey(perPageKey); ok {
+					cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+				}
+
+				// Page 1 ALSO writes the unpaginated key — the frontend's
+				// first paint URL has no page params and the HTTP
+				// dispatcher computes (-1,-1) → unpaginated key.
+				if page == prewarmStartPage {
+					_ = c.SetResolvedRaw(rctx, rKey, raw)
+					if rki, ok := cache.ParseResolvedKey(rKey); ok {
+						cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+					}
+				}
+
+				// Register cascade deps from THIS page's tracker.
+				if refs := tracker.ResourceRefs(); len(refs) > 0 {
+					for _, ref := range refs {
+						depKey := cache.L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
+						_ = c.SAddWithTTL(rctx, depKey, perPageKey, cache.ReverseIndexTTL)
+						if page == prewarmStartPage {
+							_ = c.SAddWithTTL(rctx, depKey, rKey, cache.ReverseIndexTTL)
+						}
+					}
+				}
+
+				// Append this page's resolved widget so recursivePreWarm
+				// discovers child refs from EVERY page (panels 6..N
+				// surface only on pages 2..N).
+				mu.Lock()
+				results = append(results, res)
+				mu.Unlock()
+
+				pageCount++
+
+				// Termination signal — same field useWidgetQuery.ts:75
+				// reads. Absent slice block (non-paginating widget) or
+				// continue=false ends the loop.
+				if !sliceContinues(res) {
+					break
+				}
+
+				// Reset tracker between pages — each page is its own
+				// resolution unit; re-using the tracker would conflate
+				// per-page deps under a single page-1 ref set.
+				tracker = cache.NewDependencyTracker()
+				tctx = cache.WithDependencyTracker(rctx, tracker)
 			}
 
-			mu.Lock()
-			results = append(results, res)
-			mu.Unlock()
+			if pageCount > 1 {
+				slog.Default().Debug("prewarm page-loop walked multiple pages",
+					slog.String("widget", r.name),
+					slog.String("ns", r.ns),
+					slog.Int("pages", pageCount),
+				)
+			}
 		}(ref)
 	}
 
