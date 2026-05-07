@@ -21,6 +21,7 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,26 @@ import (
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
+
+// poolHeapSampleInterval is how often the peak-tracking goroutine samples
+// HeapAlloc while the pool is draining (Lever A G3, R5 followup).
+//
+// 200ms matches the legacy WarmL1FromEntryPoints sampler so peak readings
+// are directly comparable across the two prewarm code paths.
+const poolHeapSampleInterval = 200 * time.Millisecond
+
+// poolDrainQuietWindow is how long the queue must remain empty (with at
+// least one job processed) before the pool is considered "drained" for
+// the purpose of capturing the G3 heap snapshot.
+//
+// In R5 the pool is event-driven and never reaches a permanent terminal
+// state — new users could log in hours later. We declare drain when the
+// initial LIST-fed cohort has finished, so the snapshot reflects the
+// peak under cold-start prewarm load (the gate G3 actually targets).
+//
+// 5s is generous enough to cover gaps between queued jobs at K=8 workers
+// without prematurely sampling mid-burst.
+const poolDrainQuietWindow = 5 * time.Second
 
 // PrewarmJob is a single per-user prewarm task. The worker pulls it from
 // the bounded queue and runs the entry-point widget-tree walk for that
@@ -140,6 +161,16 @@ func (p *PrewarmWorkerPool) Start(ctx context.Context) *PrewarmWorkerPool {
 		go p.workerLoop(ctx, workerID)
 	}
 
+	// Lever A peak-alloc instrumentation (Q-COLD-1 PM gate G3, R5 followup
+	// 0.25.308). The legacy WarmL1FromEntryPoints sampler at prewarm.go:451
+	// never fires under PREWARM_MODE=event-driven (default). Without this,
+	// the prewarm.* block in /metrics/runtime stays empty in production.
+	//
+	// Both paths target the same prewarmHeapStats atomic.Pointer. They are
+	// mutually exclusive per pod lifetime (legacy is wired to a no-op when
+	// the pool is started) so there is no race on the publish.
+	go p.runHeapInstrumentation(ctx)
+
 	slog.Default().Info("prewarm-pool: started",
 		slog.Int("workers", p.Workers),
 		slog.Int("queueCap", p.QueueCap),
@@ -147,6 +178,127 @@ func (p *PrewarmWorkerPool) Start(ctx context.Context) *PrewarmWorkerPool {
 		slog.Duration("jobTimeout", p.JobTimeout),
 	)
 	return p
+}
+
+// runHeapInstrumentation samples HeapAlloc at pool start, tracks the
+// peak via a 200ms-tick goroutine, and publishes the G3 snapshot once
+// the initial cohort has drained (queue empty for poolDrainQuietWindow
+// with processed > 0).
+//
+// Mirrors the pattern in WarmL1FromEntryPoints (prewarm.go:451-548) so
+// the legacy and R5 paths produce comparable numbers.
+//
+// Lifecycle: one-shot per pool. Exits on ctx cancel even if drain never
+// completes (e.g. pod has zero -clientconfig secrets).
+func (p *PrewarmWorkerPool) runHeapInstrumentation(ctx context.Context) {
+	var startMs runtime.MemStats
+	runtime.ReadMemStats(&startMs)
+	heapStart := startMs.HeapAlloc
+	var heapPeak atomic.Uint64
+	heapPeak.Store(heapStart)
+
+	prewarmStart := time.Now()
+	sampleTicker := time.NewTicker(poolHeapSampleInterval)
+	defer sampleTicker.Stop()
+
+	// drainCheck fires more sparsely than the sample tick — we don't
+	// need millisecond precision on drain detection. 500ms is small
+	// relative to the 5s quiet-window so jitter on detection is bounded.
+	drainCheck := time.NewTicker(500 * time.Millisecond)
+	defer drainCheck.Stop()
+
+	var ms runtime.MemStats
+	var quietSince time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Pod shutdown before drain. Publish what we have so the
+			// canary observer can still distinguish "pool ran but did
+			// not drain" from "pool never started". Use the last peak
+			// we observed and the current HeapAlloc as end.
+			runtime.ReadMemStats(&ms)
+			peak := heapPeak.Load()
+			if ms.HeapAlloc > peak {
+				peak = ms.HeapAlloc
+			}
+			p.publishHeapStats(heapStart, peak, ms.HeapAlloc, time.Since(prewarmStart).Milliseconds(), "ctx-cancel")
+			return
+
+		case <-sampleTicker.C:
+			runtime.ReadMemStats(&ms)
+			cur := ms.HeapAlloc
+			for {
+				prev := heapPeak.Load()
+				if cur <= prev {
+					break
+				}
+				if heapPeak.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+
+		case <-drainCheck.C:
+			// Drain criterion: at least one user processed AND the queue
+			// has been empty for poolDrainQuietWindow.
+			processed, _, _ := p.processedEnqueuedDropped()
+			if processed == 0 || p.QueueDepth() != 0 {
+				quietSince = time.Time{}
+				continue
+			}
+			if quietSince.IsZero() {
+				quietSince = time.Now()
+				continue
+			}
+			if time.Since(quietSince) < poolDrainQuietWindow {
+				continue
+			}
+
+			// Drained. Capture end state and publish.
+			runtime.ReadMemStats(&ms)
+			peak := heapPeak.Load()
+			if ms.HeapAlloc > peak {
+				// Final read may exceed last sample; preserve the true
+				// peak.
+				peak = ms.HeapAlloc
+			}
+			p.publishHeapStats(heapStart, peak, ms.HeapAlloc, time.Since(prewarmStart).Milliseconds(), "drained")
+			return
+		}
+	}
+}
+
+// processedEnqueuedDropped returns the same triple as Stats() but in
+// (processed, enqueued, dropped) order so the drain detector can name
+// the first field "processed" without aliasing the public API.
+func (p *PrewarmWorkerPool) processedEnqueuedDropped() (processed, enqueued, dropped int64) {
+	return p.processed.Load(), p.enqueued.Load(), p.dropped.Load()
+}
+
+// publishHeapStats writes the snapshot to the package-global atomic and
+// emits a final log line. Reason is "drained" on normal completion or
+// "ctx-cancel" on early shutdown.
+func (p *PrewarmWorkerPool) publishHeapStats(start, peak, end uint64, durationMs int64, reason string) {
+	stats := &PrewarmHeapStats{
+		HeapStartBytes: start,
+		HeapPeakBytes:  peak,
+		HeapEndBytes:   end,
+		DurationMs:     durationMs,
+	}
+	prewarmHeapStats.Store(stats)
+
+	processed, enqueued, dropped := p.processedEnqueuedDropped()
+	slog.Default().Info("prewarm-pool: heap-alloc snapshot published",
+		slog.String("reason", reason),
+		slog.Int64("prewarm_duration_ms", durationMs),
+		slog.Float64("prewarm_heap_alloc_start_mb", float64(start)/(1024*1024)),
+		slog.Float64("prewarm_heap_alloc_peak_mb", float64(peak)/(1024*1024)),
+		slog.Float64("prewarm_heap_alloc_end_mb", float64(end)/(1024*1024)),
+		slog.Float64("prewarm_heap_delta_mb", float64(int64(peak)-int64(start))/(1024*1024)),
+		slog.Int64("processed", processed),
+		slog.Int64("enqueued", enqueued),
+		slog.Int64("dropped", dropped),
+	)
 }
 
 // Enqueue offers a job to the pool. Returns true on success; returns
