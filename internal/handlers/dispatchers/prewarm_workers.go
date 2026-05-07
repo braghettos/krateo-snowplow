@@ -117,11 +117,41 @@ type PrewarmWorkerPool struct {
 	dropped   atomic.Int64
 	enqueued  atomic.Int64
 
+	// Q-COLD-1 Option F (2026-05-07, snowplow 0.25.309) — bind-identity
+	// dedup counters. Track:
+	//   cohortCount             — distinct binding-identities seen since
+	//                             pod start (count of representative users
+	//                             actually prewarmed).
+	//   usersSkippedAsCohortDup — users whose prewarm was skipped because
+	//                             a member of their binding-identity
+	//                             cohort was already inflight or had
+	//                             already been processed during the same
+	//                             pod lifetime.
+	//   representativeUsersProcessed — users actually processed (one per
+	//                             distinct cohort, monotonically equal to
+	//                             cohortCount under healthy operation).
+	cohortCount                 atomic.Int64
+	usersSkippedAsCohortDup     atomic.Int64
+	representativeUsersProcessed atomic.Int64
+
 	// inflightUsers prevents two workers from racing on the same
-	// username. Mirrors the per-user tryLock semantics of
-	// UserSecretWatcher.warmingUsers, kept independent here so the
-	// worker pool is robust even if the watcher's lock semantics change.
-	inflightUsers sync.Map // username -> struct{}
+	// binding-identity cohort. Pre-Option F this map was keyed by
+	// username; in 0.25.309 the key changed to the user's
+	// binding-identity (computed via RBACWatcher.CachedBindingIdentity)
+	// so that 67 users sharing one cohort produce ONE prewarm walk
+	// instead of 67. Falls back to username when bid is empty (RBAC
+	// watcher not yet synced) so the dedup degenerates safely to the
+	// pre-Option-F per-user behaviour.
+	inflightUsers sync.Map // bindingIdentity -> struct{}
+
+	// seenCohorts records every binding-identity we have ever started
+	// processing. Used to skip re-prewarms of cohorts whose prior
+	// representative finished already during the same pod lifetime.
+	// Bounded by cohort cardinality (~15 at 1004 users in production;
+	// north-star projects ~750 at 50K users — well below the sync.Map
+	// scaling concern). No eviction in v1; entries live for the pod
+	// lifetime, mirroring the L1 cache they protect.
+	seenCohorts sync.Map // bindingIdentity -> struct{}
 }
 
 // Start launches the worker goroutines. Safe to call from main wiring.
@@ -279,11 +309,17 @@ func (p *PrewarmWorkerPool) processedEnqueuedDropped() (processed, enqueued, dro
 // emits a final log line. Reason is "drained" on normal completion or
 // "ctx-cancel" on early shutdown.
 func (p *PrewarmWorkerPool) publishHeapStats(start, peak, end uint64, durationMs int64, reason string) {
+	cohorts := p.cohortCount.Load()
+	skipped := p.usersSkippedAsCohortDup.Load()
+	reps := p.representativeUsersProcessed.Load()
 	stats := &PrewarmHeapStats{
-		HeapStartBytes: start,
-		HeapPeakBytes:  peak,
-		HeapEndBytes:   end,
-		DurationMs:     durationMs,
+		HeapStartBytes:               start,
+		HeapPeakBytes:                peak,
+		HeapEndBytes:                 end,
+		DurationMs:                   durationMs,
+		CohortCount:                  cohorts,
+		UsersSkippedAsCohortDup:      skipped,
+		RepresentativeUsersProcessed: reps,
 	}
 	prewarmHeapStats.Store(stats)
 
@@ -298,6 +334,9 @@ func (p *PrewarmWorkerPool) publishHeapStats(start, peak, end uint64, durationMs
 		slog.Int64("processed", processed),
 		slog.Int64("enqueued", enqueued),
 		slog.Int64("dropped", dropped),
+		slog.Int64("cohort_count", cohorts),
+		slog.Int64("users_skipped_as_cohort_dup", skipped),
+		slog.Int64("representative_users_processed", reps),
 	)
 }
 
@@ -366,25 +405,65 @@ func (p *PrewarmWorkerPool) workerLoop(ctx context.Context, workerID int) {
 }
 
 // processOne executes a single per-user prewarm walk. Wraps the per-user
-// timeout, the per-user inflight lock, and the panic-recovery boundary
-// so that a single user's failure cannot wedge the worker.
+// timeout, the cohort inflight lock, and the panic-recovery boundary so
+// that a single user's failure cannot wedge the worker.
+//
+// Q-COLD-1 Option F (snowplow 0.25.309): the inflight key is the user's
+// binding identity (cohort key), not the username. 67 users in one
+// cohort share L1 keys (per `apiref/resolve.go:57` via `CacheIdentity`),
+// so prewarming one representative warms the whole cohort. Subsequent
+// cohort members observe `bid` already in `seenCohorts` and skip work.
+//
+// Fallback: when `RBACWatcher.CachedBindingIdentity` returns "" (e.g.
+// the watcher has not yet synced, very early ADD bursts), `bid`
+// degenerates to `job.Username` and the dedup keys per-user — matching
+// pre-Option-F behaviour. This is the same fallback used at
+// `prewarm.go:381-384` for the legacy `WarmL1FromEntryPoints` path.
 func (p *PrewarmWorkerPool) processOne(parentCtx context.Context, workerID int, job PrewarmJob) {
-	// Per-user inflight lock: skip if another worker is already
-	// processing this user. Same semantics as UserSecretWatcher's
-	// warmingUsers but local to the pool.
-	if _, loaded := p.inflightUsers.LoadOrStore(job.Username, struct{}{}); loaded {
-		slog.Debug("prewarm-pool: user already inflight, skipping",
+	// Compute the cohort key (binding identity) for this user. The
+	// `bid` value is the SAME key used by `cache.CacheIdentity` to
+	// build L1 keys, so dedup here is exactly congruent with key
+	// fan-out — no half-warmed cohort risk.
+	bid := ""
+	if p.RBACWatcher != nil {
+		bid = p.RBACWatcher.CachedBindingIdentity(job.Username, job.Groups)
+	}
+	if bid == "" {
+		bid = job.Username // fallback: treat as unique (RBAC not synced)
+	}
+
+	// Skip-if-cohort-already-prewarmed (covers the post-completion case:
+	// a previous representative finished, the L1 keys are populated,
+	// re-running the walk would just overwrite them with identical data
+	// and cost the heap pressure that is the whole motivation for
+	// Option F).
+	if _, alreadyDone := p.seenCohorts.Load(bid); alreadyDone {
+		p.usersSkippedAsCohortDup.Add(1)
+		slog.Debug("prewarm-pool: cohort already prewarmed, skipping",
 			slog.String("user", job.Username),
+			slog.String("bid", bid),
 		)
 		return
 	}
-	defer p.inflightUsers.Delete(job.Username)
+
+	// Skip-if-cohort-inflight (covers the in-flight case: another worker
+	// is currently walking this cohort).
+	if _, loaded := p.inflightUsers.LoadOrStore(bid, struct{}{}); loaded {
+		p.usersSkippedAsCohortDup.Add(1)
+		slog.Debug("prewarm-pool: cohort already inflight, skipping",
+			slog.String("user", job.Username),
+			slog.String("bid", bid),
+		)
+		return
+	}
+	defer p.inflightUsers.Delete(bid)
 
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("prewarm-pool: panic in worker (recovered)",
 				slog.Int("worker", workerID),
 				slog.String("user", job.Username),
+				slog.String("bid", bid),
 				slog.Any("panic", r),
 			)
 		}
@@ -394,15 +473,27 @@ func (p *PrewarmWorkerPool) processOne(parentCtx context.Context, workerID int, 
 	defer cancel()
 
 	start := time.Now()
-	visited := p.runPerUser(jobCtx, job)
+	visited := p.runPerUser(jobCtx, job, bid)
 	p.processed.Add(1)
+	p.representativeUsersProcessed.Add(1)
 
-	slog.Default().Info("prewarm-pool: user done",
+	// Mark cohort as warmed AFTER the walk completes. Done before
+	// removing the inflight lock so subsequent dups always observe
+	// either inflight OR seen — never neither (which would race-cause
+	// re-prewarming).
+	if _, alreadyCounted := p.seenCohorts.LoadOrStore(bid, struct{}{}); !alreadyCounted {
+		p.cohortCount.Add(1)
+	}
+
+	slog.Default().Info("prewarm-pool: cohort done",
 		slog.Int("worker", workerID),
 		slog.String("user", job.Username),
+		slog.String("bid", bid),
 		slog.Int("warmed", visited),
 		slog.Duration("elapsed", time.Since(start)),
 		slog.Int64("processed", p.processed.Load()),
+		slog.Int64("cohort_count", p.cohortCount.Load()),
+		slog.Int64("skipped_as_cohort_dup", p.usersSkippedAsCohortDup.Load()),
 	)
 }
 
@@ -410,7 +501,13 @@ func (p *PrewarmWorkerPool) processOne(parentCtx context.Context, workerID int, 
 // widget-tree walk. Returns the number of unique widgets visited (used
 // for observability). Mirrors the inner block of WarmL1FromEntryPoints
 // for one binding group.
-func (p *PrewarmWorkerPool) runPerUser(ctx context.Context, job PrewarmJob) int {
+//
+// Q-COLD-1 Option F (snowplow 0.25.309): `bid` is the cohort key
+// computed at job intake (in `processOne`) and reused here so the
+// installed `BindingIdentity` context matches the cohort dedup decision
+// exactly. Empty-bid callers should pass `job.Username` (legacy
+// fallback) — `processOne` does this already.
+func (p *PrewarmWorkerPool) runPerUser(ctx context.Context, job PrewarmJob, bid string) int {
 	// Inject elevated-call endpoint provider (same as WarmL1FromEntryPoints).
 	if p.SnowplowEndpointFn != nil {
 		ctx = cache.WithSnowplowEndpoint(ctx, func() (any, error) {
@@ -423,18 +520,6 @@ func (p *PrewarmWorkerPool) runPerUser(ctx context.Context, job PrewarmJob) int 
 	}
 
 	user := jwtutil.UserInfo{Username: job.Username, Groups: job.Groups}
-
-	// Compute binding identity for this user. When the RBAC watcher is
-	// not yet synced (e.g. very first ADD before WaitForSync resolves),
-	// the helper returns "" and we fall back to the username — same
-	// behaviour as the synchronous loop at prewarm.go:381-384.
-	bid := ""
-	if p.RBACWatcher != nil {
-		bid = p.RBACWatcher.CachedBindingIdentity(job.Username, job.Groups)
-	}
-	if bid == "" {
-		bid = job.Username
-	}
 
 	// Q-RBAC-DECOUPLE C(d) v3 — prewarm fills the UNFILTERED L1 shape
 	// (cachedRESTAction wrapper). Per-user refilter happens at HTTP-time.

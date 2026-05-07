@@ -328,6 +328,21 @@ func (rw *RBACWatcher) CachedBindingIdentity(username string, groups []string) s
 	return bid
 }
 
+// InjectBindingIdentityForTest pre-populates the identity cache so that
+// CachedBindingIdentity returns `identity` for the given (username, groups)
+// pair without needing to start the RBAC informers. Test-only helper for
+// packages outside `cache` (the `cache` package's own tests can write
+// `rw.identityCache.Store(...)` directly).
+//
+// Sorts `groups` to match the keying CachedBindingIdentity uses, so a test
+// that injects with one ordering and reads with another still observes a
+// hit.
+func (rw *RBACWatcher) InjectBindingIdentityForTest(username string, groups []string, identity string) {
+	sort.Strings(groups)
+	cacheKey := username + "\x00" + strings.Join(groups, ",")
+	rw.identityCache.Store(cacheKey, identity)
+}
+
 // ComputeBindingIdentity returns a short hash identifying the effective RBAC
 // permissions for a user. Users with the same set of RoleBindings and
 // ClusterRoleBindings produce the same identity, enabling shared L1 cache

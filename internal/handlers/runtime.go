@@ -28,12 +28,20 @@ type RuntimeMetrics struct {
 // WarmL1FromEntryPoints run (Lever A peak-alloc instrumentation,
 // Q-COLD-1 PM gate G3, 2026-05-07). Nil when prewarm has not yet
 // completed. All sizes in MB, duration in ms.
+//
+// Q-COLD-1 Option F (snowplow 0.25.309) — adds the cohort-dedup
+// counters so canary observers can verify dedup is working without
+// scraping pod logs. Zero on the legacy `WarmL1FromEntryPoints` path.
 type PrewarmInfo struct {
 	HeapStartMB float64 `json:"heap_start_mb"`
 	HeapPeakMB  float64 `json:"heap_peak_mb"`
 	HeapEndMB   float64 `json:"heap_end_mb"`
 	HeapDeltaMB float64 `json:"heap_delta_mb"`
 	DurationMs  int64   `json:"duration_ms"`
+
+	CohortCount                  int64 `json:"cohort_count"`
+	UsersSkippedAsCohortDup      int64 `json:"users_skipped_as_cohort_dup"`
+	RepresentativeUsersProcessed int64 `json:"representative_users_processed"`
 }
 
 // WorkQueueLens is the read-side observability surface of the priority
@@ -140,15 +148,19 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
 		snap := cache.GlobalMetrics.Snapshot()
 
 		// Lever A peak-alloc instrumentation (Q-COLD-1 PM gate G3).
+		// Option F (0.25.309) — also surfaces cohort-dedup counters.
 		var prewarmInfo *PrewarmInfo
 		if ps := dispatchers.LoadPrewarmHeapStats(); ps != nil {
 			deltaBytes := float64(int64(ps.HeapPeakBytes) - int64(ps.HeapStartBytes))
 			prewarmInfo = &PrewarmInfo{
-				HeapStartMB: float64(ps.HeapStartBytes) / (1024 * 1024),
-				HeapPeakMB:  float64(ps.HeapPeakBytes) / (1024 * 1024),
-				HeapEndMB:   float64(ps.HeapEndBytes) / (1024 * 1024),
-				HeapDeltaMB: deltaBytes / (1024 * 1024),
-				DurationMs:  ps.DurationMs,
+				HeapStartMB:                  float64(ps.HeapStartBytes) / (1024 * 1024),
+				HeapPeakMB:                   float64(ps.HeapPeakBytes) / (1024 * 1024),
+				HeapEndMB:                    float64(ps.HeapEndBytes) / (1024 * 1024),
+				HeapDeltaMB:                  deltaBytes / (1024 * 1024),
+				DurationMs:                   ps.DurationMs,
+				CohortCount:                  ps.CohortCount,
+				UsersSkippedAsCohortDup:      ps.UsersSkippedAsCohortDup,
+				RepresentativeUsersProcessed: ps.RepresentativeUsersProcessed,
 			}
 		}
 

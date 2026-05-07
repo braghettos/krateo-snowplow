@@ -127,11 +127,33 @@ var prewarmHeapStats atomic.Pointer[PrewarmHeapStats]
 
 // PrewarmHeapStats holds a single snapshot of the heap delta caused by
 // WarmL1FromEntryPoints. All sizes in bytes (HeapAlloc); duration in ms.
+//
+// Q-COLD-1 Option F (snowplow 0.25.309): adds the cohort-dedup counters
+// so canary observers can verify dedup is working without scraping pod
+// logs. Zero on the legacy `WarmL1FromEntryPoints` path (which already
+// dedupes by binding-identity at user-discovery time and so does not
+// need separate counters); non-zero on the R5 `PrewarmWorkerPool` path
+// where dedup happens at job-intake time.
 type PrewarmHeapStats struct {
-	HeapStartBytes  uint64 `json:"heap_start_bytes"`
-	HeapPeakBytes   uint64 `json:"heap_peak_bytes"`
-	HeapEndBytes    uint64 `json:"heap_end_bytes"`
-	DurationMs      int64  `json:"duration_ms"`
+	HeapStartBytes uint64 `json:"heap_start_bytes"`
+	HeapPeakBytes  uint64 `json:"heap_peak_bytes"`
+	HeapEndBytes   uint64 `json:"heap_end_bytes"`
+	DurationMs     int64  `json:"duration_ms"`
+
+	// CohortCount is the number of distinct binding-identities seen
+	// since pod start. At 1004 users / 67 avg per cohort this should
+	// settle near 15.
+	CohortCount int64 `json:"cohort_count"`
+	// UsersSkippedAsCohortDup counts users whose prewarm was skipped
+	// because their cohort was already inflight or already prewarmed.
+	// At 1004 users / 15 cohorts this should settle near 1004 - 15 = 989.
+	UsersSkippedAsCohortDup int64 `json:"users_skipped_as_cohort_dup"`
+	// RepresentativeUsersProcessed counts users actually processed
+	// (one per distinct cohort). Equals CohortCount under healthy
+	// operation; would diverge only if a cohort were re-prewarmed
+	// (which seenCohorts prevents) or if processOne crashed before
+	// recording.
+	RepresentativeUsersProcessed int64 `json:"representative_users_processed"`
 }
 
 // LoadPrewarmHeapStats returns the most recent snapshot or nil if prewarm
