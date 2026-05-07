@@ -20,6 +20,7 @@ type RuntimeMetrics struct {
 	WatchEvents    WatchEventsInfo `json:"watch_events"`
 	WorkQueues     WorkQueuesInfo  `json:"work_queues"`
 	L2             L2Info          `json:"l2"`
+	Prewarm        PrewarmInfo     `json:"prewarm"`
 }
 
 // WorkQueueLens is the read-side observability surface of the priority
@@ -28,6 +29,31 @@ type WorkQueueLens interface {
 	HotQueueLen() int
 	WarmQueueLen() int
 	ColdQueueLen() int
+}
+
+// PrewarmLens is the read-side observability surface of the
+// PrewarmWorkerPool. Implemented by *dispatchers.PrewarmWorkerPool.
+// Kept narrow so internal/handlers does not import dispatchers.
+type PrewarmLens interface {
+	Stats() (enqueued, processed, dropped int64)
+	QueueDepth() int
+	QueueCapacity() int
+	CohortFanouts() int64
+}
+
+// PrewarmInfo exposes the PrewarmWorkerPool counters at /metrics/runtime
+// so canary observers can verify (a) the cohort-prewarm hook fires on
+// RBAC binding ADD (cohort_fanouts > 0), (b) the queue is draining
+// (queue_depth low + processed advancing), (c) backpressure is healthy
+// (dropped == 0 in steady state). Q-COHORT-PREWARM (v0.25.312) PM gate
+// G-PREWARM-COUNT reads CohortFanouts.
+type PrewarmInfo struct {
+	Enqueued      int64 `json:"enqueued"`
+	Processed     int64 `json:"processed"`
+	Dropped       int64 `json:"dropped"`
+	QueueDepth    int   `json:"queue_depth"`
+	QueueCapacity int   `json:"queue_capacity"`
+	CohortFanouts int64 `json:"cohort_fanouts"`
 }
 
 // WorkQueuesInfo exposes the current depth of the three L1 refresh
@@ -93,8 +119,10 @@ type ClusterDepInfo struct {
 
 // RuntimeMetricsHandler returns an http.Handler that serves /metrics/runtime.
 // It collects Go runtime stats, active user count, and total cache key count.
-// queues may be nil before the ResourceWatcher is wired in startBackgroundServices.
-func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
+// queues may be nil before the ResourceWatcher is wired in
+// startBackgroundServices. prewarm may be nil before the PrewarmWorkerPool
+// is started (or when PREWARM_MODE=legacy).
+func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmLens) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
@@ -120,6 +148,19 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
 				HotLen:  queues.HotQueueLen(),
 				WarmLen: queues.WarmQueueLen(),
 				ColdLen: queues.ColdQueueLen(),
+			}
+		}
+
+		var pwInfo PrewarmInfo
+		if prewarm != nil {
+			enq, proc, drop := prewarm.Stats()
+			pwInfo = PrewarmInfo{
+				Enqueued:      enq,
+				Processed:     proc,
+				Dropped:       drop,
+				QueueDepth:    prewarm.QueueDepth(),
+				QueueCapacity: prewarm.QueueCapacity(),
+				CohortFanouts: prewarm.CohortFanouts(),
 			}
 		}
 
@@ -165,6 +206,7 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
 				ResidentBytes:     snap.L2ResidentBytes,
 				EntryCount:        snap.L2ResidentCount,
 			},
+			Prewarm: pwInfo,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

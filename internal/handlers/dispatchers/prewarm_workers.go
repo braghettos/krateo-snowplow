@@ -95,12 +95,24 @@ type PrewarmWorkerPool struct {
 	processed atomic.Int64
 	dropped   atomic.Int64
 	enqueued  atomic.Int64
+	// cohortFanouts counts how many times EnqueueForUser was successfully
+	// invoked from a cohort-prewarm fan-out (RBAC binding ADD path).
+	// Distinct from `enqueued` so /metrics/runtime can show the
+	// proactive-cohort-prewarm contribution separately.
+	cohortFanouts atomic.Int64
 
 	// inflightUsers prevents two workers from racing on the same
 	// username. Mirrors the per-user tryLock semantics of
 	// UserSecretWatcher.warmingUsers, kept independent here so the
 	// worker pool is robust even if the watcher's lock semantics change.
 	inflightUsers sync.Map // username -> struct{}
+
+	// enqueueByName is the construction-time-bound EnqueueForUser
+	// implementation. Set by Start when rc + signKey are wired in via
+	// SetEnqueueByName; nil otherwise. Centralised here so the closure
+	// stays a single allocation reused by both UserSecretWatcher and
+	// RBACWatcher paths.
+	enqueueByName atomic.Pointer[func(ctx context.Context, username string) bool]
 }
 
 // Start launches the worker goroutines. Safe to call from main wiring.
@@ -318,49 +330,145 @@ func (p *PrewarmWorkerPool) runPerUser(ctx context.Context, job PrewarmJob) int 
 	return len(visited)
 }
 
-// MakeEventDrivenPrewarmer returns a UserReadyFunc that enqueues a
-// prewarm job into the worker pool whenever the UserSecretWatcher
-// informer ADDs or UPDATEs a -clientconfig secret. Per spec §2.1.
+// EnqueueForUser resolves the user's clientconfig secret, mints a JWT,
+// and enqueues a prewarm job. Mirrors the per-user secret→JWT→Enqueue
+// path used by MakeEventDrivenPrewarmer, but callable from any goroutine
+// (UserSecretWatcher ADD, RBACWatcher binding ADD fan-out, future request
+// backstop).
 //
-// The closure resolves the per-user endpoint + groups by reading the
-// secret via endpoints.FromSecret (same path as discoverUsers in the
-// synchronous loop). It mints a short-lived JWT for the worker to use
-// when child RESTAction calls hit /call internally with exportJwt:true.
+// Returns the same bool semantics as Enqueue (false on queue full,
+// pool not started, or pool stopped). Safe to call repeatedly for the
+// same user — the pool's inflightUsers map dedups concurrent invocations
+// and per-user L1 Exists checks dedup at the cohort granularity.
+//
+// The pool's enqueueByName must be wired (SetEnqueueByName) before this
+// method does anything; an unwired pool returns false (no-op fallback).
 //
 // Per `feedback_no_special_cases.md`: nothing user-specific is hardcoded
 // here. The walk plan is the entry-point list passed at pool
 // construction; per-user data is pulled from the secret.
-func MakeEventDrivenPrewarmer(pool *PrewarmWorkerPool, rc *rest.Config, signKey string) cache.UserReadyFunc {
-	return func(ctx context.Context, username string) {
-		if pool == nil {
-			return
-		}
-		if !pool.started.Load() {
-			return
-		}
+func (p *PrewarmWorkerPool) EnqueueForUser(ctx context.Context, username string) bool {
+	if p == nil {
+		return false
+	}
+	if !p.started.Load() || p.stopped.Load() {
+		return false
+	}
+	if username == "" {
+		return false
+	}
+	fnPtr := p.enqueueByName.Load()
+	if fnPtr == nil {
+		return false
+	}
+	return (*fnPtr)(ctx, username)
+}
+
+// SetEnqueueByName binds the per-user resolution closure (secret read
+// + JWT mint + Enqueue) onto the pool. Must be called once after Start.
+// Mirrors the body of MakeEventDrivenPrewarmer's closure but lifted onto
+// the pool so RBACWatcher and other call sites can share it without
+// re-importing rest.Config or signKey.
+//
+// Pass rc == nil to install a default closure that uses
+// endpoints.FromSecret(rc, …) — production wiring. Pass a custom fn for
+// tests that want to bypass the K8s API.
+func (p *PrewarmWorkerPool) SetEnqueueByName(rc *rest.Config, signKey string) {
+	fn := func(ctx context.Context, username string) bool {
 		// Build the per-user endpoint from the freshly-added secret.
 		// Use a short bounded timeout so a slow API server cannot wedge
 		// the informer ADD goroutine indefinitely.
 		fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		secretName := username + clientConfigSecretSuffix
-		ep, err := endpoints.FromSecret(fetchCtx, rc, secretName, pool.AuthnNS)
+		ep, err := endpoints.FromSecret(fetchCtx, rc, secretName, p.AuthnNS)
 		if err != nil {
 			slog.Warn("prewarm-pool: failed to load endpoint for user; skipping enqueue",
 				slog.String("user", username),
 				slog.Any("err", err),
 			)
-			return
+			return false
 		}
 		groups := extractGroupsFromClientCert(ep.ClientCertificateData)
-
 		token := mintJWT(jwtutil.UserInfo{Username: username, Groups: groups}, signKey)
 
-		_ = pool.Enqueue(PrewarmJob{
+		return p.Enqueue(PrewarmJob{
 			Username: username,
 			Token:    token,
 			Endpoint: ep,
 			Groups:   groups,
 		})
+	}
+	p.enqueueByName.Store(&fn)
+}
+
+// SetEnqueueByNameFunc installs an arbitrary EnqueueForUser implementation.
+// Test-only seam used to bypass the K8s API; production wiring uses
+// SetEnqueueByName.
+func (p *PrewarmWorkerPool) SetEnqueueByNameFunc(fn func(ctx context.Context, username string) bool) {
+	if fn == nil {
+		p.enqueueByName.Store(nil)
+		return
+	}
+	wrapped := fn
+	p.enqueueByName.Store(&wrapped)
+}
+
+// CohortFanouts returns the number of successful EnqueueForUser
+// invocations attributed to cohort fan-outs (RBAC binding ADD path).
+// Used by /metrics/runtime to surface G-PREWARM-COUNT.
+func (p *PrewarmWorkerPool) CohortFanouts() int64 {
+	return p.cohortFanouts.Load()
+}
+
+// EnqueueForCohort enqueues prewarm jobs for the given set of usernames
+// as a single cohort fan-out, incrementing CohortFanouts by the number
+// of successfully accepted users. Drops on full queue are recorded by
+// the pool's existing dropped counter; this method does NOT block. The
+// RBAC watcher uses this after coalescing binding ADDs in its debounce
+// window.
+//
+// Returns (accepted, dropped) so the caller can log the outcome.
+func (p *PrewarmWorkerPool) EnqueueForCohort(ctx context.Context, usernames []string) (accepted, dropped int) {
+	if p == nil || !p.started.Load() || p.stopped.Load() {
+		return 0, len(usernames)
+	}
+	for _, u := range usernames {
+		if u == "" {
+			continue
+		}
+		if p.EnqueueForUser(ctx, u) {
+			accepted++
+			p.cohortFanouts.Add(1)
+		} else {
+			dropped++
+		}
+	}
+	return
+}
+
+// MakeEventDrivenPrewarmer returns a UserReadyFunc that enqueues a
+// prewarm job into the worker pool whenever the UserSecretWatcher
+// informer ADDs or UPDATEs a -clientconfig secret. Per spec §2.1.
+//
+// As of v0.25.312 this is a 1-line wrapper around EnqueueForUser; the
+// concrete secret-read + JWT-mint logic lives in SetEnqueueByName so
+// other call sites (RBACWatcher binding ADD) can share it.
+//
+// Per `feedback_no_special_cases.md`: nothing user-specific is hardcoded
+// here. The walk plan is the entry-point list passed at pool
+// construction; per-user data is pulled from the secret.
+func MakeEventDrivenPrewarmer(pool *PrewarmWorkerPool, rc *rest.Config, signKey string) cache.UserReadyFunc {
+	if pool != nil && pool.enqueueByName.Load() == nil {
+		// First caller wins; subsequent calls are no-ops (LoadOrStore-style
+		// via the SetEnqueueByName setter is intentional — production
+		// only constructs one pool).
+		pool.SetEnqueueByName(rc, signKey)
+	}
+	return func(ctx context.Context, username string) {
+		if pool == nil {
+			return
+		}
+		_ = pool.EnqueueForUser(ctx, username)
 	}
 }

@@ -53,6 +53,14 @@ var (
 	// ResourceWatcher is created. Read-only observability hook used by
 	// /metrics/runtime to surface HOT/WARM/COLD workqueue depths.
 	globalResourceWatcher *cache.ResourceWatcher
+
+	// globalPrewarmPool is set by startBackgroundServices after the
+	// PrewarmWorkerPool is constructed. Read-only observability hook
+	// used by /metrics/runtime to surface enqueued/processed/dropped
+	// counters and CohortFanouts (G-PREWARM-COUNT canary gate).
+	// Pointer-typed for atomicity; nil before pool start and when
+	// PREWARM_MODE=legacy.
+	globalPrewarmPool *dispatchers.PrewarmWorkerPool
 )
 
 // workQueueLensAdapter implements handlers.WorkQueueLens by reading the
@@ -77,6 +85,37 @@ func (workQueueLensAdapter) ColdQueueLen() int {
 		return 0
 	}
 	return globalResourceWatcher.ColdQueueLen()
+}
+
+// prewarmLensAdapter implements handlers.PrewarmLens by reading the
+// package-level globalPrewarmPool at call time. Returns zeros until
+// the pool is wired (handler is registered before
+// startBackgroundServices runs).
+type prewarmLensAdapter struct{}
+
+func (prewarmLensAdapter) Stats() (int64, int64, int64) {
+	if globalPrewarmPool == nil {
+		return 0, 0, 0
+	}
+	return globalPrewarmPool.Stats()
+}
+func (prewarmLensAdapter) QueueDepth() int {
+	if globalPrewarmPool == nil {
+		return 0
+	}
+	return globalPrewarmPool.QueueDepth()
+}
+func (prewarmLensAdapter) QueueCapacity() int {
+	if globalPrewarmPool == nil {
+		return 0
+	}
+	return globalPrewarmPool.QueueCapacity()
+}
+func (prewarmLensAdapter) CohortFanouts() int64 {
+	if globalPrewarmPool == nil {
+		return 0
+	}
+	return globalPrewarmPool.CohortFanouts()
 }
 
 func init() {
@@ -358,7 +397,7 @@ func main() {
 	mux.Handle("GET /ready", handlers.ReadinessCheck())
 	mux.Handle("GET /info", handlers.InfoHandler(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
-	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(appCache, workQueueLensAdapter{}))
+	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(appCache, workQueueLensAdapter{}, prewarmLensAdapter{}))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
 	// Create RBACWatcher early so the middleware can compute binding identities.
 	// Start() is called later in startBackgroundServices.
@@ -594,6 +633,19 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 				SnowplowK8sClient:  snowplowK8sClient,
 				DynClient:          poolDynClient,
 			}).Start(ctx)
+
+			// Q-COHORT-PREWARM (v0.25.312) — bind the per-user secret→JWT
+			// resolver onto the pool, then register the pool as the
+			// RBACWatcher's cohort-prewarm fan-out target. After this
+			// wiring, RoleBinding/ClusterRoleBinding ADD events trigger a
+			// debounced prewarm sweep covering the union of affected
+			// subjects (Option A — group subjects expand to active users).
+			prewarmPool.SetEnqueueByName(rc, signKey)
+			if rbacWatcher != nil {
+				rbacWatcher.SetPrewarmer(prewarmPool)
+			}
+			// Expose pool counters at /metrics/runtime via prewarmLensAdapter.
+			globalPrewarmPool = prewarmPool
 		}
 	}
 

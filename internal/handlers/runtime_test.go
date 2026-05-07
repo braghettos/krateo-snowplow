@@ -47,7 +47,7 @@ func TestRuntimeMetrics_ExposesL2Block(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	// nil cache + nil queues — exercises the safe-defaults branches.
-	handler := RuntimeMetricsHandler(nil, nil)
+	handler := RuntimeMetricsHandler(nil, nil, nil)
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -109,7 +109,7 @@ func TestRuntimeMetrics_ExposesL2Block(t *testing.T) {
 func TestRuntimeMetrics_PreservesExistingShape(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/metrics/runtime", nil)
 	rec := httptest.NewRecorder()
-	RuntimeMetricsHandler(nil, nil).ServeHTTP(rec, req)
+	RuntimeMetricsHandler(nil, nil, nil).ServeHTTP(rec, req)
 
 	var raw map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
@@ -118,7 +118,7 @@ func TestRuntimeMetrics_PreservesExistingShape(t *testing.T) {
 	for _, key := range []string{
 		"heap_alloc_mb", "heap_sys_mb", "goroutine_count", "num_gc",
 		"active_users", "cache_key_count",
-		"cluster_dep", "watch_events", "work_queues", "l2",
+		"cluster_dep", "watch_events", "work_queues", "l2", "prewarm",
 	} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("missing top-level field %q in /metrics/runtime output", key)

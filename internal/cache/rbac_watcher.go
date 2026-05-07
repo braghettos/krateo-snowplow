@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -26,6 +27,18 @@ import (
 // the informer's initial LIST sync) from causing continuous L1 purges.
 const rbacDebounceWindow = 2 * time.Second
 
+// RBACPrewarmer is the minimal contract RBACWatcher needs from the
+// dispatchers PrewarmWorkerPool to fan out cohort prewarm on binding-ADD
+// events. Kept narrow so internal/cache does not import dispatchers.
+//
+// Implemented by *dispatchers.PrewarmWorkerPool.
+type RBACPrewarmer interface {
+	// EnqueueForCohort enqueues prewarm jobs for the given usernames
+	// as a single cohort fan-out. Returns (accepted, dropped). Must be
+	// non-blocking for the caller (the binding-ADD informer goroutine).
+	EnqueueForCohort(ctx context.Context, usernames []string) (accepted, dropped int)
+}
+
 type RBACWatcher struct {
 	cache Cache
 	rc    *rest.Config
@@ -33,6 +46,19 @@ type RBACWatcher struct {
 	mu      sync.Mutex
 	pending bool // true when a debounced invalidation is scheduled
 	timer   *time.Timer
+
+	// Cohort-prewarm coalescing state. Distinct from `mu` (invalidation
+	// debounce) because ADD events trigger fan-outs that should not
+	// reset the invalidation timer or be reset by it. The pendingCohort
+	// flag + cohortTimer + accumulated subject sets together collapse a
+	// burst of binding-ADD events (helm rollout, initial-LIST) into one
+	// debounced fan-out covering the union of affected subjects.
+	cohortMu       sync.Mutex
+	pendingCohort  bool
+	cohortTimer    *time.Timer
+	cohortUserSet  map[string]struct{} // accumulated User subjects
+	cohortGroupSet map[string]struct{} // accumulated Group subjects (expanded at fire time)
+	prewarmer      atomic.Value         // RBACPrewarmer (nil-typed safe via Load)
 
 	// Listers for binding identity computation and local RBAC evaluation.
 	// Set after Start().
@@ -59,12 +85,21 @@ func (rw *RBACWatcher) Start(ctx context.Context) error {
 	}
 	factory := informers.NewSharedInformerFactory(clientset, 0)
 
-	// Only react to genuine mutations (Update/Delete). Skipping AddFunc avoids
+	// Roles/ClusterRoles: react only to Update/Delete. Skipping AddFunc avoids
 	// the initial-LIST storm where every pre-existing RBAC object fires an ADD
 	// event on pod startup — with thousands of resources this would flood the
 	// cache with back-to-back invalidations for several minutes.
 	rbacHandler := func(obj any) { rw.scheduleInvalidate(ctx) }
 	bindingHandler := func(obj any) { rw.scheduleInvalidateFromBinding(ctx, obj) }
+
+	// Q-COHORT-PREWARM (v0.25.312) — RoleBinding/ClusterRoleBinding ADD events
+	// trigger COHORT PREWARM (writes only; no invalidation). Per the
+	// architect spec, ADD strictly EXPANDS visibility — the user's first
+	// request would otherwise pay the cold tail (cyberjoker 22.5s on
+	// ledger row 3). The 2s debounce + subject-union coalescing collapses
+	// initial-LIST storms (~50 RBs in <1s) into ONE fan-out, and the
+	// pool's inflightUsers + L1 Exists checks dedup at cohort granularity.
+	bindingAddHandler := func(obj any) { rw.scheduleCohortPrewarmFromBinding(ctx, obj) }
 
 	_, _ = factory.Rbac().V1().Roles().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(_, n any) { rbacHandler(n) }, DeleteFunc: rbacHandler,
@@ -73,10 +108,14 @@ func (rw *RBACWatcher) Start(ctx context.Context) error {
 		UpdateFunc: func(_, n any) { rbacHandler(n) }, DeleteFunc: rbacHandler,
 	})
 	_, _ = factory.Rbac().V1().RoleBindings().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
+		AddFunc:    bindingAddHandler,
+		UpdateFunc: func(_, n any) { bindingHandler(n) },
+		DeleteFunc: bindingHandler,
 	})
 	_, _ = factory.Rbac().V1().ClusterRoleBindings().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
+		AddFunc:    bindingAddHandler,
+		UpdateFunc: func(_, n any) { bindingHandler(n) },
+		DeleteFunc: bindingHandler,
 	})
 	// Store listers for binding identity computation and local RBAC evaluation.
 	rw.rbLister = factory.Rbac().V1().RoleBindings().Lister()
@@ -134,6 +173,148 @@ func (rw *RBACWatcher) scheduleInvalidateFromBinding(ctx context.Context, obj an
 		rw.mu.Unlock()
 		rw.invalidateFromBinding(ctx, capturedObj)
 	})
+}
+
+// SetPrewarmer registers the RBACPrewarmer used to fan out cohort
+// prewarm jobs on binding-ADD events. Wired in main.go after the
+// PrewarmWorkerPool is constructed; safe to call from any goroutine and
+// safe to be left unset (binding-ADD path becomes a no-op log line).
+func (rw *RBACWatcher) SetPrewarmer(p RBACPrewarmer) {
+	if p == nil {
+		rw.prewarmer.Store((RBACPrewarmer)(nil))
+		return
+	}
+	rw.prewarmer.Store(p)
+}
+
+// scheduleCohortPrewarmFromBinding accumulates the User/Group subjects
+// of a binding-ADD event and schedules a single debounced cohort
+// fan-out. Multiple ADDs within rbacDebounceWindow merge into one
+// dispatch keyed by union-of-subjects — this is what makes the initial-
+// LIST storm tractable at ~50 RBs + 1004 active users.
+//
+// The fan-out runs `prewarmer.EnqueueForCohort(union of users)` with
+// Group subjects expanded to ALL active users (Option A from architect
+// §2.4). The pool's inflightUsers + L1 Exists short-circuits make the
+// per-user cost a few hash lookups for users whose BID didn't change,
+// and a real prewarm walk for users whose BID did change.
+func (rw *RBACWatcher) scheduleCohortPrewarmFromBinding(ctx context.Context, obj any) {
+	subjects, ok := extractSubjects(obj)
+	if !ok || len(subjects) == 0 {
+		return
+	}
+	rw.cohortMu.Lock()
+	if rw.cohortUserSet == nil {
+		rw.cohortUserSet = make(map[string]struct{})
+	}
+	if rw.cohortGroupSet == nil {
+		rw.cohortGroupSet = make(map[string]struct{})
+	}
+	for _, s := range subjects {
+		switch s.Kind {
+		case rbacv1.UserKind:
+			if s.Name != "" {
+				rw.cohortUserSet[s.Name] = struct{}{}
+			}
+		case rbacv1.GroupKind:
+			if s.Name != "" {
+				rw.cohortGroupSet[s.Name] = struct{}{}
+			}
+		}
+	}
+	if rw.pendingCohort {
+		rw.cohortTimer.Reset(rbacDebounceWindow)
+		rw.cohortMu.Unlock()
+		return
+	}
+	rw.pendingCohort = true
+	rw.cohortTimer = time.AfterFunc(rbacDebounceWindow, func() {
+		rw.fireCohortPrewarm(ctx)
+	})
+	rw.cohortMu.Unlock()
+}
+
+// fireCohortPrewarm drains the accumulated subject sets, expands Group
+// subjects against the active-users index, and dispatches a single
+// EnqueueForCohort call. Runs in the cohortTimer goroutine; non-blocking
+// for the informer.
+func (rw *RBACWatcher) fireCohortPrewarm(ctx context.Context) {
+	rw.cohortMu.Lock()
+	users := rw.cohortUserSet
+	groups := rw.cohortGroupSet
+	rw.cohortUserSet = nil
+	rw.cohortGroupSet = nil
+	rw.pendingCohort = false
+	rw.cohortMu.Unlock()
+
+	prewarmer := rw.loadPrewarmer()
+	if prewarmer == nil {
+		slog.Debug("rbac-watcher: cohort prewarm skipped (no prewarmer wired)",
+			slog.Int("users", len(users)),
+			slog.Int("groups", len(groups)),
+		)
+		return
+	}
+
+	// Build the affected-username set:
+	//   1. Direct User subjects.
+	//   2. If any Group subject was observed, expand to ALL active users
+	//      (Option A — architect §2.4). Per-user EnqueueForUser is cheap
+	//      for users whose BID didn't change (L1 Exists hits short-circuit
+	//      the walk); only users in the new group pay a real prewarm.
+	affected := make(map[string]struct{}, len(users))
+	for u := range users {
+		affected[u] = struct{}{}
+	}
+	if len(groups) > 0 {
+		active, err := rw.cache.SMembers(ctx, ActiveUsersKey)
+		if err != nil {
+			slog.Warn("rbac-watcher: cohort prewarm — SMembers(ActiveUsersKey) failed; using direct subjects only",
+				slog.Any("err", err),
+			)
+		} else {
+			for _, u := range active {
+				if u != "" {
+					affected[u] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(affected) == 0 {
+		slog.Debug("rbac-watcher: cohort prewarm — no affected users after expansion",
+			slog.Int("users", len(users)),
+			slog.Int("groups", len(groups)),
+		)
+		return
+	}
+
+	usernames := make([]string, 0, len(affected))
+	for u := range affected {
+		usernames = append(usernames, u)
+	}
+
+	accepted, dropped := prewarmer.EnqueueForCohort(ctx, usernames)
+	slog.Info("rbac-watcher: cohort prewarm fanned out on binding ADD",
+		slog.Int("users_total", len(usernames)),
+		slog.Int("user_subjects", len(users)),
+		slog.Int("group_subjects", len(groups)),
+		slog.Int("accepted", accepted),
+		slog.Int("dropped", dropped),
+	)
+}
+
+// loadPrewarmer reads the atomic.Value, returning nil if unset or
+// stored as a typed-nil interface.
+func (rw *RBACWatcher) loadPrewarmer() RBACPrewarmer {
+	v := rw.prewarmer.Load()
+	if v == nil {
+		return nil
+	}
+	p, ok := v.(RBACPrewarmer)
+	if !ok || p == nil {
+		return nil
+	}
+	return p
 }
 
 // invalidate uses the active-users set for targeted RBAC invalidation.
