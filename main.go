@@ -374,11 +374,21 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// pprof endpoints for heap/goroutine profiling
-	mux.HandleFunc("GET /debug/pprof/", http.DefaultServeMux.ServeHTTP)
-	mux.HandleFunc("GET /debug/pprof/heap", http.DefaultServeMux.ServeHTTP)
-	mux.HandleFunc("GET /debug/pprof/goroutine", http.DefaultServeMux.ServeHTTP)
-	mux.HandleFunc("GET /debug/pprof/profile", http.DefaultServeMux.ServeHTTP)
+	// pprof endpoints for heap/goroutine profiling. Q-DIAG-PPROF (0.25.321)
+	// tags responses with X-Snowplow-Build so heap-shift RCA can attribute
+	// artifacts to the exact image. Empty `build` (local `go run`) → "unknown".
+	pprofTag := func(w http.ResponseWriter, r *http.Request) {
+		tag := build
+		if tag == "" {
+			tag = "unknown"
+		}
+		w.Header().Set("X-Snowplow-Build", tag)
+		http.DefaultServeMux.ServeHTTP(w, r)
+	}
+	mux.HandleFunc("GET /debug/pprof/", pprofTag)
+	mux.HandleFunc("GET /debug/pprof/heap", pprofTag)
+	mux.HandleFunc("GET /debug/pprof/goroutine", pprofTag)
+	mux.HandleFunc("GET /debug/pprof/profile", pprofTag)
 
 	// Enable mutex + block profiling for HOT-tier contention analysis.
 	// Sampling rates match Go community defaults for production-safe overhead.
@@ -411,6 +421,18 @@ func main() {
 	if appCache != nil {
 		globalRBACWatcher = cache.NewRBACWatcher(appCache, sarc)
 	}
+	// Q-DIAG-PPROF (0.25.321) — wire RBACWatcher + MemCache lenses into
+	// /metrics/runtime. nil-safe via the Len()/Count() receivers.
+	mcDiag, _ := appCache.(*cache.MemCache)
+	cache.RegisterDiagSampler(func() cache.DiagSnapshot {
+		return cache.DiagSnapshot{
+			IdentityCacheEntries:        globalRBACWatcher.IdentityCacheLen(),
+			LastCohortBidForUserEntries: globalRBACWatcher.LastCohortBidForUserLen(),
+			EvalCacheEntries:            globalRBACWatcher.EvalCacheLen(),
+			ClusterDepSetCount:          mcDiag.SetCount(),
+			ClusterDepSetMemberTotal:    mcDiag.SetMemberTotal(),
+		}
+	})
 	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, appCache, globalRBACWatcher)
 
 	mux.Handle("GET /list", chain.Append(userCfg, withCache).Then(handlers.List()))

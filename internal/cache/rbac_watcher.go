@@ -165,6 +165,34 @@ func NewRBACWatcher(c Cache, rc *rest.Config) *RBACWatcher {
 	}
 }
 
+// IdentityCacheLen / LastCohortBidForUserLen / EvalCacheLen expose
+// RBACWatcher map sizes to /metrics/runtime (Q-DIAG-PPROF, 0.25.321).
+// All three are nil-safe.
+func (rw *RBACWatcher) IdentityCacheLen() int64 {
+	if rw == nil {
+		return 0
+	}
+	var n int64
+	rw.identityCache.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+func (rw *RBACWatcher) LastCohortBidForUserLen() int64 {
+	if rw == nil {
+		return 0
+	}
+	var n int64
+	rw.lastCohortBidForUser.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+func (rw *RBACWatcher) EvalCacheLen() int64 {
+	if rw == nil || rw.evalCache == nil {
+		return 0
+	}
+	return int64(rw.evalCache.Len())
+}
+
 func (rw *RBACWatcher) Start(ctx context.Context) error {
 	clientset, err := kubernetes.NewForConfig(rw.rc)
 	if err != nil {

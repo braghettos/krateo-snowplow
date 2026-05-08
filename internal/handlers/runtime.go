@@ -22,6 +22,19 @@ type RuntimeMetrics struct {
 	L1             L1Info          `json:"l1"`
 	L2             L2Info          `json:"l2"`
 	Prewarm        PrewarmInfo     `json:"prewarm"`
+	Diag           DiagInfo        `json:"diag"`
+}
+
+// DiagInfo exposes Q-DIAG-PPROF (0.25.321) heap-shift diagnostic gauges:
+// per-cache entry counts pprof inuse_space alone cannot disambiguate.
+// RBACWatcher: identityCache, lastCohortBidForUser, evalCache.
+// MemCache.sets: count + member total.
+type DiagInfo struct {
+	IdentityCacheEntries        int64 `json:"identity_cache_entries"`
+	LastCohortBidForUserEntries int64 `json:"last_cohort_bid_for_user_entries"`
+	EvalCacheEntries            int64 `json:"eval_cache_entries"`
+	ClusterDepSetCount          int64 `json:"cluster_dep_set_count"`
+	ClusterDepSetMemberTotal    int64 `json:"cluster_dep_set_member_total"`
 }
 
 // L1Info exposes the L1 byte-budget + LRU eviction telemetry (Q-L1-BUDGET,
@@ -30,13 +43,19 @@ type RuntimeMetrics struct {
 // that distinguish budget-driven evictions from age-driven ones. MaxBytes
 // /MaxEntries reflect the configured caps so canary observers can compute
 // utilisation percentages without re-reading env.
+//
+// Hits/Misses/HitRate (Q-DIAG-PPROF, 0.25.321) folded in from /metrics/cache
+// so canary observers can read L1 attribution without two endpoints.
 type L1Info struct {
-	ResidentBytes int64 `json:"resident_bytes"`
-	Entries       int64 `json:"entries"`
-	MaxBytes      int64 `json:"max_bytes"`
-	MaxEntries    int64 `json:"max_entries"`
-	EvictionsLRU  int64 `json:"evictions_lru"`
-	EvictionsTTL  int64 `json:"evictions_ttl"`
+	ResidentBytes int64   `json:"resident_bytes"`
+	Entries       int64   `json:"entries"`
+	MaxBytes      int64   `json:"max_bytes"`
+	MaxEntries    int64   `json:"max_entries"`
+	EvictionsLRU  int64   `json:"evictions_lru"`
+	EvictionsTTL  int64   `json:"evictions_ttl"`
+	Hits          int64   `json:"hits"`
+	Misses        int64   `json:"misses"`
+	HitRate       float64 `json:"hit_rate"`
 }
 
 // WorkQueueLens is the read-side observability surface of the priority
@@ -215,6 +234,9 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 				MaxEntries:    snap.L1MaxEntries,
 				EvictionsLRU:  snap.L1EvictionsLRU,
 				EvictionsTTL:  snap.L1EvictionsTTL,
+				Hits:          snap.L1Hits,
+				Misses:        snap.L1Misses,
+				HitRate:       snap.L1HitRate,
 			},
 			L2: L2Info{
 				Hits:              snap.L2Hits,
@@ -232,6 +254,11 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 			},
 			Prewarm: pwInfo,
 		}
+
+		// Q-DIAG-PPROF (0.25.321) — sampled gauges for heap-shift RCA;
+		// zero values when no sampler registered (unit tests, cache-off).
+		ds := cache.SampleDiag()
+		m.Diag = DiagInfo(ds)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

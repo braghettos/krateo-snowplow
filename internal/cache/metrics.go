@@ -205,6 +205,34 @@ func sampleL1() (int64, int64) {
 	return 0, 0
 }
 
+// DiagSnapshot bundles Q-DIAG-PPROF (0.25.321) diagnostic gauges sampled
+// from RBACWatcher + MemCache.sets. Same nil-safe atomic-value pattern as
+// l1SamplerFn — zero values surface when no sampler is registered.
+type DiagSnapshot struct {
+	IdentityCacheEntries        int64
+	LastCohortBidForUserEntries int64
+	EvalCacheEntries            int64
+	ClusterDepSetCount          int64
+	ClusterDepSetMemberTotal    int64
+}
+
+var diagSamplerFn atomic.Value // func() DiagSnapshot
+
+func RegisterDiagSampler(fn func() DiagSnapshot) {
+	if fn != nil {
+		diagSamplerFn.Store(fn)
+	}
+}
+
+func SampleDiag() DiagSnapshot {
+	if v := diagSamplerFn.Load(); v != nil {
+		if fn, ok := v.(func() DiagSnapshot); ok && fn != nil {
+			return fn()
+		}
+	}
+	return DiagSnapshot{}
+}
+
 // Snapshot returns the accumulated in-process metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return m.snapshotFromAtomics()

@@ -342,6 +342,34 @@ func L1MaxBytes() int64 { return l1MaxBytes() }
 // L1MaxEntries returns the configured entry cap.
 func L1MaxEntries() int { return l1MaxEntries() }
 
+// SetCount / SetMemberTotal expose c.sets cardinality for /metrics/runtime
+// (Q-DIAG-PPROF, 0.25.321) — pair distinguishes "few large sets" from
+// "many small sets" in the heap-shift RCA. Both nil-safe.
+func (c *MemCache) SetCount() int64 {
+	if c == nil {
+		return 0
+	}
+	var n int64
+	c.sets.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+func (c *MemCache) SetMemberTotal() int64 {
+	if c == nil {
+		return 0
+	}
+	var n int64
+	c.sets.Range(func(_, v any) bool {
+		if se, ok := v.(*memSetEntry); ok && se != nil {
+			se.mu.RLock()
+			n += int64(len(se.members))
+			se.mu.RUnlock()
+		}
+		return true
+	})
+	return n
+}
+
 // touchAccess updates the lastAccess timestamp on a hit. No-op if e is nil.
 func touchAccess(e *memEntry) {
 	if e != nil {
