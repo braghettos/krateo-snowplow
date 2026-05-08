@@ -1215,16 +1215,19 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 			slog.String("name", name))
 	}
 
-	// Update the raw object cache (snowplow:get:*) so the callHandler
-	// serves fresh data immediately. Same stale-while-refresh pattern as
-	// L1 resolved keys: overwrite on ADD/UPDATE, delete on DELETE.
-	if rw.cache != nil {
+	// Q-MIRROR-REMOVAL (0.25.316): the per-event snowplow:get:* mirror write
+	// has been removed. The informer's in-memory store already holds every
+	// watched object byte-for-byte (see ResourceWatcher.GetObject), so the
+	// mirror was 100% redundant and accounted for ~567K cache_keys at bench
+	// scale (5-6 GiB RSS). Callers that previously read snowplow:get:<gvr>:*
+	// now read the informer store via cache.InformerReader.
+	//
+	// DELETE events still drop any legacy mirror entry left over from warmup
+	// and the negative-cache sentinel from a prior 404, so a fresh GET after
+	// recreate doesn't serve a cached 404.
+	if rw.cache != nil && eventType == "delete" {
 		getKey := GetKey(gvr, ns, name)
-		if eventType == "delete" {
-			_ = rw.cache.Delete(ctx, getKey)
-		} else {
-			_ = rw.cache.SetForGVR(ctx, gvr, getKey, uns.Object)
-		}
+		_ = rw.cache.Delete(ctx, getKey)
 	}
 
 	gvrKey := GVRToKey(gvr)
