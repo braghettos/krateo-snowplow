@@ -205,6 +205,134 @@ func TestEvaluateRBAC_PerUserPurge(t *testing.T) {
 	}
 }
 
+// TestEvaluateRBAC_DistinguishesGroups — Q-OOM-FIX patch B-prime fixup
+// (architect 2nd-opinion ship-blocker, 2026-05-08).
+//
+// Three production code paths call EvaluateRBAC with the SAME username
+// but DIFFERENT groups slices (HTTP/JWT, prewarm cert OUs, L1 background
+// refresh hard-coded [system:masters]). Without the groups in the cache
+// key, whichever caller hits first poisons the cache for the others —
+// purgeUserCacheData does NOT fire because no RBAC binding mutated, so
+// the stale authz decision sticks.
+//
+// This test pins the contract that the cache key DISTINGUISHES disjoint
+// group sets:
+//   1. EvaluateRBAC(alice, [admins], ...)      — lister called once.
+//   2. EvaluateRBAC(alice, [developers], ...)  — lister called AGAIN
+//      because the (user, groupsHash) tuple differs.
+//   3. EvaluateRBAC(alice, [admins], ...)      — cache HIT, lister NOT
+//      called again.
+//
+// Sort-order independence is tested by passing the same set in two
+// orders and asserting cache hit.
+func TestEvaluateRBAC_DistinguishesGroups(t *testing.T) {
+	user := "alice"
+	gr := schema.GroupResource{Group: "core.krateo.io", Resource: "compositions"}
+
+	crb, cr := fixtureClusterAdminBinding(user, gr.Group, gr.Resource)
+	rw, counting := newRBACWatcherWithListers(t,
+		[]*rbacv1.ClusterRoleBinding{crb}, []*rbacv1.ClusterRole{cr})
+
+	// 1. First call with [admins] — populates cache.
+	if !rw.EvaluateRBAC(user, []string{"admins"}, "list", gr, "") {
+		t.Fatalf("call#1 [admins]: expected allow")
+	}
+	if got := counting.calls(); got != 1 {
+		t.Fatalf("call#1 [admins]: lister calls = %d, want 1", got)
+	}
+
+	// 2. Same user, DIFFERENT groups — MUST miss the cache and re-scan.
+	if !rw.EvaluateRBAC(user, []string{"developers"}, "list", gr, "") {
+		t.Fatalf("call#2 [developers]: expected allow")
+	}
+	if got := counting.calls(); got != 2 {
+		t.Fatalf("call#2 [developers]: lister calls = %d, want 2 "+
+			"(SHIP BLOCKER: cache key must distinguish groups slices)", got)
+	}
+
+	// 3. Repeat call#1's tuple — MUST hit the cache.
+	if !rw.EvaluateRBAC(user, []string{"admins"}, "list", gr, "") {
+		t.Fatalf("call#3 [admins] repeat: expected allow")
+	}
+	if got := counting.calls(); got != 2 {
+		t.Fatalf("call#3 [admins] repeat: lister calls = %d, want 2 (cache hit expected)", got)
+	}
+
+	// 4. Multi-element set [admins, devs] (sorted form) — distinct
+	// from both prior tuples, MUST miss.
+	if !rw.EvaluateRBAC(user, []string{"admins", "devs"}, "list", gr, "") {
+		t.Fatalf("call#4 [admins,devs]: expected allow")
+	}
+	if got := counting.calls(); got != 3 {
+		t.Fatalf("call#4 [admins,devs]: lister calls = %d, want 3", got)
+	}
+
+	// 5. Same multi-element set in REVERSE order — sort-key MUST treat
+	// it as identical to call#4 (cache hit).
+	if !rw.EvaluateRBAC(user, []string{"devs", "admins"}, "list", gr, "") {
+		t.Fatalf("call#5 [devs,admins] reversed: expected allow")
+	}
+	if got := counting.calls(); got != 3 {
+		t.Fatalf("call#5 [devs,admins] reversed: lister calls = %d, want 3 "+
+			"(sort-stable hash should produce cache HIT)", got)
+	}
+
+	// 6. nil vs empty-slice groups — MUST hash identically (both → 0
+	// per the len(groups) > 0 guard in evalCacheKey).
+	if !rw.EvaluateRBAC(user, nil, "list", gr, "") {
+		t.Fatalf("call#6 nil-groups: expected allow")
+	}
+	listerCallsAfterNil := counting.calls()
+	if !rw.EvaluateRBAC(user, []string{}, "list", gr, "") {
+		t.Fatalf("call#7 empty-groups: expected allow")
+	}
+	if got := counting.calls(); got != listerCallsAfterNil {
+		t.Fatalf("call#7 empty-groups: lister calls = %d, want %d "+
+			"(nil and empty groups MUST hash identically)", got, listerCallsAfterNil)
+	}
+}
+
+// TestEvalCacheKey_GroupsAreSortStable — direct unit test for the key
+// derivation. Belt-and-braces complement to TestEvaluateRBAC_Distinguishes
+// Groups: locks the sort+hash contract at the function boundary so a
+// future regression in evalCacheKey would surface here even without
+// going through EvaluateRBAC.
+func TestEvalCacheKey_GroupsAreSortStable(t *testing.T) {
+	gr := schema.GroupResource{Group: "core.krateo.io", Resource: "compositions"}
+	k1 := evalCacheKey("alice", "list", gr, "ns1", []string{"admins", "devs", "ops"})
+	k2 := evalCacheKey("alice", "list", gr, "ns1", []string{"ops", "admins", "devs"})
+	if k1 != k2 {
+		t.Fatalf("evalCacheKey not sort-stable:\n k1=%q\n k2=%q", k1, k2)
+	}
+
+	k3 := evalCacheKey("alice", "list", gr, "ns1", []string{"admins"})
+	if k1 == k3 {
+		t.Fatalf("evalCacheKey collapsed disjoint group sets to the same key:\n k1=%q\n k3=%q", k1, k3)
+	}
+
+	kNil := evalCacheKey("alice", "list", gr, "ns1", nil)
+	kEmpty := evalCacheKey("alice", "list", gr, "ns1", []string{})
+	if kNil != kEmpty {
+		t.Fatalf("nil vs empty groups should hash identically:\n nil=%q\n empty=%q", kNil, kEmpty)
+	}
+
+	// Username-prefix invariant: the per-user purge in purgeUserCacheData
+	// uses HasPrefix on "username|", which MUST still match every key
+	// for that user regardless of groups.
+	for _, key := range []string{k1, k2, k3, kNil, kEmpty} {
+		if !startsWithPrefix(key, "alice|") {
+			t.Fatalf("evalCacheKey lost username-prefix invariant: %q", key)
+		}
+	}
+}
+
+// startsWithPrefix is a tiny stand-in for strings.HasPrefix to keep this
+// test file's import list trivially small. Same semantics as
+// strings.HasPrefix.
+func startsWithPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
 // TestEvaluateRBAC_LRUEvictsOldestUnderPressure verifies the bounded LRU
 // drops the oldest entry once cap is exceeded. Architect requirement
 // (re-review 2026-05-08): the cache must NOT grow unbounded under
