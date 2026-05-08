@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -663,16 +665,27 @@ func (rw *RBACWatcher) EvaluateRBAC(username string, groups []string, verb strin
 	}
 
 	// Q-OOM-FIX cache short-circuit. Key shape:
-	//   "username|verb|group|resource|namespace"
+	//   "username|<groupsHash>|verb|group|resource|namespace"
 	//
-	// Groups are intentionally NOT part of the key. The K8s authorizer's
-	// allow decision is the union of all matching subjects (User + Group),
-	// so a per-(user,verb,gr,ns) decision changes only when a binding
-	// affecting this user changes — and our two invalidation hooks
-	// (invalidate / purgeUserCacheData) cover exactly that. Including
-	// groups would explode key cardinality (cyberjoker JWT + cert paths
-	// pass disjoint group sets for the same user) and hurt hit rate.
-	cacheKey := evalCacheKey(username, verb, gr, namespace)
+	// Architect 2nd-opinion fixup (2026-05-08, ship-blocking): the
+	// groupsHash MUST be part of the key. Three production paths call
+	// EvaluateRBAC with the same username but different groups slices:
+	//   - HTTP/JWT path: groups from JWT claim
+	//     (internal/handlers/userconfig.go:48,81)
+	//   - Prewarm cert path: groups from cert OUs
+	//     (internal/handlers/dispatchers/prewarm_workers.go:273,355,357)
+	//   - L1 background refresh: hard-coded [system:masters]
+	//     (internal/handlers/dispatchers/l1_refresh.go:96-99)
+	//
+	// Without the groups in the key, whichever caller arrives first
+	// poisons the cache for the others — purgeUserCacheData() does NOT
+	// fire for these cross-path mismatches because no RBAC binding
+	// mutated, so the stale authz decision sticks.
+	//
+	// The username-prefix purge in purgeUserCacheData (see
+	// "username + |" RemoveWithPrefix call) still works because the
+	// key still starts with "username|".
+	cacheKey := evalCacheKey(username, verb, gr, namespace, groups)
 	if rw.evalCache != nil {
 		if v, ok := rw.evalCache.Get(cacheKey); ok {
 			return v
@@ -688,8 +701,27 @@ func (rw *RBACWatcher) EvaluateRBAC(username string, groups []string, verb strin
 
 // evalCacheKey derives the lookup key for evalCache. Kept package-private
 // and inlined-friendly so unit tests can exercise the same key shape.
-func evalCacheKey(username, verb string, gr schema.GroupResource, namespace string) string {
-	return username + "|" + verb + "|" + gr.Group + "|" + gr.Resource + "|" + namespace
+//
+// The groups slice is sorted before hashing so callers passing the same
+// set in different order produce the same key. fnv64a is the cheapest
+// non-crypto hash in the stdlib; collision resistance is a non-issue
+// here (the key already pins username + verb + gr + ns explicitly, the
+// groups hash only disambiguates between disjoint group sets for the
+// same (user, verb, gr, ns) tuple). Empty / nil groups hash to 0 so the
+// hot HTTP path (single group set) skips the hash machinery cost.
+func evalCacheKey(username, verb string, gr schema.GroupResource, namespace string, groups []string) string {
+	var gh uint64
+	if len(groups) > 0 {
+		sorted := append([]string(nil), groups...)
+		sort.Strings(sorted)
+		h := fnv.New64a()
+		for _, g := range sorted {
+			_, _ = h.Write([]byte(g))
+			_, _ = h.Write([]byte{0})
+		}
+		gh = h.Sum64()
+	}
+	return username + "|" + strconv.FormatUint(gh, 16) + "|" + verb + "|" + gr.Group + "|" + gr.Resource + "|" + namespace
 }
 
 // evaluateRBACUncached runs the actual lister scan. Extracted so the hot
