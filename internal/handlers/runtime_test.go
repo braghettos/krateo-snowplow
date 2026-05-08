@@ -197,3 +197,97 @@ func TestRuntimeMetrics_ExposesL1Block(t *testing.T) {
 		}
 	}
 }
+
+// TestRuntimeMetrics_ExposesDiagBlock guards the Q-DIAG-PPROF (0.25.321)
+// canary contract: /metrics/runtime MUST surface the five heap-shift RCA
+// gauges under top-level "diag". Required-field set is the architect spec:
+// identity_cache_entries, last_cohort_bid_for_user_entries,
+// eval_cache_entries, cluster_dep_set_count, cluster_dep_set_member_total.
+//
+// PM amendment 3 (2026-05-08) requires tester to upload an H-ranking
+// attribution to the ledger as a deliverable; this test pins the JSON
+// shape so the canary harness can extract the gauges by key.
+func TestRuntimeMetrics_ExposesDiagBlock(t *testing.T) {
+	cache.RegisterDiagSampler(func() cache.DiagSnapshot {
+		return cache.DiagSnapshot{
+			IdentityCacheEntries:        11,
+			LastCohortBidForUserEntries: 22,
+			EvalCacheEntries:            33,
+			ClusterDepSetCount:          44,
+			ClusterDepSetMemberTotal:    55,
+		}
+	})
+	t.Cleanup(func() {
+		cache.RegisterDiagSampler(func() cache.DiagSnapshot { return cache.DiagSnapshot{} })
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/runtime", nil)
+	rec := httptest.NewRecorder()
+	RuntimeMetricsHandler(nil, nil, nil).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%q", rec.Code, rec.Body.String())
+	}
+
+	var got RuntimeMetrics
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v body=%q", err, rec.Body.String())
+	}
+
+	if got.Diag.IdentityCacheEntries != 11 ||
+		got.Diag.LastCohortBidForUserEntries != 22 ||
+		got.Diag.EvalCacheEntries != 33 ||
+		got.Diag.ClusterDepSetCount != 44 ||
+		got.Diag.ClusterDepSetMemberTotal != 55 {
+		t.Errorf("Diag gauges not surfaced: %+v (want 11/22/33/44/55)", got.Diag)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("raw decode: %v", err)
+	}
+	diag, ok := raw["diag"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected top-level 'diag' object, got %T", raw["diag"])
+	}
+	required := []string{
+		"identity_cache_entries",
+		"last_cohort_bid_for_user_entries",
+		"eval_cache_entries",
+		"cluster_dep_set_count",
+		"cluster_dep_set_member_total",
+	}
+	for _, k := range required {
+		if _, ok := diag[k]; !ok {
+			t.Errorf("missing required diag field %q in JSON output: %v", k, diag)
+		}
+	}
+}
+
+// TestRuntimeMetrics_L1HitsMissesHitRate verifies the L1 hit/miss/hit_rate
+// fields (Q-DIAG-PPROF, 0.25.321) are sourced from cache.GlobalMetrics
+// and surfaced under the top-level "l1" block — needed so canary observers
+// can read both /call attribution AND L1 hit-rate from one endpoint.
+func TestRuntimeMetrics_L1HitsMissesHitRate(t *testing.T) {
+	cache.GlobalMetrics.L1Hits.Store(8)
+	cache.GlobalMetrics.L1Misses.Store(2)
+	t.Cleanup(func() {
+		cache.GlobalMetrics.L1Hits.Store(0)
+		cache.GlobalMetrics.L1Misses.Store(0)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/runtime", nil)
+	rec := httptest.NewRecorder()
+	RuntimeMetricsHandler(nil, nil, nil).ServeHTTP(rec, req)
+
+	var got RuntimeMetrics
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.L1.Hits != 8 || got.L1.Misses != 2 {
+		t.Errorf("L1.Hits/Misses: got %d/%d want 8/2", got.L1.Hits, got.L1.Misses)
+	}
+	if got.L1.HitRate < 79.999 || got.L1.HitRate > 80.001 {
+		t.Errorf("L1.HitRate = %.3f, want 80.0", got.L1.HitRate)
+	}
+}
