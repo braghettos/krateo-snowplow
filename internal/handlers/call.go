@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/httpcall"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -106,16 +108,35 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				response.NotFound(wri, fmt.Errorf("resource not found (cached)"))
 				return
 			}
-			// Positive cache check.
-			if raw, hit, rerr := c.GetRaw(req.Context(), cacheKey); hit && rerr == nil {
+			// Q-MIRROR-REMOVAL (0.25.316): the snowplow:get:* mirror is gone.
+			// Serve the GET cache hit directly from the informer's in-memory
+			// store. ListObjects already returns a stripped, transform-applied
+			// view of every watched object — exactly what the legacy mirror
+			// held — so we marshal once at request time. Marshal cost is on
+			// the order of microseconds for a single object; the savings (no
+			// per-event 1:1 mirror write) are 5-6 GiB at bench.
+			if raw, hit := callTryServeFromInformer(req.Context(), opts, log); hit {
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallHits, "call_hits")
-				log.Debug("call: cache hit", slog.String("key", cacheKey))
 				wri.Header().Set("Content-Type", "application/json")
 				wri.WriteHeader(http.StatusOK)
 				_, _ = wri.Write(raw)
 				return
 			}
-		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallMisses, "call_misses")
+			// Positive cache check (LIST path or first-fetch GET fall-through).
+			// The LIST path (no name) still uses AssembleListFromIndex which
+			// itself reads from the informer post-mirror-removal. Single-name
+			// GETs that miss the informer (informer not yet synced for this
+			// GVR, or RBAC redirected to a different namespace) fall through
+			// to the K8s API call below, then write SetRaw on success.
+			if raw, hit, rerr := c.GetRaw(req.Context(), cacheKey); hit && rerr == nil {
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallHits, "call_hits")
+				log.Debug("call: cache hit (kv)", slog.String("key", cacheKey))
+				wri.Header().Set("Content-Type", "application/json")
+				wri.WriteHeader(http.StatusOK)
+				_, _ = wri.Write(raw)
+				return
+			}
+			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallMisses, "call_misses")
 			log.Info("call: cache miss", slog.String("key", cacheKey), slog.String("verb", opts.verb), slog.String("gvr", cache.GVRToKey(opts.gvr)))
 		}
 	}
@@ -207,6 +228,94 @@ func callCacheKey(opts callOptions) string {
 		return cache.ListKey(opts.gvr, opts.nsn.Namespace)
 	}
 	return cache.GetKey(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
+}
+
+// callTryServeFromInformer attempts to satisfy a GET (named resource) or LIST
+// (no name) directly from the informer's in-memory store, marshaling once at
+// request time. Returns (bytes, true) on hit. Returns (nil, false) when:
+//   - no InformerReader is in ctx (e.g. unit tests without ResourceWatcher),
+//   - the GVR has no registered informer yet (registered just-in-time via
+//     SAddGVR above; first request races sync — fall through to K8s API),
+//   - the named object is absent (callHandler issues the K8s GET so the
+//     negative-cache sentinel fires correctly on a real 404).
+//
+// Q-MIRROR-REMOVAL (0.25.316): replaces the snowplow:get:* mirror reads.
+func callTryServeFromInformer(ctx context.Context, opts callOptions, log *slog.Logger) ([]byte, bool) {
+	ir := cache.InformerReaderFromContext(ctx)
+	if ir == nil {
+		return nil, false
+	}
+
+	// LIST path (no name): assemble UnstructuredList from informer store.
+	if opts.nsn.Name == "" {
+		objs, ok := ir.ListObjects(opts.gvr, opts.nsn.Namespace)
+		if !ok {
+			return nil, false
+		}
+		raw, err := marshalUnstructuredList(opts.gvr, objs)
+		if err != nil {
+			log.Debug("call: informer list marshal failed",
+				slog.String("gvr", cache.GVRToKey(opts.gvr)),
+				slog.Any("err", err))
+			return nil, false
+		}
+		log.Debug("call: cache hit (informer-list)",
+			slog.String("gvr", cache.GVRToKey(opts.gvr)),
+			slog.Int("items", len(objs)))
+		return raw, true
+	}
+
+	// GET path: single named object.
+	uns, ok := ir.GetObject(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
+	if !ok || uns == nil {
+		return nil, false
+	}
+	raw, err := json.Marshal(uns.Object)
+	if err != nil {
+		log.Debug("call: informer object marshal failed",
+			slog.String("gvr", cache.GVRToKey(opts.gvr)),
+			slog.String("ns", opts.nsn.Namespace),
+			slog.String("name", opts.nsn.Name),
+			slog.Any("err", err))
+		return nil, false
+	}
+	log.Debug("call: cache hit (informer-get)",
+		slog.String("gvr", cache.GVRToKey(opts.gvr)),
+		slog.String("ns", opts.nsn.Namespace),
+		slog.String("name", opts.nsn.Name))
+	return raw, true
+}
+
+// marshalUnstructuredList builds a Kubernetes-shaped UnstructuredList JSON
+// from a slice of *unstructured.Unstructured. Mirrors the wire format that
+// memcache.AssembleListFromIndex used to produce, so existing list consumers
+// (frontend, RESTAction iterators) see no shape change.
+func marshalUnstructuredList(gvr schema.GroupVersionResource, items []*unstructured.Unstructured) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteString(`{"apiVersion":"`)
+	if gvr.Group == "" {
+		buf.WriteString(gvr.Version)
+	} else {
+		buf.WriteString(gvr.Group)
+		buf.WriteByte('/')
+		buf.WriteString(gvr.Version)
+	}
+	buf.WriteString(`","kind":"List","metadata":{"resourceVersion":""},"items":[`)
+	for i, uns := range items {
+		if uns == nil {
+			continue
+		}
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		raw, err := json.Marshal(uns.Object)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(raw)
+	}
+	buf.WriteString(`]}`)
+	return buf.Bytes(), nil
 }
 
 func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err error) {
