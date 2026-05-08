@@ -68,7 +68,20 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 		return
 	}
 
-	// Positive cache check.
+	// Q-MIRROR-REMOVAL (0.25.316): prefer the informer's in-memory store over
+	// the snowplow:get:* mirror — zero I/O, zero copy. Falls through to the
+	// legacy mirror Get below when no InformerReader is in ctx (unit tests)
+	// or the GVR has no registered informer yet.
+	if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+		if uns, ok := ir.GetObject(res.GVR, ref.Namespace, ref.Name); ok && uns != nil {
+			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.GetHits, "get_hits")
+			log.Debug("object cache hit (informer)", slog.String("key", cacheKey))
+			res.Unstructured = uns
+			return
+		}
+	}
+
+	// Positive cache check (legacy mirror fallback).
 	if c != nil {
 		var cached unstructured.Unstructured
 		if hit, rerr := c.Get(ctx, cacheKey, &cached); hit && rerr == nil {
@@ -123,14 +136,13 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	}
 	uns.SetManagedFields(nil)
 
-	if c != nil {
-		// Only store the K8s API response if the key is absent. The
-		// ResourceWatcher may have already stored a fresher version while
-		// this request was in-flight (e.g., a mutation event arrived).
-		if !c.Exists(ctx, cacheKey) {
-			_ = c.SetForGVR(ctx, res.GVR, cacheKey, uns)
-		}
-	}
+	// Q-MIRROR-REMOVAL (0.25.316): no SetForGVR mirror writeback. The
+	// informer's WATCH will populate the in-memory store on the next event
+	// for this object; subsequent objects.Get calls hit the informer fast
+	// path above without any cache duplication. The negative-cache (404)
+	// path above still writes its sentinel, since the informer cannot
+	// represent "object known to be absent".
+	_ = c // unused (kept for symmetry with neg-cache path above)
 
 	res.Unstructured = uns
 	res.Err = nil
