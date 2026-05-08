@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,12 +19,62 @@ import (
 // compile-time check: *MemCache satisfies Cache.
 var _ Cache = (*MemCache)(nil)
 
+// ── L1 budget knobs (Q-L1-BUDGET, 0.25.319) ──────────────────────────────────
+//
+// Per architect 2026-05-08: the L1 kv map had no byte cap, no entry cap, and
+// no LRU. At 49K bench × 1004 users it sustained 2.32 GiB; only TTL × write-
+// rate bounded growth. These knobs put a hard ceiling on the L1 footprint and
+// add LRU sweep so the eviction order is predictable. The L2 sweeper at
+// l2_refilter.go:549-607 is the structural template.
+const (
+	envL1MaxBytes   = "CACHE_L1_MAX_BYTES"
+	envL1MaxEntries = "CACHE_L1_MAX_ENTRIES"
+
+	defaultL1MaxBytes   int64 = 2 << 30 // 2 GiB
+	defaultL1MaxEntries int   = 200_000
+)
+
+// l1MaxBytes reads CACHE_L1_MAX_BYTES on every call (cheap; the budget
+// check fires once per StartEviction tick + once per write that overflows).
+// Returns the default when unset, empty, or unparseable.
+func l1MaxBytes() int64 {
+	v := strings.TrimSpace(os.Getenv(envL1MaxBytes))
+	if v == "" {
+		return defaultL1MaxBytes
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return defaultL1MaxBytes
+	}
+	return n
+}
+
+// l1MaxEntries reads CACHE_L1_MAX_ENTRIES on every call.
+func l1MaxEntries() int {
+	v := strings.TrimSpace(os.Getenv(envL1MaxEntries))
+	if v == "" {
+		return defaultL1MaxEntries
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return defaultL1MaxEntries
+	}
+	return n
+}
+
 // ── Entry types ──────────────────────────────────────────────────────────────
 
 // memEntry stores a single key-value pair with an optional expiry.
+//
+// LRU tracking (Q-L1-BUDGET, 0.25.319): lastAccess is updated on every
+// successful GetRaw via an atomic.Int64 store. The byte-budget sweeper sorts
+// entries by lastAccess ascending and evicts the oldest until under both the
+// byte cap and entry cap. Updates are racy-but-monotonic (occasional clobber
+// of a slightly older nano timestamp by a slightly newer one is fine for LRU).
 type memEntry struct {
-	data      []byte
-	expiresAt int64 // unix nano; 0 = never expires
+	data       []byte
+	expiresAt  int64        // unix nano; 0 = never expires
+	lastAccess atomic.Int64 // unix nano; updated on every GetRaw hit
 }
 
 // memSetEntry stores a set of string members with an optional expiry.
@@ -53,6 +106,13 @@ type MemCache struct {
 	gvrTTLs     sync.Map
 	onNewGVR    atomic.Value // stores gvrNotifyFunc
 	resourceTTL time.Duration
+
+	// Q-L1-BUDGET (0.25.319) — atomic counters for budget accounting +
+	// /metrics/runtime exposure. residentBytes is the sum of len(data) for
+	// every live entry in c.kv (NOT sets/rbac — those are bounded by other
+	// means). entryCount mirrors len(c.kv) without Range.
+	residentBytes atomic.Int64
+	entryCount    atomic.Int64
 }
 
 // NewMem creates a new in-process cache with the given default resource TTL.
@@ -91,6 +151,11 @@ func (c *MemCache) SetGVRNotifier(fn func(context.Context, schema.GroupVersionRe
 
 // StartEviction launches a background goroutine that removes expired entries
 // every 30 seconds. The goroutine exits when ctx is cancelled.
+//
+// Q-L1-BUDGET (0.25.319): in addition to the TTL pass, after the TTL sweep
+// completes we check residentBytes / entryCount against the configured caps
+// and run an LRU sweep when over. Mirrors the L2 sweeper at
+// l2_refilter.go:557-607.
 func (c *MemCache) StartEviction(ctx context.Context) {
 	go func() {
 		t := time.NewTicker(30 * time.Second)
@@ -103,7 +168,9 @@ func (c *MemCache) StartEviction(ctx context.Context) {
 				now := time.Now().UnixNano()
 				c.kv.Range(func(k, v any) bool {
 					if e := v.(*memEntry); e.expiresAt > 0 && e.expiresAt < now {
-						c.kv.Delete(k)
+						if c.kvDelete(k.(string)) != nil {
+							GlobalMetrics.L1EvictionsTTL.Add(1)
+						}
 					}
 					return true
 				})
@@ -120,9 +187,66 @@ func (c *MemCache) StartEviction(ctx context.Context) {
 					}
 					return true
 				})
+
+				// LRU budget sweep — runs after TTL pass so we evict only
+				// what's still alive (TTL-expired entries are already gone).
+				c.sweepLRUIfOverBudget()
 			}
 		}
 	}()
+}
+
+// sweepLRUIfOverBudget evicts least-recently-accessed kv entries until both
+// residentBytes <= 0.9 × cap and entryCount <= 0.9 × cap. The 10% slack
+// matches L2's strategy and avoids thrash on bursty writers. Single goroutine
+// (the StartEviction tick) so no internal locking is required beyond the
+// counter atomics.
+//
+// Concurrent writers may push residentBytes up while we sort; that's fine —
+// the next tick will catch up. Race-free because every counter delta is
+// applied via atomic ops in kvStore/kvDelete.
+func (c *MemCache) sweepLRUIfOverBudget() {
+	maxBytes := l1MaxBytes()
+	maxEntries := l1MaxEntries()
+	curBytes := c.residentBytes.Load()
+	curCount := c.entryCount.Load()
+
+	if curBytes <= maxBytes && curCount <= int64(maxEntries) {
+		return
+	}
+
+	type item struct {
+		key string
+		ts  int64
+		sz  int
+	}
+	items := make([]item, 0, curCount)
+	c.kv.Range(func(k, v any) bool {
+		ks, _ := k.(string)
+		e, ok := v.(*memEntry)
+		if !ok || e == nil {
+			return true
+		}
+		items = append(items, item{key: ks, ts: e.lastAccess.Load(), sz: len(e.data)})
+		return true
+	})
+	sort.Slice(items, func(i, j int) bool { return items[i].ts < items[j].ts })
+
+	targetBytes := int64(float64(maxBytes) * 0.9)
+	targetCount := int64(float64(maxEntries) * 0.9)
+
+	evicted := int64(0)
+	for _, it := range items {
+		if c.residentBytes.Load() <= targetBytes && c.entryCount.Load() <= targetCount {
+			break
+		}
+		if c.kvDelete(it.key) != nil {
+			evicted++
+		}
+	}
+	if evicted > 0 {
+		GlobalMetrics.L1EvictionsLRU.Add(evicted)
+	}
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -151,6 +275,80 @@ func cloneBytes(b []byte) []byte {
 	return cp
 }
 
+// ── Q-L1-BUDGET (0.25.319) — counter-aware kv mutation helpers ─────────────
+//
+// Every code path that adds, replaces, or removes a *memEntry from c.kv MUST
+// route through one of these helpers so c.residentBytes and c.entryCount stay
+// accurate. The byte delta is computed from the *new* entry's data length
+// minus the previous entry's data length (if any). LRU access is stamped on
+// store so freshly-written entries do not get evicted on the very next sweep.
+
+// kvStore inserts or replaces an entry, updating residentBytes/entryCount and
+// stamping lastAccess. Returns nothing — the caller does not need to know
+// whether a replace happened.
+func (c *MemCache) kvStore(key string, e *memEntry) {
+	now := time.Now().UnixNano()
+	e.lastAccess.Store(now)
+	prev, loaded := c.kv.Swap(key, e)
+	if loaded {
+		if pe, ok := prev.(*memEntry); ok && pe != nil {
+			c.residentBytes.Add(int64(len(e.data)) - int64(len(pe.data)))
+			return
+		}
+	}
+	c.residentBytes.Add(int64(len(e.data)))
+	c.entryCount.Add(1)
+}
+
+// kvDelete removes an entry, decrementing the counters. Returns the deleted
+// entry (or nil) so callers (TTL pass, LRU sweep) can also subtract internal
+// state if they cached the size.
+func (c *MemCache) kvDelete(key string) *memEntry {
+	prev, loaded := c.kv.LoadAndDelete(key)
+	if !loaded {
+		return nil
+	}
+	pe, ok := prev.(*memEntry)
+	if !ok || pe == nil {
+		return nil
+	}
+	c.residentBytes.Add(-int64(len(pe.data)))
+	c.entryCount.Add(-1)
+	return pe
+}
+
+// L1ResidentBytes returns the current resident byte count of c.kv. Exposed
+// for /metrics/runtime.
+func (c *MemCache) L1ResidentBytes() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.residentBytes.Load()
+}
+
+// L1EntryCount returns the current entry count in c.kv.
+func (c *MemCache) L1EntryCount() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.entryCount.Load()
+}
+
+// L1MaxBytes / L1MaxEntries surface the configured caps so /metrics/runtime
+// can publish utilisation percentages without re-reading env. Values are
+// re-read on every call (env may change at runtime in dev/test).
+func L1MaxBytes() int64 { return l1MaxBytes() }
+
+// L1MaxEntries returns the configured entry cap.
+func L1MaxEntries() int { return l1MaxEntries() }
+
+// touchAccess updates the lastAccess timestamp on a hit. No-op if e is nil.
+func touchAccess(e *memEntry) {
+	if e != nil {
+		e.lastAccess.Store(time.Now().UnixNano())
+	}
+}
+
 // ── Core read/write ──────────────────────────────────────────────────────────
 
 func (c *MemCache) GetRaw(_ context.Context, key string) ([]byte, bool, error) {
@@ -163,12 +361,17 @@ func (c *MemCache) GetRaw(_ context.Context, key string) ([]byte, bool, error) {
 	}
 	e := v.(*memEntry)
 	if isExpired(e.expiresAt) {
-		c.kv.Delete(key)
+		if c.kvDelete(key) != nil {
+			GlobalMetrics.L1EvictionsTTL.Add(1)
+		}
 		return nil, false, nil
 	}
 	if bytes.Equal(e.data, []byte(notFoundSentinel)) {
+		// Touch sentinel too — keeps LRU consistent for negative cache.
+		touchAccess(e)
 		return nil, false, nil
 	}
+	touchAccess(e)
 	return cloneBytes(e.data), true, nil
 }
 
@@ -207,7 +410,9 @@ func (c *MemCache) Exists(_ context.Context, key string) bool {
 	}
 	e := v.(*memEntry)
 	if isExpired(e.expiresAt) {
-		c.kv.Delete(key)
+		if c.kvDelete(key) != nil {
+			GlobalMetrics.L1EvictionsTTL.Add(1)
+		}
 		return false
 	}
 	return true
@@ -221,7 +426,7 @@ func (c *MemCache) Set(_ context.Context, key string, val any) error {
 	if err != nil {
 		return err
 	}
-	c.kv.Store(key, &memEntry{data: data, expiresAt: expiresAt(c.resourceTTL)})
+	c.kvStore(key, &memEntry{data: data, expiresAt: expiresAt(c.resourceTTL)})
 	return nil
 }
 
@@ -233,7 +438,7 @@ func (c *MemCache) SetWithTTL(_ context.Context, key string, val any, ttl time.D
 	if err != nil {
 		return err
 	}
-	c.kv.Store(key, &memEntry{data: data, expiresAt: expiresAt(ttl)})
+	c.kvStore(key, &memEntry{data: data, expiresAt: expiresAt(ttl)})
 	return nil
 }
 
@@ -241,7 +446,7 @@ func (c *MemCache) SetRaw(_ context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
 	}
-	c.kv.Store(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(c.resourceTTL)})
+	c.kvStore(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(c.resourceTTL)})
 	return nil
 }
 
@@ -253,7 +458,7 @@ func (c *MemCache) SetForGVR(_ context.Context, gvr schema.GroupVersionResource,
 	if err != nil {
 		return err
 	}
-	c.kv.Store(key, &memEntry{data: data, expiresAt: expiresAt(c.TTLForGVR(gvr))})
+	c.kvStore(key, &memEntry{data: data, expiresAt: expiresAt(c.TTLForGVR(gvr))})
 	return nil
 }
 
@@ -268,7 +473,7 @@ func (c *MemCache) SetMultiForGVR(_ context.Context, gvr schema.GroupVersionReso
 		if err != nil {
 			return err
 		}
-		c.kv.Store(key, &memEntry{data: data, expiresAt: exp})
+		c.kvStore(key, &memEntry{data: data, expiresAt: exp})
 	}
 	return nil
 }
@@ -277,7 +482,7 @@ func (c *MemCache) SetRawForGVR(_ context.Context, gvr schema.GroupVersionResour
 	if c == nil {
 		return nil
 	}
-	c.kv.Store(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(c.TTLForGVR(gvr))})
+	c.kvStore(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(c.TTLForGVR(gvr))})
 	return nil
 }
 
@@ -288,7 +493,7 @@ func (c *MemCache) SetResolvedRaw(_ context.Context, key string, val []byte) err
 	if c == nil {
 		return nil
 	}
-	c.kv.Store(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(ResolvedCacheTTL)})
+	c.kvStore(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(ResolvedCacheTTL)})
 
 	// Maintain per-user resolved index.
 	info, hasInfo := ParseResolvedKey(key)
@@ -304,7 +509,7 @@ func (c *MemCache) SetAPIResultRaw(_ context.Context, key string, val []byte) er
 	if c == nil {
 		return nil
 	}
-	c.kv.Store(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(APIResultCacheTTL)})
+	c.kvStore(key, &memEntry{data: cloneBytes(val), expiresAt: expiresAt(APIResultCacheTTL)})
 	return nil
 }
 
@@ -313,7 +518,7 @@ func (c *MemCache) Delete(_ context.Context, keys ...string) error {
 		return nil
 	}
 	for _, k := range keys {
-		c.kv.Delete(k)
+		c.kvDelete(k)
 	}
 	return nil
 }
@@ -330,7 +535,9 @@ func (c *MemCache) GetNotFound(_ context.Context, key string) bool {
 	}
 	e := v.(*memEntry)
 	if isExpired(e.expiresAt) {
-		c.kv.Delete(key)
+		if c.kvDelete(key) != nil {
+			GlobalMetrics.L1EvictionsTTL.Add(1)
+		}
 		return false
 	}
 	return bytes.Equal(e.data, []byte(notFoundSentinel))
@@ -340,7 +547,7 @@ func (c *MemCache) SetNotFound(_ context.Context, key string) error {
 	if c == nil {
 		return nil
 	}
-	c.kv.Store(key, &memEntry{
+	c.kvStore(key, &memEntry{
 		data:      []byte(notFoundSentinel),
 		expiresAt: expiresAt(notFoundTTL),
 	})
@@ -367,7 +574,7 @@ func (c *MemCache) AtomicUpdateJSON(_ context.Context, key string, fn func([]byt
 	if err != nil || newVal == nil {
 		return err
 	}
-	c.kv.Store(key, &memEntry{data: newVal, expiresAt: expiresAt(ttl)})
+	c.kvStore(key, &memEntry{data: newVal, expiresAt: expiresAt(ttl)})
 	return nil
 }
 
@@ -393,7 +600,9 @@ func (c *MemCache) ScanKeys(_ context.Context, pattern string) ([]string, error)
 		key := k.(string)
 		e := v.(*memEntry)
 		if isExpired(e.expiresAt) {
-			c.kv.Delete(k)
+			if c.kvDelete(key) != nil {
+				GlobalMetrics.L1EvictionsTTL.Add(1)
+			}
 			return true
 		}
 		if matched, _ := path.Match(pattern, key); matched {
@@ -420,7 +629,9 @@ func (c *MemCache) DeleteByPrefix(_ context.Context, prefix string) (int, error)
 		key := k.(string)
 		e := v.(*memEntry)
 		if isExpired(e.expiresAt) {
-			c.kv.Delete(k)
+			if c.kvDelete(key) != nil {
+				GlobalMetrics.L1EvictionsTTL.Add(1)
+			}
 			return true
 		}
 		if strings.HasPrefix(key, prefix) {
@@ -429,7 +640,7 @@ func (c *MemCache) DeleteByPrefix(_ context.Context, prefix string) (int, error)
 		return true
 	})
 	for _, k := range victims {
-		c.kv.Delete(k)
+		c.kvDelete(k)
 	}
 	return len(victims), nil
 }
@@ -832,7 +1043,7 @@ func (c *MemCache) SetStringWithTTL(_ context.Context, key, value string, ttl ti
 	if c == nil {
 		return nil
 	}
-	c.kv.Store(key, &memEntry{data: []byte(value), expiresAt: expiresAt(ttl)})
+	c.kvStore(key, &memEntry{data: []byte(value), expiresAt: expiresAt(ttl)})
 	return nil
 }
 
@@ -846,9 +1057,12 @@ func (c *MemCache) GetString(_ context.Context, key string) (string, bool, error
 	}
 	e := v.(*memEntry)
 	if isExpired(e.expiresAt) {
-		c.kv.Delete(key)
+		if c.kvDelete(key) != nil {
+			GlobalMetrics.L1EvictionsTTL.Add(1)
+		}
 		return "", false, nil
 	}
+	touchAccess(e)
 	return string(e.data), true, nil
 }
 

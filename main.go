@@ -207,6 +207,12 @@ func main() {
 		mc := cache.NewMem(*resourceTTL)
 		mc.StartEviction(context.Background())
 		appCache = mc
+		// Q-L1-BUDGET (0.25.319) — wire the live MemCache resident-byte/
+		// entry counters into MetricsSnapshot so /metrics/runtime can
+		// publish gauges. No goroutine; called once per snapshot.
+		cache.RegisterL1Sampler(func() (int64, int64) {
+			return mc.L1ResidentBytes(), mc.L1EntryCount()
+		})
 		log.Info("in-process cache enabled")
 
 		// Q-RBACC-L2-1 — start the L2 post-refilter cache LRU sweep on

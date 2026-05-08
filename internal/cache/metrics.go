@@ -70,6 +70,13 @@ type Metrics struct {
 	// self-healed L1 entries that were resolved before the CRD existed.
 	CRDRegisterL1Evictions atomic.Int64
 
+	// ── L1 byte-budget + LRU eviction (Q-L1-BUDGET, 0.25.319) ────────────
+	// L1EvictionsLRU counts entries evicted by the byte/entry-count budget
+	// sweep (least-recently-accessed first). L1EvictionsTTL counts entries
+	// evicted by the existing TTL pass (was untracked before 0.25.319).
+	L1EvictionsLRU atomic.Int64
+	L1EvictionsTTL atomic.Int64
+
 	// ── L2 post-refilter cache (Q-RBACC-L2-1) ────────────────────────────
 	// Counters surface at /metrics/runtime under l2_* keys. Hit-rate is
 	// computed by the snapshot consumer.
@@ -141,6 +148,17 @@ type MetricsSnapshot struct {
 	// was just auto-registered. See keys.go L1ResourceDepGroupKey.
 	CRDRegisterL1Evictions int64 `json:"crd_register_l1_evictions"`
 
+	// L1 byte-budget + LRU eviction (Q-L1-BUDGET, 0.25.319). Evictions
+	// counters are monotonic; ResidentBytes/Entries are gauges sampled
+	// once per snapshot from the live MemCache via the registered hook
+	// (see RegisterL1Sampler below).
+	L1EvictionsLRU int64 `json:"l1_evictions_lru"`
+	L1EvictionsTTL int64 `json:"l1_evictions_ttl"`
+	L1ResidentBytes int64 `json:"l1_resident_bytes"`
+	L1Entries       int64 `json:"l1_entries"`
+	L1MaxBytes      int64 `json:"l1_max_bytes"`
+	L1MaxEntries    int64 `json:"l1_max_entries"`
+
 	// L2 post-refilter cache (Q-RBACC-L2-1). HitRate is computed in the
 	// snapshot for parity with L1. ResidentBytes/Count are sampled once
 	// per snapshot from the live counters.
@@ -160,6 +178,32 @@ type MetricsSnapshot struct {
 }
 
 var GlobalMetrics = &Metrics{}
+
+// l1SamplerFn is registered by main.go so MetricsSnapshot can sample the
+// live MemCache's residentBytes/entryCount without a hard dependency edge.
+// Nil-safe: snapshots return 0 for the gauges when no sampler is registered
+// (e.g. unit tests that build snapshots in isolation).
+var l1SamplerFn atomic.Value // func() (residentBytes, entries int64)
+
+// RegisterL1Sampler wires the MemCache's L1ResidentBytes / L1EntryCount into
+// MetricsSnapshot. Called once at startup right after NewMem. Idempotent —
+// re-registering replaces the previous sampler.
+func RegisterL1Sampler(fn func() (int64, int64)) {
+	if fn != nil {
+		l1SamplerFn.Store(fn)
+	}
+}
+
+// sampleL1 is called from snapshotFromAtomics. Returns 0,0 when no sampler
+// is registered.
+func sampleL1() (int64, int64) {
+	if v := l1SamplerFn.Load(); v != nil {
+		if fn, ok := v.(func() (int64, int64)); ok && fn != nil {
+			return fn()
+		}
+	}
+	return 0, 0
+}
 
 // Snapshot returns the accumulated in-process metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
@@ -213,7 +257,13 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		L2EvictionsTotal:    m.L2EvictionsTotal.Load(),
 		L2ResidentBytes:     L2ResidentBytes(),
 		L2ResidentCount:     L2ResidentCount(),
+
+		L1EvictionsLRU: m.L1EvictionsLRU.Load(),
+		L1EvictionsTTL: m.L1EvictionsTTL.Load(),
+		L1MaxBytes:     l1MaxBytes(),
+		L1MaxEntries:   int64(l1MaxEntries()),
 	}
+	s.L1ResidentBytes, s.L1Entries = sampleL1()
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)
 	s.ListHitRate = hitRate(s.ListHits, s.ListMisses)
 	s.RBACHitRate = hitRate(s.RBACHits, s.RBACMisses)

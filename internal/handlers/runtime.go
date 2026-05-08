@@ -19,8 +19,24 @@ type RuntimeMetrics struct {
 	ClusterDep     ClusterDepInfo  `json:"cluster_dep"`
 	WatchEvents    WatchEventsInfo `json:"watch_events"`
 	WorkQueues     WorkQueuesInfo  `json:"work_queues"`
+	L1             L1Info          `json:"l1"`
 	L2             L2Info          `json:"l2"`
 	Prewarm        PrewarmInfo     `json:"prewarm"`
+}
+
+// L1Info exposes the L1 byte-budget + LRU eviction telemetry (Q-L1-BUDGET,
+// 0.25.319) at /metrics/runtime. ResidentBytes/Entries are gauge snapshots
+// of the live MemCache; EvictionsLRU/EvictionsTTL are monotonic counters
+// that distinguish budget-driven evictions from age-driven ones. MaxBytes
+// /MaxEntries reflect the configured caps so canary observers can compute
+// utilisation percentages without re-reading env.
+type L1Info struct {
+	ResidentBytes int64 `json:"resident_bytes"`
+	Entries       int64 `json:"entries"`
+	MaxBytes      int64 `json:"max_bytes"`
+	MaxEntries    int64 `json:"max_entries"`
+	EvictionsLRU  int64 `json:"evictions_lru"`
+	EvictionsTTL  int64 `json:"evictions_ttl"`
 }
 
 // WorkQueueLens is the read-side observability surface of the priority
@@ -192,6 +208,14 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 				DeleteTombstone: snap.WatchEventsDeleteTombstone,
 			},
 			WorkQueues: wqInfo,
+			L1: L1Info{
+				ResidentBytes: snap.L1ResidentBytes,
+				Entries:       snap.L1Entries,
+				MaxBytes:      snap.L1MaxBytes,
+				MaxEntries:    snap.L1MaxEntries,
+				EvictionsLRU:  snap.L1EvictionsLRU,
+				EvictionsTTL:  snap.L1EvictionsTTL,
+			},
 			L2: L2Info{
 				Hits:              snap.L2Hits,
 				Misses:            snap.L2Misses,
