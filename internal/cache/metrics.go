@@ -76,8 +76,13 @@ type Metrics struct {
 	L2Hits               atomic.Int64
 	L2Misses             atomic.Int64
 	L2Writes             atomic.Int64
-	L2SkippedHighRatio   atomic.Int64
-	L2SkippedSizeCap     atomic.Int64
+	// Q-OOM-FIX (Patch F, 2026-05-08) — incremented when l1cache's
+	// resolveAndCacheInner skips L2Put because the existing entry is
+	// byte-equal to the new refiltered bytes. Surfaces the wasted-write
+	// reduction at /metrics/runtime.
+	L2WritesSkippedIdentical atomic.Int64
+	L2SkippedHighRatio       atomic.Int64
+	L2SkippedSizeCap         atomic.Int64
 	L2EvictionsL1Delete  atomic.Int64
 	L2EvictionsIdentity  atomic.Int64
 	L2EvictionsRA        atomic.Int64
@@ -139,11 +144,12 @@ type MetricsSnapshot struct {
 	// L2 post-refilter cache (Q-RBACC-L2-1). HitRate is computed in the
 	// snapshot for parity with L1. ResidentBytes/Count are sampled once
 	// per snapshot from the live counters.
-	L2Hits              int64   `json:"l2_hits"`
-	L2Misses            int64   `json:"l2_misses"`
-	L2Writes            int64   `json:"l2_writes"`
-	L2SkippedHighRatio  int64   `json:"l2_skipped_high_ratio"`
-	L2SkippedSizeCap    int64   `json:"l2_skipped_size_cap"`
+	L2Hits                   int64 `json:"l2_hits"`
+	L2Misses                 int64 `json:"l2_misses"`
+	L2Writes                 int64 `json:"l2_writes"`
+	L2WritesSkippedIdentical int64 `json:"l2_writes_skipped_identical"`
+	L2SkippedHighRatio       int64 `json:"l2_skipped_high_ratio"`
+	L2SkippedSizeCap         int64 `json:"l2_skipped_size_cap"`
 	L2EvictionsL1Delete int64   `json:"l2_evictions_l1_delete"`
 	L2EvictionsIdentity int64   `json:"l2_evictions_identity"`
 	L2EvictionsRA       int64   `json:"l2_evictions_ra"`
@@ -195,11 +201,12 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 
 		CRDRegisterL1Evictions: m.CRDRegisterL1Evictions.Load(),
 
-		L2Hits:              m.L2Hits.Load(),
-		L2Misses:            m.L2Misses.Load(),
-		L2Writes:            m.L2Writes.Load(),
-		L2SkippedHighRatio:  m.L2SkippedHighRatio.Load(),
-		L2SkippedSizeCap:    m.L2SkippedSizeCap.Load(),
+		L2Hits:                   m.L2Hits.Load(),
+		L2Misses:                 m.L2Misses.Load(),
+		L2Writes:                 m.L2Writes.Load(),
+		L2WritesSkippedIdentical: m.L2WritesSkippedIdentical.Load(),
+		L2SkippedHighRatio:       m.L2SkippedHighRatio.Load(),
+		L2SkippedSizeCap:         m.L2SkippedSizeCap.Load(),
 		L2EvictionsL1Delete: m.L2EvictionsL1Delete.Load(),
 		L2EvictionsIdentity: m.L2EvictionsIdentity.Load(),
 		L2EvictionsRA:       m.L2EvictionsRA.Load(),
