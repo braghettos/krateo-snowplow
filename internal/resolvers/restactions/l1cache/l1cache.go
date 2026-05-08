@@ -21,6 +21,7 @@
 package l1cache
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -289,7 +290,23 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 			if user, uerr := xcontext.UserInfo(ctx); uerr == nil {
 				groupsHash = cache.HashGroups(user.Groups)
 			}
-			cache.L2Put(in.ResolvedKey, rki.Username, groupsHash, refiltered, status, false, "v3", len(raw))
+			// Q-OOM-FIX (Patch F, 2026-05-08) — skip identical L2 writes.
+			// Under the no-op UPDATE storm (Patch C absorbs the bulk; the
+			// remainder reaches here because the Refilter pipeline ran),
+			// the existing L2 entry is byte-equal to `refiltered` for the
+			// vast majority of re-resolves. Re-Putting churns
+			// residentBytes accounting + reverse-index bookkeeping +
+			// triggers an opportunistic sweep — none of which produces
+			// observable behaviour change.
+			//
+			// L2Get is cheap (sync.Map lookup + tag check). On error /
+			// miss we fall through to L2Put exactly as before.
+			if existing, ok := cache.L2Get(in.ResolvedKey, rki.Username, groupsHash); ok &&
+				existing != nil && bytes.Equal(existing.Refiltered, refiltered) {
+				cache.GlobalMetrics.L2WritesSkippedIdentical.Add(1)
+			} else {
+				cache.L2Put(in.ResolvedKey, rki.Username, groupsHash, refiltered, status, false, "v3", len(raw))
+			}
 		}
 	}
 
