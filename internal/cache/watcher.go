@@ -1169,7 +1169,7 @@ var noisyConfigMapNamespaces = map[string]bool{
 	"gmp-system":  true,
 }
 
-func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, _, obj any, eventType string) {
+func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, oldObj, obj any, eventType string) {
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
@@ -1193,6 +1193,36 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	case "delete":
 		GlobalMetrics.WatchEventsDelete.Add(1)
 	}
+
+	// Q-OOM-FIX (v0.25.313 RCA, 2026-05-08) — Patch C: filter no-op
+	// UPDATE events. Upstream controllers re-emit UPDATE at ~4.5/s
+	// sustained (~70/s during the measurement burst that triggered the
+	// 16 GiB OOM) for objects whose etcd-tracked state did NOT change.
+	// resourceVersion is monotonic per object; equal RVs between old and
+	// new mean no mutation, so every downstream cache write + L1 refresh
+	// triggered by this event is wasted work. Returning early here drops
+	// the storm before it touches L2 raw cache or the L1 workqueue.
+	//
+	// Conservative gate: only short-circuit when BOTH old and new are
+	// *unstructured.Unstructured (the SharedIndexInformer normal path)
+	// AND both expose a non-empty resourceVersion. Anything else falls
+	// through to the original handling.
+	if eventType == "update" {
+		if oldUns, oldOK := oldObj.(*unstructured.Unstructured); oldOK {
+			oldRV := oldUns.GetResourceVersion()
+			newRV := uns.GetResourceVersion()
+			if oldRV != "" && oldRV == newRV {
+				GlobalMetrics.WatchEventsNoopFiltered.Add(1)
+				slog.Debug("resource-watcher: no-op UPDATE filtered (same resourceVersion)",
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", uns.GetNamespace()),
+					slog.String("name", uns.GetName()),
+					slog.String("rv", newRV))
+				return
+			}
+		}
+	}
+
 	ns, name := uns.GetNamespace(), uns.GetName()
 
 	// Skip noisy configmap updates from system namespaces (e.g. cluster-kubestore

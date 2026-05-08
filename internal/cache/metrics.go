@@ -57,6 +57,11 @@ type Metrics struct {
 	WatchEventsUpdate          atomic.Int64
 	WatchEventsDelete          atomic.Int64
 	WatchEventsDeleteTombstone atomic.Int64
+	// Q-OOM-FIX (Patch C, 2026-05-08) — incremented when handleEvent
+	// short-circuits a no-op UPDATE because old.resourceVersion ==
+	// new.resourceVersion. A growing delta vs WatchEventsUpdate is the
+	// direct measure of how much wasted work the patch absorbs.
+	WatchEventsNoopFiltered atomic.Int64
 
 	// ── CRD auto-register convergence (Q-PREWARM-R5 fix) ─────────────────
 	// CRDRegisterL1Evictions counts L1 resolved keys evicted because a CRD
@@ -124,6 +129,7 @@ type MetricsSnapshot struct {
 	WatchEventsUpdate          int64 `json:"watch_events_update"`
 	WatchEventsDelete          int64 `json:"watch_events_delete"`
 	WatchEventsDeleteTombstone int64 `json:"watch_events_delete_tombstone"`
+	WatchEventsNoopFiltered    int64 `json:"watch_events_noop_filtered"`
 
 	// CRD auto-register convergence (Q-PREWARM-R5 fix). Counts L1
 	// resolved keys evicted because a CRD for their dependency group
@@ -185,6 +191,7 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		WatchEventsUpdate:          m.WatchEventsUpdate.Load(),
 		WatchEventsDelete:          m.WatchEventsDelete.Load(),
 		WatchEventsDeleteTombstone: m.WatchEventsDeleteTombstone.Load(),
+		WatchEventsNoopFiltered:    m.WatchEventsNoopFiltered.Load(),
 
 		CRDRegisterL1Evictions: m.CRDRegisterL1Evictions.Load(),
 
