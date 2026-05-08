@@ -207,56 +207,31 @@ func (w *Warmer) Run(ctx context.Context) {
 
 func (w *Warmer) warmGVR(ctx context.Context, dynClient k8sdynamic.Interface, gvr schema.GroupVersionResource) {
 	log := slog.Default()
+
+	// Q-MIRROR-REMOVAL (0.25.316): warmup no longer writes the snowplow:get:*
+	// mirror or the snowplow:list-idx:* SETs. The informer's initial-sync
+	// LIST populates its in-memory store, which is now the authoritative
+	// read source for AssembleListFromIndex, /call GET hits, and
+	// prewarmFetchCR (see watcher.go, memcache.go, call.go, prewarm.go).
+	//
+	// We retain the dynamic LIST as a startup health check — it confirms
+	// RBAC + connectivity for each warmup GVR before the informer starts
+	// emitting events, surfacing misconfiguration in startup logs rather
+	// than as a silent first-request 403/timeout. The objects themselves
+	// are immediately discarded; the data lives only in the informer store.
 	list, err := dynClient.Resource(gvr).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Warn("warmup: failed to list GVR", slog.String("gvr", gvr.String()), slog.Any("err", err))
 		return
 	}
 
-	byNamespace := make(map[string][]int)
+	// Count for observability only — no caching side effects.
+	byNamespace := make(map[string]int)
 	for i := range list.Items {
-		obj := &list.Items[i]
-		StripAnnotationsFromUnstructured(obj)
-		getKey := GetKey(gvr, obj.GetNamespace(), obj.GetName())
-		if serr := w.cache.SetForGVR(ctx, gvr, getKey, obj); serr != nil {
-			log.Warn("warmup: failed to cache object", slog.String("key", getKey), slog.Any("err", serr))
-		}
-		byNamespace[obj.GetNamespace()] = append(byNamespace[obj.GetNamespace()], i)
+		byNamespace[list.Items[i].GetNamespace()]++
 	}
 
-	ttl := w.cache.TTLForGVR(gvr)
-
-	// ── Per-item index SETs ──────────────────────────────────────────────────
-	// Build cluster-wide index members.
-	var clusterMembers []string
-	for i := range list.Items {
-		obj := &list.Items[i]
-		ns, name := obj.GetNamespace(), obj.GetName()
-		if ns != "" {
-			clusterMembers = append(clusterMembers, ns+"/"+name)
-		} else {
-			clusterMembers = append(clusterMembers, name)
-		}
-	}
-	if len(clusterMembers) > 0 {
-		_ = w.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ""), clusterMembers, ttl)
-	}
-
-	// Build per-namespace index members.
-	nsMembers := make(map[string][]string)
-	for ns, indices := range byNamespace {
-		if ns == "" {
-			continue
-		}
-		for _, idx := range indices {
-			nsMembers[ns] = append(nsMembers[ns], list.Items[idx].GetName())
-		}
-	}
-	for ns, members := range nsMembers {
-		_ = w.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
-	}
-
-	log.Info("warmup: cached GVR", slog.String("gvr", gvr.String()),
+	log.Info("warmup: GVR health check ok", slog.String("gvr", gvr.String()),
 		slog.Int("count", len(list.Items)), slog.Int("namespaces", len(byNamespace)))
 }
 
