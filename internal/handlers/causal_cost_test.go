@@ -80,14 +80,14 @@ func TestStatusRecorder_PassThroughBaseline(t *testing.T) {
 	}
 
 	// Recorder fields must reflect what the client saw.
-	if sr.headerStatus != http.StatusCreated {
-		t.Errorf("recorder headerStatus: got %d, want %d", sr.headerStatus, http.StatusCreated)
+	if sr.HeaderStatus != http.StatusCreated {
+		t.Errorf("recorder headerStatus: got %d, want %d", sr.HeaderStatus, http.StatusCreated)
 	}
-	if sr.bytesWritten != int64(len(payload)) {
-		t.Errorf("recorder bytesWritten: got %d, want %d", sr.bytesWritten, len(payload))
+	if sr.BytesWritten != int64(len(payload)) {
+		t.Errorf("recorder bytesWritten: got %d, want %d", sr.BytesWritten, len(payload))
 	}
-	if sr.writeErr != nil {
-		t.Errorf("recorder writeErr: got %v, want nil", sr.writeErr)
+	if sr.WriteErr != nil {
+		t.Errorf("recorder writeErr: got %v, want nil", sr.WriteErr)
 	}
 }
 
@@ -100,9 +100,9 @@ func TestStatusRecorder_WriteHeaderIsSticky(t *testing.T) {
 	sr.WriteHeader(http.StatusOK)
 	sr.WriteHeader(http.StatusInternalServerError) // should be ignored
 
-	if sr.headerStatus != http.StatusOK {
+	if sr.HeaderStatus != http.StatusOK {
 		t.Errorf("headerStatus: got %d, want %d (first WriteHeader wins)",
-			sr.headerStatus, http.StatusOK)
+			sr.HeaderStatus, http.StatusOK)
 	}
 }
 
@@ -118,12 +118,12 @@ func TestStatusRecorder_ImplicitWriteHeaderOnFirstWrite(t *testing.T) {
 		t.Fatalf("Write: unexpected err: %v", err)
 	}
 
-	if sr.headerStatus != http.StatusOK {
+	if sr.HeaderStatus != http.StatusOK {
 		t.Errorf("headerStatus on implicit: got %d, want %d",
-			sr.headerStatus, http.StatusOK)
+			sr.HeaderStatus, http.StatusOK)
 	}
-	if sr.bytesWritten != 5 {
-		t.Errorf("bytesWritten: got %d, want 5", sr.bytesWritten)
+	if sr.BytesWritten != 5 {
+		t.Errorf("bytesWritten: got %d, want 5", sr.BytesWritten)
 	}
 }
 
@@ -152,11 +152,11 @@ func TestStatusRecorder_WriteErrorIsCapturedAndPropagated(t *testing.T) {
 		t.Errorf("second write: got n=%d, want 1 (partial)", n)
 	}
 
-	if sr.bytesWritten != 3 {
-		t.Errorf("bytesWritten: got %d, want 3 (2 full + 1 partial)", sr.bytesWritten)
+	if sr.BytesWritten != 3 {
+		t.Errorf("bytesWritten: got %d, want 3 (2 full + 1 partial)", sr.BytesWritten)
 	}
-	if !errors.Is(sr.writeErr, sentinelErr) {
-		t.Errorf("writeErr: got %v, want %v", sr.writeErr, sentinelErr)
+	if !errors.Is(sr.WriteErr, sentinelErr) {
+		t.Errorf("writeErr: got %v, want %v", sr.WriteErr, sentinelErr)
 	}
 
 	// Subsequent writes after an error — the recorder must still pass
@@ -168,9 +168,9 @@ func TestStatusRecorder_WriteErrorIsCapturedAndPropagated(t *testing.T) {
 	if !errors.Is(err, otherErr) {
 		t.Errorf("third write: got err=%v, want %v", err, otherErr)
 	}
-	if !errors.Is(sr.writeErr, sentinelErr) {
+	if !errors.Is(sr.WriteErr, sentinelErr) {
 		t.Errorf("writeErr after second error: got %v, want %v (first wins)",
-			sr.writeErr, sentinelErr)
+			sr.WriteErr, sentinelErr)
 	}
 }
 

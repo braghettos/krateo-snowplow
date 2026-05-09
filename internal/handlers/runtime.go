@@ -24,6 +24,30 @@ type RuntimeMetrics struct {
 	Prewarm        PrewarmInfo     `json:"prewarm"`
 	Diag           DiagInfo        `json:"diag"`
 	CallEvents     CallEventsInfo  `json:"call_events"`
+	Widgets        WidgetsInfo     `json:"widgets"`
+}
+
+// WidgetsInfo exposes Q-5XX-DIAG (0.25.324) widget-handler attribution
+// counters. ResponsesByResource keys "{group}/{resource}/{reload_idx}/{class}"
+// where class ∈ {2xx,4xx,5xx}. ErrorByClass keys the writeWidgetError site
+// (rbac_forbidden, object_get_failed, apiref_resolve_failed, marshal_failed,
+// restaction_dispatch_failed). UAFSkipped keys the
+// auditUserAccessFilterSkipped reason (api_error, ...). UAFTouchingCount /
+// UAFNonTouchingCount tally hits at the widgets.go gate (uafSkip = tracker
+// .UAFTouching()) — UAFTouchingByResource breaks the same tally down by
+// "{group}/{resource}/{reload_idx}/{true|false}" so observers can see if
+// the failing CRs are systematically UAFTouching=false while siblings are
+// UAFTouching=true (the H1' smoking gun).
+//
+// All maps surface only non-empty buckets to keep the /metrics/runtime
+// payload bounded under cold cache.
+type WidgetsInfo struct {
+	ResponsesByResource map[string]int64 `json:"responses_by_resource,omitempty"`
+	ErrorByClass        map[string]int64 `json:"error_by_class,omitempty"`
+	UAFSkipped          map[string]int64 `json:"uaf_skipped,omitempty"`
+	UAFTouchingByResource map[string]int64 `json:"uaf_touching_by_resource,omitempty"`
+	UAFTouchingCount    int64            `json:"uaf_touching_count"`
+	UAFNonTouchingCount int64            `json:"uaf_non_touching_count"`
 }
 
 // CallEventsInfo exposes Q-CAUSAL-COST (0.25.323) /call exit-edge counters.
@@ -277,6 +301,16 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 			ClientGone:                 snap.CallClientGone,
 			ClientGoneAfterWriteHeader: snap.CallClientGoneAfterWriteHeader,
 			WriteError:                 snap.CallWriteError,
+		}
+
+		// Q-5XX-DIAG (0.25.324) — widget handler 5xx attribution.
+		m.Widgets = WidgetsInfo{
+			ResponsesByResource:   snap.WidgetResponsesByResource,
+			ErrorByClass:          snap.WidgetErrorByClass,
+			UAFSkipped:            snap.UAFSkipped,
+			UAFTouchingByResource: snap.UAFTouchingByResource,
+			UAFTouchingCount:      snap.UAFTouchingCount,
+			UAFNonTouchingCount:   snap.UAFNonTouchingCount,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

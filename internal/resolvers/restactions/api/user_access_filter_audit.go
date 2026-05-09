@@ -60,6 +60,15 @@ func auditUserAccessFilterSkipped(
 		slog.String("reason", reason),
 		slog.String("error", errMsg),
 	)
+
+	// Q-5XX-DIAG (0.25.324) — co-emit a counter so /metrics/runtime can
+	// report skipped-UAF totals by reason without log scraping. Reason
+	// is a small enum (currently only "api_error") so cardinality is
+	// bounded.
+	if reason == "" {
+		reason = "unknown"
+	}
+	cache.IncMapKey(&cache.GlobalMetrics.UAFSkipped, reason)
 }
 
 // auditUserAccessFilter writes the structured audit log entry for one

@@ -437,61 +437,33 @@ func logCallDone(req *http.Request, rec *statusRecorder, start time.Time) {
 			causeStr = cause.Error()
 		}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallClientGone, "call_client_gone")
-		if rec.headerStatus != 0 {
+		if rec.HeaderStatus != 0 {
 			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallClientGoneAfterWriteHeader, "call_client_gone_after_write_header")
 		}
 	}
-	if rec.writeErr != nil {
-		writeErrStr = rec.writeErr.Error()
+	if rec.WriteErr != nil {
+		writeErrStr = rec.WriteErr.Error()
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallWriteError, "call_write_error")
 	}
 	slog.Info("call.done",
 		slog.String("url", req.URL.String()),
 		slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-		slog.Int("status", rec.headerStatus),
-		slog.Int64("bytes", rec.bytesWritten),
+		slog.Int("status", rec.HeaderStatus),
+		slog.Int64("bytes", rec.BytesWritten),
 		slog.String("write_err", writeErrStr),
 		slog.String("ctx_err", ctxErrStr),
 		slog.String("cause", causeStr),
 	)
 }
 
-// statusRecorder is a transparent http.ResponseWriter wrapper. Captures
-// status code, cumulative bytes written, and the first non-nil Write error.
-// Pass-through only — no behavior change. On implicit-WriteHeader (Write
-// without prior WriteHeader) sets headerStatus=200 to mirror net/http.
-type statusRecorder struct {
-	http.ResponseWriter
-	headerStatus int
-	bytesWritten int64
-	writeErr     error
-	wroteHeader  bool
-}
+// statusRecorder is the package-private alias retained so call.go's
+// existing references compile unchanged. The implementation lives in the
+// exported StatusRecorder type so dispatchers (and future packages) can
+// reuse it without import cycles. See recorder.go.
+type statusRecorder = StatusRecorder
 
 func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
-	return &statusRecorder{ResponseWriter: w}
-}
-
-func (s *statusRecorder) WriteHeader(code int) {
-	if !s.wroteHeader {
-		s.headerStatus = code
-		s.wroteHeader = true
-	}
-	s.ResponseWriter.WriteHeader(code)
-}
-
-func (s *statusRecorder) Write(b []byte) (int, error) {
-	if !s.wroteHeader {
-		// Mirror net/http's implicit 200-on-first-Write contract.
-		s.headerStatus = http.StatusOK
-		s.wroteHeader = true
-	}
-	n, err := s.ResponseWriter.Write(b)
-	s.bytesWritten += int64(n)
-	if err != nil && s.writeErr == nil {
-		s.writeErr = err
-	}
-	return n, err
+	return NewStatusRecorder(w)
 }
 
 func callResponseHandler(out map[string]any) func(io.ReadCloser) error {

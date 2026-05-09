@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -14,6 +16,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	hpkg "github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/profile"
 	"github.com/krateoplatformops/snowplow/internal/objects"
@@ -47,8 +50,20 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	log := xcontext.Logger(req.Context())
 
+	// Q-5XX-DIAG (0.25.324) — wrap wri above gzip so the deferred exit
+	// hook captures the LOGICAL (uncompressed) bytes the handler emitted
+	// plus the first WriteHeader status. The wrapper sits inside this
+	// ServeHTTP — gzip middleware wraps the mux ABOVE us — so wri here is
+	// already the gzip wrapper. Wrapping again is safe (pass-through) and
+	// gives counters the unzipped view that maps to JSON-payload size.
+	rec := hpkg.NewStatusRecorder(wri)
+	wri = rec
+	reloadIdx := readReloadIdx(req)
+	defer logWidgetDone(req, rec, start, reloadIdx)
+
 	extras, err := util.ParseExtras(req)
 	if err != nil {
+		bumpWidgetErrorClass(req, "bad_request", reloadIdx, err)
 		response.BadRequest(wri, err)
 		return
 	}
@@ -136,15 +151,16 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	got := fetchObject(req)
 	fetchSpan.End()
 	if got.Err != nil {
+		bumpWidgetErrorClass(req, "object_get_failed", reloadIdx, fmt.Errorf("%s", got.Err.Message))
 		response.Encode(wri, got.Err)
 		return
 	}
 
 	// Resolve the widget. L1 keys are per-user so there is no
 	// thundering herd — each user resolves their own key.
-	res, resolveErr := resolveWidgetFromObject(req.Context(), c, got, resolvedKey, r.authnNS, perPage, page, extras)
+	res, resolveErr := resolveWidgetFromObjectInstrumented(req.Context(), c, got, resolvedKey, r.authnNS, perPage, page, extras, reloadIdx)
 	if resolveErr != nil {
-		writeWidgetError(wri, resolveErr)
+		writeWidgetError(req, wri, resolveErr, classifyResolveError(resolveErr), reloadIdx)
 		return
 	}
 	log.Info("Widget successfully resolved",
@@ -161,13 +177,27 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	writeSpan.End()
 }
 
-// resolveWidgetFromObject performs the full widget resolution: resolve → marshal
+// resolveWidgetFromObject is the legacy unlabelled entry point for L1
+// refresh paths that do not flow through the HTTP handler (no
+// X-Reload-Idx header). It forwards to resolveWidgetFromObjectInstrumented
+// with reloadIdx=-1 so the UAF-tracker counter labels record the same
+// "production traffic" bucket the architect's spec calls out for absent
+// header.
+func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Result, resolvedKey, authnNS string, perPage, page int, extras map[string]any) (*ResolveWidgetResult, error) {
+	return resolveWidgetFromObjectInstrumented(ctx, c, got, resolvedKey, authnNS, perPage, page, extras, -1)
+}
+
+// resolveWidgetFromObjectInstrumented performs the full widget resolution: resolve → marshal
 // → cache-set → pre-warm children. It is called both from the HTTP handler
 // and from L1 refresh (via ResolveWidget).
 //
 // Returns a *ResolveWidgetResult so singleflight callers can access both the
 // raw JSON (for HTTP response) and the resolved unstructured (for child pre-warming).
-func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Result, resolvedKey, authnNS string, perPage, page int, extras map[string]any) (*ResolveWidgetResult, error) {
+//
+// reloadIdx is the per-request X-Reload-Idx label used to bucket the
+// UAFTouching/Non-touching counters at the L1-write gate; -1 marks
+// production traffic where the harness header is absent.
+func resolveWidgetFromObjectInstrumented(ctx context.Context, c cache.Cache, got objects.Result, resolvedKey, authnNS string, perPage, page int, extras map[string]any, reloadIdx int) (*ResolveWidgetResult, error) {
 	ctx, span := widgetTracer.Start(ctx, "widget.resolve",
 		trace.WithAttributes(
 			attribute.String("widget.kind", widgets.GetKind(got.Unstructured.Object)),
@@ -238,7 +268,7 @@ func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Res
 	}
 	marshalSpan.End()
 	if merr != nil {
-		return nil, merr
+		return nil, fmt.Errorf("marshal_failed: %w", merr)
 	}
 
 	// Write resolved output to L1. Register cascade deps so that:
@@ -261,6 +291,7 @@ func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Res
 	// correct). Cascade dep registration + child prewarm are also
 	// skipped because they depend on the L1 key that we did not write.
 	uafSkip := tracker.UAFTouching()
+	bumpUAFGateCounter(got.Unstructured, uafSkip, reloadIdx)
 	if c != nil && resolvedKey != "" && !uafSkip {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
 		// Touch the key so it starts HOT for refresh priority.
@@ -304,7 +335,17 @@ func ResolveWidget(ctx context.Context, c cache.Cache, got objects.Result, resol
 	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
 }
 
-func writeWidgetError(wri http.ResponseWriter, err error) {
+// writeWidgetError encodes err to wri preserving any apierrors.StatusError
+// HTTP code (apiserver-conformant) and otherwise downgrading to a 500.
+//
+// Q-5XX-DIAG (0.25.324) — class is the architect-defined error-class label
+// (rbac_forbidden / object_get_failed / apiref_resolve_failed /
+// marshal_failed / restaction_dispatch_failed) and is also bumped on the
+// WidgetErrorByClass counter via bumpWidgetErrorClass. The companion
+// log line carries reload_idx and ctx_err so observers can correlate
+// across the deferred logWidgetDone audit emission.
+func writeWidgetError(req *http.Request, wri http.ResponseWriter, err error, class string, reloadIdx int) {
+	bumpWidgetErrorClass(req, class, reloadIdx, err)
 	var statusErr *apierrors.StatusError
 	if errors.As(err, &statusErr) {
 		code := int(statusErr.Status().Code)
@@ -313,6 +354,172 @@ func writeWidgetError(wri http.ResponseWriter, err error) {
 		return
 	}
 	response.InternalError(wri, err)
+}
+
+// classifyResolveError maps a widgets.Resolve return error onto one of
+// the architect-defined error-class labels. rbac_forbidden takes
+// precedence; marshal_failed is detected via the wrapper sentinel
+// added in resolveWidgetFromObjectInstrumented; apiref_resolve_failed
+// catches inner-call errors carrying "apiref" in the message; remainder
+// falls through to restaction_dispatch_failed.
+func classifyResolveError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		return "rbac_forbidden"
+	}
+	msg := err.Error()
+	if strings.HasPrefix(msg, "marshal_failed:") {
+		return "marshal_failed"
+	}
+	if strings.Contains(msg, "apiref") {
+		return "apiref_resolve_failed"
+	}
+	return "restaction_dispatch_failed"
+}
+
+// readReloadIdx parses the harness-emitted X-Reload-Idx header into an int.
+// Returns -1 (production-traffic sentinel per architect) when the header
+// is absent or unparseable.
+func readReloadIdx(req *http.Request) int {
+	v := req.Header.Get("X-Reload-Idx")
+	if v == "" {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// widgetGVRLabel returns the "{group}/{resource}" portion of the per-resource
+// counter key for a widget request. Falls back to "unknown/unknown" when
+// query parameters are absent (bench traffic always supplies them; only
+// degenerate paths reach this branch).
+func widgetGVRLabel(req *http.Request) string {
+	gvr, err := util.ParseGVR(req)
+	if err != nil {
+		return "unknown/unknown"
+	}
+	return fmt.Sprintf("%s/%s", gvr.Group, gvr.Resource)
+}
+
+// widgetGVRLabelFromObject returns the same per-resource label as
+// widgetGVRLabel but reads it from the unstructured.Unstructured returned
+// by fetchObject. Used at the UAF-tracker gate inside
+// resolveWidgetFromObjectInstrumented where no *http.Request is in scope
+// (L1-refresh paths invoke the resolver without an HTTP request).
+func widgetGVRLabelFromObject(uns *unstructured.Unstructured) string {
+	if uns == nil {
+		return "unknown/unknown"
+	}
+	apiVersion := widgets.GetAPIVersion(uns.Object)
+	kind := widgets.GetKind(uns.Object)
+	group := apiVersion
+	if i := strings.IndexByte(apiVersion, '/'); i >= 0 {
+		group = apiVersion[:i]
+	}
+	return fmt.Sprintf("%s/%s", group, kind)
+}
+
+// bumpWidgetErrorClass increments the WidgetErrorByClass counter and
+// emits the architect-required slog.Info("widget.error", ...) line.
+// All sites take the same shape so a future log-grep correlation across
+// reload_idx is mechanical.
+func bumpWidgetErrorClass(req *http.Request, class string, reloadIdx int, err error) {
+	if class == "" {
+		return
+	}
+	cache.IncMapKey(&cache.GlobalMetrics.WidgetErrorByClass, class)
+	var ctxErr string
+	if e := req.Context().Err(); e != nil {
+		ctxErr = e.Error()
+	}
+	var errStr string
+	if err != nil {
+		errStr = err.Error()
+	}
+	slog.Info("widget.error",
+		slog.String("class", class),
+		slog.String("url", req.URL.Path),
+		slog.Int("reload_idx", reloadIdx),
+		slog.String("ctx_err", ctxErr),
+		slog.String("err", errStr),
+	)
+}
+
+// bumpUAFGateCounter records both the unlabelled UAFTouching/NonTouching
+// totals and the per-resource label "{group}/{resource}/{reload_idx}/{true|false}"
+// so observers can verify whether the failing CRs (bench-app-05-{906,909,
+// 916}-composition-panel) are systematically UAFTouching=false while
+// siblings are UAFTouching=true.
+func bumpUAFGateCounter(uns *unstructured.Unstructured, uafTouching bool, reloadIdx int) {
+	if uafTouching {
+		cache.GlobalMetrics.UAFTouchingCount.Add(1)
+	} else {
+		cache.GlobalMetrics.UAFNonTouchingCount.Add(1)
+	}
+	key := fmt.Sprintf("%s/%d/%t", widgetGVRLabelFromObject(uns), reloadIdx, uafTouching)
+	cache.IncMapKey(&cache.GlobalMetrics.UAFTouchingByResource, key)
+}
+
+// statusClass returns the 2xx/4xx/5xx bucket for an HTTP status code.
+// Used to key the WidgetResponsesByResource counter so observers can
+// see the per-CR shape of healthy vs failing responses without the
+// counter cardinality of distinct codes (200, 201, 401, 403, 500, 502).
+func statusClass(code int) string {
+	switch {
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code == 0:
+		// No header was written — handler returned with body but never
+		// called WriteHeader (or panicked before). Mirror the deferred
+		// log line's status=0 emission with a distinct bucket so the
+		// counter stays consistent with the audit channel.
+		return "no_header"
+	default:
+		return "other"
+	}
+}
+
+// logWidgetDone is the deferred Q-5XX-DIAG exit hook for widgetsHandler.
+// Mirrors call.go's logCallDone but additionally bumps the
+// WidgetResponsesByResource counter keyed by "{group}/{resource}/
+// {reload_idx}/{class}" so observers can attribute per-CR 5xx rates.
+func logWidgetDone(req *http.Request, rec *hpkg.StatusRecorder, start time.Time, reloadIdx int) {
+	ctx := req.Context()
+	ctxErr := ctx.Err()
+	var causeStr, ctxErrStr, writeErrStr string
+	if ctxErr != nil {
+		ctxErrStr = ctxErr.Error()
+		if cause := context.Cause(ctx); cause != nil && cause != ctxErr {
+			causeStr = cause.Error()
+		}
+	}
+	if rec.WriteErr != nil {
+		writeErrStr = rec.WriteErr.Error()
+	}
+	class := statusClass(rec.HeaderStatus)
+	gvrLabel := widgetGVRLabel(req)
+	key := fmt.Sprintf("%s/%d/%s", gvrLabel, reloadIdx, class)
+	cache.IncMapKey(&cache.GlobalMetrics.WidgetResponsesByResource, key)
+	slog.Info("widget.done",
+		slog.String("url", req.URL.Path),
+		slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+		slog.Int("status", rec.HeaderStatus),
+		slog.Int64("bytes", rec.BytesWritten),
+		slog.Int("reload_idx", reloadIdx),
+		slog.String("class", class),
+		slog.String("write_err", writeErrStr),
+		slog.String("ctx_err", ctxErrStr),
+		slog.String("cause", causeStr),
+	)
 }
 
 // ResolveWidgetResult holds the resolved unstructured widget and its serialized

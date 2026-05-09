@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -103,6 +104,60 @@ type Metrics struct {
 	CallClientGone                 atomic.Int64
 	CallClientGoneAfterWriteHeader atomic.Int64
 	CallWriteError                 atomic.Int64
+
+	// ── Widget 5xx attribution counters (Q-5XX-DIAG, 0.25.324) ──────────
+	// Investigation-only instrumentation for the H1' cache-key-collision
+	// hypothesis: widget L1 keys are per binding-identity (NOT per-user)
+	// and rely on MarkUAFTouching() being called during apiref resolution
+	// to gate the L1 write at widgets.go:263. The counters below let an
+	// observer attribute 5xx widget responses to the failing CRs and
+	// confirm whether `bench-app-05-{906,909,916}-composition-panel` are
+	// systematically UAFTouching=false while siblings are UAFTouching=true.
+	//
+	// All maps are sync.Map of (string -> *atomic.Int64). Keys:
+	//   WidgetResponsesByResource: "{group}/{resource}/{reload_idx}/{2xx|4xx|5xx}"
+	//   WidgetErrorByClass: error class enum (rbac_forbidden, object_get_failed,
+	//                       apiref_resolve_failed, marshal_failed, restaction_dispatch_failed)
+	//   UAFSkipped: skip reason enum (api_error, ...)
+	//   UAFTouchingByResource: "{group}/{resource}/{reload_idx}/{true|false}"
+	WidgetResponsesByResource sync.Map // string -> *atomic.Int64
+	WidgetErrorByClass        sync.Map // string -> *atomic.Int64
+	UAFSkipped                sync.Map // string -> *atomic.Int64
+	UAFTouchingByResource     sync.Map // string -> *atomic.Int64
+	UAFTouchingCount          atomic.Int64
+	UAFNonTouchingCount       atomic.Int64
+}
+
+// IncMapKey atomically increments the counter at key inside m, allocating
+// a new *atomic.Int64 on first use. LoadOrStore guarantees only one
+// counter exists per key under concurrent access. Returns the new value.
+//
+// Used by the Q-5XX-DIAG (0.25.324) per-string-key counters where the
+// label space is open (group/resource/reload_idx/class) and a static
+// struct field would not fit.
+func IncMapKey(m *sync.Map, key string) int64 {
+	v, _ := m.LoadOrStore(key, &atomic.Int64{})
+	return v.(*atomic.Int64).Add(1)
+}
+
+// SnapshotMap copies a sync.Map of (string -> *atomic.Int64) to a plain
+// map[string]int64. Safe under concurrent IncMapKey writes — each entry
+// is loaded atomically. Returns nil when the map is empty so JSON output
+// suppresses empty blocks (smaller /metrics/runtime payload).
+func SnapshotMap(m *sync.Map) map[string]int64 {
+	out := map[string]int64{}
+	m.Range(func(k, v any) bool {
+		ks, _ := k.(string)
+		ai, _ := v.(*atomic.Int64)
+		if ai != nil {
+			out[ks] = ai.Load()
+		}
+		return true
+	})
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Inc atomically increments the given counter and updates the OTel metric.
@@ -190,6 +245,15 @@ type MetricsSnapshot struct {
 	CallClientGone                 int64 `json:"call_client_gone"`
 	CallClientGoneAfterWriteHeader int64 `json:"call_client_gone_after_write_header"`
 	CallWriteError                 int64 `json:"call_write_error"`
+
+	// Widget 5xx attribution (Q-5XX-DIAG, 0.25.324). Maps surface at
+	// /metrics/runtime under the widgets block. nil when no entries.
+	WidgetResponsesByResource map[string]int64 `json:"widget_responses_by_resource,omitempty"`
+	WidgetErrorByClass        map[string]int64 `json:"widget_error_by_class,omitempty"`
+	UAFSkipped                map[string]int64 `json:"uaf_skipped,omitempty"`
+	UAFTouchingByResource     map[string]int64 `json:"uaf_touching_by_resource,omitempty"`
+	UAFTouchingCount          int64            `json:"uaf_touching_count"`
+	UAFNonTouchingCount       int64            `json:"uaf_non_touching_count"`
 }
 
 var GlobalMetrics = &Metrics{}
@@ -309,6 +373,13 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		CallClientGone:                 m.CallClientGone.Load(),
 		CallClientGoneAfterWriteHeader: m.CallClientGoneAfterWriteHeader.Load(),
 		CallWriteError:                 m.CallWriteError.Load(),
+
+		WidgetResponsesByResource: SnapshotMap(&m.WidgetResponsesByResource),
+		WidgetErrorByClass:        SnapshotMap(&m.WidgetErrorByClass),
+		UAFSkipped:                SnapshotMap(&m.UAFSkipped),
+		UAFTouchingByResource:     SnapshotMap(&m.UAFTouchingByResource),
+		UAFTouchingCount:          m.UAFTouchingCount.Load(),
+		UAFNonTouchingCount:       m.UAFNonTouchingCount.Load(),
 	}
 	s.L1ResidentBytes, s.L1Entries = sampleL1()
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)
