@@ -494,20 +494,109 @@ func (rw *ResourceWatcher) enqueueRefresh(pages []pageKey, triggerGVR schema.Gro
 }
 
 // registerFromRedis reads the watched-gvrs set from Redis and registers
-// informers for each GVR. Does NOT call factory.Start — the caller does
-// that after all registrations are complete.
+// informers for each GVR in bounded batches (Q-OOM-STARTUP-FANIN, 0.25.329).
+// Each batch admits at most STARTUP_INFORMER_FANIN concurrent registrations,
+// then calls factory.Start (idempotent) and waits for WaitForCacheSync before
+// admitting the next batch. This caps the LIST-decode memory peak that
+// caused the 12+ GiB inuse_space spikes observed in 0.25.327 c1+c2.
+//
+// factory.Start is idempotent — it only starts informers not yet started —
+// so calling it once per batch keeps prior batches running and admits only
+// the freshly-registered informers. WaitForCacheSync polls every started
+// informer; previously-synced ones return immediately, so the per-batch
+// wall time is dominated by the slowest informer in the current batch.
 func (rw *ResourceWatcher) registerFromRedis(ctx context.Context) {
 	members, err := rw.cache.SMembers(ctx, WatchedGVRsKey)
 	if err != nil {
 		slog.Warn("resource-watcher: failed to read watched GVR set", slog.Any("err", err))
 		return
 	}
+
+	// Filter and parse GVRs up-front so the batch loop deals with a clean slice.
+	gvrs := make([]schema.GroupVersionResource, 0, len(members))
 	for _, key := range members {
 		gvr := ParseGVRKey(key)
 		if gvr.Resource == "" {
 			continue
 		}
-		rw.registerInformer(gvr)
+		gvrs = append(gvrs, gvr)
+	}
+
+	fanin := startupInformerFanin()
+	slog.Info("startup-fanin: registering informers in batches",
+		slog.Int("fanin", fanin),
+		slog.Int("total_gvrs", len(gvrs)))
+
+	rw.registerBatched(ctx, gvrs, fanin)
+}
+
+// registerBatched registers `gvrs` in batches of size `fanin`, starting the
+// factory and waiting for cache sync after each batch. Exposed (package-private)
+// for unit tests that exercise the batch sequencing without depending on
+// Start/Stop side effects.
+func (rw *ResourceWatcher) registerBatched(ctx context.Context, gvrs []schema.GroupVersionResource, fanin int) {
+	if fanin < 1 {
+		fanin = 1
+	}
+
+	// Channel-based semaphore: each goroutine takes a slot before calling
+	// registerInformer and releases on return. WaitGroup tracks per-batch
+	// completion so the next batch waits for both registration AND cache sync.
+	sem := make(chan struct{}, fanin)
+
+	batchIdx := 0
+	for start := 0; start < len(gvrs); start += fanin {
+		end := start + fanin
+		if end > len(gvrs) {
+			end = len(gvrs)
+		}
+		batch := gvrs[start:end]
+		batchStart := time.Now()
+
+		var wg sync.WaitGroup
+		for _, g := range batch {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(gvr schema.GroupVersionResource) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				rw.registerInformer(gvr)
+			}(g)
+		}
+		wg.Wait()
+
+		// Start the factory: idempotent, only newly-registered informers begin
+		// their initial LIST/WATCH. Then wait for them to sync before the next
+		// batch admits its 8 LIST pipelines. This is the chokepoint that caps
+		// peak inuse_space.
+		rw.factory.Start(ctx.Done())
+		rw.factory.WaitForCacheSync(ctx.Done())
+
+		batchSync := time.Since(batchStart)
+		slog.Info("startup-fanin: batch synced",
+			slog.Int("batch_idx", batchIdx),
+			slog.Int("batch_size", len(batch)),
+			slog.Int64("sync_duration_ms", batchSync.Milliseconds()))
+		// PM A7: WARN if a single batch sync exceeds 30 s. The architect's
+		// projection is 5-15 s per batch; >30 s eats more than half the 60 s
+		// WaitForCacheSync timeout at main.go:728 and risks regressing
+		// time-to-Ready past the existing budget.
+		if batchSync > 30*time.Second {
+			slog.Warn("startup-fanin: batch sync exceeded 30s",
+				slog.Int("batch_idx", batchIdx),
+				slog.Int64("duration_ms", batchSync.Milliseconds()))
+		}
+		batchIdx++
+
+		// Honor context cancellation between batches so a SIGTERM during
+		// startup hydration aborts cleanly.
+		select {
+		case <-ctx.Done():
+			slog.Info("startup-fanin: aborted by context cancellation",
+				slog.Int("completed_batches", batchIdx))
+			return
+		default:
+		}
 	}
 }
 
