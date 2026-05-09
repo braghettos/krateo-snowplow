@@ -1837,6 +1837,43 @@ def _self_test_destructive_clean_guard():
     log(f"self-test OK: {len(cases)} case(s) passed")
 
 
+def _self_test_assert_clean_guard_wiring():
+    """Verify assert_clean() consults the SCALE guard.
+
+    Doesn't actually call clean_environment() (would touch the cluster).
+    Inspects the function signature + body via inspect.getsource and
+    asserts both `_destructive_clean_guard` and `allow_destructive` are
+    referenced. This is the structural contract Diego asked for: the
+    --phases path MUST gate cleanup on the SCALE guard, just like
+    --scenario crb-delete and --clean-only.
+    """
+    import inspect
+    src = inspect.getsource(assert_clean)
+    failed = 0
+    if "_destructive_clean_guard" not in src:
+        log("  [FAIL] assert_clean does not call _destructive_clean_guard")
+        failed += 1
+    else:
+        log("  [OK ] assert_clean calls _destructive_clean_guard")
+    if "allow_destructive" not in inspect.signature(assert_clean).parameters:
+        log("  [FAIL] assert_clean has no allow_destructive parameter")
+        failed += 1
+    else:
+        log("  [OK ] assert_clean accepts allow_destructive")
+    # Confirm main() forwards args.allow_destructive_clean into assert_clean.
+    main_src = inspect.getsource(main)
+    if "allow_destructive=args.allow_destructive_clean" not in main_src:
+        log("  [FAIL] main() does not forward "
+            "args.allow_destructive_clean into assert_clean")
+        failed += 1
+    else:
+        log("  [OK ] main() forwards args.allow_destructive_clean")
+    if failed:
+        log(f"assert_clean-guard-wiring FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("assert_clean-guard-wiring OK")
+
+
 def _self_test_password_from_secret():
     """Functional check for the secret-derived USERS dict.
 
@@ -1876,13 +1913,21 @@ def _self_test_password_from_secret():
     log("password-from-secret OK")
 
 
-def assert_clean(retry_with_cleanup=True):
+def assert_clean(retry_with_cleanup=True, allow_destructive=False):
     """Assert cluster has no bench leftovers. If dirty and retry_with_cleanup,
     invoke clean_environment() once and re-check; raise if still dirty.
 
+    The SCALE guard (`_destructive_clean_guard`) is consulted before any
+    cleanup so the bench refuses to wipe the Phase-6 customer-shape
+    baseline (~50K compositions, ~50 bench namespaces) on a normal
+    --phases run. Pass `allow_destructive=True` to override.
+
     Today's failure mode this prevents: test runs blind into a cluster with
     543 stuck Roles or 89 orphan repoes left from a prior aborted run, and
-    then aborts mid-deploy after wasting 30+ minutes.
+    then aborts mid-deploy after wasting 30+ minutes. Equally important:
+    on the Phase-6 baseline cluster, the same code path used to wipe
+    tens of thousands of compositions just to "warm up" a single scenario;
+    the SCALE guard prevents that.
     """
     section("Pre-flight: cluster state")
     state = cluster_dirty_state()
@@ -1893,6 +1938,13 @@ def assert_clean(retry_with_cleanup=True):
     log(f"Pre-flight DIRTY: {dirty}")
     if not retry_with_cleanup:
         raise RuntimeError(f"Cluster dirty, abort: {dirty}")
+    blocks, reason = _destructive_clean_guard(state, allow_destructive)
+    if blocks:
+        log(f"Pre-flight: SCALE guard active — {reason}")
+        log("Pre-flight: skipping clean_environment(); proceeding "
+            "with phases on the existing cluster. Pass "
+            "--allow-destructive-clean to override.")
+        return
     log("Pre-flight: invoking clean_environment() ...")
     clean_environment()
     state = cluster_dirty_state()
@@ -4557,6 +4609,7 @@ def main():
 
     if args.self_test:
         _self_test_destructive_clean_guard()
+        _self_test_assert_clean_guard_wiring()
         _self_test_password_from_secret()
         sys.exit(0)
 
@@ -4625,7 +4678,8 @@ def main():
 
     verify_deployed_image()
     cleanup_rogue_rbac()
-    assert_clean(retry_with_cleanup=True)
+    assert_clean(retry_with_cleanup=True,
+                 allow_destructive=args.allow_destructive_clean)
     tokens = login_all()
 
     if 1 in phases:
