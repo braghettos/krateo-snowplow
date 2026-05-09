@@ -153,6 +153,17 @@ type ResourceWatcher struct {
 	// enqueueRefresh call appends entries; processItem drains them to
 	// build a DirtySet for targeted API result cache bypass.
 	dirtyEntries sync.Map // map[string]*dirtyEntryBucket
+
+	// startInformerSem is a global bounded semaphore that gates entry to
+	// startInformer (Q-OOM-STARTINFORMER-SEM, 0.25.330). Capacity is set
+	// from STARTUP_INFORMER_FANIN (default 8). F-v1 (0.25.329) bounded
+	// only registerFromRedis; the 0.25.329 smoke proved that path is
+	// vestigial post-Redis-removal and the real LIST-decode peak comes
+	// from startInformer (AddGVR via GVR notifier + CRD auto-register)
+	// fired up to 8 trees concurrently by the prewarm pool. The sem
+	// caps simultaneous factory.Start + WaitForCacheSync pipelines
+	// uniformly across every caller (no special cases).
+	startInformerSem chan struct{}
 }
 
 func NewResourceWatcher(c Cache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -198,6 +209,10 @@ func NewResourceWatcher(c Cache, rc *rest.Config) (*ResourceWatcher, error) {
 			workqueue.NewTypedItemExponentialFailureRateLimiter[string](1*time.Second, 30*time.Second),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "snowplow-cold"},
 		),
+		// Q-OOM-STARTINFORMER-SEM (0.25.330): bound runtime startInformer
+		// fan-in using the existing STARTUP_INFORMER_FANIN knob (default 8,
+		// validated by startupInformerFanin to never fall back to unbounded).
+		startInformerSem: make(chan struct{}, startupInformerFanin()),
 	}, nil
 }
 
@@ -1214,7 +1229,58 @@ func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) boo
 // Used by AddGVR when a new GVR is discovered at request time.
 // After starting, it waits for the informer to sync and then reconciles
 // the L2 Redis cache from the informer's authoritative in-memory store.
+//
+// Q-OOM-STARTINFORMER-SEM (0.25.330): the entire body is gated by a global
+// bounded semaphore (rw.startInformerSem, capacity STARTUP_INFORMER_FANIN,
+// default 8). This prevents the prewarm pool (4 workers × inner=2 = 8
+// concurrent resolver trees) plus CRD auto-registration from spawning more
+// than `cap` simultaneous factory.Start + WaitForCacheSync pipelines. Each
+// pipeline runs an initial paginated LIST whose decoded objects dominate
+// inuse_space at startup; capping the concurrent count is the primary OOM
+// throttle. F-v1's registerFromRedis bounding is preserved upstream of this
+// gate (vestigial post Redis-removal but harmless — kept per architect
+// rule "surgical add only").
 func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
+	// PM A9 telemetry: wait_duration_ms isolates "cap is binding"
+	// (wait>0) from "cap was non-binding" (wait==0). Without this,
+	// pprof at "fan-in cap working" and "no contention" look identical
+	// — primary falsifier missing.
+	waitStart := time.Now()
+	rw.startInformerSem <- struct{}{}
+	waitDuration := time.Since(waitStart)
+	inFlight := len(rw.startInformerSem) // tokens currently held in the buffered chan
+	semCap := cap(rw.startInformerSem)
+	slog.Info("startInformer: bounded concurrency",
+		slog.String("gvr", gvr.String()),
+		slog.Int("in_flight", inFlight),
+		slog.Int("cap", semCap),
+		slog.Int64("wait_duration_ms", waitDuration.Milliseconds()),
+	)
+	// PM A7: WARN if a single caller waits >30s for a slot. At fanin=8
+	// the cap should not bind for long; sustained >30s waits indicate
+	// stuck WaitForCacheSync upstream and should surface in alerts.
+	if waitDuration > 30*time.Second {
+		slog.Warn("startInformer: wait exceeded 30s",
+			slog.String("gvr", gvr.String()),
+			slog.Int64("wait_ms", waitDuration.Milliseconds()))
+	}
+
+	syncStart := time.Now()
+	defer func() {
+		syncDuration := time.Since(syncStart)
+		slog.Info("startInformer: complete",
+			slog.String("gvr", gvr.String()),
+			slog.Int64("sync_duration_ms", syncDuration.Milliseconds()))
+		// PM A7: WARN if a single sync exceeds 30s.
+		if syncDuration > 30*time.Second {
+			slog.Warn("startInformer: sync exceeded 30s",
+				slog.String("gvr", gvr.String()),
+				slog.Int64("sync_ms", syncDuration.Milliseconds()))
+		}
+		// Release on every exit path including panics.
+		<-rw.startInformerSem
+	}()
+
 	if !rw.registerInformer(gvr) {
 		return
 	}
