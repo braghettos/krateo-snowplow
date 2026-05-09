@@ -63,6 +63,14 @@ type Metrics struct {
 	// direct measure of how much wasted work the patch absorbs.
 	WatchEventsNoopFiltered atomic.Int64
 
+	// Ship 1.5a (0.25.322) — incremented when handleEvent's eventCh send
+	// hits the default branch (channel full). Scaffolded for Ship 1.5b
+	// (eventCh capacity reduction); in 1.5a the buffer stays at 1M so this
+	// counter is expected to remain at 0. A non-zero value at the 1.5b
+	// canary is the back-pressure signal that the smaller buffer is
+	// observing real producer/consumer mismatch.
+	InformerEventDropped atomic.Int64
+
 	// ── CRD auto-register convergence (Q-PREWARM-R5 fix) ─────────────────
 	// CRDRegisterL1Evictions counts L1 resolved keys evicted because a CRD
 	// for their dependency group was just auto-registered (the convergence
@@ -76,6 +84,14 @@ type Metrics struct {
 	// evicted by the existing TTL pass (was untracked before 0.25.319).
 	L1EvictionsLRU atomic.Int64
 	L1EvictionsTTL atomic.Int64
+
+	// Ship 1.5a (0.25.322) — incremented when l1cache.resolveAndCacheInner
+	// skips SetResolvedRaw because the freshly marshaled v3 bytes are
+	// byte-equal to the existing L1 entry. Mirrors L2WritesSkippedIdentical
+	// for the L1 outer-cache write path; surfaces the no-op refresh
+	// dampening at /metrics/runtime so canary observers can verify the
+	// dampener is firing under the no-op UPDATE storm.
+	L1WritesSkippedIdentical atomic.Int64
 
 	// ── L2 post-refilter cache (Q-RBACC-L2-1) ────────────────────────────
 	// Counters surface at /metrics/runtime under l2_* keys. Hit-rate is
@@ -143,6 +159,9 @@ type MetricsSnapshot struct {
 	WatchEventsDeleteTombstone int64 `json:"watch_events_delete_tombstone"`
 	WatchEventsNoopFiltered    int64 `json:"watch_events_noop_filtered"`
 
+	// Ship 1.5a (0.25.322) — back-pressure scaffold for Ship 1.5b.
+	InformerEventDropped int64 `json:"informer_event_dropped_total"`
+
 	// CRD auto-register convergence (Q-PREWARM-R5 fix). Counts L1
 	// resolved keys evicted because a CRD for their dependency group
 	// was just auto-registered. See keys.go L1ResourceDepGroupKey.
@@ -158,6 +177,8 @@ type MetricsSnapshot struct {
 	L1Entries       int64 `json:"l1_entries"`
 	L1MaxBytes      int64 `json:"l1_max_bytes"`
 	L1MaxEntries    int64 `json:"l1_max_entries"`
+	// Ship 1.5a (0.25.322) — L1 no-op refresh dampener.
+	L1WritesSkippedIdentical int64 `json:"l1_writes_skipped_identical"`
 
 	// L2 post-refilter cache (Q-RBACC-L2-1). HitRate is computed in the
 	// snapshot for parity with L1. ResidentBytes/Count are sampled once
@@ -270,6 +291,7 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		WatchEventsDelete:          m.WatchEventsDelete.Load(),
 		WatchEventsDeleteTombstone: m.WatchEventsDeleteTombstone.Load(),
 		WatchEventsNoopFiltered:    m.WatchEventsNoopFiltered.Load(),
+		InformerEventDropped:       m.InformerEventDropped.Load(),
 
 		CRDRegisterL1Evictions: m.CRDRegisterL1Evictions.Load(),
 
@@ -286,10 +308,11 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		L2ResidentBytes:     L2ResidentBytes(),
 		L2ResidentCount:     L2ResidentCount(),
 
-		L1EvictionsLRU: m.L1EvictionsLRU.Load(),
-		L1EvictionsTTL: m.L1EvictionsTTL.Load(),
-		L1MaxBytes:     l1MaxBytes(),
-		L1MaxEntries:   int64(l1MaxEntries()),
+		L1EvictionsLRU:           m.L1EvictionsLRU.Load(),
+		L1EvictionsTTL:           m.L1EvictionsTTL.Load(),
+		L1WritesSkippedIdentical: m.L1WritesSkippedIdentical.Load(),
+		L1MaxBytes:               l1MaxBytes(),
+		L1MaxEntries:             int64(l1MaxEntries()),
 	}
 	s.L1ResidentBytes, s.L1Entries = sampleL1()
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)

@@ -102,12 +102,16 @@ type WorkQueuesInfo struct {
 
 // WatchEventsInfo exposes informer event delivery counters. DeleteTombstone
 // is the smoking-gun signal: when non-zero, the reflector synthesized a
-// Delete via relist because the original watch event was lost.
+// Delete via relist because the original watch event was lost. Dropped
+// (Ship 1.5a, 0.25.322) is the back-pressure signal scaffolded for Ship
+// 1.5b's eventCh capacity reduction; in 1.5a the buffer stays at 1M so
+// Dropped is expected to remain at 0.
 type WatchEventsInfo struct {
 	Add             int64 `json:"add"`
 	Update          int64 `json:"update"`
 	Delete          int64 `json:"delete"`
 	DeleteTombstone int64 `json:"delete_tombstone"`
+	Dropped         int64 `json:"informer_event_dropped_total"`
 }
 
 // L2Info exposes the L2 post-refilter cache (Q-RBACC-L2-1) counters at
@@ -225,6 +229,7 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 				Update:          snap.WatchEventsUpdate,
 				Delete:          snap.WatchEventsDelete,
 				DeleteTombstone: snap.WatchEventsDeleteTombstone,
+				Dropped:         snap.InformerEventDropped,
 			},
 			WorkQueues: wqInfo,
 			L1: L1Info{

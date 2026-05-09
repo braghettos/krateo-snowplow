@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"sync"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/jqutil"
@@ -14,6 +15,36 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// Ship 1.5a (0.25.322) — sync.Pool for the JQ input scratch holder.
+// jsonHandlerCompute is hot on every L1 MISS / refresh cycle. The pool
+// stores ONLY the scratch struct; `tmp any` is reset to nil before Put
+// (gojq purity audit at /tmp/snowplow-runs/gojq-purity-audit-2026-05-03.md
+// — output trees stay owned by gojq, never pooled). Preserves
+// feedback_cache_must_not_constrain_jq.md.
+type decodeBuffer struct {
+	tmp any
+}
+
+var decodeBufferPool = sync.Pool{
+	New: func() any { return &decodeBuffer{} },
+}
+
+func acquireDecodeBuffer() *decodeBuffer {
+	return decodeBufferPool.Get().(*decodeBuffer)
+}
+
+func releaseDecodeBuffer(b *decodeBuffer) {
+	if b == nil {
+		return
+	}
+	// Reset before Put — gojq purity invariant: the next Get must not
+	// observe stale tree references (which gojq may have aliased to its
+	// output). Setting to nil drops references and forces a fresh
+	// json.Unmarshal target on the next acquire.
+	b.tmp = nil
+	decodeBufferPool.Put(b)
+}
 
 var apiHandlerTracer = otel.Tracer("snowplow/resolvers/restactions/api")
 
@@ -55,14 +86,27 @@ func jsonHandlerCompute(ctx context.Context, opts jsonHandlerOptions, raw []byte
 			attribute.String("key", opts.key),
 			attribute.Int("bytes", len(raw)),
 		))
-	var tmp any
-	if err := json.Unmarshal(raw, &tmp); err != nil {
+	// Ship 1.5a (0.25.322) — JQ input scratch via sync.Pool. The buffer
+	// holds the unmarshaled JSON tree fed to gojq; gojq is free to mutate
+	// `tmp` in place. After Eval completes the tree may be aliased into
+	// gojq's output, so we drop the local pointer and let the pool's
+	// reset-on-release zero the field before reuse.
+	buf := acquireDecodeBuffer()
+	if err := json.Unmarshal(raw, &buf.tmp); err != nil {
+		releaseDecodeBuffer(buf)
 		unmarshalSpan.End()
 		return nil, err
 	}
+	tmp := buf.tmp
 	unmarshalSpan.End()
 
 	if opts.filter == nil {
+		// No JQ stage: tmp is the output. We MUST NOT recycle the buffer
+		// here — gojq purity is irrelevant when no JQ ran, but the caller
+		// retains tmp via the returned value, so reusing the holder
+		// would alias future writes onto the caller's tree.
+		buf.tmp = nil
+		releaseDecodeBuffer(buf)
 		return tmp, nil
 	}
 
@@ -92,11 +136,24 @@ func jsonHandlerCompute(ctx context.Context, opts jsonHandlerOptions, raw []byte
 	if err != nil {
 		log.Error("unable to evaluate JQ filter",
 			slog.String("filter", q), slog.Any("error", err))
+		// Return tmp as fallback; clear pool slot. tmp may be aliased to
+		// gojq scratch, so drop pool pointer without reuse.
+		buf.tmp = nil
+		releaseDecodeBuffer(buf)
 		return tmp, nil
 	}
+	// Reuse the same scratch holder for the post-JQ unmarshal — gojq's
+	// output bytes are independent (jqutil.Eval returns a JSON string).
 	if err := json.Unmarshal([]byte(s), &tmp); err != nil {
+		buf.tmp = nil
+		releaseDecodeBuffer(buf)
 		return nil, err
 	}
+	// Drop pool reference AFTER the final unmarshal so the holder is not
+	// reused while tmp is still being shaped. tmp itself is owned by the
+	// caller from this point.
+	buf.tmp = nil
+	releaseDecodeBuffer(buf)
 	return tmp, nil
 }
 

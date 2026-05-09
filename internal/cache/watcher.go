@@ -27,6 +27,47 @@ import (
 
 var watcherTracer = otel.Tracer("snowplow/watcher")
 
+// Ship 1.5a (0.25.322) — decode-concurrency back-pressure. handleEventSem
+// caps concurrent handleEvent decode work (H5 = 48% inuse_space at +2h on
+// 0.25.321); processItemSem caps concurrent L1 refresh work (H6 = 27%).
+// Caps min(GOMAXPROCS,8) / min(GOMAXPROCS,4) per architect plan + PM gate.
+// Events still drain FIFO; back-pressure queues at the listener boundary.
+var (
+	handleEventSem chan struct{}
+	processItemSem chan struct{}
+	semInitOnce    sync.Once
+)
+
+func ensureSemaphores() {
+	semInitOnce.Do(func() {
+		nproc := runtime.GOMAXPROCS(0)
+		decCap := nproc
+		if decCap > 8 {
+			decCap = 8
+		}
+		piCap := nproc
+		if piCap > 4 {
+			piCap = 4
+		}
+		handleEventSem = make(chan struct{}, decCap)
+		processItemSem = make(chan struct{}, piCap)
+	})
+}
+
+// HandleEventSemCap returns the configured cap of handleEventSem (used
+// by tests to verify min(GOMAXPROCS, 8) sizing).
+func HandleEventSemCap() int {
+	ensureSemaphores()
+	return cap(handleEventSem)
+}
+
+// ProcessItemSemCap returns the configured cap of processItemSem (used
+// by tests to verify min(GOMAXPROCS, 4) sizing).
+func ProcessItemSemCap() int {
+	ensureSemaphores()
+	return cap(processItemSem)
+}
+
 // ---------------------------------------------------------------------------
 // Access-recency tracking for HOT / WARM / COLD refresh priority
 // ---------------------------------------------------------------------------
@@ -328,6 +369,20 @@ func (rw *ResourceWatcher) processNext(ctx context.Context) bool {
 // L1RefreshFunc for each page. On success the rate limiter is reset; cascade
 // targets are enqueued via enqueueCascade.
 func (rw *ResourceWatcher) processItem(ctx context.Context, identity string) {
+	// Ship 1.5a (0.25.322) — bound concurrent processItem work. cap =
+	// min(GOMAXPROCS, 4). runWorkers spins GOMAXPROCS workers, but each
+	// processItem fans out to several L1 refreshes (page expansion +
+	// cascade); without this cap, the worker count alone is not a tight
+	// enough bound on decode-tree resident set. The semaphore back-
+	// pressures workers without changing FIFO drain order.
+	ensureSemaphores()
+	select {
+	case processItemSem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() { <-processItemSem }()
+
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
@@ -1174,6 +1229,19 @@ var noisyConfigMapNamespaces = map[string]bool{
 }
 
 func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, oldObj, obj any, eventType string) {
+	// Ship 1.5a (0.25.322) — decode-concurrency back-pressure. Acquire a
+	// semaphore slot before doing the per-event decode work (toUnstructured
+	// cast, RV equality probe, eventCh send). Cap = min(GOMAXPROCS, 8). The
+	// acquire blocks instead of dropping; informer listeners back-pressure
+	// upstream naturally when the cap is saturated.
+	ensureSemaphores()
+	select {
+	case handleEventSem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() { <-handleEventSem }()
+
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
@@ -1292,6 +1360,12 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		eventType: eventType,
 	}:
 	default:
+		// Ship 1.5a (0.25.322) — back-pressure scaffold. eventCh stays at
+		// 1M in 1.5a so this branch is expected to remain dormant; the
+		// counter is wired now so 1.5b's smaller buffer ships with
+		// observability already in place. /metrics/runtime exposes
+		// informer_event_dropped_total via the snapshot.
+		GlobalMetrics.InformerEventDropped.Add(1)
 		slog.Warn("resource-watcher: L1 event queue full, dropping event",
 			slog.String("gvr", gvr.String()),
 			slog.String("ns", ns),

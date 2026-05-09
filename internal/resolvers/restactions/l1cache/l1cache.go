@@ -222,7 +222,30 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 	// not post-process business-level field selection.
 
 	if in.Cache != nil && in.ResolvedKey != "" {
-		_ = in.Cache.SetResolvedRaw(tctx, in.ResolvedKey, raw)
+		// Ship 1.5a (0.25.322) — skip identical L1 writes. Under the no-op
+		// UPDATE storm (Q-OOM-FIX Patch C absorbs the bulk; the remainder
+		// reaches the resolver because resourceVersion changed but the
+		// resolved widget output did not), the freshly marshaled v3 bytes
+		// are byte-equal to the cached entry for the vast majority of
+		// re-resolves. Re-Putting churns L1 LRU bookkeeping +
+		// resident-byte accounting + downstream cascade — none of which
+		// produces observable behaviour change.
+		//
+		// GetRaw is cheap (sync.Map lookup). On miss we fall through to
+		// SetResolvedRaw exactly as before. RegisterL1Dependencies still
+		// runs unconditionally — dep registration is idempotent and we
+		// must keep the reverse index fresh even when the value is
+		// stable (a dependency relationship may have appeared via
+		// cascade). Mirrors the L2WritesSkippedIdentical pattern proven
+		// in 0.25.319 / 0.25.321.
+		skipped := false
+		if existing, hit, _ := in.Cache.GetRaw(tctx, in.ResolvedKey); hit && bytes.Equal(existing, raw) {
+			cache.GlobalMetrics.L1WritesSkippedIdentical.Add(1)
+			skipped = true
+		}
+		if !skipped {
+			_ = in.Cache.SetResolvedRaw(tctx, in.ResolvedKey, raw)
+		}
 		// Only touch on HTTP requests and prewarm, NOT background refresh.
 		// Background refresh is system activity — temperature must reflect
 		// user access only. DirtySet in context signals background refresh.
