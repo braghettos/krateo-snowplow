@@ -96,18 +96,24 @@ func main() {
 		use.Logger(log),
 	)
 
-	// Cache plumbing — present at 0.30.1, dormant by default.
+	// Cache subsystem — Tag 0.30.4 (cache=on activation).
 	//
 	// When CACHE_ENABLED is unset / false / 0 / no, cache.Disabled()
 	// returns true and cache.NewResourceWatcher returns (nil, nil)
 	// without instantiating the dynamicinformer factory. No goroutines
 	// spawn. Every consumer (objects.Get, dynamic.ListObjects,
-	// api.Resolve) checks cache.Disabled() at the top and falls back
-	// to apiserver.
+	// rbac.UserCan, EvaluateRBAC) checks cache.Disabled() at the top
+	// and falls back to the apiserver / SubjectAccessReview path.
 	//
-	// When CACHE_ENABLED=true the factory is constructed but
-	// factory.Start() is NOT called here — that's deferred to 0.30.2
-	// which lands consumer routing.
+	// When CACHE_ENABLED=true:
+	//   - the dynamic informer factory is constructed,
+	//   - the four Role-Based Access Control GVRs are eagerly
+	//     registered (Role, RoleBinding, ClusterRole, ClusterRoleBinding),
+	//   - factory.Start() is invoked inside NewResourceWatcher,
+	//   - cache.SetGlobal(rw) publishes the watcher for EvaluateRBAC.
+	//
+	// We then block (with a timeout) on WaitForCacheSync so the first
+	// /call dispatched at startup does not race informer LISTs.
 	cacheCtx, cacheCancel := context.WithCancel(context.Background())
 	defer cacheCancel()
 
@@ -129,6 +135,19 @@ func main() {
 						slog.Any("err", wErr))
 				} else {
 					cacheWatcher = w
+					cache.SetGlobal(w)
+					// Block until RBAC informer LISTs complete so the
+					// first dispatch is not racing the initial sync.
+					// Bounded at 60s — soft failure (log + continue),
+					// not fatal.
+					syncCtx, syncCancel := context.WithTimeout(cacheCtx, 60*time.Second)
+					if err := w.WaitForCacheSync(syncCtx, 60*time.Second); err != nil {
+						log.Warn("cache: initial WaitForCacheSync incomplete; first dispatches may evaluate against partial RBAC index",
+							slog.Any("err", err))
+					} else {
+						log.Info("cache: RBAC informers fully synced")
+					}
+					syncCancel()
 				}
 			}
 		}
@@ -139,7 +158,12 @@ func main() {
 		// PM gate verifies via `kubectl logs`.
 		_, _ = cache.NewResourceWatcher(cacheCtx, nil)
 	}
-	_ = cacheWatcher // wired to dispatchers at 0.30.2
+	defer func() {
+		if cacheWatcher != nil {
+			cacheWatcher.Stop()
+			cache.SetGlobal(nil)
+		}
+	}()
 
 	mux := http.NewServeMux()
 

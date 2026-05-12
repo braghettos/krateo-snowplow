@@ -1,12 +1,16 @@
 // Package cache provides the snowplow informer-backed cache subsystem.
 //
-// At 0.30.1 the package is "plumbing only": types and constructors are
-// compiled in but every consumer takes the apiserver branch because
-// Disabled() defaults to true. Routing flips on at 0.30.2.
+// At 0.30.4 cache=on (CACHE_ENABLED=true) eagerly registers the four
+// Role-Based Access Control GVRs in the dynamic informer factory,
+// starts it, and publishes the watcher via SetGlobal so EvaluateRBAC
+// can serve in-process Role-Based Access Control decisions without
+// ever calling SubjectAccessReview against apiserver (Revision 1
+// binding).
 //
 // Per project_redis_removal.md the cache subsystem MUST stay removable
 // via the CACHE_ENABLED env toggle. Disabled() is the single read of
-// that toggle.
+// that toggle; when true the package returns nil watchers and every
+// consumer falls back to the apiserver / SubjectAccessReview path.
 package cache
 
 import "os"

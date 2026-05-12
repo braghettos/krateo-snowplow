@@ -12,6 +12,7 @@ import (
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/maps"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -55,6 +56,21 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				slog.String("kind", widgets.GetKind(got.Unstructured.Object)),
 			),
 		)
+
+	// Revision 2 binding (0.30.4): cache=on mode gates every widget
+	// dispatch by EvaluateRBAC. Cache=off skips the gate — fetchObject
+	// already ran per-user against apiserver.
+	if !cache.Disabled() {
+		if !checkDispatchRBAC(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
+			log.Warn("widget dispatch denied by EvaluateRBAC",
+				slog.String("gvr", got.GVR.String()),
+			)
+			response.Encode(wri, response.New(http.StatusForbidden,
+				fmt.Errorf("forbidden: cannot get %s in namespace %q",
+					got.GVR.Resource, got.Unstructured.GetNamespace())))
+			return
+		}
+	}
 
 	perPage, page := paginationInfo(log, req)
 

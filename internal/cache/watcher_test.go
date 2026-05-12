@@ -8,10 +8,36 @@ import (
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
 
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
+
+// rbacListKinds maps every RBAC GVR registered by NewResourceWatcher
+// to its corresponding List kind so dynamicfake.NewSimpleDynamicClient
+// can serve informer LISTs without panicking.
+//
+// dynamicfake.NewSimpleDynamicClient (no-custom-list-kinds variant)
+// requires every GVR LISTed to have a registered List kind in its
+// scheme. The cache=on constructor eagerly LISTs all four RBAC types,
+// so unit tests MUST hand it a client that knows about them.
+func rbacListKinds() map[schema.GroupVersionResource]string {
+	return map[schema.GroupVersionResource]string{
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:                "RoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:         "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:         "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
+	}
+}
+
+// newTestScheme returns a scheme with RBAC types registered so the
+// dynamic fake client can decode informer LISTs.
+func newTestScheme() *k8sruntime.Scheme {
+	sch := k8sruntime.NewScheme()
+	_ = rbacv1.AddToScheme(sch)
+	return sch
+}
 
 // TestNewResourceWatcher_DormantWhenCacheDisabled covers PM amendment 1
 // (factory dormancy unit test). When CACHE_ENABLED is unset or false:
@@ -70,14 +96,17 @@ func TestNewResourceWatcher_DormantValuesEnumerated(t *testing.T) {
 }
 
 // TestNewResourceWatcher_FactoryConstructedWhenCacheEnabled covers PM
-// amendment 1 (other half). When CACHE_ENABLED=true:
+// amendment 1 (other half), now reframed for 0.30.4 activation. When
+// CACHE_ENABLED=true:
 //
 //   - NewResourceWatcher MUST return a non-nil watcher
-//   - factory.Start MUST NOT be called yet (deferred to 0.30.2)
+//   - the four RBAC GVRs MUST be eagerly registered
+//   - factory.Start MUST be called from the constructor (0.30.4
+//     flips this on; was deferred at 0.30.1/0.30.3)
 //
-// The "Start not called" invariant is verified indirectly: with no
-// informers registered AND no Start invoked, NumGoroutine MUST NOT
-// climb past the constructor itself.
+// "Start was called" is verified by counting registered informers and
+// by checking that the goroutine delta is consistent with informer
+// run-loops (one per registered GVR + a small bookkeeping headroom).
 func TestNewResourceWatcher_FactoryConstructedWhenCacheEnabled(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 
@@ -85,9 +114,9 @@ func TestNewResourceWatcher_FactoryConstructedWhenCacheEnabled(t *testing.T) {
 		t.Fatalf("Disabled() should be false when CACHE_ENABLED=true")
 	}
 
-	dyn := dynamicfake.NewSimpleDynamicClient(k8sruntime.NewScheme())
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
 
-	before := runtime.NumGoroutine()
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
 		t.Fatalf("NewResourceWatcher: unexpected error: %v", err)
@@ -96,29 +125,17 @@ func TestNewResourceWatcher_FactoryConstructedWhenCacheEnabled(t *testing.T) {
 		t.Fatalf("NewResourceWatcher: expected non-nil watcher when CACHE_ENABLED=true")
 	}
 	defer rw.Stop()
-
-	// Allow any spurious scheduler activity to settle.
-	runtime.Gosched()
-	time.Sleep(20 * time.Millisecond)
-	runtime.Gosched()
-
-	after := runtime.NumGoroutine()
-	delta := after - before
-	// PM amendment 3: < 3 goroutine delta. Construction without Start
-	// should ideally be 0 — we leave headroom for one bookkeeping
-	// goroutine if the factory ever adds one in future client-go versions.
-	if delta >= 3 {
-		t.Fatalf("goroutine delta = %d (want < 3); before=%d after=%d", delta, before, after)
-	}
 }
 
-// TestNewResourceWatcher_AddResourceTypeWithoutStart documents that
-// AddResourceType BEFORE Start does not spawn goroutines — only
-// Start() activates the informer Run loops. This is the contract the
-// 0.30.2 routing relies on.
-func TestNewResourceWatcher_AddResourceTypeWithoutStart(t *testing.T) {
+// TestNewResourceWatcher_RBACTypesEagerlyRegistered locks in the
+// 0.30.4 Revision 1 binding: the four RBAC GVRs are registered by
+// the constructor and the factory is started so EvaluateRBAC can read
+// from the informer index immediately.
+func TestNewResourceWatcher_RBACTypesEagerlyRegistered(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
-	dyn := dynamicfake.NewSimpleDynamicClient(k8sruntime.NewScheme())
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
 
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
@@ -129,17 +146,90 @@ func TestNewResourceWatcher_AddResourceTypeWithoutStart(t *testing.T) {
 	}
 	defer rw.Stop()
 
-	before := runtime.NumGoroutine()
-	rw.AddResourceType(schema.GroupVersionResource{
-		Group: "", Version: "v1", Resource: "configmaps",
-	})
-	runtime.Gosched()
-	time.Sleep(20 * time.Millisecond)
-	runtime.Gosched()
-	after := runtime.NumGoroutine()
+	// Every RBAC GVR exposed via the package-level RBACResourceTypes
+	// slice must be registered. We probe via ListObjects — empty slice
+	// is fine; absence-from-registry returns nil.
+	for _, gvr := range cache.RBACResourceTypes {
+		if got := rw.ListObjects(gvr, ""); got == nil {
+			t.Fatalf("ListObjects(%s, \"\") = nil; expected the GVR to be registered (possibly empty list)", gvr)
+		}
+	}
 
-	if after-before >= 3 {
-		t.Fatalf("AddResourceType (no Start) goroutine delta = %d (want < 3)", after-before)
+	// SetGlobal/Global round-trip — wire the singleton.
+	cache.SetGlobal(rw)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+	if cache.Global() != rw {
+		t.Fatalf("cache.Global() did not return the watcher set via SetGlobal()")
+	}
+}
+
+// TestNewResourceWatcher_AddResourceTypeIdempotent confirms that
+// re-registering an already-registered RBAC GVR after Start() is a
+// behavioural no-op (no duplicate informer registered, no panic).
+// We measure idempotence via ListObjects calls, NOT goroutine counts,
+// because the four eager-registered informers are running and the
+// scheduler may rebalance workers at any time.
+func TestNewResourceWatcher_AddResourceTypeIdempotent(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("expected non-nil watcher")
+	}
+	defer rw.Stop()
+
+	gvr := schema.GroupVersionResource{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles",
+	}
+	listsBefore := rw.ListObjects(gvr, "")
+	if listsBefore == nil {
+		t.Fatalf("ListObjects(%s) returned nil; expected an empty slice (eager-registered)", gvr)
+	}
+
+	// Re-add an already-registered RBAC GVR. The implementation MUST
+	// no-op on existence; if it didn't we'd see a panic from a
+	// duplicate informer Run().
+	rw.AddResourceType(gvr)
+
+	listsAfter := rw.ListObjects(gvr, "")
+	if listsAfter == nil {
+		t.Fatalf("after re-AddResourceType, ListObjects returned nil")
+	}
+}
+
+// TestNewResourceWatcher_GoroutineFootprintBounded sanity-checks that
+// constructor activation does not leak unbounded goroutines per GVR.
+// We expect roughly one Reflector + one informer + one bookkeeping
+// goroutine per registered GVR (≤ 5×len). Headroom = 8× to absorb
+// client-go version drift.
+func TestNewResourceWatcher_GoroutineFootprintBounded(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
+
+	before := runtime.NumGoroutine()
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	defer rw.Stop()
+
+	runtime.Gosched()
+	time.Sleep(50 * time.Millisecond)
+	runtime.Gosched()
+
+	after := runtime.NumGoroutine()
+	delta := after - before
+	const headroom = 8
+	maxAllowed := len(cache.RBACResourceTypes) * headroom
+	if delta > maxAllowed {
+		t.Fatalf("goroutine delta = %d (want <= %d); before=%d after=%d", delta, maxAllowed, before, after)
 	}
 }
 

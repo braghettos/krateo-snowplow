@@ -23,9 +23,26 @@ import (
 // (Q-OOM-WARMER, ship/0.25.320).
 const listPageLimit int64 = 500
 
-// ResourceWatcher is the cluster-wide informer cache. At 0.30.1 it is
-// constructed but NOT started by any consumer (the factory is only
-// instantiated when CACHE_ENABLED is true). Routing flips on at 0.30.2.
+// RBACResourceTypes is the eager-registered Role-Based Access Control
+// resource-type set (0.30.4 binding, plan §"Tag 0.30.4 What's implemented"
+// bullet 1). The four GVRs are eagerly informer-registered by
+// NewResourceWatcher when CACHE_ENABLED=true so EvaluateRBAC can serve
+// in-process Role-Based Access Control decisions without ever calling
+// SubjectAccessReview against apiserver (Revision 1 binding).
+//
+// Per feedback_no_special_cases.md: NO per-resource policy lives in this
+// set — it is the bare minimum required by EvaluateRBAC.
+var RBACResourceTypes = []schema.GroupVersionResource{
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"},
+}
+
+// ResourceWatcher is the cluster-wide informer cache. At 0.30.4 the
+// factory is instantiated AND started by NewResourceWatcher when
+// CACHE_ENABLED=true; the four Role-Based Access Control GVRs are
+// eagerly registered.
 //
 // All methods are safe for concurrent use. AddResourceType registers an
 // informer for a GVR; Start launches them; Get/List read from the
@@ -52,6 +69,12 @@ type ResourceWatcher struct {
 //
 // Callers MUST nil-check the return value: when nil, every consumer
 // takes the apiserver branch.
+//
+// At 0.30.4 (Revision 1 binding) cache=on mode eagerly registers the
+// Role-Based Access Control GVRs (Role, RoleBinding, ClusterRole,
+// ClusterRoleBinding) and starts the factory so EvaluateRBAC can serve
+// in-process Role-Based Access Control decisions without ever calling
+// SubjectAccessReview against apiserver.
 func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWatcher, error) {
 	if Disabled() {
 		slog.Info("cache.disabled=true",
@@ -83,16 +106,24 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		informers: map[schema.GroupVersionResource]informers.GenericInformer{},
 		stopCh:    make(chan struct{}),
 	}
-	_ = ctx // reserved for future wiring (0.30.2 caller may pass-through)
+	_ = ctx // reserved for future wiring (0.30.6 eager-registration caller may pass-through)
 
-	// We never call factory.Start() here — that's deliberately deferred
-	// to 0.30.2 when consumer routing flips on. At 0.30.1 the factory
-	// stays passive (no informers registered, no goroutines spawned by
-	// the constructor — Stop() is the only shutdown path).
+	// Revision 1 binding: register the four Role-Based Access Control
+	// GVRs eagerly and start the factory. This is the single set of
+	// types EvaluateRBAC reads from; without these we cannot meet the
+	// "zero SubjectAccessReview in cache=on" rule.
+	for _, gvr := range RBACResourceTypes {
+		rw.addResourceTypeLocked(gvr)
+	}
+	rw.factory.Start(rw.stopCh)
+	rw.started = true
 
-	slog.Info("cache.plumbing_present=true cache.routed=false",
+	slog.Info("cache.plumbing_present=true cache.routed=true rbac.informer_started=true",
 		slog.String("subsystem", "cache"),
 		slog.Int64("list_page_limit", listPageLimit),
+		slog.Int("resource_types_registered", len(rw.informers)),
+		slog.String("rbac.evaluate_path", "in-process"),
+		slog.String("subject_access_review_calls_in_cache_on_path", "banned"),
 	)
 
 	return rw, nil
@@ -101,12 +132,20 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 // AddResourceType registers an informer for gvr. Idempotent: calling
 // twice for the same GVR is a no-op. Safe for concurrent use.
 //
-// At 0.30.1 no consumer calls this method — it lands wired but unused.
-// Coverage for the 0.30.2 activation gate.
+// At 0.30.4 the constructor eagerly registers the four Role-Based
+// Access Control GVRs. Future tags will register additional resource
+// types lazily on first dispatch (0.30.6 eager registration covers
+// RestAction inventory).
 func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
+	rw.addResourceTypeLocked(gvr)
+}
+
+// addResourceTypeLocked is the lock-held implementation of
+// AddResourceType. Callers MUST hold rw.mu.Lock().
+func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource) {
 	if _, exists := rw.informers[gvr]; exists {
 		return
 	}
@@ -121,12 +160,11 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 }
 
 // Start launches every registered informer and begins serving from the
-// in-memory cache. Idempotent. Must be called after every needed GVR
-// has been added via AddResourceType.
+// in-memory cache. Idempotent.
 //
-// At 0.30.1 this is unused (consumers stay on apiserver branch). The
-// dormancy unit test asserts Start() is NOT invoked from
-// NewResourceWatcher itself.
+// At 0.30.4 NewResourceWatcher invokes Start() automatically after
+// eager RBAC registration — callers normally do not need to call this
+// directly. Future tags may use it for lazy GVR registration scenarios.
 func (rw *ResourceWatcher) Start() {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
@@ -266,4 +304,40 @@ func (rw *ResourceWatcher) Stop() {
 	default:
 		close(rw.stopCh)
 	}
+}
+
+// global holds the cluster-wide ResourceWatcher singleton wired in
+// main.go. Cache=on consumers read it via Global(); a nil return is the
+// canonical cache=off branch signal.
+//
+// We accept a package-level singleton here because:
+//   - the watcher is genuinely process-scoped (one factory per pod);
+//   - threading it through every resolver call site would touch ~30
+//     unrelated files for no behavioural gain;
+//   - the cache=off branch is encoded as nil — there is no other
+//     "disabled" state to model.
+//
+// Per feedback_no_special_cases.md the singleton holds no per-resource
+// or per-user policy: it is a pointer or it is nil.
+var (
+	globalMu      sync.RWMutex
+	globalWatcher *ResourceWatcher
+)
+
+// SetGlobal wires rw as the process-scoped ResourceWatcher. Called once
+// from main.go after NewResourceWatcher succeeds. Passing nil clears
+// the singleton — used by tests and by the cache=off path.
+func SetGlobal(rw *ResourceWatcher) {
+	globalMu.Lock()
+	globalWatcher = rw
+	globalMu.Unlock()
+}
+
+// Global returns the process-scoped ResourceWatcher or nil when the
+// cache subsystem is disabled / not yet wired. Cache=on consumers MUST
+// nil-check the return value.
+func Global() *ResourceWatcher {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return globalWatcher
 }

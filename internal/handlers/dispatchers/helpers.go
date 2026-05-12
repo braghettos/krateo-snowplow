@@ -1,6 +1,7 @@
 package dispatchers
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func fetchObject(req *http.Request) (got objects.Result) {
@@ -64,4 +67,47 @@ func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
 	}
 
 	return
+}
+
+// checkDispatchRBAC is the cache=on permission gate (Revision 2
+// binding, Tag 0.30.4). Returns true iff the user identified by ctx is
+// permitted to GET the dispatched CR in namespace.
+//
+// The check runs against the *dispatch target* (RestAction or Widget
+// CR) — the same object the cache=off fetchObject branch hits the
+// apiserver for. In cache=on mode fetchObject does not enforce RBAC
+// for that GET, so the gate must run explicitly here.
+//
+// Callers MUST only invoke this in cache=on mode (`!cache.Disabled()`).
+// In cache=off mode the gate is implicit in fetchObject's per-user
+// apiserver call.
+func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, namespace string) bool {
+	log := xcontext.Logger(ctx)
+
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		log.Error("checkDispatchRBAC: unable to extract UserInfo",
+			slog.Any("err", err),
+		)
+		return false
+	}
+
+	allowed, evalErr := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username:  ui.Username,
+		Groups:    ui.Groups,
+		Verb:      "get",
+		Group:     gvr.Group,
+		Resource:  gvr.Resource,
+		Namespace: namespace,
+	})
+	if evalErr != nil {
+		log.Error("checkDispatchRBAC: EvaluateRBAC error",
+			slog.String("user", ui.Username),
+			slog.String("gvr", gvr.String()),
+			slog.String("namespace", namespace),
+			slog.Any("err", evalErr),
+		)
+		return false
+	}
+	return allowed
 }

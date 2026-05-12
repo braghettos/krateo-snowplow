@@ -2,6 +2,7 @@ package dispatchers
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/snowplow/apis"
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,6 +47,24 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
+	}
+
+	// Revision 2 binding (0.30.4): in cache=on mode every RestAction
+	// dispatch is gated by EvaluateRBAC against the CR being dispatched.
+	// Cache=off skips this gate — fetchObject already runs per-user
+	// against apiserver, which enforces RBAC inline.
+	if !cache.Disabled() {
+		if !checkDispatchRBAC(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
+			log.Warn("RESTAction dispatch denied by EvaluateRBAC",
+				slog.String("name", got.Unstructured.GetName()),
+				slog.String("namespace", got.Unstructured.GetNamespace()),
+				slog.String("gvr", got.GVR.String()),
+			)
+			response.Encode(wri, response.New(http.StatusForbidden,
+				fmt.Errorf("forbidden: cannot get %s in namespace %q",
+					got.GVR.Resource, got.Unstructured.GetNamespace())))
+			return
+		}
 	}
 
 	scheme := runtime.NewScheme()
