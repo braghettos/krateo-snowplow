@@ -1419,6 +1419,73 @@ def wait_for_compositions(expected, timeout=300, tolerance=5):
     return False
 
 
+def wait_for_restaction_steady_state(timeout=600, target_per_ns=120,
+                                     polling_interval=10, min_total=None):
+    """Wait until RESTAction reconciliation has caught up post-deploy.
+
+    Each composition triggers the composition-dynamic-controller to
+    deploy ~`target_per_ns` RESTActions in its namespace. At SCALE=50K
+    across 50 bench-ns this is ~6000 RESTActions. If Phase 6 measures
+    S6 immediately after the composition LIST count converges, the
+    RESTAction reconciliation may still be far behind — admin widgets
+    that depend on these RESTActions silently render with partial data.
+
+    Strategy: poll the cluster-wide RESTAction count; exit when either
+      (a) the count has been STABLE across 3 consecutive polls
+          (controller queue drained), OR
+      (b) the count is >= `min_total` if provided.
+
+    This is intentionally TOLERANT — at large scale the RESTAction
+    controller workqueue cannot guarantee 100% reconciliation in
+    bounded time; we only need a steady state, not a target count.
+    `target_per_ns` is informational (used in the log line so the
+    operator can spot under-reconciliation by eyeballing the ratio).
+
+    Returns True if stability was reached, False on timeout. The caller
+    proceeds in either case; the bench logs the outcome so the
+    canonical row's `validation` block can later be correlated with
+    "RESTAction count at measurement time" if needed.
+    """
+    last_count = -1
+    stable_polls = 0
+    deadline = time.time() + timeout
+    start = time.time()
+    log(f"Waiting for RESTAction reconciliation steady state "
+        f"(timeout={timeout}s, target_per_ns={target_per_ns}, "
+        f"min_total={min_total}) ...")
+    while time.time() < deadline:
+        rc, out, _ = kubectl(
+            "get", "restactions.templates.krateo.io",
+            "-A", "--no-headers", "-o", "name", timeout_secs=60)
+        if rc == 0:
+            count = len([line for line in out.splitlines() if line.strip()])
+        else:
+            count = -1
+        if count == last_count and count > 0:
+            stable_polls += 1
+            if stable_polls >= 3:
+                elapsed = int(time.time() - start)
+                log(f"  RESTAction count stable at {count} after {elapsed}s; "
+                    f"proceeding")
+                return True
+            if min_total is not None and count >= min_total:
+                elapsed = int(time.time() - start)
+                log(f"  RESTAction count={count} >= min_total={min_total} "
+                    f"after {elapsed}s; proceeding")
+                return True
+        else:
+            stable_polls = 0
+        last_count = count
+        elapsed = int(time.time() - start)
+        log(f"  RESTAction reconciliation ... count={count} "
+            f"(stable_streak={stable_polls}, {elapsed}s elapsed)")
+        time.sleep(polling_interval)
+    elapsed = int(time.time() - start)
+    log(f"  RESTAction reconciliation TIMEOUT at count={last_count} "
+        f"after {elapsed}s; proceeding anyway")
+    return False
+
+
 def delete_all_compositions():
     """Delete all bench compositions via namespace-cascade.
 
@@ -3103,6 +3170,329 @@ def _self_test_widget_validation():
         log(f"widget-validation FAILED: {failed} case(s)")
         sys.exit(1)
     log("widget-validation OK")
+
+
+def _self_test_phase6_iterates_users():
+    """Verify Phase 6's browser-nav loop iterates both admin AND cyberjoker.
+
+    Phase A 0.30.4 exposed that the canonical row's cyber_on / cyber_off
+    cells were auto-mirrored from admin_on / admin_off because the
+    browser-nav loop only logged in as admin. Customer mix is 95%+
+    narrow-RBAC, so cyberjoker MUST produce real samples per cache mode.
+
+    Inspects run_phase_browser_scaling source and asserts:
+      1. Both "admin" and "cyberjoker" literals appear in the function.
+      2. A user-iteration loop is present (over a tuple/list containing
+         both subjects).
+      3. The verify-against-cluster flag is conditional on the subject
+         (admin only — cyberjoker's piechart cannot equal the cluster
+         total under RBAC restriction).
+      4. _browser_measure_stage accepts both `user` and
+         `verify_against_cluster` keyword args.
+
+    Locks the customer-shape coverage in code so a future regression
+    cannot silently revert to admin-only browser navs.
+    """
+    import inspect
+    failed = 0
+
+    # 1 + 2 — source contains both subjects and iterates them.
+    src = inspect.getsource(run_phase_browser_scaling)
+    if '"admin"' not in src:
+        log("  [FAIL] run_phase_browser_scaling does not reference \"admin\"")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_browser_scaling references \"admin\"")
+    if '"cyberjoker"' not in src:
+        log("  [FAIL] run_phase_browser_scaling does not reference \"cyberjoker\"")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_browser_scaling references \"cyberjoker\"")
+    # Either ("admin", "cyberjoker") or ["admin", "cyberjoker"] inline
+    # tuple/list literal proves the iteration intent at the source level.
+    import re as _re
+    iter_re = _re.compile(
+        r'[\(\[]\s*"admin"\s*,\s*"cyberjoker"\s*[\)\]]')
+    if not iter_re.search(src):
+        log("  [FAIL] run_phase_browser_scaling has no "
+            "(\"admin\", \"cyberjoker\") iteration literal")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_browser_scaling iterates "
+            "(\"admin\", \"cyberjoker\")")
+
+    # 3 — verify_against_cluster is conditional on the subject.
+    if "verify_against_cluster=(" not in src and \
+       'verify_against_cluster=u_name == "admin"' not in src:
+        log("  [FAIL] run_phase_browser_scaling does not pass "
+            "verify_against_cluster conditional on user")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_browser_scaling gates "
+            "verify_against_cluster on user identity")
+
+    # 4 — _browser_measure_stage accepts the new kwargs.
+    sig = inspect.signature(_browser_measure_stage).parameters
+    if "user" not in sig:
+        log("  [FAIL] _browser_measure_stage missing `user` parameter")
+        failed += 1
+    else:
+        log("  [OK ] _browser_measure_stage accepts user")
+    if "verify_against_cluster" not in sig:
+        log("  [FAIL] _browser_measure_stage missing "
+            "`verify_against_cluster` parameter")
+        failed += 1
+    else:
+        log("  [OK ] _browser_measure_stage accepts verify_against_cluster")
+
+    if failed:
+        log(f"phase6-iterates-users FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("phase6-iterates-users OK")
+
+
+def _self_test_cell_aggregator_filters_zeros():
+    """Verify the cell aggregator filters waterfallMs=0 sentinels.
+
+    The widget-validation framework sets `waterfallMs = 0` when the
+    rendered page failed its terminal-state gate. Phase A 0.30.4
+    measured mix_weighted.cold_ms = 4314 (vs prior 8106) — a 45%
+    "improvement" that turned out to be percentile pollution by
+    invalid-nav sentinels.
+
+    Synthetic-input test:
+      - Build all_results with a mix of valid (waterfallMs > 0) and
+        invalid (waterfallMs == 0 OR incomplete=True) navs.
+      - Build the canonical row and assert each cell's percentiles
+        come from the >0 subset ONLY.
+      - Assert valid_nav_count / invalid_nav_count / terminal_fail_rate
+        are populated on every cell.
+      - Assert that an all-invalid cell reports None (not 0) for its
+        percentile fields.
+    """
+    import inspect
+    failed = 0
+
+    # Cell-level: synthetic input. Mix valid + invalid navs for admin
+    # under cache=ON. Cyber and the OFF branch left empty so the row
+    # builder exercises both real-sample and empty-cell paths.
+    fake_navs = [
+        # Valid samples (waterfallMs > 0, no incomplete flag).
+        {"user": "admin", "nav_num": 1, "cold_warm": "COLD",
+         "waterfallMs": 800},
+        {"user": "admin", "nav_num": 2, "cold_warm": "WARM",
+         "waterfallMs": 200},
+        {"user": "admin", "nav_num": 3, "cold_warm": "WARM",
+         "waterfallMs": 220},
+        # Invalid sentinels — must be filtered from the percentile set.
+        {"user": "admin", "nav_num": 4, "cold_warm": "WARM",
+         "waterfallMs": 0, "incomplete": True,
+         "validation": {"terminal_state": "fail",
+                        "skeleton_count": 3, "errored_count": 0,
+                        "expected_calls": 16, "actual_calls": 4,
+                        "calls_within_tolerance": False}},
+        {"user": "admin", "nav_num": 5, "cold_warm": "WARM",
+         "waterfallMs": 0, "incomplete": True,
+         "validation": {"terminal_state": "fail",
+                        "skeleton_count": 5, "errored_count": 0,
+                        "expected_calls": 16, "actual_calls": 2,
+                        "calls_within_tolerance": False}},
+    ]
+    fake_results = [{
+        "stage": "6", "cache": "ON",
+        "pages": {"Dashboard": {"navigations": fake_navs}},
+    }]
+    row = _build_canonical_ledger_row(fake_results)
+    admin_on = row["cells"]["admin_on"]
+
+    # Cell.cold_ms must equal pct([800], 50) = 800 (the only valid
+    # cold sample). NOT 0 (would mean sentinel survived) and NOT a
+    # median of [800, 0, 0, 0] = 0.
+    if admin_on.get("cold_ms") != 800:
+        log(f"  [FAIL] admin_on.cold_ms={admin_on.get('cold_ms')!r}, "
+            f"expected 800 (only valid cold sample)")
+        failed += 1
+    else:
+        log("  [OK ] admin_on.cold_ms=800 (zero sentinels filtered)")
+
+    # Cell.warm_p50_ms must equal pct([200, 220], 50). The two zero
+    # sentinels must be filtered out, NOT median'd into the set.
+    if admin_on.get("warm_p50_ms") not in (200, 210, 220):
+        # pct may use linear/nearest — accept any valid p50 of the >0 set.
+        log(f"  [FAIL] admin_on.warm_p50_ms={admin_on.get('warm_p50_ms')!r}, "
+            f"expected p50 of {{200, 220}} (zero sentinels filtered)")
+        failed += 1
+    else:
+        log(f"  [OK ] admin_on.warm_p50_ms={admin_on.get('warm_p50_ms')} "
+            "(from filtered set)")
+
+    # Cell.valid_nav_count must equal 3 (the >0 waterfall navs).
+    if admin_on.get("valid_nav_count") != 3:
+        log(f"  [FAIL] admin_on.valid_nav_count="
+            f"{admin_on.get('valid_nav_count')!r}, expected 3")
+        failed += 1
+    else:
+        log("  [OK ] admin_on.valid_nav_count=3")
+
+    # Cell.invalid_nav_count must equal 2 (the two sentinels).
+    if admin_on.get("invalid_nav_count") != 2:
+        log(f"  [FAIL] admin_on.invalid_nav_count="
+            f"{admin_on.get('invalid_nav_count')!r}, expected 2")
+        failed += 1
+    else:
+        log("  [OK ] admin_on.invalid_nav_count=2")
+
+    # Cell.terminal_fail_rate must equal 2/5 = 0.4.
+    if abs((admin_on.get("terminal_fail_rate") or 0) - 0.4) > 1e-4:
+        log(f"  [FAIL] admin_on.terminal_fail_rate="
+            f"{admin_on.get('terminal_fail_rate')!r}, expected 0.4")
+        failed += 1
+    else:
+        log("  [OK ] admin_on.terminal_fail_rate=0.4")
+
+    # All-invalid cell test: every nav has waterfallMs=0. The cell
+    # must report None (not 0) for cold_ms/warm_p50_ms/warm_p99_ms so
+    # the row-level verdict short-circuits to INVALID.
+    all_invalid_navs = [
+        {"user": "admin", "nav_num": 1, "cold_warm": "COLD",
+         "waterfallMs": 0, "incomplete": True,
+         "validation": {"terminal_state": "fail",
+                        "skeleton_count": 3, "errored_count": 0,
+                        "expected_calls": 16, "actual_calls": 1,
+                        "calls_within_tolerance": False}},
+        {"user": "admin", "nav_num": 2, "cold_warm": "WARM",
+         "waterfallMs": 0, "incomplete": True,
+         "validation": {"terminal_state": "fail",
+                        "skeleton_count": 3, "errored_count": 0,
+                        "expected_calls": 16, "actual_calls": 1,
+                        "calls_within_tolerance": False}},
+    ]
+    all_invalid_results = [{
+        "stage": "6", "cache": "ON",
+        "pages": {"Dashboard": {"navigations": all_invalid_navs}},
+    }]
+    row2 = _build_canonical_ledger_row(all_invalid_results)
+    admin_on2 = row2["cells"]["admin_on"]
+    for k in ("cold_ms", "warm_p50_ms", "warm_p99_ms"):
+        if admin_on2.get(k) is not None:
+            log(f"  [FAIL] all-invalid cell {k}="
+                f"{admin_on2.get(k)!r}, expected None")
+            failed += 1
+        else:
+            log(f"  [OK ] all-invalid cell {k}=None")
+    if row2.get("verdict") != "INVALID":
+        log(f"  [FAIL] all-invalid row verdict="
+            f"{row2.get('verdict')!r}, expected INVALID")
+        failed += 1
+    else:
+        log("  [OK ] all-invalid row verdict=INVALID")
+
+    # Source-level: builder source must reference the filter literal
+    # so a future refactor cannot silently delete the gate.
+    builder_src = inspect.getsource(_build_canonical_ledger_row)
+    if "valid_nav_count" not in builder_src:
+        log("  [FAIL] _build_canonical_ledger_row does not emit "
+            "valid_nav_count")
+        failed += 1
+    else:
+        log("  [OK ] builder emits valid_nav_count")
+    if "invalid_nav_count" not in builder_src:
+        log("  [FAIL] _build_canonical_ledger_row does not emit "
+            "invalid_nav_count")
+        failed += 1
+    else:
+        log("  [OK ] builder emits invalid_nav_count")
+    if "terminal_fail_rate" not in builder_src:
+        log("  [FAIL] _build_canonical_ledger_row does not emit "
+            "terminal_fail_rate")
+        failed += 1
+    else:
+        log("  [OK ] builder emits terminal_fail_rate")
+
+    if failed:
+        log(f"cell-aggregator-filters-zeros FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("cell-aggregator-filters-zeros OK")
+
+
+def _self_test_wait_for_restaction_steady_state_exists():
+    """Verify wait_for_restaction_steady_state is defined and called.
+
+    Each composition triggers ~120 RESTAction reconciliations in its
+    namespace. Phase A 0.30.4 measured S6 immediately after the
+    composition LIST converged, but the RESTAction workqueue was still
+    deploying — admin widgets that depend on those RESTActions silently
+    dropped, and the comparison vs the previous probe (which had
+    carry-over RESTActions present) was unsound.
+
+    This test locks the helper + its call site in code:
+      1. The function is defined and callable.
+      2. Its signature accepts `timeout`, `target_per_ns`, and
+         `polling_interval` kwargs.
+      3. run_phase_browser_scaling source contains a call to it,
+         positioned AFTER the wait_for_compositions(SCALE, ...) line
+         and BEFORE the S6 _measure_all_users call. The order is
+         load-bearing — calling the wait before the comp count
+         converges would test the wrong steady state.
+    """
+    import inspect
+    failed = 0
+
+    fn = globals().get("wait_for_restaction_steady_state")
+    if not callable(fn):
+        log("  [FAIL] wait_for_restaction_steady_state not defined")
+        failed += 1
+        # Cannot continue — bail before signature/call-site checks.
+        log(f"wait-for-restaction-steady-state-exists FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("  [OK ] wait_for_restaction_steady_state is callable")
+
+    sig = inspect.signature(fn).parameters
+    for kwarg in ("timeout", "target_per_ns", "polling_interval"):
+        if kwarg not in sig:
+            log(f"  [FAIL] wait_for_restaction_steady_state missing "
+                f"`{kwarg}` parameter")
+            failed += 1
+        else:
+            log(f"  [OK ] accepts kwarg {kwarg}")
+
+    # Phase 6 source must call the helper between S6 comp deployment
+    # and S6 measurement.
+    phase6_src = inspect.getsource(run_phase_browser_scaling)
+    if "wait_for_restaction_steady_state(" not in phase6_src:
+        log("  [FAIL] run_phase_browser_scaling does not call "
+            "wait_for_restaction_steady_state")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_browser_scaling calls "
+            "wait_for_restaction_steady_state")
+
+    # Position check: the call must appear AFTER wait_for_compositions
+    # (which converges the LIST count) and BEFORE _measure_all_users(6,
+    # ...) (the S6 admin browser-nav block).
+    pos_compositions = phase6_src.find("wait_for_compositions(SCALE")
+    pos_restaction = phase6_src.find("wait_for_restaction_steady_state(")
+    pos_s6_measure = phase6_src.find('_measure_all_users(6,')
+    if pos_compositions < 0:
+        log("  [FAIL] cannot locate wait_for_compositions(SCALE in "
+            "run_phase_browser_scaling")
+        failed += 1
+    elif pos_restaction < pos_compositions:
+        log("  [FAIL] wait_for_restaction_steady_state called BEFORE "
+            "wait_for_compositions — wrong order")
+        failed += 1
+    elif pos_s6_measure >= 0 and pos_restaction >= pos_s6_measure:
+        log("  [FAIL] wait_for_restaction_steady_state called AFTER "
+            "_measure_all_users(6, ...) — wrong order")
+        failed += 1
+    else:
+        log("  [OK ] wait_for_restaction_steady_state placed between "
+            "comp convergence and S6 measure")
+
+    if failed:
+        log(f"wait-for-restaction-steady-state-exists FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("wait-for-restaction-steady-state-exists OK")
 
 
 def _self_test_phase5_runs_both_users():
@@ -5623,14 +6013,22 @@ def _verify_composition_count_ui(page):
 
 
 def _browser_measure_stage(page, stage_num, stage_desc, cache_mode,
-                           token=None, num_navs=3, user="admin"):
+                           token=None, num_navs=3, user="admin",
+                           verify_against_cluster=True):
     """Navigate browser to each page num_navs times, return timing data.
     Expects an already-logged-in page object and an admin JWT token.
 
     `user` tags every emitted navigation dict with the subject the
     measurement applies to so the canonical-row exporter can bucket
     samples per cell (admin/cyberjoker × ON/OFF). The page must already
-    be logged in as `user`; this argument is metadata only."""
+    be logged in as `user`; this argument is metadata only.
+
+    `verify_against_cluster` controls the S6 piechart convergence check.
+    For admin (cluster-wide RBAC) the piechart value must converge to the
+    cluster's total composition count; for cyberjoker (RBAC scoped to a
+    single namespace) the piechart will legitimately show fewer than the
+    cluster total, so we fall back to an intra-user UI-vs-API consistency
+    check (api_count == ui_count) instead of the cluster equality."""
     ns_count, comp_count = count_bench_ns(), count_compositions()
     log(f"Cluster: {ns_count} bench ns, {comp_count} compositions")
 
@@ -5726,18 +6124,29 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                     except Exception:
                         pass
                     if SCREENSHOTS:
-                        ss_name = f"S{stage_num}_{cache_mode}_poll{poll_num}_api{api_str_p}_ui{ui_str_p}_cluster{fresh_comp_count}.png"
+                        ss_name = f"S{stage_num}_{cache_mode}_{user}_poll{poll_num}_api{api_str_p}_ui{ui_str_p}_cluster{fresh_comp_count}.png"
                         try:
                             page.screenshot(path=os.path.join(screenshots_dir, ss_name))
                             log(f"    screenshot: {ss_name}")
                         except Exception as e:
                             log(f"    screenshot failed: {e}")
 
-                    api_ok = (api_count >= 0 and api_count == fresh_comp_count)
-                    ui_ok = (ui_count >= 0 and ui_count == fresh_comp_count)
-                    if api_ok and ui_ok:
-                        matched = True
-                        break
+                    if verify_against_cluster:
+                        # Admin: piechart must equal cluster truth.
+                        api_ok = (api_count >= 0 and api_count == fresh_comp_count)
+                        ui_ok = (ui_count >= 0 and ui_count == fresh_comp_count)
+                        if api_ok and ui_ok:
+                            matched = True
+                            break
+                    else:
+                        # Cyberjoker (RBAC-restricted): the piechart will
+                        # show fewer compositions than the cluster total,
+                        # so we cannot use cluster equality. Instead require
+                        # api == ui (intra-user consistency) with both > -1.
+                        if (api_count >= 0 and ui_count >= 0
+                                and api_count == ui_count):
+                            matched = True
+                            break
                     time.sleep(verify_interval)
 
                 convergence_ms = int((time.time() - verify_start) * 1000)
@@ -5807,7 +6216,7 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                 except Exception:
                     pass
                 if SCREENSHOTS:
-                    ss_final = f"S{stage_num}_{cache_mode}_VERIFY_{'PASS' if matched else 'FAIL'}_api{api_str}_ui{ui_str}_{conv_str}.png"
+                    ss_final = f"S{stage_num}_{cache_mode}_{user}_VERIFY_{'PASS' if matched else 'FAIL'}_api{api_str}_ui{ui_str}_{conv_str}.png"
                     try:
                         page.screenshot(path=os.path.join(screenshots_dir, ss_final))
                         log(f"    screenshot: {ss_final}")
@@ -5903,15 +6312,51 @@ def run_phase_browser_scaling(tokens):
             if cache_mode == "ON":
                 wait_for_l1_warmup()
 
-            # Login once, reuse page for all stages in this cache mode
-            username, password = "admin", _ensure_users()["admin"]
-            ctx = browser.new_context(viewport={"width": 1280, "height": 900},
-                                      ignore_https_errors=True)
-            page = ctx.new_page()
-            if not _browser_login(page, username, password):
-                log(f"  Login failed for cache={cache_mode}")
-                ctx.close()
+            # Phase 6 must cover the customer mix (95% narrow-RBAC +
+            # 5% admin per feedback_north_star_is_frontend_ux.md). For
+            # each cache mode we open ONE browser context per user
+            # subject so the cluster mutations between stages remain
+            # shared — running the full S1-S8 loop twice would double
+            # the wall-clock and risk drift between the admin/cyberjoker
+            # measurements. The page handles live for the full mode.
+            user_subjects = ("admin", "cyberjoker")
+            user_pages = {}
+            for user_subject in user_subjects:
+                creds = _ensure_users()
+                pw = creds.get(user_subject)
+                if not pw:
+                    log(f"  No password for {user_subject!r}; skipping subject")
+                    continue
+                u_ctx = browser.new_context(viewport={"width": 1280, "height": 900},
+                                            ignore_https_errors=True)
+                u_page = u_ctx.new_page()
+                if not _browser_login(u_page, user_subject, pw):
+                    log(f"  Login failed for {user_subject} cache={cache_mode}")
+                    u_ctx.close()
+                    continue
+                user_pages[user_subject] = {"ctx": u_ctx, "page": u_page,
+                                            "token": tokens_fresh.get(user_subject)}
+            if not user_pages:
+                log(f"  No usable browser sessions for cache={cache_mode}")
                 continue
+
+            def _measure_all_users(stage_num, stage_desc):
+                """Run _browser_measure_stage on every (user, page) and
+                append a per-user entry to all_results. The cluster
+                state is identical across the inner iterations — only
+                the browser subject changes."""
+                for u_name, u_state in user_pages.items():
+                    r = _browser_measure_stage(
+                        u_state["page"], stage_num, stage_desc, cache_mode,
+                        token=u_state["token"], user=u_name,
+                        verify_against_cluster=(u_name == "admin"))
+                    if r:
+                        # Tag the stage entry with the subject so the
+                        # canonical-row exporter can bucket samples per
+                        # cell (admin/cyberjoker × ON/OFF). Per-nav user
+                        # tagging happens inside _browser_measure_stage.
+                        r["user"] = u_name
+                        all_results.append(r)
 
             def _snapshot_l1():
                 """Snapshot L1 sentinel before a cluster mutation."""
@@ -5924,30 +6369,25 @@ def run_phase_browser_scaling(tokens):
                     time.sleep(5)  # brief pause for informer events to fire
 
             # S1 — Zero state
-            r = _browser_measure_stage(page, 1, "Zero state", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            _measure_all_users(1, "Zero state")
 
             # S2 — 1 ns + compdef
             ts = _snapshot_l1()
             create_bench_namespaces(1, 1); wait_for_bench_namespaces(1)
             deploy_compositiondefinition("bench-ns-01"); time.sleep(15)
             _stabilize(ts)
-            r = _browser_measure_stage(page, 2, "1 ns + compdef", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            _measure_all_users(2, "1 ns + compdef")
 
             # S3 — 20 namespaces
             ts = _snapshot_l1()
             create_bench_namespaces(2, 20); wait_for_bench_namespaces(20); time.sleep(10)
             _stabilize(ts)
-            r = _browser_measure_stage(page, 3, "20 bench ns", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            _measure_all_users(3, "20 bench ns")
 
             if SMOKE:
                 log("SMOKE=1: Skipping stages 4-8")
-                ctx.close()
+                for u_state in user_pages.values():
+                    u_state["ctx"].close()
                 continue
 
             # S4 — 20 compositions
@@ -5955,9 +6395,7 @@ def run_phase_browser_scaling(tokens):
             wait_for_crd(); deploy_compositions(1, 20, 1)
             wait_for_compositions(20)
             _stabilize(ts, quiesce=True)
-            r = _browser_measure_stage(page, 4, "20 compositions", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            _measure_all_users(4, "20 compositions")
 
             # S5/S6 — namespaces + compositions (driven by SCALE)
             # At large scale, use fewer namespaces with more compositions per ns.
@@ -5971,9 +6409,7 @@ def run_phase_browser_scaling(tokens):
             ts = _snapshot_l1()
             create_bench_namespaces(21, s5_ns_end); wait_for_bench_namespaces(s5_ns_end, timeout=600)
             _stabilize(ts, quiesce=True)
-            r = _browser_measure_stage(page, 5, f"{s5_ns_end} bench ns", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            _measure_all_users(5, f"{s5_ns_end} bench ns")
 
             # S6 — compositions
             s6_timeout = 1200 if SCALE <= 5000 else 3600
@@ -5996,9 +6432,18 @@ def run_phase_browser_scaling(tokens):
             _stabilize(ts, quiesce=True, quiesce_secs=15)
             pie_stop.set()
             pie_thread.join(timeout=10)
-            r = _browser_measure_stage(page, 6, f"{SCALE} compositions", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            # RESTAction reconciliation must catch up BEFORE we measure
+            # S6. Each composition triggers ~120 RESTActions in its ns;
+            # at 50K compositions over 50 ns that's ~6000 RESTActions.
+            # Phase A 0.30.4 measured S6 while the controller was still
+            # deploying RESTActions, so admin /dashboard silently lost
+            # widgets that depended on yet-unborn RESTActions. The wait
+            # is intentionally tolerant — it exits on stability, not on
+            # a hard count, since the controller workqueue at 50K does
+            # not guarantee 100% reconciliation in bounded time.
+            wait_for_restaction_steady_state(
+                timeout=600, target_per_ns=120, polling_interval=10)
+            _measure_all_users(6, f"{SCALE} compositions")
 
             # Heap and key-count snapshot at peak scale
             if cache_mode == "ON":
@@ -6040,13 +6485,17 @@ def run_phase_browser_scaling(tokens):
                 time.sleep(10)
             else:
                 log("WARNING: snowplow pod not ready after restart")
-            # Re-acquire token (pod restart may have flushed auth state)
+            # Re-acquire tokens (pod restart may have flushed auth state).
+            # Push the refreshed tokens back into user_pages so every
+            # per-user measurement uses a valid bearer for convergence
+            # polling. Browser localStorage still carries the prior
+            # token; the verify path uses the Python token argument.
             tokens_fresh = login_all()
             admin_token = tokens_fresh.get("admin")
-            # Measure dashboard after restart
-            r = _browser_measure_stage(page, "6b", "Post-restart (50K)", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            for u_name, u_state in user_pages.items():
+                u_state["token"] = tokens_fresh.get(u_name)
+            # Measure dashboard after restart for each user
+            _measure_all_users("6b", "Post-restart (50K)")
 
             # Scale Argo back up for S7/S8 delete tests (finalizer processing)
             for deploy in ("argocd-server", "argocd-applicationset-controller", "argocd-repo-server"):
@@ -6073,7 +6522,7 @@ def run_phase_browser_scaling(tokens):
             delete_one_composition("bench-ns-01", "bench-app-01-01")
             wait_for_composition_gone("bench-ns-01", "bench-app-01-01")
             _stabilize(ts)
-            r = _browser_measure_stage(page, 7, "Deleted 1 comp", cache_mode, token=admin_token)
+            _measure_all_users(7, "Deleted 1 comp")
             # Stop log tail
             s7_tail.terminate()
             s7_tail.wait(timeout=5)
@@ -6082,8 +6531,6 @@ def run_phase_browser_scaling(tokens):
                 log(f"  S7 logs saved to {s7_log_file} ({lines} lines)")
             except Exception as e:
                 log(f"  S7 log capture failed: {e}")
-            if r:
-                all_results.append(r)
 
             # Multi-user convergence: cyberjoker has RBAC limited to
             # demo-system namespace, so should see FEWER compositions than
@@ -6102,11 +6549,10 @@ def run_phase_browser_scaling(tokens):
             delete_one_bench_namespace(s8_ns)
             wait_for_namespace_gone(s8_ns)
             _stabilize(ts)
-            r = _browser_measure_stage(page, 8, "Deleted 1 ns", cache_mode, token=admin_token)
-            if r:
-                all_results.append(r)
+            _measure_all_users(8, "Deleted 1 ns")
 
-            ctx.close()
+            for u_state in user_pages.values():
+                u_state["ctx"].close()
 
         browser.close()
 
@@ -6115,13 +6561,25 @@ def run_phase_browser_scaling(tokens):
     # ── Summary table ──
     section("BROWSER SCALING SUMMARY")
 
-    # Group by stage
+    # Group by stage. Each stage now carries up to four entries
+    # (admin/cyberjoker × ON/OFF) since Phase 6 measures both user
+    # subjects per cache mode. The summary table still shows admin
+    # for back-compat (per-user numbers are emitted via the canonical
+    # ledger row's cells block); the cell values come from whichever
+    # entry has `user != "cyberjoker"` first, falling back to whatever
+    # is present so a cyberjoker-only run still renders.
     stages = {}
     for entry in all_results:
         key = entry["stage"]
         if key not in stages:
             stages[key] = {"desc": entry["desc"]}
-        stages[key][entry["cache"]] = entry
+        cm = entry["cache"]
+        # Prefer the admin entry for the summary table. If admin
+        # already populated, keep it; otherwise accept any user so the
+        # table renders even when admin alone failed to login.
+        existing = stages[key].get(cm)
+        if existing is None or existing.get("user") not in ("admin", None):
+            stages[key][cm] = entry
 
     for page_name in [p[0] for p in BROWSER_SCALING_PAGES]:
         print(f"\n  {BOLD}{page_name}{RESET}")
@@ -6365,27 +6823,68 @@ def _build_canonical_ledger_row(all_results):
     ship_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
     # Per-cell waterfall stats from Phase 6 navigations.
+    #
+    # The validation framework (commit 653c2db) marks `waterfallMs = 0`
+    # as an "incomplete" sentinel when the rendered page failed its
+    # terminal-state gate (skeleton still visible, /call count outside
+    # tolerance, etc.). Those zeros MUST be filtered BEFORE percentile
+    # computation — including them dragged Phase A 0.30.4's cold_ms
+    # from 8106 to 4314 (-45%) and hid that ~82% of admin navs at
+    # S3-S8 never reached a usable terminal state.
+    #
+    # The cell carries `valid_nav_count`, `invalid_nav_count`, and
+    # `terminal_fail_rate` alongside the percentiles so the PM can see
+    # the sample-set health at a glance. If every nav in a cell was
+    # invalid, the cell's percentiles report `None` (not 0) so the
+    # row-level verdict can short-circuit to INVALID cleanly.
     def _cell_stats(user, cache_mode):
         cold_samples = []
         warm_samples = []
+        valid_nav_count = 0
+        invalid_nav_count = 0
         for entry in all_results:
             if entry.get("cache") != cache_mode:
                 continue
-            for page_name, pg in (entry.get("pages") or {}).items():
+            for _, pg in (entry.get("pages") or {}).items():
                 for nav in (pg.get("navigations") or []):
                     if nav.get("user") and nav["user"] != user:
                         continue
+                    # Treat both the explicit sentinel (waterfallMs=0)
+                    # and `incomplete=True` as invalid. Older navs that
+                    # predate the sentinel will satisfy wf > 0 and pass.
                     wf = nav.get("waterfallMs", 0) or 0
-                    if wf <= 0:
+                    if wf <= 0 or nav.get("incomplete"):
+                        invalid_nav_count += 1
                         continue
+                    valid_nav_count += 1
                     if nav.get("nav_num") == 1 or nav.get("cold_warm") == "COLD":
                         cold_samples.append(wf)
                     else:
                         warm_samples.append(wf)
+        total_navs = valid_nav_count + invalid_nav_count
+        terminal_fail_rate = (
+            float(invalid_nav_count) / total_navs if total_navs else 0.0
+        )
+        # All-invalid cells report None so verdict can short-circuit to
+        # INVALID. The summary table reads `cold_ms or 0`, so None is
+        # safe for the display path; downstream consumers must treat
+        # None as "no usable samples".
+        if total_navs > 0 and valid_nav_count == 0:
+            return {
+                "cold_ms":              None,
+                "warm_p50_ms":          None,
+                "warm_p99_ms":          None,
+                "valid_nav_count":      0,
+                "invalid_nav_count":    invalid_nav_count,
+                "terminal_fail_rate":   round(terminal_fail_rate, 4),
+            }
         return {
-            "cold_ms": pct(cold_samples, 50) if cold_samples else 0,
-            "warm_p50_ms": pct(warm_samples, 50) if warm_samples else 0,
-            "warm_p99_ms": pct(warm_samples, 99) if warm_samples else 0,
+            "cold_ms":            pct(cold_samples, 50) if cold_samples else 0,
+            "warm_p50_ms":        pct(warm_samples, 50) if warm_samples else 0,
+            "warm_p99_ms":        pct(warm_samples, 99) if warm_samples else 0,
+            "valid_nav_count":    valid_nav_count,
+            "invalid_nav_count":  invalid_nav_count,
+            "terminal_fail_rate": round(terminal_fail_rate, 4),
         }
 
     cells = {
@@ -6395,16 +6894,26 @@ def _build_canonical_ledger_row(all_results):
         "cyber_off":  _cell_stats("cyberjoker", "OFF"),
     }
 
-    # Mirror admin → cyber when Phase 6 only ran the admin subject AND
-    # admin produced non-zero numbers. Customer mix is 95%+ narrow-RBAC
-    # (project_q_cold_1_state.md), so dropping cyber to zero whenever
-    # we did not separately measure it would leave mix_weighted zeroed
-    # on every floor run. The mirror is annotated, not hardcoded — when
-    # Phase 6 grows a cyberjoker loop the per-cell samples take over.
+    # Mirror admin → cyber ONLY when Phase 6 did NOT separately run
+    # cyberjoker (i.e. cyber cell has zero total navs). After Gap-1's
+    # cyberjoker browser-nav loop landed, cyber cells carry real
+    # samples and the mirror MUST stay out of the way. The mirror also
+    # never overwrites a real (even partially-valid) cell — it only
+    # rescues a completely-unmeasured cell on backward-compat runs.
+    def _cell_has_navs(c):
+        v = c.get("valid_nav_count") or 0
+        iv = c.get("invalid_nav_count") or 0
+        return (v + iv) > 0
+
+    def _cell_has_data(c):
+        cold = c.get("cold_ms")
+        wp50 = c.get("warm_p50_ms")
+        return (cold is not None and cold > 0) or (wp50 is not None and wp50 > 0)
+
     def _mirror(target, source):
-        if cells[target]["cold_ms"] > 0 or cells[target]["warm_p50_ms"] > 0:
-            return  # cyber was actually measured — keep its samples
-        if cells[source]["cold_ms"] <= 0 and cells[source]["warm_p50_ms"] <= 0:
+        if _cell_has_navs(cells[target]):
+            return  # cyber was actually measured this run — keep its samples
+        if not _cell_has_data(cells[source]):
             return  # nothing to mirror from
         cells[target] = dict(cells[source])
         cells[target]["mirrored_from"] = source
@@ -6417,9 +6926,28 @@ def _build_canonical_ledger_row(all_results):
     # the chart), so the *_on cells are structured N/A. Compute against
     # whichever side has samples — prefer ON, fall back to OFF — so the
     # ledger row always carries the customer-shape readout.
+    #
+    # When a cell carries `None` (all-invalid), the mix_weighted value
+    # for that field is also None — the row-level verdict logic then
+    # marks the row INVALID and avoids fabricating a percentile from
+    # zero usable samples.
+    def _val(cell, field):
+        v = cell.get(field)
+        return v if (v is not None and v > 0) else None
+
     def _mw_pick(field):
-        cyber = cells["cyber_on"][field] if cells["cyber_on"][field] > 0 else cells["cyber_off"][field]
-        admin = cells["admin_on"][field] if cells["admin_on"][field] > 0 else cells["admin_off"][field]
+        cyber = _val(cells["cyber_on"], field)
+        if cyber is None:
+            cyber = _val(cells["cyber_off"], field)
+        admin = _val(cells["admin_on"], field)
+        if admin is None:
+            admin = _val(cells["admin_off"], field)
+        if cyber is None and admin is None:
+            return None  # no usable samples in either cell
+        if cyber is None:
+            return int(round(admin))
+        if admin is None:
+            return int(round(cyber))
         return int(round(0.95 * cyber + 0.05 * admin))
     mix_weighted = {
         "cold_ms":     _mw_pick("cold_ms"),
@@ -6458,11 +6986,17 @@ def _build_canonical_ledger_row(all_results):
     # waterfall numbers are unusable — verdict becomes INVALID so the PM
     # knows not to score this row. This is independent of PASS/FAIL/FLOOR.
     validation = _aggregate_validation(all_results)
+
+    # An all-invalid cell (terminal_fail_rate == 1.0 with at least one
+    # nav attempted) means the cell's percentiles are None, so the row
+    # cannot be scored. Surface as INVALID before the normal
+    # gate-by-gate compute_verdict path, which assumes numeric inputs.
+    mix_has_null = any(v is None for v in mix_weighted.values())
     base_verdict = _compute_verdict(
         mix_weighted, restarts,
         _convergence_p99_for_stage(all_results, "8"),
         cells=cells)
-    if validation["navs_terminal_fail"] > 0:
+    if validation["navs_terminal_fail"] > 0 or mix_has_null:
         verdict = "INVALID"
     else:
         verdict = base_verdict
@@ -6515,24 +7049,40 @@ def _compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
                  build on.
     REJECT:      pod crashed, no usable measurements
     """
-    if not mix_weighted or mix_weighted.get("warm_p50_ms", 0) <= 0:
+    # The mix_weighted dict may carry None values when every nav in a
+    # cell hit terminal-state failure (after Gap-2 zero-filter landed).
+    # Treat None as "no samples" so the gate path does not crash on
+    # arithmetic against None.
+    if not mix_weighted:
+        return "REJECT"
+    wp50 = mix_weighted.get("warm_p50_ms")
+    cold = mix_weighted.get("cold_ms")
+    if wp50 is None or wp50 <= 0:
         return "REJECT"
     if restarts > 0:
         return "FAIL"
+
+    def _wp50(c):
+        v = (c or {}).get("warm_p50_ms")
+        return v if v is not None else 0
+
     # FLOOR detection: ON cells are zero (chart had no toggle) but the
     # OFF cells carry real numbers, so mix_weighted came from the OFF
     # branch. This is the floor-tag baseline; not a PASS/FAIL gate.
     if cells:
-        on_zero = (cells.get("admin_on", {}).get("warm_p50_ms", 0) <= 0 and
-                   cells.get("cyber_on", {}).get("warm_p50_ms", 0) <= 0)
-        off_nonzero = (cells.get("admin_off", {}).get("warm_p50_ms", 0) > 0 or
-                       cells.get("cyber_off", {}).get("warm_p50_ms", 0) > 0)
+        on_zero = (_wp50(cells.get("admin_on")) <= 0 and
+                   _wp50(cells.get("cyber_on")) <= 0)
+        off_nonzero = (_wp50(cells.get("admin_off")) > 0 or
+                       _wp50(cells.get("cyber_off")) > 0)
         if on_zero and off_nonzero:
             return "FLOOR"
     misses = 0
-    if mix_weighted["warm_p50_ms"] > 500:
+    if wp50 > 500:
         misses += 1
-    if mix_weighted["cold_ms"] > 1000:
+    if cold is None or cold > 1000:
+        # Treat None cold as a miss (no samples) — but only if the
+        # warm-p50 path produced a number. Otherwise we already
+        # bailed REJECT above.
         misses += 1
     if conv_s8_p99 is not None and conv_s8_p99 > 1000:
         misses += 1
@@ -7568,6 +8118,9 @@ def main():
         _self_test_canonical_ledger_row()
         _self_test_canonical_ledger_row_floor_shape()
         _self_test_widget_validation()
+        _self_test_phase6_iterates_users()
+        _self_test_cell_aggregator_filters_zeros()
+        _self_test_wait_for_restaction_steady_state_exists()
         _self_test_phase8_wired()
         _self_test_password_from_secret()
         _self_test_namespace_cascade_delete()
