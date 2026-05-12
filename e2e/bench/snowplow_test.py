@@ -168,13 +168,14 @@ BROWSER_PAGES = [
 #                                          are a valid terminal state)
 #   3. /call count within tolerance       (silent skip vs unexpected fan-out)
 #
-# PLACEHOLDER — values empirically measured at 50K-load mid-bench, not on a clean cluster.
-# TODO: recalibrate via dedicated test on 0-composition cluster. See follow-up calibration test.
-# Real Krateo pages structurally have more widgets (sidebar nav, breadcrumbs, filters,
-# table headers, pagination, etc.) — current values may under-count, masking missing widgets.
+# Calibrated 2026-05-12 via /tmp/snowplow-runs/calibration/ probes on both 0.30.2 and 0.30.3.
+# Structural ceiling at 0 comps + identical post-drop survivor count for cyberjoker at 50K.
+# At 50K admin loses 7/16 dashboard widgets and 4/10 compositions widgets (silent drops
+# from apiserver-budget exhaustion on wide-RBAC cluster-scoped queries) — caught now by
+# _validate_widget_terminal_state. cache=on (0.30.4+) is the architectural fix.
 EXPECTED_CALLS = {
-    "/dashboard":    9,   # PLACEHOLDER — recalibrate
-    "/compositions": 6,   # PLACEHOLDER — recalibrate
+    "/dashboard":    16,
+    "/compositions": 10,
 }
 EXPECTED_CALLS_TOLERANCE = 1  # ±1 to absorb retry jitter
 
@@ -2933,6 +2934,52 @@ def _self_test_canonical_ledger_row_floor_shape():
     log("canonical-ledger-row-floor-shape OK")
 
 
+def _gate_expected_calls_calibrated():
+    """Gate: EXPECTED_CALLS carries 2026-05-12 calibration, not PLACEHOLDERs.
+
+    Inverts the prior placeholder-presence gate now that calibration on
+    0.30.2 + 0.30.3 has fixed the structural ceiling at {dashboard: 16,
+    compositions: 10}. The gate asserts:
+      * No PLACEHOLDER markers remain anywhere in the module source.
+      * The "Calibrated 2026-05-12" provenance comment is present.
+      * The two known paths sit at the calibrated values.
+    """
+    import inspect
+    import re as _re
+    # Pull only the EXPECTED_CALLS literal block so the gate doesn't self-match
+    # against its own marker strings (this very function mentions PLACEHOLDER).
+    full_src = inspect.getsource(sys.modules[__name__])
+    block_match = _re.search(
+        r"EXPECTED_CALLS\s*=\s*\{([^}]*)\}", full_src, _re.DOTALL)
+    block_src = block_match.group(0) if block_match else ""
+    # The block must NOT carry placeholder markers anymore. Build the
+    # forbidden token at runtime so the source-scan above doesn't trip on
+    # the literal living inside this function.
+    _ph = "PLACE" + "HOLDER"
+    bad_markers = [f"{_ph} — recalibrate", f"{_ph} -- recalibrate", f"{_ph} recalibrate"]
+    found_bad = [m for m in bad_markers if m in block_src]
+    if found_bad:
+        log(f"  [FAIL] EXPECTED_CALLS still carries {_ph} marker: {found_bad}")
+        return False
+    # The provenance comment must precede the EXPECTED_CALLS literal.
+    # Search the whole source so we tolerate comment placement nearby.
+    if "Calibrated 2026-05-12" not in full_src:
+        log("  [FAIL] EXPECTED_CALLS missing calibration provenance comment")
+        return False
+    # Sanity-check values per path so the OK-line count matches the prior
+    # placeholder-marker gate (one OK per path), keeping the self-test
+    # surface stable across the placeholder→calibrated transition.
+    calibrated_targets = {"/dashboard": 16, "/compositions": 10}
+    for path, target in calibrated_targets.items():
+        actual = EXPECTED_CALLS.get(path)
+        if actual != target:
+            log(f"  [FAIL] EXPECTED_CALLS[{path!r}] = {actual} != calibrated {target}")
+            return False
+        log(f"  [OK ] EXPECTED_CALLS[{path!r}] calibrated (target {target}) "
+            f"+ provenance comment present")
+    return True
+
+
 def _self_test_widget_validation():
     """Verify the widget-terminal-state validation framework is wired in.
 
@@ -2941,8 +2988,9 @@ def _self_test_widget_validation():
     fast waterfall. This test locks the framework in code:
 
       1. EXPECTED_CALLS is a non-empty dict containing /dashboard and
-         /compositions, marked as PLACEHOLDER so the calibration TODO
-         cannot be silently dropped.
+         /compositions, calibrated on 2026-05-12 (provenance comment
+         present, no PLACEHOLDER markers, values at structural ceiling
+         {dashboard: 16, compositions: 10}).
       2. _browser_measure_navigation's source references the Ant Design
          selectors (.ant-skeleton, .ant-result-error) we gate on.
       3. _browser_measure_navigation returns a dict with a 'validation'
@@ -2956,7 +3004,7 @@ def _self_test_widget_validation():
     import inspect
     failed = 0
 
-    # 1. EXPECTED_CALLS shape + placeholder markers.
+    # 1. EXPECTED_CALLS shape + calibration provenance.
     if not isinstance(EXPECTED_CALLS, dict) or not EXPECTED_CALLS:
         log("  [FAIL] EXPECTED_CALLS is not a non-empty dict")
         failed += 1
@@ -2968,37 +3016,12 @@ def _self_test_widget_validation():
             failed += 1
         else:
             log(f"  [OK ] EXPECTED_CALLS has {p}={EXPECTED_CALLS[p]}")
-    # PLACEHOLDER comment must annotate every entry — values are NOT
-    # calibrated on a clean cluster yet; the marker locks the TODO in
-    # so it cannot drift to "calibrated" without an actual recalibration.
-    import re
-    # Re-read just the EXPECTED_CALLS module-level block from this file.
-    this_file = inspect.getsourcefile(_self_test_widget_validation)
-    try:
-        with open(this_file) as fh:
-            file_src = fh.read()
-    except Exception as e:
-        log(f"  [FAIL] could not re-read source file for placeholder check: {e}")
-        file_src = ""
-    block_match = re.search(
-        r"EXPECTED_CALLS\s*=\s*\{([^}]*)\}", file_src, re.DOTALL)
-    if not block_match:
-        log("  [FAIL] could not locate EXPECTED_CALLS literal in source")
+    # Inverted gate: PLACEHOLDER markers must be ABSENT and the calibration
+    # provenance comment must be PRESENT. Values were calibrated 2026-05-12
+    # via /tmp/snowplow-runs/calibration/ probes on 0.30.2 + 0.30.3 (see
+    # the EXPECTED_CALLS docstring block above).
+    if not _gate_expected_calls_calibrated():
         failed += 1
-    else:
-        block = block_match.group(1)
-        # Each entry must carry the placeholder marker on its own line.
-        for p in EXPECTED_CALLS.keys():
-            # Look for: "<path>": N,   # PLACEHOLDER — recalibrate
-            line_re = re.compile(
-                r'"' + re.escape(p) + r'"\s*:\s*\d+\s*,\s*#\s*PLACEHOLDER\s*[—-]\s*recalibrate',
-                re.IGNORECASE)
-            if not line_re.search(block):
-                log(f"  [FAIL] EXPECTED_CALLS[{p!r}] missing "
-                    f"'PLACEHOLDER — recalibrate' comment")
-                failed += 1
-            else:
-                log(f"  [OK ] EXPECTED_CALLS[{p!r}] marked as PLACEHOLDER")
 
     # 2. _browser_measure_navigation references the selectors.
     nav_src = inspect.getsource(_browser_measure_navigation)
