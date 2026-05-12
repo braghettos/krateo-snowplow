@@ -157,6 +157,27 @@ BROWSER_PAGES = [
     ("Compositions", "/compositions"),
 ]
 
+# Widget-terminal-state validation gates for _browser_measure_navigation.
+# A page where every /call returned HTTP 200 but widgets never rendered
+# would otherwise "pass" with a fast waterfall — a silent regression. The
+# stability poll exits when no new /call requests fire, but Ant Design's
+# Skeleton placeholder can still be on screen at that moment. After the
+# poll returns we therefore check:
+#   1. .ant-skeleton count == 0           (no widget still loading)
+#   2. .ant-result-error count            (soft signal; errored widgets
+#                                          are a valid terminal state)
+#   3. /call count within tolerance       (silent skip vs unexpected fan-out)
+#
+# PLACEHOLDER — values empirically measured at 50K-load mid-bench, not on a clean cluster.
+# TODO: recalibrate via dedicated test on 0-composition cluster. See follow-up calibration test.
+# Real Krateo pages structurally have more widgets (sidebar nav, breadcrumbs, filters,
+# table headers, pagination, etc.) — current values may under-count, masking missing widgets.
+EXPECTED_CALLS = {
+    "/dashboard":    9,   # PLACEHOLDER — recalibrate
+    "/compositions": 6,   # PLACEHOLDER — recalibrate
+}
+EXPECTED_CALLS_TOLERANCE = 1  # ±1 to absorb retry jitter
+
 TEST_NS = "bench-crud-test"
 TEST_NAME_WARM = "bench-app-01"
 TEST_NAME_NEW = "cache-test-app"
@@ -2912,6 +2933,155 @@ def _self_test_canonical_ledger_row_floor_shape():
     log("canonical-ledger-row-floor-shape OK")
 
 
+def _self_test_widget_validation():
+    """Verify the widget-terminal-state validation framework is wired in.
+
+    Validation gates exist so a page where every /call returns HTTP 200
+    but the dashboard's widgets never render cannot silently pass with a
+    fast waterfall. This test locks the framework in code:
+
+      1. EXPECTED_CALLS is a non-empty dict containing /dashboard and
+         /compositions, marked as PLACEHOLDER so the calibration TODO
+         cannot be silently dropped.
+      2. _browser_measure_navigation's source references the Ant Design
+         selectors (.ant-skeleton, .ant-result-error) we gate on.
+      3. _browser_measure_navigation returns a dict with a 'validation'
+         key — proved via source inspection since we can't execute it
+         without a browser.
+      4. _build_canonical_ledger_row writes a top-level 'validation'
+         field; verdict can be INVALID when navs_terminal_fail > 0.
+      5. _aggregate_validation produces the expected aggregate keys
+         given a synthetic all_results with mixed pass/fail navs.
+    """
+    import inspect
+    failed = 0
+
+    # 1. EXPECTED_CALLS shape + placeholder markers.
+    if not isinstance(EXPECTED_CALLS, dict) or not EXPECTED_CALLS:
+        log("  [FAIL] EXPECTED_CALLS is not a non-empty dict")
+        failed += 1
+    else:
+        log(f"  [OK ] EXPECTED_CALLS has {len(EXPECTED_CALLS)} entries")
+    for p in ("/dashboard", "/compositions"):
+        if p not in EXPECTED_CALLS:
+            log(f"  [FAIL] EXPECTED_CALLS missing {p!r}")
+            failed += 1
+        else:
+            log(f"  [OK ] EXPECTED_CALLS has {p}={EXPECTED_CALLS[p]}")
+    # PLACEHOLDER comment must annotate every entry — values are NOT
+    # calibrated on a clean cluster yet; the marker locks the TODO in
+    # so it cannot drift to "calibrated" without an actual recalibration.
+    import re
+    # Re-read just the EXPECTED_CALLS module-level block from this file.
+    this_file = inspect.getsourcefile(_self_test_widget_validation)
+    try:
+        with open(this_file) as fh:
+            file_src = fh.read()
+    except Exception as e:
+        log(f"  [FAIL] could not re-read source file for placeholder check: {e}")
+        file_src = ""
+    block_match = re.search(
+        r"EXPECTED_CALLS\s*=\s*\{([^}]*)\}", file_src, re.DOTALL)
+    if not block_match:
+        log("  [FAIL] could not locate EXPECTED_CALLS literal in source")
+        failed += 1
+    else:
+        block = block_match.group(1)
+        # Each entry must carry the placeholder marker on its own line.
+        for p in EXPECTED_CALLS.keys():
+            # Look for: "<path>": N,   # PLACEHOLDER — recalibrate
+            line_re = re.compile(
+                r'"' + re.escape(p) + r'"\s*:\s*\d+\s*,\s*#\s*PLACEHOLDER\s*[—-]\s*recalibrate',
+                re.IGNORECASE)
+            if not line_re.search(block):
+                log(f"  [FAIL] EXPECTED_CALLS[{p!r}] missing "
+                    f"'PLACEHOLDER — recalibrate' comment")
+                failed += 1
+            else:
+                log(f"  [OK ] EXPECTED_CALLS[{p!r}] marked as PLACEHOLDER")
+
+    # 2. _browser_measure_navigation references the selectors.
+    nav_src = inspect.getsource(_browser_measure_navigation)
+    # The selectors live inside the helper it calls; check both functions.
+    val_src = inspect.getsource(_validate_widget_terminal_state)
+    combined = nav_src + "\n" + val_src
+    for selector in (".ant-skeleton", ".ant-result-error"):
+        if selector not in combined:
+            log(f"  [FAIL] navigation/validation does not reference {selector}")
+            failed += 1
+        else:
+            log(f"  [OK ] {selector} present in measure/validate source")
+
+    # 3. _browser_measure_navigation returns a 'validation' key.
+    if '"validation": validation' not in nav_src and "'validation': validation" not in nav_src:
+        log("  [FAIL] _browser_measure_navigation does not return 'validation' key")
+        failed += 1
+    else:
+        log("  [OK ] _browser_measure_navigation return dict carries 'validation'")
+
+    # 4. _build_canonical_ledger_row writes top-level 'validation' + INVALID verdict.
+    builder_src = inspect.getsource(_build_canonical_ledger_row)
+    if '"validation": validation' not in builder_src:
+        log("  [FAIL] _build_canonical_ledger_row does not write top-level 'validation'")
+        failed += 1
+    else:
+        log("  [OK ] _build_canonical_ledger_row writes top-level 'validation'")
+    if '"INVALID"' not in builder_src:
+        log("  [FAIL] _build_canonical_ledger_row does not emit INVALID verdict")
+        failed += 1
+    else:
+        log("  [OK ] _build_canonical_ledger_row emits INVALID verdict on fail")
+
+    # 5. _aggregate_validation with synthetic input.
+    synthetic = [{
+        "stage": "6", "cache": "ON",
+        "pages": {"Dashboard": {"navigations": [
+            {"label": "Dashboard-cold-admin", "validation": {
+                "terminal_state": "pass", "skeleton_count": 0,
+                "errored_count": 0, "expected_calls": 9,
+                "actual_calls": 9, "calls_within_tolerance": True}},
+            {"label": "Dashboard-warm-admin", "validation": {
+                "terminal_state": "fail", "skeleton_count": 3,
+                "errored_count": 1, "expected_calls": 9,
+                "actual_calls": 2, "calls_within_tolerance": False}},
+            # Nav without validation must be ignored (forward compat).
+            {"label": "Dashboard-legacy"},
+        ]}},
+    }]
+    agg = _aggregate_validation(synthetic)
+    if agg.get("navs_terminal_pass") != 1:
+        log(f"  [FAIL] aggregate navs_terminal_pass={agg.get('navs_terminal_pass')} expected 1")
+        failed += 1
+    else:
+        log("  [OK ] aggregate navs_terminal_pass=1")
+    if agg.get("navs_terminal_fail") != 1:
+        log(f"  [FAIL] aggregate navs_terminal_fail={agg.get('navs_terminal_fail')} expected 1")
+        failed += 1
+    else:
+        log("  [OK ] aggregate navs_terminal_fail=1")
+    if agg.get("skeleton_failures") != ["Dashboard-warm-admin"]:
+        log(f"  [FAIL] aggregate skeleton_failures={agg.get('skeleton_failures')!r}")
+        failed += 1
+    else:
+        log("  [OK ] aggregate skeleton_failures=['Dashboard-warm-admin']")
+    if agg.get("errored_widgets_total") != 1:
+        log(f"  [FAIL] aggregate errored_widgets_total={agg.get('errored_widgets_total')} expected 1")
+        failed += 1
+    else:
+        log("  [OK ] aggregate errored_widgets_total=1")
+    mismatches = agg.get("call_count_mismatches") or []
+    if len(mismatches) != 1 or mismatches[0][0] != "Dashboard-warm-admin":
+        log(f"  [FAIL] aggregate call_count_mismatches={mismatches!r}")
+        failed += 1
+    else:
+        log("  [OK ] aggregate call_count_mismatches captures fail nav")
+
+    if failed:
+        log(f"widget-validation FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("widget-validation OK")
+
+
 def _self_test_phase5_runs_both_users():
     """Verify Phase 5 covers both admin AND cyberjoker.
 
@@ -4909,6 +5079,77 @@ def _browser_login(page, username, password, retries=3):
     return False
 
 
+def _validate_widget_terminal_state(page, page_path, label):
+    """Inspect the rendered page after the /call stability poll returns.
+
+    The waterfall measurement only tells us when network activity stopped.
+    It does not tell us whether the dashboard actually rendered piechart
+    + table or whether every widget is still showing a Skeleton because
+    the stability poll exited prematurely. This helper applies three
+    gates and returns a structured result dict; callers decide whether
+    to invalidate `waterfallMs` based on `terminal_state`.
+
+    Gates:
+      1. .ant-skeleton count must be 0 — HARD FAIL (premature stability).
+      2. .ant-result-error count is recorded but NOT a failure: errored
+         widgets are a valid terminal state (the widget reported failure
+         visibly, doing its job).
+      3. /call count must be within EXPECTED_CALLS_TOLERANCE of
+         EXPECTED_CALLS[page_path] — HARD FAIL on deviation. Pages not
+         in EXPECTED_CALLS are skipped silently (don't block new pages
+         from being benched before characterization).
+
+    Returns a dict with keys:
+        skeleton_count, errored_count, expected_calls, actual_calls,
+        calls_within_tolerance, terminal_state ("pass" or "fail")
+    """
+    try:
+        skeleton_count = page.locator(".ant-skeleton").count()
+    except Exception as e:
+        log(f"    [WARN] could not count .ant-skeleton at {label}: {e}")
+        skeleton_count = 0
+    try:
+        errored_count = page.locator(".ant-result-error").count()
+    except Exception as e:
+        log(f"    [WARN] could not count .ant-result-error at {label}: {e}")
+        errored_count = 0
+    try:
+        actual_calls = page.evaluate(
+            "() => performance.getEntriesByType('resource')"
+            ".filter(e => e.name.includes('/call')).length")
+    except Exception as e:
+        log(f"    [WARN] could not read /call count at {label}: {e}")
+        actual_calls = 0
+
+    expected = EXPECTED_CALLS.get(page_path)
+    if expected is None:
+        calls_within_tolerance = True
+    else:
+        calls_within_tolerance = abs(actual_calls - expected) <= EXPECTED_CALLS_TOLERANCE
+
+    terminal_state = "pass"
+    if skeleton_count > 0:
+        log(f"    [FAIL] stability_premature: {skeleton_count} skeletons "
+            f"still visible at {label}")
+        terminal_state = "fail"
+    if errored_count > 0:
+        # Soft signal — record + log, do NOT flip terminal_state.
+        log(f"    [WARN] errored_widgets={errored_count} at {label}")
+    if expected is not None and not calls_within_tolerance:
+        log(f"    [FAIL] call_count_mismatch: expected={expected}"
+            f"±{EXPECTED_CALLS_TOLERANCE} actual={actual_calls} at {label}")
+        terminal_state = "fail"
+
+    return {
+        "skeleton_count": skeleton_count,
+        "errored_count": errored_count,
+        "expected_calls": expected,
+        "actual_calls": actual_calls,
+        "calls_within_tolerance": calls_within_tolerance,
+        "terminal_state": terminal_state,
+    }
+
+
 def _browser_measure_navigation(page, page_path, label, min_calls=0):
     """Navigate to a page and measure the /call API waterfall timing.
 
@@ -4968,6 +5209,14 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
             _stable_streak = 0
         _prev_count = _cur_count
         page.wait_for_timeout(1000)
+
+    # Widget-terminal-state validation. The stability poll only knows about
+    # /call traffic; it cannot tell us whether the page actually rendered
+    # widgets. Apply the skeleton/error/call-count gates here, BEFORE the
+    # waterfall math, so we can mark waterfallMs=0 (incomplete sentinel)
+    # when the rendered terminal state is invalid. See
+    # _validate_widget_terminal_state for gate definitions.
+    validation = _validate_widget_terminal_state(page, page_path, label)
 
     # Measure /call waterfall + cluster calls into progressive-rendering levels.
     # A new level starts when the next call's startTime exceeds the max end-time
@@ -5029,6 +5278,14 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         result["waterfallMs"] = 0  # 0 = incomplete, shown as "*" in summary
         result["incomplete"] = True
 
+    # Widget-terminal-state gates: if validation says fail (skeleton still
+    # visible OR /call count outside tolerance), invalidate waterfallMs the
+    # same way as the min_calls sentinel above. Keep the waterfall formula
+    # itself unchanged — we only mark the sample as unusable.
+    if validation["terminal_state"] != "pass":
+        result["waterfallMs"] = 0
+        result["incomplete"] = True
+
     # Also measure navigation timing
     nav = page.evaluate("""() => {
         const t = performance.getEntriesByType('navigation')[0];
@@ -5056,6 +5313,7 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         "levels": result.get("levels", []),
         "httpOk": ok_count,
         "httpErr": err_count,
+        "validation": validation,
     }
 
 
@@ -6010,6 +6268,50 @@ def _convergence_p99_for_stage(all_results, stage_label):
     return pct(samples, 99)
 
 
+def _aggregate_validation(all_results):
+    """Aggregate widget-terminal-state validation across every nav.
+
+    Walks all_results (the Phase-6 list of stage entries), looks at each
+    nav's `validation` sub-dict (populated by _browser_measure_navigation),
+    and produces a top-level summary for the canonical ledger row. The PM
+    uses this to decide whether the measurement is even valid: if any
+    nav had a skeleton still on screen or a /call-count mismatch, the
+    waterfall numbers cannot be trusted regardless of how fast they look.
+
+    Returns dict with:
+      navs_terminal_pass, navs_terminal_fail,
+      skeleton_failures: [label, ...],
+      errored_widgets_total: int,
+      call_count_mismatches: [(label, expected, actual), ...]
+    """
+    summary = {
+        "navs_terminal_pass": 0,
+        "navs_terminal_fail": 0,
+        "skeleton_failures": [],
+        "errored_widgets_total": 0,
+        "call_count_mismatches": [],
+    }
+    for entry in all_results:
+        for _, pg in (entry.get("pages") or {}).items():
+            for nav in (pg.get("navigations") or []):
+                v = nav.get("validation")
+                if not isinstance(v, dict):
+                    continue  # nav predates the validation gate or skipped
+                label = nav.get("label") or "<unlabeled>"
+                if v.get("terminal_state") == "pass":
+                    summary["navs_terminal_pass"] += 1
+                else:
+                    summary["navs_terminal_fail"] += 1
+                if v.get("skeleton_count", 0) > 0:
+                    summary["skeleton_failures"].append(label)
+                summary["errored_widgets_total"] += int(v.get("errored_count", 0) or 0)
+                exp = v.get("expected_calls")
+                if exp is not None and not v.get("calls_within_tolerance", True):
+                    summary["call_count_mismatches"].append(
+                        (label, exp, v.get("actual_calls", 0)))
+    return summary
+
+
 def _build_canonical_ledger_row(all_results):
     """Assemble the canonical ledger row from Phase-6 measurements.
 
@@ -6028,6 +6330,9 @@ def _build_canonical_ledger_row(all_results):
       convergence_per_class_cold_p99,
       tag_specific_verifications,
       pod_restart_count,
+      validation: { navs_terminal_pass, navs_terminal_fail,
+                    skeleton_failures, errored_widgets_total,
+                    call_count_mismatches },
       verdict
     Phase 8 (per-mutation) lands at Commit 6; this writer leaves those
     fields as null when Phase 8 has not run.
@@ -6125,6 +6430,20 @@ def _build_canonical_ledger_row(all_results):
     except Exception:
         pass
 
+    # Widget-terminal-state aggregation across every nav. When any nav
+    # had a skeleton still on screen or a /call-count mismatch, the
+    # waterfall numbers are unusable — verdict becomes INVALID so the PM
+    # knows not to score this row. This is independent of PASS/FAIL/FLOOR.
+    validation = _aggregate_validation(all_results)
+    base_verdict = _compute_verdict(
+        mix_weighted, restarts,
+        _convergence_p99_for_stage(all_results, "8"),
+        cells=cells)
+    if validation["navs_terminal_fail"] > 0:
+        verdict = "INVALID"
+    else:
+        verdict = base_verdict
+
     return {
         "tag": tag,
         "ship_date": ship_date,
@@ -6143,9 +6462,8 @@ def _build_canonical_ledger_row(all_results):
         "convergence_per_class_cold_p99":   _load_per_mutation_metric("cold_p99"),
         "tag_specific_verifications": {},
         "pod_restart_count": restarts,
-        "verdict": _compute_verdict(mix_weighted, restarts,
-                                    _convergence_p99_for_stage(all_results, "8"),
-                                    cells=cells),
+        "validation": validation,
+        "verdict": verdict,
     }
 
 
@@ -7226,6 +7544,7 @@ def main():
         _self_test_phase5_runs_both_users()
         _self_test_canonical_ledger_row()
         _self_test_canonical_ledger_row_floor_shape()
+        _self_test_widget_validation()
         _self_test_phase8_wired()
         _self_test_password_from_secret()
         _self_test_namespace_cascade_delete()
