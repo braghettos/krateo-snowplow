@@ -5,6 +5,42 @@
 **Author:** Architect.
 **Status:** Detailed per-tag breakdown of the PM-approved-with-amendments roadmap, revised 2026-05-09 to fold in Diego's six binding constraints (chart-strip, portal-strip, tag-regex, in-process Role-Based Access Control evaluation, Role-Based Access Control enforced on every RestAction dispatch including non-userAccessFilter, convergence p99 < 1 s scoring metric).
 
+---
+
+## SESSION CHECKPOINT — 2026-05-13 end of day
+
+| Tag | Status | Notes |
+|---|---|---|
+| 0.30.0 → 0.30.5 | SHIPPED (historical) | |
+| 0.30.6 v0 (eager-register) | SUPERSEDED (broken — pre-flight gap) | Replaced by v2 |
+| 0.30.61 | SHIPPED (mitigation: gated eager-register OFF) | |
+| 0.30.6 v2 (typed-RBAC indexer) | SHIPPED + VALIDATED | -62% CPU on cyber dashboard, FromUnstructured 4760→0ms |
+| **0.30.7 (L1 resolved-output cache scaffold)** | **DEPLOYED** (helm rev 98, image live) | Phase A bench mix-weighted cold=1453ms warm_p50=893ms — **first time within ~1.5× of north-star at 50K** |
+| **0.30.71 (CACHE_ENABLED=false extends to disable typed-RBAC + informer cache)** | **TAGGED + IMAGE BUILT** (CI ✓) | Diagnostic-only; NOT deployed; default unchanged |
+| **0.30.8 (DELETE-evict + UPDATE-refresher)** | **REBASED (onto 0.30.71), UNCOMMITTED** | Working tree on `ship-0.30.8-resolved-cache-deps`; awaiting architect+PM re-review + pre-flight falsifier `delete_stale_gap.py` |
+| 0.30.9 (UAF) | PLANNED | When ships, remove cyberjoker ClusterRoles from portal chart |
+| 0.30.10+ | PLANNED | Per original plan |
+
+**Today's key findings:**
+- **§0.30.8 Revision 16 amendment (CREATE-event handler) FALSIFIED + ROLLED BACK** — pre-flight probe showed first nav after `Created bench-ns` reached 16/16 calls in 3s. Today's 192 cyberjoker FAILs from 0.30.6 v2 bench were bench-harness rapid-namespace-bulk-stress + over-broad `.ant-skeleton` selector, NOT real product behavior. Plan reverted to original DELETE-evict-only scope (committed to main as `5957a49`).
+- **Safety guard for `internal/rbac/rbac_test.go`** (`335eda4`) cherry-picked onto main + ship-0.30.7-l1-scaffold + pushed to braghettos. Prevents future CRD-wipe via `go test ./internal/rbac/...`.
+- **Bench-harness fix `bd05f96`**: scoped skeleton selector `[data-widget-renderer] .ant-skeleton` + per-user EXPECTED_CALLS dict pushed to braghettos. **PENDING frontend change**: `WidgetRenderer.tsx` must wrap loading `<Skeleton>` in `<div data-widget-renderer>` to make selector match (currently false-negative risk).
+- **Branch policy:** Option B chosen — fold 0.30.71 forward. 0.30.8 rebased onto 0.30.71. All future tags inherit cache-off diagnostic mode.
+- **Cluster has UNCLEAN bench residue** at session-end: 49 bench-ns + 50K compositions + 162 ClusterRoles + 2369 CRBs. Next bench needs CompositionDefinition delete sequence FIRST before namespace delete.
+
+**Queued for next session (priority order):**
+1. Frontend `data-widget-renderer` wrapper change in `WidgetRenderer.tsx` (3 retries today errored via Agent dispatch — try direct Edit)
+2. 0.30.8 architect + PM re-review on rebased branch
+3. 0.30.8 pre-flight falsifier `delete_stale_gap.py`
+4. 0.30.8 commit + tag + push + deploy
+5. 0.30.71 deploy + true-cache-off measurement
+6. Cluster cleanup (CompDef delete sequence)
+7. 0.30.9 UAF dispatch
+
+**Detailed session state in memory:** `project_session_checkpoint_2026_05_13.md`
+
+---
+
 **Foundations (do not re-explain here — read first):**
 - `/Users/diegobraga/krateo/snowplow-cache/snowplow/docs/clean-slate-proposal-from-0.20.5.md`
 - `/Users/diegobraga/krateo/snowplow-cache/snowplow/docs/informer-as-cache-primer.md`
