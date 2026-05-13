@@ -211,11 +211,43 @@ func main() {
 			}
 		}
 	} else {
-		// Disabled() emits the canonical "cache.disabled=true" log line
-		// from inside NewResourceWatcher — call it for the side-effect
-		// even when we know it returns nil. This is the falsifier the
-		// PM gate verifies via `kubectl logs`.
-		_, _ = cache.NewResourceWatcher(cacheCtx, nil)
+		// 0.30.71 — "true cache-off" diagnostic mode.
+		//
+		// CACHE_ENABLED=false unconditionally disables the L1
+		// resolved-output cache, the typed-RBAC indexer, and the
+		// informer factory. We still construct a passthrough
+		// ResourceWatcher (when in-cluster config is available) so
+		// the watcher API stays callable; every Get/List call routes
+		// to apiserver via the dynamic client. NewResourceWatcher
+		// emits the loud WARN diagnostic-mode banner so operators
+		// see immediately that ALL caching is off.
+		//
+		// When in-cluster config or dynamic.NewForConfig fails (e.g.
+		// running outside a cluster for unit tests), we fall back to
+		// the pre-0.30.71 nil-watcher shape — consumers nil-check
+		// cache.Global() and take their own apiserver branch.
+		rc, rcErr := rest.InClusterConfig()
+		if rcErr != nil {
+			log.Info("cache: rest.InClusterConfig unavailable in disabled mode; watcher will be nil",
+				slog.Any("err", rcErr))
+			_, _ = cache.NewResourceWatcher(cacheCtx, nil)
+		} else {
+			dynCli, dynErr := dynamic.NewForConfig(rc)
+			if dynErr != nil {
+				log.Warn("cache: dynamic.NewForConfig failed in disabled mode; watcher will be nil",
+					slog.Any("err", dynErr))
+				_, _ = cache.NewResourceWatcher(cacheCtx, nil)
+			} else {
+				w, wErr := cache.NewResourceWatcher(cacheCtx, dynCli)
+				if wErr != nil {
+					log.Warn("cache: NewResourceWatcher failed in disabled mode; watcher will be nil",
+						slog.Any("err", wErr))
+				} else if w != nil {
+					cacheWatcher = w
+					cache.SetGlobal(w)
+				}
+			}
+		}
 	}
 	defer func() {
 		if cacheWatcher != nil {

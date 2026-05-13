@@ -24,6 +24,28 @@ import (
 // (Q-OOM-WARMER, ship/0.25.320).
 const listPageLimit int64 = 500
 
+// watcherMode discriminates the two ResourceWatcher operational modes
+// introduced at 0.30.71 ("extended CACHE_ENABLED"):
+//
+//   - modeInformer (CACHE_ENABLED=true, operational/production): the
+//     factory is constructed, RBAC GVRs are eager-registered, the
+//     SetTransform typed-RBAC pipeline runs, and every Get/List is
+//     served from the informer indexer in O(1).
+//
+//   - modePassthrough (CACHE_ENABLED=false, diagnostic/measurement):
+//     NO factory, NO informers, NO goroutines. Every Get/List call
+//     reaches apiserver via the dynamic client. This is the "true
+//     cache-off" baseline used to measure the L1+typed-RBAC+informer
+//     stack's compound effect on warm-p50 latency. Operational
+//     customers MUST NOT run in this mode (informer cache savings
+//     vanish; apiserver pressure spikes).
+type watcherMode int
+
+const (
+	modeInformer    watcherMode = 0 // cache=on, factory-backed
+	modePassthrough watcherMode = 1 // cache=off + dyn provided, apiserver-routed
+)
+
 // RBACResourceTypes is the eager-registered Role-Based Access Control
 // resource-type set (0.30.4 binding, plan §"Tag 0.30.4 What's implemented"
 // bullet 1). The four GVRs are eagerly informer-registered by
@@ -54,6 +76,12 @@ var RBACResourceTypes = []schema.GroupVersionResource{
 // Per feedback_no_special_cases.md the type does not embed any
 // per-resource policy — every consumer treats Disabled() uniformly.
 type ResourceWatcher struct {
+	// mode is the operational discriminator (0.30.71). modeInformer
+	// is the production path; modePassthrough routes every Get/List
+	// straight to apiserver via dyn. mode is set once at construction
+	// and never mutated.
+	mode watcherMode
+
 	dyn     dynamic.Interface
 	factory dynamicinformer.DynamicSharedInformerFactory
 
@@ -75,13 +103,32 @@ type ResourceWatcher struct {
 	stopCh chan struct{}
 }
 
-// NewResourceWatcher constructs a cluster-wide informer factory bound
-// to dyn. When Disabled() is true the function returns (nil, nil) and
-// NEVER instantiates the factory — guaranteeing zero goroutines and
-// zero apiserver traffic in cache=off mode.
+// NewResourceWatcher constructs a cluster-wide ResourceWatcher.
+//
+// Mode selection (0.30.71 extended CACHE_ENABLED semantics):
+//
+//   - CACHE_ENABLED=true (production, modeInformer): the dynamic
+//     informer factory is constructed, the four Role-Based Access
+//     Control GVRs are eagerly registered, the SetTransform pipeline
+//     runs, and factory.Start fires. Every Get/List is served from
+//     the informer indexer in O(1).
+//
+//   - CACHE_ENABLED=false + dyn != nil (diagnostic, modePassthrough):
+//     NO factory is constructed, NO informers run, NO goroutines
+//     spawn. Every Get/List is routed to apiserver via dyn. This is
+//     the "true cache-off" measurement mode introduced at 0.30.71.
+//     A loud WARN log is emitted so operators see immediately that
+//     ALL caching layers (L1, typed-RBAC, informer) are dead.
+//
+//   - CACHE_ENABLED=false + dyn == nil: returns (nil, nil) for
+//     backward compatibility with PM-amendment-1 tests that asserted
+//     "dormant when disabled" before 0.30.71 existed.
 //
 // Callers MUST nil-check the return value: when nil, every consumer
-// takes the apiserver branch.
+// takes the apiserver branch. When non-nil in passthrough mode,
+// Get/List still route to apiserver — the difference is that the
+// watcher API stays callable instead of forcing every consumer to
+// nil-check + duplicate the apiserver branch.
 //
 // At 0.30.4 (Revision 1 binding) cache=on mode eagerly registers the
 // Role-Based Access Control GVRs (Role, RoleBinding, ClusterRole,
@@ -90,12 +137,39 @@ type ResourceWatcher struct {
 // SubjectAccessReview against apiserver.
 func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWatcher, error) {
 	if Disabled() {
-		slog.Info("cache.disabled=true",
+		// 0.30.71 split: with dyn=nil we preserve the pre-0.30.71
+		// (nil, nil) contract that watcher_test.go's dormancy tests
+		// rely on. With dyn != nil we build a passthrough watcher
+		// so consumers that hold the watcher pointer can still call
+		// Get/List; every call routes to apiserver.
+		if dyn == nil {
+			slog.Info("cache.disabled=true",
+				slog.String("subsystem", "cache"),
+				slog.Bool("plumbing_present", true),
+				slog.Bool("routed", false),
+				slog.String("mode", "dormant-no-dyn"),
+			)
+			return nil, nil
+		}
+
+		slog.Warn(
+			"CACHE_ENABLED=false — typed-RBAC + informer cache + L1 ALL disabled (diagnostic mode; do not run in production)",
 			slog.String("subsystem", "cache"),
 			slog.Bool("plumbing_present", true),
-			slog.Bool("routed", false),
+			slog.Bool("routed", true),
+			slog.String("mode", "passthrough"),
+			slog.String("rationale", "0.30.71: true cache-off baseline for warm-p50 measurement"),
+			slog.String("rbac.evaluate_path", "SubjectAccessReview"),
+			slog.String("informer.get_list_path", "apiserver"),
+			slog.String("l1.resolved_cache_path", "disabled"),
 		)
-		return nil, nil
+		_ = ctx
+		return &ResourceWatcher{
+			mode:      modePassthrough,
+			dyn:       dyn,
+			informers: map[schema.GroupVersionResource]informers.GenericInformer{},
+			stopCh:    make(chan struct{}),
+		}, nil
 	}
 
 	if dyn == nil {
@@ -114,6 +188,7 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	)
 
 	rw := &ResourceWatcher{
+		mode:      modeInformer,
 		dyn:       dyn,
 		factory:   factory,
 		informers: map[schema.GroupVersionResource]informers.GenericInformer{},
@@ -172,14 +247,39 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	return rw, nil
 }
 
+// Mode returns the operational discriminator (modeInformer or
+// modePassthrough). Exposed for falsifier-log diagnostics and unit
+// tests; production callers should rely on Disabled() / Get-List
+// behaviour instead.
+func (rw *ResourceWatcher) Mode() watcherMode {
+	if rw == nil {
+		return modeInformer // unreachable: callers nil-check upstream
+	}
+	return rw.mode
+}
+
+// IsPassthrough reports whether the watcher routes Get/List to
+// apiserver (0.30.71 diagnostic mode). A nil receiver returns false
+// so call sites stay terse.
+func (rw *ResourceWatcher) IsPassthrough() bool {
+	return rw != nil && rw.mode == modePassthrough
+}
+
 // AddResourceType registers an informer for gvr. Idempotent: calling
 // twice for the same GVR is a no-op. Safe for concurrent use.
+//
+// In modePassthrough (0.30.71) this is a no-op: every Get/List call
+// is already apiserver-routed via the dynamic client, so there is
+// nothing to register and no informer to start.
 //
 // At 0.30.4 the constructor eagerly registers the four Role-Based
 // Access Control GVRs. Future tags will register additional resource
 // types lazily on first dispatch (0.30.6 eager registration covers
 // RestAction inventory).
 func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
+	if rw.mode == modePassthrough {
+		return
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -295,6 +395,9 @@ func gvrResourceTypeString(gvr schema.GroupVersionResource) string {
 // eager RBAC registration — callers normally do not need to call this
 // directly. Future tags may use it for lazy GVR registration scenarios.
 func (rw *ResourceWatcher) Start() {
+	if rw.mode == modePassthrough {
+		return
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -308,7 +411,13 @@ func (rw *ResourceWatcher) Start() {
 // WaitForCacheSync blocks until every registered informer's local
 // store is in sync with apiserver, or the timeout elapses. Returns nil
 // on success, error on timeout or context cancellation.
+//
+// In modePassthrough (0.30.71) there is no informer to sync — every
+// read goes to apiserver — so the function returns nil immediately.
 func (rw *ResourceWatcher) WaitForCacheSync(ctx context.Context, timeout time.Duration) error {
+	if rw.mode == modePassthrough {
+		return nil
+	}
 	rw.mu.RLock()
 	syncs := make([]clientcache.InformerSynced, 0, len(rw.informers))
 	for _, gi := range rw.informers {
@@ -329,10 +438,39 @@ func (rw *ResourceWatcher) WaitForCacheSync(ctx context.Context, timeout time.Du
 	return nil
 }
 
-// GetObject returns the cached unstructured object for (gvr, namespace,
-// name) or (nil, false) when missing. Reads are served from the
-// informer indexer in O(1).
+// passthroughGetTimeout bounds the apiserver Get/List call in
+// modePassthrough so a stalled apiserver cannot wedge a caller
+// indefinitely. 30s mirrors the dynamic.Client default behaviour
+// elsewhere in snowplow.
+const passthroughGetTimeout = 30 * time.Second
+
+// GetObject returns the unstructured object for (gvr, namespace,
+// name) or (nil, false) when missing.
+//
+// In modeInformer (cache=on) the lookup is served from the informer
+// indexer in O(1).
+//
+// In modePassthrough (cache=off + dyn provided, 0.30.71) the lookup
+// is routed to apiserver via the dynamic client. Each call is a fresh
+// apiserver Get; there is NO in-process caching. This is the "true
+// cache-off" path the diagnostic mode promises.
 func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, bool) {
+	if rw.mode == modePassthrough {
+		ctx, cancel := context.WithTimeout(context.Background(), passthroughGetTimeout)
+		defer cancel()
+		var uns *unstructured.Unstructured
+		var err error
+		if namespace == "" {
+			uns, err = rw.dyn.Resource(gvr).Get(ctx, name, metav1.GetOptions{})
+		} else {
+			uns, err = rw.dyn.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+		}
+		if err != nil || uns == nil {
+			return nil, false
+		}
+		return uns, true
+	}
+
 	rw.mu.RLock()
 	gi, ok := rw.informers[gvr]
 	rw.mu.RUnlock()
@@ -358,9 +496,22 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 	return uns, true
 }
 
-// ListObjects returns every cached unstructured object for gvr scoped
-// to namespace. Pass empty string for cluster-wide listing.
+// ListObjects returns every object for gvr scoped to namespace.
+// Pass empty string for cluster-wide listing.
+//
+// In modeInformer (cache=on) the list is served from the informer
+// indexer in O(N) over the namespace partition.
+//
+// In modePassthrough (cache=off + dyn provided, 0.30.71) the list is
+// routed to apiserver via the dynamic client with the same
+// listPageLimit bounded paging policy used by the informer factory.
+// Each call is a fresh apiserver LIST; there is NO in-process
+// caching. Paging is iterated until Continue is empty so callers see
+// the full set.
 func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespace string) []*unstructured.Unstructured {
+	if rw.mode == modePassthrough {
+		return rw.listPassthrough(gvr, namespace)
+	}
 	rw.mu.RLock()
 	gi, ok := rw.informers[gvr]
 	rw.mu.RUnlock()
@@ -391,6 +542,46 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespac
 	return out
 }
 
+// listPassthrough is the modePassthrough implementation of ListObjects.
+// Iterates apiserver LIST with bounded paging until Continue is empty.
+// Errors are swallowed (logged at debug) and a possibly-partial slice
+// is returned — same contract the informer indexer gives on a partial
+// sync: callers MUST be tolerant of empty / partial results.
+func (rw *ResourceWatcher) listPassthrough(gvr schema.GroupVersionResource, namespace string) []*unstructured.Unstructured {
+	ctx, cancel := context.WithTimeout(context.Background(), passthroughGetTimeout)
+	defer cancel()
+
+	var out []*unstructured.Unstructured
+	var continueToken string
+	for {
+		opts := metav1.ListOptions{Limit: listPageLimit, Continue: continueToken}
+		var list *unstructured.UnstructuredList
+		var err error
+		if namespace == "" {
+			list, err = rw.dyn.Resource(gvr).List(ctx, opts)
+		} else {
+			list, err = rw.dyn.Resource(gvr).Namespace(namespace).List(ctx, opts)
+		}
+		if err != nil || list == nil {
+			slog.Debug("cache.passthrough.list_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.String("namespace", namespace),
+				slog.Any("err", err),
+			)
+			return out
+		}
+		for i := range list.Items {
+			item := list.Items[i]
+			out = append(out, &item)
+		}
+		continueToken = list.GetContinue()
+		if continueToken == "" {
+			return out
+		}
+	}
+}
+
 func filterByNamespace(items []interface{}, ns string) []interface{} {
 	out := make([]interface{}, 0, len(items))
 	for _, it := range items {
@@ -413,13 +604,27 @@ func filterByNamespace(items []interface{}, ns string) []interface{} {
 // final type-assert at the call-site.
 //
 // Returns (nil, false) when the GVR is not registered, the key is
-// missing, or the underlying object is nil. NEVER falls back to
-// apiserver. ZERO conversion cost — this is the read-path mate to
-// stripAndType* in strip.go.
+// missing, or the underlying object is nil.
+//
+// In modeInformer (cache=on) this serves typed pointers in O(1) with
+// zero per-call FromUnstructured cost. In modePassthrough (cache=off
+// + dyn provided, 0.30.71) the call routes to apiserver and returns
+// the resulting *unstructured.Unstructured (which IS a runtime.Object)
+// — the caller's as{Kind} helper in internal/rbac/evaluate.go falls
+// through to the Unstructured fallback path (FromUnstructured per
+// call). That is exactly the "original FromUnstructured-based RBAC
+// evaluation" the diagnostic mode promises.
 //
 // For non-RBAC callers that still want the Unstructured (e.g.
 // resolver-side reads), GetObject is preserved unchanged.
 func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, namespace, name string) (runtime.Object, bool) {
+	if rw.mode == modePassthrough {
+		uns, ok := rw.GetObject(gvr, namespace, name)
+		if !ok || uns == nil {
+			return nil, false
+		}
+		return uns, true
+	}
 	rw.mu.RLock()
 	gi, ok := rw.informers[gvr]
 	rw.mu.RUnlock()
@@ -445,14 +650,29 @@ func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, names
 	return robj, true
 }
 
-// ListTypedObjects returns every cached object for gvr scoped to
-// namespace as []runtime.Object — without the *unstructured.Unstructured
+// ListTypedObjects returns every object for gvr scoped to namespace
+// as []runtime.Object — without the *unstructured.Unstructured
 // type-assert that ListObjects performs. Caller does the final type
 // assert at the call-site.
 //
-// Pass empty namespace for cluster-wide listing. NEVER falls back to
-// apiserver. ZERO conversion cost.
+// Pass empty namespace for cluster-wide listing.
+//
+// In modeInformer (cache=on) the list is served from the informer
+// indexer with zero per-call FromUnstructured cost.
+//
+// In modePassthrough (cache=off + dyn provided, 0.30.71) the list is
+// routed to apiserver and the returned []runtime.Object holds
+// *unstructured.Unstructured values — callers' as{Kind} helpers fall
+// through to FromUnstructured (the "original" RBAC path).
 func (rw *ResourceWatcher) ListTypedObjects(gvr schema.GroupVersionResource, namespace string) []runtime.Object {
+	if rw.mode == modePassthrough {
+		uns := rw.listPassthrough(gvr, namespace)
+		out := make([]runtime.Object, 0, len(uns))
+		for _, u := range uns {
+			out = append(out, u)
+		}
+		return out
+	}
 	rw.mu.RLock()
 	gi, ok := rw.informers[gvr]
 	rw.mu.RUnlock()

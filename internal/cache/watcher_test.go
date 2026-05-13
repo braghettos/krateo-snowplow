@@ -9,6 +9,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -240,5 +241,195 @@ func TestDisabled_TruthyValues(t *testing.T) {
 		if cache.Disabled() {
 			t.Fatalf("Disabled() should be false for CACHE_ENABLED=%q", v)
 		}
+	}
+}
+
+// TestNewResourceWatcher_PassthroughMode_NonNilDynBuildsWatcher covers
+// the 0.30.71 "extended CACHE_ENABLED" semantics: when CACHE_ENABLED=false
+// AND a non-nil dynamic.Interface is supplied, NewResourceWatcher
+// returns a non-nil passthrough watcher (mode=passthrough). The
+// pre-0.30.71 nil-dyn dormancy contract is preserved by the parallel
+// TestNewResourceWatcher_DormantWhenCacheDisabled test above.
+func TestNewResourceWatcher_PassthroughMode_NonNilDynBuildsWatcher(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("CACHE_ENABLED=false + non-nil dyn: expected passthrough watcher, got nil")
+	}
+	if !rw.IsPassthrough() {
+		t.Fatalf("watcher must report IsPassthrough()=true in CACHE_ENABLED=false + non-nil dyn")
+	}
+	defer rw.Stop()
+}
+
+// TestNewResourceWatcher_PassthroughMode_NoGoroutinesSpawned is the
+// "no informer factory" contract for 0.30.71 passthrough mode. The
+// passthrough watcher MUST NOT spawn informer goroutines — its
+// Get/List methods route directly to apiserver via the dynamic
+// client. We measure delta and require it to be 0 (same bar the
+// pre-0.30.71 dormant test set).
+func TestNewResourceWatcher_PassthroughMode_NoGoroutinesSpawned(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
+
+	before := runtime.NumGoroutine()
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("expected non-nil passthrough watcher")
+	}
+	defer rw.Stop()
+
+	runtime.Gosched()
+	time.Sleep(50 * time.Millisecond)
+	runtime.Gosched()
+
+	after := runtime.NumGoroutine()
+	delta := after - before
+	if delta != 0 {
+		t.Fatalf("passthrough mode goroutine delta = %d (want 0); before=%d after=%d", delta, before, after)
+	}
+}
+
+// TestNewResourceWatcher_PassthroughMode_GetRoutesToApiserver is the
+// load-bearing 0.30.71 assertion: in passthrough mode, GetObject
+// returns the object served by the dynamic client (apiserver), NOT
+// from any in-process cache. We seed the fake dynamic client with a
+// known object and confirm GetObject returns it. If GetObject
+// silently fell through to an indexer (or to nil), this test fails.
+func TestNewResourceWatcher_PassthroughMode_GetRoutesToApiserver(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+
+	gvr := schema.GroupVersionResource{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles",
+	}
+	seedCR := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: "admin-via-apiserver"},
+	}
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds(), seedCR)
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil || !rw.IsPassthrough() {
+		t.Fatalf("expected passthrough watcher; got %v IsPassthrough=%v", rw, rw.IsPassthrough())
+	}
+	defer rw.Stop()
+
+	uns, ok := rw.GetObject(gvr, "", "admin-via-apiserver")
+	if !ok || uns == nil {
+		t.Fatalf("passthrough GetObject: expected the seeded ClusterRole, got (%v, %v)", uns, ok)
+	}
+	if uns.GetName() != "admin-via-apiserver" {
+		t.Fatalf("passthrough GetObject returned wrong name: %q", uns.GetName())
+	}
+}
+
+// TestNewResourceWatcher_PassthroughMode_ListRoutesToApiserver covers
+// the cluster-wide LIST path in passthrough mode. The fake dynamic
+// client is seeded with two ClusterRoleBindings; ListObjects must
+// return both.
+func TestNewResourceWatcher_PassthroughMode_ListRoutesToApiserver(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+
+	gvr := schema.GroupVersionResource{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings",
+	}
+	seedA := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "crb-a"}}
+	seedB := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "crb-b"}}
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds(), seedA, seedB)
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil || !rw.IsPassthrough() {
+		t.Fatalf("expected passthrough watcher")
+	}
+	defer rw.Stop()
+
+	got := rw.ListObjects(gvr, "")
+	if len(got) != 2 {
+		names := make([]string, 0, len(got))
+		for _, u := range got {
+			names = append(names, u.GetName())
+		}
+		t.Fatalf("passthrough ListObjects: want 2 ClusterRoleBindings, got %d (%v)", len(got), names)
+	}
+}
+
+// TestNewResourceWatcher_PassthroughMode_AddResourceTypeIsNoOp
+// confirms that AddResourceType in passthrough mode does NOT
+// register an informer (no informer factory exists). The behavioural
+// contract is: subsequent GetObject still works (via apiserver),
+// goroutine count does not change.
+func TestNewResourceWatcher_PassthroughMode_AddResourceTypeIsNoOp(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil || !rw.IsPassthrough() {
+		t.Fatalf("expected passthrough watcher")
+	}
+	defer rw.Stop()
+
+	before := runtime.NumGoroutine()
+	gvr := schema.GroupVersionResource{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles",
+	}
+	rw.AddResourceType(gvr)
+	runtime.Gosched()
+	time.Sleep(20 * time.Millisecond)
+	runtime.Gosched()
+	after := runtime.NumGoroutine()
+	if after-before != 0 {
+		t.Fatalf("passthrough AddResourceType spawned goroutines: before=%d after=%d", before, after)
+	}
+}
+
+// TestNewResourceWatcher_PassthroughMode_WaitForCacheSyncReturnsNil
+// confirms that in passthrough mode WaitForCacheSync is a no-op
+// returning nil immediately. Main wires it after construction so
+// startup MUST not block on a non-existent informer sync.
+func TestNewResourceWatcher_PassthroughMode_WaitForCacheSyncReturnsNil(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil || !rw.IsPassthrough() {
+		t.Fatalf("expected passthrough watcher")
+	}
+	defer rw.Stop()
+
+	start := time.Now()
+	if err := rw.WaitForCacheSync(context.Background(), 5*time.Second); err != nil {
+		t.Fatalf("WaitForCacheSync in passthrough must return nil; got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("WaitForCacheSync in passthrough took %v; must be near-instant", elapsed)
 	}
 }

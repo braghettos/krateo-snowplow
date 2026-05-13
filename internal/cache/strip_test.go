@@ -248,7 +248,13 @@ func TestStrip_AssertRBACPanicsOnMissingOverride(t *testing.T) {
 // *rbacv1.ClusterRoleBinding), NOT *unstructured.Unstructured. This
 // is the contract internal/rbac/evaluate.go relies on for zero
 // per-call FromUnstructured cost.
+//
+// 0.30.71 — the transform is gated on !Disabled(); the test must
+// set CACHE_ENABLED=true so the production-mode typed path is
+// exercised. The DisabledMode counterpart (TestStrip_TypedTransform_DisabledFallsBackToUnstructured)
+// asserts the diagnostic-mode behaviour.
 func TestStrip_TypedTransform_ProducesTypedPointer(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
 	resetStripLoggingForTest()
 	cases := []struct {
 		name     string
@@ -384,6 +390,7 @@ func TestStrip_TypedTransform_ProducesTypedPointer(t *testing.T) {
 // fallback path. The informer never sees an error. Plan §Risks bullet
 // 2.
 func TestStrip_TypedTransform_MalformedFallsBack(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
 	resetStripLoggingForTest()
 	gvr := rbacTypedGVRs[3] // clusterrolebindings
 	tf := StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)
@@ -413,6 +420,7 @@ func TestStrip_TypedTransform_MalformedFallsBack(t *testing.T) {
 // only copy; if strip didn't run, the typed object would carry the
 // bulk fields forward.
 func TestStrip_TypedTransform_StripsBeforeConverting(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
 	resetStripLoggingForTest()
 	gvr := rbacTypedGVRs[3] // clusterrolebindings
 	tf := StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)
@@ -476,5 +484,108 @@ func TestStrip_DropsEmptyAnnotationMap(t *testing.T) {
 	stripped := out.(*unstructured.Unstructured)
 	if got := stripped.GetAnnotations(); got != nil && len(got) != 0 {
 		t.Fatalf("expected empty/nil annotations after sole-key drop, got %v", got)
+	}
+}
+
+// TestStrip_TypedTransform_DisabledFallsBackToUnstructured is the
+// 0.30.71 diagnostic-mode contract: when CACHE_ENABLED=false the
+// typed conversion path is skipped and the transform returns the
+// stripped *unstructured.Unstructured. The downstream as{Kind}
+// helpers in internal/rbac/evaluate.go then fall through to
+// to{Kind} (FromUnstructured per call) — the "original
+// FromUnstructured-based RBAC evaluation" diagnostic mode promises.
+//
+// Important: in production this code path is unreachable because
+// NewResourceWatcher returns (nil, nil) or a passthrough watcher
+// when Disabled(), neither of which installs SetTransform. The
+// gate is defense-in-depth — surfaces the contract for any future
+// caller that invokes StripBulkyFieldsForResourceType outside the
+// informer pipeline.
+func TestStrip_TypedTransform_DisabledFallsBackToUnstructured(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+	resetStripLoggingForTest()
+
+	for _, gvr := range rbacTypedGVRs {
+		gvr := gvr
+		t.Run(gvr.Resource, func(t *testing.T) {
+			resetStripLoggingForTest()
+			tf := StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)
+			uns := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+				"kind":       gvr.Resource,
+				"metadata":   map[string]interface{}{"name": "demo"},
+			}}
+			out, err := tf(uns)
+			if err != nil {
+				t.Fatalf("transform error: %v", err)
+			}
+			if _, isUns := out.(*unstructured.Unstructured); !isUns {
+				t.Fatalf("CACHE_ENABLED=false: typed path must be inert; want *unstructured.Unstructured, got %T", out)
+			}
+			// Type-asserting to the typed shape MUST fail.
+			switch gvr.Resource {
+			case "clusterrolebindings":
+				if _, isTyped := out.(*rbacv1.ClusterRoleBinding); isTyped {
+					t.Fatalf("CACHE_ENABLED=false: typed conversion fired (got *rbacv1.ClusterRoleBinding)")
+				}
+			case "rolebindings":
+				if _, isTyped := out.(*rbacv1.RoleBinding); isTyped {
+					t.Fatalf("CACHE_ENABLED=false: typed conversion fired (got *rbacv1.RoleBinding)")
+				}
+			case "clusterroles":
+				if _, isTyped := out.(*rbacv1.ClusterRole); isTyped {
+					t.Fatalf("CACHE_ENABLED=false: typed conversion fired (got *rbacv1.ClusterRole)")
+				}
+			case "roles":
+				if _, isTyped := out.(*rbacv1.Role); isTyped {
+					t.Fatalf("CACHE_ENABLED=false: typed conversion fired (got *rbacv1.Role)")
+				}
+			}
+		})
+	}
+}
+
+// TestStrip_TypedTransform_DisabledStripStillRuns confirms that even
+// when CACHE_ENABLED=false skips the typed-conversion path, the
+// default strip (managedFields + last-applied-configuration drop) is
+// still applied. The diagnostic mode is about caching, not about
+// breaking the strip rule.
+func TestStrip_TypedTransform_DisabledStripStillRuns(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+	resetStripLoggingForTest()
+	gvr := rbacTypedGVRs[3] // clusterrolebindings
+	tf := StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)
+
+	uns := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRoleBinding",
+		"metadata": map[string]interface{}{
+			"name": "demo",
+			"annotations": map[string]interface{}{
+				"kubectl.kubernetes.io/last-applied-configuration": "should-be-dropped",
+				"keep-me": "yes",
+			},
+			"managedFields": []interface{}{
+				map[string]interface{}{"manager": "kubectl"},
+			},
+		},
+	}}
+
+	out, err := tf(uns)
+	if err != nil {
+		t.Fatalf("transform error: %v", err)
+	}
+	stripped, ok := out.(*unstructured.Unstructured)
+	if !ok {
+		t.Fatalf("CACHE_ENABLED=false: want *unstructured.Unstructured, got %T", out)
+	}
+	if _, present := stripped.GetAnnotations()["kubectl.kubernetes.io/last-applied-configuration"]; present {
+		t.Fatalf("CACHE_ENABLED=false: default strip skipped — last-applied annotation still present")
+	}
+	if stripped.GetAnnotations()["keep-me"] != "yes" {
+		t.Fatalf("CACHE_ENABLED=false: default strip dropped unrelated annotation")
+	}
+	if len(stripped.GetManagedFields()) != 0 {
+		t.Fatalf("CACHE_ENABLED=false: default strip skipped — managedFields still present")
 	}
 }

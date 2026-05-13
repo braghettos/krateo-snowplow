@@ -191,10 +191,25 @@ func StripBulkyFieldsForResourceType(resourceType string, gvr schema.GroupVersio
 		// Unstructured (logged WARN inside the override) — informer
 		// never stalls. Falsifier log includes typed_kind and
 		// conversion_ms per plan §"Code-path falsifier".
-		if typedOverride, ok := typedResourceOverrides[gvr]; ok {
-			out, pre, post, typedKind, conversionMs := typedOverride(uns)
-			logFirstStripOnceTyped(resourceType, pre, post, typedKind, conversionMs)
-			return out, nil
+		//
+		// 0.30.71 — diagnostic mode: when CACHE_ENABLED=false the
+		// typed-RBAC indexer MUST be inert so the watcher (if
+		// constructed in passthrough mode) carries Unstructured
+		// downstream. The downstream as{Kind} helpers in
+		// internal/rbac/evaluate.go fall back to to{Kind}
+		// (FromUnstructured per call) — the "original
+		// FromUnstructured-based RBAC evaluation" the diagnostic
+		// mode asks for. This is defense-in-depth: at 0.30.71 the
+		// only caller of this function is addResourceTypeLocked,
+		// which only runs in cache=on mode anyway, but the gate
+		// makes the contract explicit and survives future call
+		// sites that may not check Disabled() upstream.
+		if !Disabled() {
+			if typedOverride, ok := typedResourceOverrides[gvr]; ok {
+				out, pre, post, typedKind, conversionMs := typedOverride(uns)
+				logFirstStripOnceTyped(resourceType, pre, post, typedKind, conversionMs)
+				return out, nil
+			}
 		}
 
 		// Per-resource-type strip-only override: if a custom
