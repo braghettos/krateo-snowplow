@@ -157,27 +157,56 @@ func main() {
 					// fan-in by STARTUP_INFORMER_FANIN (default 8).
 					// Soft failure: log + continue; the lazy fallback
 					// in AddResourceType handles the gap.
-					fanin := env.Int("STARTUP_INFORMER_FANIN", 8)
-					startupTimeout := time.Duration(env.Int("STARTUP_TIMEOUT_SECONDS", 120)) * time.Second
-					invCtx, invCancel := context.WithTimeout(cacheCtx, startupTimeout)
-					inv, invErr := cache.CollectResourceTypesFromRestActions(invCtx, dynCli)
-					if invErr != nil {
-						log.Warn("cache: RestAction inventory walk failed; falling through to lazy registration",
-							slog.Any("err", invErr))
+					//
+					// As of 2026-05-13 post-mortem (tag 0.30.61): gated off
+					// by default because no consumer reads from the
+					// eagerly-registered informers at this tag — the
+					// resolver still calls apiserver directly, so eager
+					// registration is pure apiserver pressure. Bench at
+					// 0.30.6 showed 3× S7/S8 convergence regression + new
+					// S6b VERIFY TIMEOUT vs 0.30.5. Re-enable when
+					// resolver-cache wiring lands. Set
+					// EAGER_REGISTER_ENABLED=true to opt-in (will cause
+					// apiserver pressure at 50K scale per bench data;
+					// see project_regression_journal.md 2026-05-13).
+					//
+					// The inventory walker (inventory.go), eager.go, and
+					// the watcher.go eagerSet plumbing are intentionally
+					// preserved as dormant library code.
+					if os.Getenv("EAGER_REGISTER_ENABLED") == "true" {
+						log.Info("eager-register: enabled via EAGER_REGISTER_ENABLED=true",
+							slog.String("subsystem", "cache"))
+						fanin := env.Int("STARTUP_INFORMER_FANIN", 8)
+						startupTimeout := time.Duration(env.Int("STARTUP_TIMEOUT_SECONDS", 120)) * time.Second
+						invCtx, invCancel := context.WithTimeout(cacheCtx, startupTimeout)
+						inv, invErr := cache.CollectResourceTypesFromRestActions(invCtx, dynCli)
+						if invErr != nil {
+							log.Warn("cache: RestAction inventory walk failed; falling through to lazy registration",
+								slog.Any("err", invErr))
+							// Mark eager-done with an empty set so any
+							// post-startup AddResourceType is treated as
+							// expected-lazy (no WARN spam).
+							w.MarkEagerSet([]schema.GroupVersionResource{})
+						} else {
+							n, regErr := cache.EagerRegisterAll(invCtx, w, inv, fanin, startupTimeout)
+							if regErr != nil {
+								log.Warn("cache: eager registration WaitForCacheSync incomplete",
+									slog.Int("resource_types", n),
+									slog.Any("err", regErr))
+							}
+							w.MarkEagerSet(inv)
+						}
+						invCancel()
+					} else {
+						log.Info("eager-register: disabled (default); set EAGER_REGISTER_ENABLED=true to opt-in",
+							slog.String("subsystem", "cache"),
+							slog.String("rationale", "no consumer reads from eagerly-registered informers at this tag; see project_regression_journal.md 2026-05-13"))
 						// Mark eager-done with an empty set so any
 						// post-startup AddResourceType is treated as
-						// expected-lazy (no WARN spam).
+						// expected-lazy (no WARN spam from the eagerSet
+						// gate in watcher.AddResourceType).
 						w.MarkEagerSet([]schema.GroupVersionResource{})
-					} else {
-						n, regErr := cache.EagerRegisterAll(invCtx, w, inv, fanin, startupTimeout)
-						if regErr != nil {
-							log.Warn("cache: eager registration WaitForCacheSync incomplete",
-								slog.Int("resource_types", n),
-								slog.Any("err", regErr))
-						}
-						w.MarkEagerSet(inv)
 					}
-					invCancel()
 				}
 			}
 		}
