@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -14,8 +15,18 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
+
+// lazyRegisterSlowThreshold is the ceiling above which EnsureResourceType
+// emits a WARN log line. The call itself is just `rw.mu.Lock()` plus a
+// `factory.ForResource` + goroutine spawn — sub-millisecond expected.
+// Anything above this threshold means rw.mu is heavily contended or
+// factory.ForResource is doing real work (rare client-go discovery
+// path). The threshold is intentionally aggressive so the falsifier
+// fires before 8s-class first-read symptoms accumulate.
+const lazyRegisterSlowThreshold = 250 * time.Millisecond
 
 const (
 	//annotationKeyVerboseAPI = "krateo.io/verbose"
@@ -187,6 +198,31 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			continue
 		}
 
+		// 0.30.92 widening: lazy-register the informer for every
+		// downstream apiserver GVR enumerated by this stage's request
+		// options. Without this, the 0.30.91 hook only fired for the
+		// entry-point RESTAction GVR (recorded in restactions.go's
+		// dispatcher) — downstream GVRs the resolver dispatches inner
+		// HTTP calls against (e.g. compositions, sidebar widgets,
+		// resourcesRefs targets) never received an informer, so the
+		// 0.30.8 dep-tracker DeleteFunc never fired and
+		// `evict_delete_total` stayed 0 after deliberate DELETE events
+		// (probe `/tmp/snowplow-runs/0.30.91/preflight/probe.log`,
+		// gates 1 + 4 FAIL).
+		//
+		// `call.Path` is the JQ-evaluated apiserver REST path
+		// (e.g. `/apis/composition.krateo.io/v1/namespaces/<ns>/
+		// githubscaffoldingwithcompositionpages`). `ParseAPIServerPathToGVR`
+		// extracts (Group, Version, Resource) and skips non-apiserver
+		// paths (external endpoints, malformed templated fragments).
+		// EnsureResourceType is idempotent + singleflight under rw.mu;
+		// duplicate calls within the loop are sub-microsecond no-ops.
+		//
+		// Timing instrumentation: if EnsureResourceType ever blocks
+		// longer than lazyRegisterSlowThreshold we emit a WARN so the
+		// 0.30.92 first-read-latency follow-up has a falsifier.
+		lazyRegisterInnerCallPaths(log, tmp)
+
 		for _, call := range tmp {
 			call.Endpoint = &ep
 			call.ResponseHandler = jsonHandler(ctx, jsonHandlerOptions{
@@ -243,6 +279,72 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	//delete(dict, "slice")
 
 	return dict
+}
+
+// lazyRegisterInnerCallPaths walks the per-stage RequestOptions slice
+// (one entry per iterator dispatch — the iterator + non-iterator paths
+// share this code) and calls cache.Global().EnsureResourceType for the
+// GVR derived from each call.Path. Idempotent across paths that point
+// at the same GVR (singleflight under rw.mu).
+//
+// Cache=off / watcher=nil branch is silently skipped — there is no
+// informer to register and the apiserver-fallback path in
+// `httpcall.Do` handles the call regardless.
+//
+// Paths that don't resolve to an apiserver GVR (external endpoints,
+// JQ-evaluation failures that leak `${...}` to the final string) are
+// also silently skipped — those have no informer counterpart and the
+// dispatch will hit the external URL through `httpcall.Do` as before.
+//
+// Timing: per-call duration is measured; calls slower than
+// lazyRegisterSlowThreshold emit a WARN log so a regression in
+// rw.mu contention or factory.ForResource cost becomes visible.
+func lazyRegisterInnerCallPaths(log *slog.Logger, opts []httpcall.RequestOptions) {
+	rw := cache.Global()
+	if rw == nil {
+		return
+	}
+	seen := map[schema.GroupVersionResource]struct{}{}
+	for i := range opts {
+		path := opts[i].Path
+		gvr, ok := cache.ParseAPIServerPathToGVR(path)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[gvr]; dup {
+			continue
+		}
+		seen[gvr] = struct{}{}
+
+		start := time.Now()
+		added, _ := rw.EnsureResourceType(gvr)
+		elapsed := time.Since(start)
+
+		// Emit a one-shot INFO line on first registration of a GVR so
+		// the gate-2 probe can count distinct lazy-registered GVRs.
+		// The cache layer emits its own `cache.lazy_register` line —
+		// we add a callsite-specific marker so post-mortems can tell
+		// whether the entry came from a widget dep edge or an inner
+		// resolver call.
+		if added {
+			log.Info("cache.lazy_register.inner_call",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.String("path", path),
+				slog.Duration("ensure_elapsed", elapsed),
+				slog.String("hint", "resolver inner-call first touch — informer registered + dep-tracker handlers wired"),
+			)
+		}
+		if elapsed > lazyRegisterSlowThreshold {
+			log.Warn("cache.lazy_register.slow",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.Duration("elapsed", elapsed),
+				slog.Duration("threshold", lazyRegisterSlowThreshold),
+				slog.String("hint", "EnsureResourceType blocked unexpectedly long — investigate rw.mu contention"),
+			)
+		}
+	}
 }
 
 func removeManagedFields(data any) {

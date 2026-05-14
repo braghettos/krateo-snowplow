@@ -99,7 +99,7 @@ func CollectResourceTypesFromRestActions(ctx context.Context, dynClient dynamic.
 				if pathRaw == "" {
 					continue
 				}
-				gvr, ok := parseAPIServerPathToGVR(pathRaw)
+				gvr, ok := ParseAPIServerPathToGVR(pathRaw)
 				if !ok {
 					continue
 				}
@@ -135,7 +135,7 @@ func CollectResourceTypesFromRestActions(ctx context.Context, dynClient dynamic.
 	return out, nil
 }
 
-// parseAPIServerPathToGVR extracts (Group, Version, Resource) from a
+// ParseAPIServerPathToGVR extracts (Group, Version, Resource) from a
 // Kubernetes apiserver URL path. Supports both shapes:
 //
 //   /api/v1/...                     -> core group   ({"", "v1", <resource>})
@@ -153,7 +153,13 @@ func CollectResourceTypesFromRestActions(ctx context.Context, dynClient dynamic.
 // the lazy fallback in watcher.go is expected to catch these at
 // dispatch time. This is deliberate: the inventory walker is a
 // "best-effort eager" — we don't try to evaluate JQ at startup.
-func parseAPIServerPathToGVR(path string) (schema.GroupVersionResource, bool) {
+//
+// 0.30.92 widening: exported so the resolver's inner-call path
+// (internal/resolvers/restactions/api/resolve.go) can derive the GVR
+// from the JQ-evaluated apiserver path and call EnsureResourceType
+// BEFORE the httpcall.Do dispatch — closing the gap that left
+// downstream GVRs (e.g. compositions) without an informer at 0.30.91.
+func ParseAPIServerPathToGVR(path string) (schema.GroupVersionResource, bool) {
 	// Strip query string.
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]

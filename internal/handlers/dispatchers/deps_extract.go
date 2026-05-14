@@ -37,12 +37,19 @@ package dispatchers
 import (
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// dispatcherLazyRegisterSlowThreshold mirrors the resolver-side
+// ceiling. Anything over 250ms means rw.mu was contended (or
+// factory.ForResource was unexpectedly slow). The hot path is expected
+// to be sub-millisecond.
+const dispatcherLazyRegisterSlowThreshold = 250 * time.Millisecond
 
 // restActionGVR is the canonical GVR for the RestAction CR (edge type 2).
 var restActionGVR = schema.GroupVersionResource{
@@ -141,7 +148,20 @@ func ensureWatcherInformerForGVR(gvr schema.GroupVersionResource) {
 	if rw == nil {
 		return
 	}
+	// 0.30.92: time the singleflight to surface rw.mu contention. The
+	// resolver-side analogue in restactions/api/resolve.go emits the
+	// same WARN on the inner-call path.
+	start := time.Now()
 	_, _ = rw.EnsureResourceType(gvr)
+	if elapsed := time.Since(start); elapsed > dispatcherLazyRegisterSlowThreshold {
+		slog.Warn("cache.lazy_register.slow",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.Duration("elapsed", elapsed),
+			slog.Duration("threshold", dispatcherLazyRegisterSlowThreshold),
+			slog.String("call_site", "dispatchers.recordWidgetDeps"),
+		)
+	}
 }
 
 // recordRestActionSelfDep records the self-dep edge for a RestAction
