@@ -60,16 +60,19 @@ const (
 // runtime *RESTAction / *Widget object) avoids racey shared-state on
 // the hit path — readers get an immutable []byte slice.
 //
-// Sub-ship A keeps the dependency fields nil/empty. They are reserved
-// for sub-ship B (0.30.8) so callers can update wiring without a second
-// breaking change.
+// Sub-ship B (0.30.8) populates the Inputs field so the refresher can
+// re-invoke the resolver on UPDATE/PATCH events. RawJSON + CreatedAt
+// remain unchanged from sub-ship A.
 type ResolvedEntry struct {
 	RawJSON   []byte    // pre-encoded resolver output, ready to write
 	CreatedAt time.Time // for TTL eviction
 
-	// Reserved for 0.30.8 (do not populate at 0.30.7):
-	//   ResourceTypeDeps []schema.GroupVersionResource
-	//   NamespaceDeps    []string
+	// Inputs is the canonical key-input bundle the entry was resolved
+	// from. The refresher uses it to drive a re-resolve when an
+	// UPDATE/PATCH event fires for any of this entry's dep tuples.
+	// Nil-safe: a missing Inputs (e.g., legacy 0.30.7 entries during a
+	// rolling restart) skips refresh but still serves TTL+LRU correctly.
+	Inputs *ResolvedKeyInputs
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set
@@ -118,11 +121,12 @@ type ResolvedCacheStore struct {
 	curBytes int64
 
 	// Falsifier counters (atomic; safe to read without mu).
-	hitTotal       atomic.Uint64
-	missTotal      atomic.Uint64
-	evictLRUTotal  atomic.Uint64
-	evictTTLTotal  atomic.Uint64
-	storeTotal     atomic.Uint64
+	hitTotal        atomic.Uint64
+	missTotal       atomic.Uint64
+	evictLRUTotal   atomic.Uint64
+	evictTTLTotal   atomic.Uint64
+	evictDeleteTotal atomic.Uint64 // 0.30.8: DELETE-event-driven evictions
+	storeTotal      atomic.Uint64
 }
 
 type lruItem struct {
@@ -171,6 +175,11 @@ func ResolvedCache() *ResolvedCacheStore {
 			int64FromEnv(envResolvedCacheMaxBytes, defaultResolvedCacheMaxBytes),
 			time.Duration(intFromEnv(envResolvedCacheTTLSeconds, defaultResolvedCacheTTLSeconds))*time.Second,
 		)
+		// 0.30.8: wire the cache into the dep tracker so OnDelete can
+		// evict and so any eviction path (LRU/TTL/DELETE) calls
+		// Deps().RemoveL1Key to keep dep records and L1 entries
+		// in lock-step.
+		Deps().SetStore(resolvedCacheInstance)
 		startResolvedCacheSummary(resolvedCacheInstance)
 	})
 	return resolvedCacheInstance
@@ -386,15 +395,16 @@ func (c *ResolvedCacheStore) Bytes() int64 {
 // atomic and may drift between fields by a single call, which is fine
 // for log aggregation.
 type ResolvedCacheStats struct {
-	Entries       int
-	Bytes         int64
-	MaxEntries    int
-	MaxBytes      int64
-	HitTotal      uint64
-	MissTotal     uint64
-	StoreTotal    uint64
-	EvictLRUTotal uint64
-	EvictTTLTotal uint64
+	Entries          int
+	Bytes            int64
+	MaxEntries       int
+	MaxBytes         int64
+	HitTotal         uint64
+	MissTotal        uint64
+	StoreTotal       uint64
+	EvictLRUTotal    uint64
+	EvictTTLTotal    uint64
+	EvictDeleteTotal uint64 // 0.30.8: DELETE-event-driven evictions
 }
 
 func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
@@ -406,15 +416,16 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 	bytes := c.curBytes
 	c.mu.Unlock()
 	return ResolvedCacheStats{
-		Entries:       entries,
-		Bytes:         bytes,
-		MaxEntries:    c.maxEntries,
-		MaxBytes:      c.maxBytes,
-		HitTotal:      c.hitTotal.Load(),
-		MissTotal:     c.missTotal.Load(),
-		StoreTotal:    c.storeTotal.Load(),
-		EvictLRUTotal: c.evictLRUTotal.Load(),
-		EvictTTLTotal: c.evictTTLTotal.Load(),
+		Entries:          entries,
+		Bytes:            bytes,
+		MaxEntries:       c.maxEntries,
+		MaxBytes:         c.maxBytes,
+		HitTotal:         c.hitTotal.Load(),
+		MissTotal:        c.missTotal.Load(),
+		StoreTotal:       c.storeTotal.Load(),
+		EvictLRUTotal:    c.evictLRUTotal.Load(),
+		EvictTTLTotal:    c.evictTTLTotal.Load(),
+		EvictDeleteTotal: c.evictDeleteTotal.Load(),
 	}
 }
 
@@ -444,6 +455,11 @@ func (c *ResolvedCacheStore) evictUntilUnderCapsLocked() {
 
 // removeElementLocked drops el from order + index and adjusts the byte
 // counter. Must be called with mu held.
+//
+// 0.30.8: also clears the dep-tracker reverse index for this key so
+// dep records don't outlive the L1 entry. RemoveL1Key is itself
+// lock-free (sync.Map ops) so calling it while holding c.mu is safe;
+// the reverse path never re-enters the store.
 func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
@@ -453,6 +469,48 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 		// Defensive — should never happen with non-negative bytes.
 		c.curBytes = 0
 	}
+	// Dep-tracker cleanup. Safe even when L1 is the only consumer
+	// (Deps() is always non-nil); a no-op when no edges were ever
+	// recorded for this key.
+	Deps().RemoveL1Key(item.key)
+}
+
+// deleteForDep removes the entry under key, returning true if a live
+// entry was found and dropped. Increments the DELETE-eviction counter.
+// Used by DepTracker.OnDelete; production code MUST NOT call this
+// path directly (DELETE eviction must flow through the dep tracker so
+// the dep-record cleanup runs alongside the L1 drop).
+//
+// Performs a separate lock acquisition from any in-flight Get/Put —
+// holds c.mu only for the duration of the index lookup + LRU detach.
+// The dep tracker calls RemoveL1Key AFTER deleteForDep returns; since
+// the entry is already gone from index/order, the second cleanup pass
+// is a cheap no-op on the L1 side and does the actual dep-record
+// removal on the dep side.
+func (c *ResolvedCacheStore) deleteForDep(key string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	el, ok := c.index[key]
+	if !ok {
+		c.mu.Unlock()
+		return false
+	}
+	// removeElementLocked also calls Deps().RemoveL1Key — but in this
+	// path the dep tracker is mid-iteration over the reverse index
+	// for THIS key, and LoadAndDelete inside RemoveL1Key is a no-op
+	// the second time. We accept the trivial double-call rather than
+	// branching the eviction body.
+	delete(c.index, el.Value.(*lruItem).key)
+	c.order.Remove(el)
+	c.curBytes -= el.Value.(*lruItem).bytes
+	if c.curBytes < 0 {
+		c.curBytes = 0
+	}
+	c.mu.Unlock()
+	c.evictDeleteTotal.Add(1)
+	return true
 }
 
 // startResolvedCacheSummary launches a single bounded goroutine that
@@ -476,10 +534,12 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 		defer t.Stop()
 		for range t.C {
 			s := c.Stats()
-			// Falsifier shape per plan §"Code-path falsifier":
+			d := Deps().Stats()
+			r := refresherStatsSnapshot()
+			// Falsifier shape per plan §"Code-path falsifier" (0.30.8):
 			//   resolved_cache.summary entries=N bytes=B hit_rate=0.NN
-			//   evict_lru=X evict_delete=Y
-			// evict_delete is always 0 in sub-ship A (lands at 0.30.8).
+			//   evict_lru=X evict_delete=Y refresh_enqueued=M refresh_completed=K
+			//   dep_map_size=D
 			slog.Info("resolved_cache.summary",
 				slog.String("subsystem", "cache"),
 				slog.Int("entries", s.Entries),
@@ -487,7 +547,14 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Float64("hit_rate", s.HitRate()),
 				slog.Uint64("evict_lru", s.EvictLRUTotal),
 				slog.Uint64("evict_ttl", s.EvictTTLTotal),
-				slog.Uint64("evict_delete", 0),
+				slog.Uint64("evict_delete", s.EvictDeleteTotal),
+				slog.Uint64("refresh_enqueued", d.EnqueueUpdateTotal),
+				slog.Uint64("refresh_completed", r.completed),
+				slog.Uint64("refresh_failed", r.failed),
+				slog.Uint64("refresh_skipped_dedup", r.skippedDedup),
+				slog.Int64("dep_map_size", d.TotalRecords),
+				slog.Uint64("dep_record_total", d.RecordTotal),
+				slog.Uint64("dep_record_dropped_cap", d.RecordDroppedCap),
 				slog.Uint64("hit_total", s.HitTotal),
 				slog.Uint64("miss_total", s.MissTotal),
 				slog.Uint64("store_total", s.StoreTotal),

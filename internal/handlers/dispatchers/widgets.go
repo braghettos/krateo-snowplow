@@ -75,7 +75,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	// Tag 0.30.7: L1 resolved-output cache lookup. Same gating
 	// semantics as restactions.go — strictly after EvaluateRBAC.
-	cacheKey, cacheHandle := dispatchCacheLookupKey(req.Context(), "widgets",
+	// 0.30.8: cacheInputs is returned so we can stash it on the L1
+	// entry for the refresher to drive a re-resolve on UPDATE.
+	cacheKey, cacheHandle, cacheInputs := dispatchCacheLookupKey(req.Context(), "widgets",
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		perPage, page, extras)
@@ -129,7 +131,15 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if cacheHandle != nil && cacheKey != "" {
-		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{RawJSON: encoded})
+		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
+			RawJSON: encoded,
+			Inputs:  cacheInputs,
+		})
+		// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction
+		// dep, and render-eligible resourcesRefs deps (action-only
+		// refs filtered out per Revision 14). Edge type 3 (inner K8s
+		// calls inside the RestAction) is OUT OF SCOPE at this tag.
+		recordWidgetDeps(log, cacheKey, got.GVR, res)
 	}
 
 	log.Info("Widget successfully resolved",

@@ -304,6 +304,16 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 // regression is loud. Lazy registration for a GVR NOT in the eager
 // inventory is normal (e.g. customer-added RestAction post-startup).
 func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource) {
+	// 0.30.71 + 0.30.8: defensive guard. AddResourceType already
+	// early-returns in modePassthrough, and NewResourceWatcher's
+	// passthrough branch never reaches addResourceTypeLocked (no
+	// factory exists in passthrough mode). This re-asserts the
+	// invariant in case a future caller routes around AddResourceType
+	// — without it, rw.factory.ForResource(gvr) on the next line
+	// would nil-panic.
+	if rw.mode == modePassthrough {
+		return
+	}
 	if _, exists := rw.informers[gvr]; exists {
 		return
 	}
@@ -319,6 +329,51 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 			slog.String("resource_type", resourceType),
 			slog.String("error", err.Error()),
 			slog.Bool("post_start", rw.started),
+		)
+	}
+
+	// 0.30.8: dep-tracker event hooks for the L1 resolved-output
+	// cache. Installed at registration time so every newly-added
+	// informer gains wiring on first use (covers both eager + lazy
+	// AddResourceType paths). Per
+	// feedback_l1_invalidation_delete_only.md, DELETE evicts, UPDATE
+	// enqueues refresh, ADD is a deliberate no-op for dep-tracking
+	// (the informer still consumes ADD for its own LIST/WATCH state).
+	//
+	// Mode-gating (0.30.71 + 0.30.8): these handlers are wired ONLY
+	// in modeInformer. In modePassthrough the early-return at the
+	// top of this function fires; in modePassthrough L1 is also off
+	// (ResolvedCache() returns nil) so a dep tracker without a store
+	// would record forward edges that the watcher could never
+	// invalidate — wiring them at all in passthrough is wasted work.
+	//
+	// The handlers run on the informer's processor goroutine. Both
+	// OnDelete and OnUpdate complete in O(deps-for-this-tuple); the
+	// hot path is sync.Map operations.
+	if _, regErr := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(_, newObj interface{}) {
+			ns, name := metaNSName(newObj)
+			Deps().OnUpdate(gvr, ns, name)
+		},
+		DeleteFunc: func(obj interface{}) {
+			// DeletedFinalStateUnknown wraps the last-known object
+			// when the watcher missed the explicit DELETE. Unwrap
+			// so we still get the (ns, name) tuple.
+			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
+				obj = tomb.Obj
+			}
+			ns, name := metaNSName(obj)
+			Deps().OnDelete(gvr, ns, name)
+		},
+		// AddFunc is intentionally NOT wired. Pre-flight falsifier
+		// (probe.log 2026-05-13) showed the scale-up CREATE-event
+		// transient does not reproduce on 0.30.7; the Revision 16
+		// scope expansion was rolled back.
+	}); regErr != nil {
+		slog.Warn("cache.deps.add_event_handler_failed",
+			slog.String("subsystem", "cache"),
+			slog.String("resource_type", resourceType),
+			slog.String("error", regErr.Error()),
 		)
 	}
 
@@ -374,6 +429,23 @@ func (rw *ResourceWatcher) MarkEagerSet(eagerSet []schema.GroupVersionResource) 
 	}
 	rw.eagerSet = m
 	rw.eagerDone = true
+}
+
+// metaNSName extracts (namespace, name) from an informer-event object.
+// Returns ("", "") if obj is not a metav1-conforming runtime object.
+//
+// The function tolerates both *unstructured.Unstructured and any typed
+// object that implements GetNamespace/GetName (the four RBAC types are
+// typed; everything else is unstructured at 0.30.5+).
+func metaNSName(obj interface{}) (string, string) {
+	type nsNameAccessor interface {
+		GetNamespace() string
+		GetName() string
+	}
+	if a, ok := obj.(nsNameAccessor); ok {
+		return a.GetNamespace(), a.GetName()
+	}
+	return "", ""
 }
 
 // gvrResourceTypeString renders gvr as "group/version/Resource" for the

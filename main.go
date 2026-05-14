@@ -137,6 +137,18 @@ func main() {
 				} else {
 					cacheWatcher = w
 					cache.SetGlobal(w)
+
+					// 0.30.8: wire the L1 resolved-output cache refresher.
+					// Order matters: register dispatcher handlers BEFORE
+					// StartRefresher so the worker pool sees them on
+					// first dequeue, and BEFORE the watcher starts
+					// emitting UPDATE events (which it already may be
+					// doing — NewResourceWatcher calls factory.Start
+					// internally for the RBAC GVRs). Idempotent on
+					// duplicate calls.
+					dispatchers.RegisterRefreshHandlers()
+					cache.StartRefresher(cacheCtx)
+
 					// Block until RBAC informer LISTs complete so the
 					// first dispatch is not racing the initial sync.
 					// Bounded at 60s — soft failure (log + continue),

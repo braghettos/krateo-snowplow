@@ -24,20 +24,26 @@ func TestDispatchCacheLookupKey_CacheOffReturnsNilHandle(t *testing.T) {
 	// Even with RESOLVED_CACHE_ENABLED=true, CACHE_ENABLED=false
 	// must short-circuit to "no L1".
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	_, h := dispatchCacheLookupKey(context.Background(), "widgets",
+	_, h, in := dispatchCacheLookupKey(context.Background(), "widgets",
 		"g", "v", "r", "ns", "name", -1, -1, nil)
 	if h != nil {
 		t.Fatalf("CACHE_ENABLED=false must yield nil cache handle, got %T", h)
+	}
+	if in != nil {
+		t.Fatalf("CACHE_ENABLED=false must yield nil inputs, got %+v", in)
 	}
 }
 
 func TestDispatchCacheLookupKey_ResolvedToggleOffReturnsNilHandle(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "false")
-	_, h := dispatchCacheLookupKey(context.Background(), "widgets",
+	_, h, in := dispatchCacheLookupKey(context.Background(), "widgets",
 		"g", "v", "r", "ns", "name", -1, -1, nil)
 	if h != nil {
 		t.Fatalf("RESOLVED_CACHE_ENABLED=false must yield nil handle, got %T", h)
+	}
+	if in != nil {
+		t.Fatalf("RESOLVED_CACHE_ENABLED=false must yield nil inputs, got %+v", in)
 	}
 }
 
@@ -48,10 +54,13 @@ func TestDispatchCacheLookupKey_NoUserInfoReturnsNilHandle(t *testing.T) {
 	// fail closed when it's absent.
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	_, h := dispatchCacheLookupKey(context.Background(), "widgets",
+	_, h, in := dispatchCacheLookupKey(context.Background(), "widgets",
 		"g", "v", "r", "ns", "name", -1, -1, nil)
 	if h != nil {
 		t.Fatalf("missing UserInfo must yield nil handle, got %T", h)
+	}
+	if in != nil {
+		t.Fatalf("missing UserInfo must yield nil inputs, got %+v", in)
 	}
 }
 

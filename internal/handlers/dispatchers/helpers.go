@@ -117,26 +117,30 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 
 // dispatchCacheLookupKey builds the L1 resolved-output cache key and
 // returns the live cache handle, if the L1 layer is enabled. Returns
-// (key, nil) when L1 is disabled — callers MUST treat handle==nil as
-// "skip cache lookup, take the 0.30.6 path".
+// (key, nil, nil) when L1 is disabled — callers MUST treat handle==nil
+// as "skip cache lookup, take the 0.30.6 path".
 //
 // User identity is read from the request context; on error (missing
 // or unparseable UserInfo) we treat the request as uncacheable —
 // returning a nil handle — so the request still resolves correctly but
 // never reads or writes the L1 cache. A keyless request would risk
 // cross-user leaks, which is unacceptable.
-func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle) {
+//
+// 0.30.8: the function also returns the canonical ResolvedKeyInputs so
+// the caller can stash it on the L1 entry. Refresher reuses Inputs to
+// drive a re-resolve on UPDATE/PATCH events.
+func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
 	c := cache.ResolvedCache()
 	if c == nil {
-		return "", nil
+		return "", nil, nil
 	}
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		// Defence in depth — without an identity we cannot key
 		// safely. Skip the cache for this request.
-		return "", nil
+		return "", nil, nil
 	}
-	key := cache.ComputeKey(cache.ResolvedKeyInputs{
+	inputs := cache.ResolvedKeyInputs{
 		HandlerKind: handlerKind,
 		Group:       group,
 		Version:     version,
@@ -148,8 +152,8 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		PerPage:     perPage,
 		Page:        page,
 		Extras:      extras,
-	})
-	return key, c
+	}
+	return cache.ComputeKey(inputs), c, &inputs
 }
 
 // cacheHandle is the narrow interface the dispatchers depend on. The

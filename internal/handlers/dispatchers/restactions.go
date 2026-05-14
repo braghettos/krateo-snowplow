@@ -74,11 +74,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// hits short-circuit the resolver + JSON re-encode; misses fall
 	// through to the 0.30.6-equivalent resolve-and-encode path.
 	//
-	// Per feedback_l1_invalidation_delete_only.md: this sub-ship
-	// (0.30.7) uses TTL-only invalidation; DELETE-driven eviction
-	// lands at 0.30.8. UPDATE/PATCH use stale-while-revalidate by
-	// rule.
-	cacheKey, cacheHandle := dispatchCacheLookupKey(req.Context(), "restactions",
+	// Per feedback_l1_invalidation_delete_only.md:
+	//   * DELETE evicts dependent L1 keys (0.30.8 dep tracker).
+	//   * UPDATE/PATCH enqueue refresh via the background refresher
+	//     (stale-while-revalidate; never evicts).
+	//   * TTL remains the outer safety net.
+	cacheKey, cacheHandle, cacheInputs := dispatchCacheLookupKey(req.Context(), "restactions",
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		perPage, page, extras)
@@ -147,7 +148,18 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 	if cacheHandle != nil && cacheKey != "" {
-		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{RawJSON: encoded})
+		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
+			RawJSON: encoded,
+			Inputs:  cacheInputs,
+		})
+		// 0.30.8: record the self-dep so a DELETE on this RestAction
+		// CR evicts the cached entry, and an UPDATE re-resolves it.
+		// Inner-K8s-call deps (edge type 3) are NOT recorded at this
+		// tag — that would require a *RecordingDeps context threaded
+		// through resolve.go, which is deferred to a future sub-ship.
+		// TTL remains the outer safety net for changes the dep
+		// tracker cannot see.
+		cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 	}
 
 	log.Info("RESTAction successfully resolved",
