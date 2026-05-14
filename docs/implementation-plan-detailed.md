@@ -1213,9 +1213,156 @@ The static-const form (~5 GVRs from static-path RAs) is bounded, predictable, an
 
 ---
 
-## Tag `0.30.9` — Step 5: userAccessFilter + ServiceAccount-dispatch + refilter (atomic ship) — **bundled with lazy-register-on-resolver-touch (Revision 17)**
+## Tag `0.30.9` — Step 5: userAccessFilter + ServiceAccount-dispatch + refilter (atomic ship) — **bundled with lazy-register-on-resolver-touch (Revision 17, redesigned Revision 18)**
 
-### Revision 17 preamble (binding, 2026-05-14)
+### Revision 18 preamble (binding, 2026-05-14 PM — OOM finding + metadata-only redesign)
+
+**0.30.92 OOM finding (artifact: helm rev 108 OOMKill on `compositions-list`).** The Revision 17 lazy-register design landed as `7e253fe` (`0.30.91`) + widened to inner-call paths as `a3d8814` (`0.30.92`). Admin smoke triggered an OOMKill at the 2 Gi container limit:
+
+- Widened hook fired correctly for `composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages`.
+- Informer initial-sync paged 48 995 compositions cluster-wide. With the 0.30.5 strip (managedFields + last-applied annotation removed) the residual per-object footprint is dominated by `status.managed[]` and the unstructured `map[string]any` overhead — call it ~20 KiB heap per Composition. 49 K × 20 KiB ≈ 1 Gi.
+- Simultaneously the resolver's per-namespace LIST cascade (49 bench namespaces × the composition GVR) materialised a second copy in the dispatch path before the informer was sync — ~1 Gi more.
+- Combined RSS crossed 2 Gi mid-LIST → OOMKill. Pod recovered (1 restart). Rolled back to `0.30.8` (helm rev 109).
+
+**0.30.92 was tagged but not promoted.** The tag is preserved as the regression-witness for Revision 18. Production-safe state is currently DELETE-evict-dormant (the 0.30.8 0.30.71 dormancy bug remains until 0.30.93+).
+
+**Production scale update (binding, 2026-05-14):** per `project_production_scale.md` the canonical customer scale is **50 000 compositions** (not 10 K — the prior estimate was stale). The Revision 18 redesign MUST validate at SCALE=50000 with RSS ≤ 1.8 Gi. Bumping the 2 Gi container limit is REJECTED per `feedback_no_shortcuts_or_workarounds.md` — same logic as yesterday's eager-register-OOM rejection.
+
+**Redesign space considered (architect, 2026-05-14 PM):**
+
+| Option | Heap @ 50K | Time-to-evict-active | Risk | LoC | Compat (typed-RBAC + DepTracker) |
+|---|---|---|---|---|---|
+| A. Async informer creation (defer `EnsureResourceType` past response) | ~1 Gi (same informer cost; sync just deferred) | First DELETE after lazy-fire is silent (TTL covers); evict-active +30–120 s after touch | Loses dep edge for the request that triggered registration | ~40 | Compatible |
+| B. Paged informer initial-sync (`Limit=500` already in `tweak`) | ~1 Gi steady-state (lower peak — saves ~200 MiB transient) | Same as 0.30.92 | Doesn't change steady-state; OOM still fires once 49K objects land in the indexer | ~10 | Compatible |
+| C. Selective lazy-register (skip Composition GVR; carve-out by cardinality) | ~100 MiB total (RBAC + small GVRs only) | DELETE-evict never activates for compositions; permanent gap | Violates `feedback_no_special_cases.md` unless expressed via CRD annotation | ~80 | Composition L1 entries TTL-only forever |
+| D. **`PartialObjectMetadata` informers for high-cardinality GVRs** | **~100–150 MiB total at 50K** (metadata-only: name/ns/labels/annotations/owner refs ≈ 2–3 KiB/object) | Evict-active immediately on informer sync (same semantics as full informer for DepTracker which only reads `(gvr, ns, name)`) | Metadata-only indexer cannot serve resolver `GetObject` cache hits — resolver path falls back to apiserver for composition reads. **Acceptable**: today's resolver dispatches LIST via `httpcall.Do` against apiserver anyway (no cache-served Get path for compositions today; informer was only there to feed the dep-tracker). | ~120 | DepTracker.OnDelete/OnUpdate uses `metaNSName(obj)` which works on `metav1.PartialObjectMetadata` (it implements `GetNamespace`/`GetName`). Typed-RBAC overrides not affected (those are RBAC GVRs only). |
+| E. Pure event-driven watch (no local cache, RetryWatcher) | ~0 MiB steady-state | Evict-active on first event received post-Watch-Established (~100 ms) | No initial-LIST snapshot — pod restart misses DELETEs that occurred during the restart window (~5–30 s blind spot) | ~200 | DepTracker fires from raw `watch.Event`; not compatible with `ListTypedObjects`/`GetTypedObject` (no store) — but typed-RBAC GVRs stay on the full informer path so unaffected |
+| F. Hybrid: metadata-only watch → upgrade to full informer on first DELETE | ~100 MiB pre-DELETE; ~1 Gi post-first-DELETE | Identical to D | Adds a state-machine + upgrade path; the "upgrade" is what OOMed | ~250 | Same as D pre-upgrade |
+
+**Recommendation: Option D — `PartialObjectMetadata` informers for high-cardinality GVRs, expressed via a uniform metadata mechanism (annotation on the CRD), not a per-resource carve-out.**
+
+**Rationale.**
+
+1. **DepTracker only needs `(gvr, ns, name)`.** Confirmed at `watcher.go:471-484`: `metaNSName(obj)` reads `GetNamespace` + `GetName` only; nothing in the OnDelete/OnUpdate path touches `status` or `spec`. `metav1.PartialObjectMetadata` satisfies the `nsNameAccessor` interface. This is a free 10× memory reduction for the eviction mechanism.
+2. **Resolver doesn't read compositions through the informer today.** Compositions are dispatched via `httpcall.Do` (apiserver) in the resolver inner-call path; the only reason the 0.30.91/92 lazy-register hook fires `EnsureResourceType` for the composition GVR is to wire the DepTracker event handlers. There is no resolver `GetObject(compositions)` call site — verified by grep. So a metadata-only indexer doesn't regress any current read path.
+3. **Uniform mechanism, not a special-case** (per `feedback_no_special_cases.md`). The rule is **annotation-driven**: a CRD or registered resource carries `krateo.io/cache-mode: metadata` to opt into the metadata-only informer. Snowplow inspects this at `EnsureResourceType` time via the discovery client OR via a static set of GVRs whose CRDs Krateo ships (Composition is one). NOT hardcoded by Resource name. Customer CRDs without the annotation use the default full informer (current 0.30.92 behaviour). The annotation predicate is itself expressed as `func(gvr) bool` — no per-Resource switch statement.
+4. **Why not A:** defers the OOM by half a second — the informer still allocates 1 Gi when it eventually runs. Doesn't fix the structural issue.
+5. **Why not B:** paging at LIST time only changes peak vs steady-state; the indexer at steady-state still holds the 1 Gi.
+6. **Why not C:** permanent DELETE-evict gap on the highest-churn resource type in Krateo. Customer-visible.
+7. **Why not E:** missing the initial-LIST snapshot creates a pod-restart-time DELETE-blindness window. Watch-only is fragile against apiserver restarts (RetryWatcher resumes from last RV; if the etcd compaction window is exceeded the watcher silently drops events). Operationally heavy.
+8. **Why not F:** the "upgrade to full informer" branch is the OOM-causing branch. Adding a state machine to gate it doesn't fix the underlying cost; it just makes the OOM event-triggered instead of touch-triggered.
+
+**Estimated heap at 50K with Option D applied:**
+
+- Compositions: 50 K × ~2.5 KiB metadata = ~125 MiB
+- RBAC (existing full informers, ~few-K objects total): ~20 MiB
+- Other lazy-registered GVRs (widgets, restactions, customresourcedefinitions, namespaces — all low-cardinality, <1 K each, full informers): ~50 MiB
+- Resolver per-request transients: ~100 MiB worst-case (admin smoke LIST cascade)
+- Total expected RSS: ~300–500 MiB — well under 1.8 Gi gate.
+
+### Revision 18 implementation outline
+
+- **`internal/cache/watcher.go` (MODIFY, ~60 LoC).** Add `EnsureResourceTypeMetadataOnly(gvr)` variant: uses `metadatainformer.NewFilteredSharedInformerFactory` (`k8s.io/client-go/metadata/metadatainformer`) instead of the dynamic factory. Shares the same `rw.informers`/`rw.syncCh` maps. Shares the DepTracker event-handler wiring (the `metaNSName` extractor already works on `PartialObjectMetadata`). `EnsureResourceType` dispatches to the metadata-only variant when the predicate `shouldUseMetadataOnly(gvr)` returns true.
+- **`internal/cache/cache_mode.go` (NEW, ~60 LoC — was 40, +20 for static-seed fallback per PM Revision 18 item 2).** `shouldUseMetadataOnly(gvr) bool` evaluates a two-tier predicate:
+  1. **Annotation (long-term primary).** At startup, snowplow lists CRDs via the discovery client; any CRD carrying annotation `krateo.io/cache-mode: metadata` is registered in the metadata-only set. The annotation lives on the CRD itself, so customer CRDs without it use the default full informer (current 0.30.92 behaviour). NO per-Resource hardcoding in snowplow source; the discriminator lives in the CRD.
+  2. **Static-seed fallback (operationally-safe-today path).** Snowplow ALSO carries a small static list of GVR-pattern matchers covering Krateo's known high-cardinality CRDs. The seed list is **GVR-pattern**, not exact-GVR — it tolerates the per-CompositionDefinition version suffix (`v1-2-2`, `v12-8-3`, etc.). Initial seed:
+     ```
+     // internal/cache/cache_mode.go (seed list — explicit, finite, audited at PR review)
+     var metadataOnlyGVRSeed = []gvrPattern{
+       {Group: "composition.krateo.io", ResourcePrefix: "githubscaffoldingwithcompositionpages"},
+       {Group: "composition.krateo.io", ResourcePrefix: "vmmigration"},
+       // additional Composition family members added as CompositionDefinitions ship
+     }
+     ```
+     A GVR matches the seed if `gvr.Group == pattern.Group && strings.HasPrefix(gvr.Resource, pattern.ResourcePrefix)`. The seed is a defensive predicate: `shouldUseMetadataOnly(gvr) = annotated(gvr) OR matchesSeed(gvr)`.
+  3. **Why both.** The Composition family of CRDs is generated at runtime by `core-provider` from CompositionDefinitions; per `project_no_upstream_authority.md` snowplow cannot patch `core-provider` to emit the annotation on every generated CRD. Until that upstream change ships, snowplow needs the seed to stay below the 1.8 Gi gate. Once the annotation ships upstream, the seed remains as defensive-fallback (no removal) — both predicates remain live and their union is the active set.
+  4. **Discovery-failure mode.** If the discovery client fails at startup, the annotation set is empty BUT the seed still routes Composition GVRs to metadata-only. Snowplow stays in metadata-only mode for the family regardless of cluster state — this is the operational-safety property.
+  5. **Customer-CRD safety.** Customer CRDs whose Group is NOT `composition.krateo.io` are unaffected by the seed; they only opt into metadata-only via explicit annotation. The seed is Krateo-Composition-family-scoped by construction.
+- **`internal/cache/watcher_test.go` (NEW test, ~60 LoC).** `TestEnsureResourceTypeMetadataOnly_DepTrackerFires`: install a fake `PartialObjectMetadata` informer, simulate a DELETE event, assert `Deps().OnDelete` is invoked with correct `(gvr, ns, name)`.
+- **No changes** to `deps_extract.go`, `resolve.go`, or `restactions.go` — `EnsureResourceType` keeps the same signature; routing is internal to `cache/watcher.go`.
+
+### Pre-flight falsifier for §0.30.93 (Revision 18) — **stress gate**
+
+**Artifact path:** `/tmp/snowplow-runs/0.30.93/preflight/lazy_register_evict_stress.txt`.
+
+**Why a stress gate.** The 0.30.92 OOM occurred mid-request (LIST cascade overlapped with informer initial-sync). The previous 4-gate probe sampled RSS at three idle checkpoints — pod-Ready, post-first-10-dispatches, post-S7 — none of which observed the LIST/sync overlap window. The new gate drives realistic admin smoke load WHILE the lazy-register fires for the first time.
+
+**Script spec — `delete_stale_gap_v4_stress.py`** (extension of v3):
+
+1. Helm install `0.30.93` image with `CACHE_ENABLED=true`, `EAGER_REGISTER_ENABLED=false`, `RESOLVED_CACHE_TTL_SECONDS=3600`. Bench cluster at SCALE=50000.
+2. Wait pod Ready. Sample RSS via `kubectl top pod` → checkpoint `pod_ready` (expected ≤ 200 MiB; RBAC informers only).
+3. **Stress phase A — concurrent admin smoke during first-touch:** spawn 10 parallel `/call compositions-list` requests as admin user. Sample RSS at 250 ms intervals for the next 60 s into the artifact. Record peak RSS observed during stress phase A.
+4. Verify log line `cache.lazy_register.metadata_only fired gvr=composition.krateo.io/v1-2-2/...` (NEW) AND `cache.lazy_register.inner_call` appears for the Composition GVR.
+5. **Stress phase B — sustained 20 RPS admin mix for 5 min** (compositions-list + sidebar-nav + restaction-get). Sample RSS at 1 s intervals. Record peak.
+6. `kubectl delete composition <name>` on one Composition. Poll `deps_evict_delete_total`; assert delta > 0 within 10 s.
+7. Re-issue admin smoke; assert deleted Composition is absent.
+8. RSS samples written: phase-A peak, phase-B peak, post-S7 idle.
+
+**Hard-gate fail conditions** (any one blocks ship):
+
+- Phase-A peak RSS > 1.8 Gi (1843 MiB) → OOM regression → ROLLBACK.
+- Phase-B peak RSS > 1.8 Gi → sustained-load regression → ROLLBACK.
+- `evict_delete == 0` after DELETE → DepTracker not wired through metadata-only informer → ROLLBACK and fix.
+- `cache.lazy_register.metadata_only` log line absent → routing bug; falling back to full informer.
+- p99 of stress-phase-A response time > 8 s → first-touch latency regression on metadata-only path.
+
+**Existing v3 falsifier (`delete_stale_gap_v3.py`)** runs unchanged as the regression-fix witness for the non-Composition (full-informer) GVRs.
+
+### Estimated LoC and effort (Revision 18 redesign)
+
+- Code: ~100 production + ~80 test = ~180 LoC, **net REPLACE** of the 0.30.92 widening hook (which stays for non-metadata-only GVRs).
+- Combined Sub-scope B (lazy-register + metadata-only routing): ~275 LoC vs prior 175 LoC estimate (+100 LoC for the metadata-only path).
+- Effort: +0.25 sprint over the Revision 17 estimate (the metadata-informer plumbing is standard client-go).
+- The 0.30.92 OOM-finding tag is preserved as the regression witness; not promoted, not deleted.
+
+### RSS-gate level (PM Revision 18 item 6 — confirmation)
+
+The §0.30.93 stress falsifier (`delete_stale_gap_v4_stress.py`) MUST use the **1.8 GiB strict test-cluster gate** (1843 MiB rounded), NOT the production-chart memory limit. Specifically:
+
+- Phase-A peak RSS > 1.8 GiB → hard-fail → ROLLBACK.
+- Phase-B peak RSS > 1.8 GiB → hard-fail → ROLLBACK.
+- Idle (post-S7) RSS > 1.8 GiB → hard-fail → ROLLBACK.
+
+**Production chart values** (request=4Gi, limit=8Gi per Diego's confirmation 2026-05-14) provide 4–5× headroom above the 1.8 GiB falsifier gate. **Production 8Gi is safety headroom, not budget license.** The falsifier MUST fail any ship whose RSS exceeds 1.8 GiB at test scale, because Diego's design direction is minimize regardless of production limit. Raising the gate to align with production would mask the OOM regression class the gate is designed to catch (a customer running Krateo on a 2Gi-limited cluster — fully supported deployment shape — must not be a fatal misconfiguration).
+
+The 1.8 GiB gate is a **design budget**, not a deployment constraint: it forces minimization at the snowplow level so production headroom remains free for transient spikes (admin smoke LIST cascades, future per-user-credential allocations, GC scheduling) rather than being absorbed by baseline informer cost.
+
+### Deployment sequencing (PM Revision 18 item 10 — BLOCKER)
+
+§0.30.93 ships changes that touch both snowplow's binary AND the CRD shape (annotation). Misordered rollout creates an OOM regression window because: (a) snowplow without the annotation set falls back to the static seed (safe), but (b) snowplow with annotation-driven discovery on an annotation-less CRD set ALSO falls back to the static seed (safe). The defensive seed makes the sequence resilient to either order — but the recommended sequence below is the lowest-risk path.
+
+**(a) Chart owner of the annotation.** Composition CRDs (e.g. `githubscaffoldingwithcompositionpages.composition.krateo.io`) are **NOT chart-owned**. They are **generated at runtime by `core-provider`** from a `CompositionDefinition` custom resource (verified at `/Users/diegobraga/krateo/core-provider/internal/tools/crd/crd.go`). Per `project_no_upstream_authority.md`, snowplow cannot patch `core-provider` to emit the `krateo.io/cache-mode: metadata` annotation. **Therefore the annotation cannot be added by helm-upgrading any snowplow-side chart.** Two delivery paths exist:
+
+  1. **Upstream PR to `core-provider`** (long-term, not in 0.30.93 scope): `core-provider` adds the annotation to the generated CRD object during `Install`/`Update`. Owner: core-provider team. Ship: independent of snowplow tag cadence. Cannot block 0.30.93.
+  2. **Manual annotation by the cluster operator** (interim, deployment-specific): an operator running a customer cluster can run `kubectl annotate crd githubscaffoldingwithcompositionpages.composition.krateo.io krateo.io/cache-mode=metadata` once. This is NOT chart-driven and is NOT how production deploys happen — it is documented as the canonical opt-in for clusters that prefer annotation-driven discovery over static seed.
+
+  **Until either path lands, snowplow relies on the static seed** (`internal/cache/cache_mode.go`) as the primary cache-mode discriminator for the Composition family. The seed is owned by snowplow, ships in the snowplow image, and requires no chart coordination.
+
+**(b) Helm-upgrade order.** When the annotation does eventually flow (via core-provider upstream PR or manual operator annotation):
+  - Annotation-bearing CRDs SHOULD land BEFORE the snowplow image upgrade. This way, on snowplow pod boot the discovery client immediately sees the annotation and registers metadata-only routing without falling through to the seed.
+  - In practice: `helm upgrade snowplow-crd` (if and when that subchart starts owning the annotation — currently it does not own Composition CRDs) MUST precede `helm upgrade snowplow` (with new image).
+  - **0.30.93 ship requires NO chart re-ordering** because the static seed makes snowplow safe-by-default. Future tags that retire the seed (only after core-provider upstream PR has been live in customer clusters for ≥2 release cycles) will reinstate this ordering as a hard constraint.
+
+**(c) Rollback story.** If the annotation reverts (e.g. operator deletes the annotation, or core-provider releases a regression that removes it):
+  - Snowplow's `shouldUseMetadataOnly(gvr)` falls back to `matchesSeed(gvr)`.
+  - Composition GVRs in the seed list (the entire Krateo Composition family) STAY in metadata-only mode.
+  - No OOM regression; no helm rollback required.
+  - The `cache.lazy_register.metadata_only` log line continues to fire for Composition GVRs, but the discriminator reason switches from `reason=annotation` to `reason=static_seed`. This is observable in logs without metric changes.
+
+**(d) Chart-driven only.** Per `feedback_helm_only_for_portal.md` and `feedback_chart_only_for_snowplow.md`: NO `kubectl apply` for any annotation-bearing manifest at deploy time. The annotation either lands via core-provider upstream PR (preferred long-term) or via operator-scoped `kubectl annotate` (interim manual opt-in, documented but not part of the chart-driven deploy story). The snowplow chart upgrade itself ships ONLY the snowplow binary + the static seed — no annotation manipulation. This keeps the chart-driven rollout pure.
+
+**Why the seed makes sequencing safe.** The defensive-seed predicate decouples snowplow's OOM-safety from any external annotation state. The annotation is the long-term mechanism for customer-CRD opt-in; the seed is the operationally-required mechanism for Krateo's own Composition family today. Both predicates remain live in steady state — the union ensures Composition GVRs stay metadata-only regardless of cluster annotation state. This is the property that protects against any rollout-ordering misstep.
+
+### Tag promotion path (PM Revision 18 item 11)
+
+Validated commit (passing all 4 hard gates + the §0.30.93 stress gate) → tagged `0.30.93` first; the same commit is also annotated as `0.30.9` for the canonical Step 5 release narrative (UAF + lazy-register + metadata-only routing, atomic). RC witnesses (`0.30.91`, `0.30.92`, `0.30.93`) are retained alongside as historical artifacts:
+  - `0.30.91` = Revision 17 lazy-register, narrow inner-call hook scope (incomplete coverage).
+  - `0.30.92` = Revision 17 widened inner-call hook (OOM-finding witness — preserved, not promoted).
+  - `0.30.93` = Revision 18 metadata-only redesign (the validated ship).
+
+Ledger Row 28 attributes BOTH tag names (`0.30.9` and `0.30.93`) to the same commit SHA. The dual-naming is purely organizational: `0.30.93` preserves the RC-witness numbering granularity for forensic clarity; `0.30.9` is the customer-facing release name in the north-star ledger and changelog.
+
+### Revision 17 preamble (binding, 2026-05-14 — superseded for Sub-scope B mechanism, retained for context)
 
 **Scope expansion:** the original 0.30.9 atomic UAF ship is bundled with an architectural fix for the 0.30.8 DELETE-evict mechanism. Three findings drive the amendment:
 
