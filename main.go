@@ -210,9 +210,26 @@ func main() {
 						}
 						invCancel()
 					} else {
-						log.Info("eager-register: disabled (default); set EAGER_REGISTER_ENABLED=true to opt-in",
+						// 0.30.9 Sub-scope B (Revision 17): lazy
+						// registration of resolver-touched GVRs is
+						// the production default for DELETE-evict.
+						// The dispatcher hot path calls
+						// cache.Global().EnsureResourceType(gvr) on
+						// every dep-edge record, so the informer
+						// (and the watcher.go UpdateFunc/DeleteFunc
+						// handlers) comes online on first touch.
+						// EAGER_REGISTER_ENABLED=true remains
+						// available as an OPTIONAL warm-start knob
+						// for bench/large-customer scenarios that
+						// want cold-zero on the first request; the
+						// cost is a startup memory burst (OOM'd at
+						// 50K bench scale on 0.30.8 — see
+						// project_regression_journal.md 2026-05-13).
+						log.Info("eager-register: disabled (default); lazy-register-on-resolver-touch provides DELETE-evict",
 							slog.String("subsystem", "cache"),
-							slog.String("rationale", "no consumer reads from eagerly-registered informers at this tag; see project_regression_journal.md 2026-05-13"))
+							slog.String("rationale", "0.30.9 Sub-scope B: informers wired on first dep-record via EnsureResourceType; bounded memory at production scale"),
+							slog.String("override_hint", "set EAGER_REGISTER_ENABLED=true for warm-start (bench-only; costs startup memory)"),
+						)
 						// Mark eager-done with an empty set so any
 						// post-startup AddResourceType is treated as
 						// expected-lazy (no WARN spam from the eagerSet

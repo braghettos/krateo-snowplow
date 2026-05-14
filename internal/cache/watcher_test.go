@@ -3,6 +3,8 @@ package cache_test
 import (
 	"context"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,8 +208,11 @@ func TestNewResourceWatcher_AddResourceTypeIdempotent(t *testing.T) {
 // TestNewResourceWatcher_GoroutineFootprintBounded sanity-checks that
 // constructor activation does not leak unbounded goroutines per GVR.
 // We expect roughly one Reflector + one informer + one bookkeeping
-// goroutine per registered GVR (≤ 5×len). Headroom = 8× to absorb
-// client-go version drift.
+// goroutine per registered GVR (≤ 5×len). At 0.30.9 Sub-scope B
+// each registered GVR ALSO has one sync-watcher goroutine (closes
+// the per-GVR sync channel on HasSynced) — short-lived but counted
+// here. Headroom = 10× absorbs client-go version drift + the new
+// sync-watcher.
 func TestNewResourceWatcher_GoroutineFootprintBounded(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 
@@ -227,7 +232,7 @@ func TestNewResourceWatcher_GoroutineFootprintBounded(t *testing.T) {
 
 	after := runtime.NumGoroutine()
 	delta := after - before
-	const headroom = 8
+	const headroom = 10
 	maxAllowed := len(cache.RBACResourceTypes) * headroom
 	if delta > maxAllowed {
 		t.Fatalf("goroutine delta = %d (want <= %d); before=%d after=%d", delta, maxAllowed, before, after)
@@ -431,5 +436,232 @@ func TestNewResourceWatcher_PassthroughMode_WaitForCacheSyncReturnsNil(t *testin
 	}
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("WaitForCacheSync in passthrough took %v; must be near-instant", elapsed)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Tag 0.30.9 Sub-scope B — EnsureResourceType (lazy-register-on-touch)
+// ----------------------------------------------------------------------
+
+// secretGVR is the canonical "previously-unseen, non-RBAC" GVR used by
+// the EnsureResourceType tests. Secrets are registered in the scheme
+// every fake-dynamic builder accepts.
+var secretGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+
+// secretsListKinds extends rbacListKinds with the Secrets List entry
+// so the fake dynamic client accepts a lazy-registered Secret informer
+// without panicking on the initial LIST.
+func secretsListKinds() map[schema.GroupVersionResource]string {
+	m := rbacListKinds()
+	m[secretGVR] = "SecretList"
+	return m
+}
+
+// TestEnsureResourceType_FirstCallReturnsAddedTrueAndOpenChannel
+// covers the "miss → register" path. EnsureResourceType MUST return
+// added=true on first call, with a non-nil sync channel that closes
+// once the informer reports HasSynced.
+func TestEnsureResourceType_FirstCallReturnsAddedTrueAndOpenChannel(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), secretsListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("expected non-nil watcher")
+	}
+	defer rw.Stop()
+
+	added, ch := rw.EnsureResourceType(secretGVR)
+	if !added {
+		t.Fatalf("first EnsureResourceType: want added=true, got false")
+	}
+	if ch == nil {
+		t.Fatalf("first EnsureResourceType: sync channel must be non-nil")
+	}
+	// Sync channel should close quickly via the fake dynamic client.
+	select {
+	case <-ch:
+		// Closed — informer reported HasSynced.
+	case <-time.After(3 * time.Second):
+		t.Fatalf("EnsureResourceType sync channel did not close within 3s")
+	}
+}
+
+// TestEnsureResourceType_SecondCallReturnsAddedFalseSameChannel
+// covers the "hit → idempotent" path. A second EnsureResourceType
+// call MUST return added=false and the SAME sync channel (so callers
+// that block on it can race a concurrent first-reader to the same
+// channel close — singleflight per plan §"Singleflight on
+// EnsureResourceType").
+func TestEnsureResourceType_SecondCallReturnsAddedFalseSameChannel(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), secretsListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("expected non-nil watcher")
+	}
+	defer rw.Stop()
+
+	added1, ch1 := rw.EnsureResourceType(secretGVR)
+	if !added1 {
+		t.Fatalf("first call: want added=true")
+	}
+
+	added2, ch2 := rw.EnsureResourceType(secretGVR)
+	if added2 {
+		t.Fatalf("second call: want added=false, got true (double-register)")
+	}
+	if ch1 != ch2 {
+		// Compare channels by value (Go semantics: two distinct
+		// channel allocations are unequal).
+		t.Fatalf("second call: want SAME sync channel as first call; got distinct allocations")
+	}
+}
+
+// TestEnsureResourceType_IdempotentParallel covers the binding
+// singleflight guarantee per plan §"Singleflight on EnsureResourceType":
+// 100 concurrent goroutines calling EnsureResourceType for the same
+// previously-unseen GVR MUST produce EXACTLY ONE informer registration
+// (i.e., exactly ONE added=true return) and share exactly one sync
+// channel.
+//
+// Without singleflight under rw.mu, each goroutine would call
+// factory.ForResource(gvr) and Informer().Run separately — duplicate
+// informers, duplicate event-handler fires, broken dep-tracker
+// behaviour. The test asserts the lock-as-singleflight contract.
+func TestEnsureResourceType_IdempotentParallel(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), secretsListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("expected non-nil watcher")
+	}
+	defer rw.Stop()
+
+	const N = 100
+	var (
+		addedCount int32
+		channels   sync.Map // map[chan struct{}]struct{} via interface{}
+		wg         sync.WaitGroup
+		start      = make(chan struct{})
+	)
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			<-start // release all goroutines simultaneously
+			added, ch := rw.EnsureResourceType(secretGVR)
+			if added {
+				atomic.AddInt32(&addedCount, 1)
+			}
+			// Store the channel; distinct channel allocations would
+			// be unique map keys.
+			channels.Store(ch, struct{}{})
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&addedCount); got != 1 {
+		t.Fatalf("singleflight broken: %d goroutines saw added=true; want exactly 1", got)
+	}
+	uniqueChannels := 0
+	channels.Range(func(_, _ any) bool { uniqueChannels++; return true })
+	if uniqueChannels != 1 {
+		t.Fatalf("singleflight broken: %d distinct sync channels handed out; want 1", uniqueChannels)
+	}
+}
+
+// TestEnsureResourceType_SyncChannelClosesAfterHasSynced covers the
+// "caller can block on sync" contract: the channel returned by
+// EnsureResourceType MUST close after the informer reports HasSynced.
+// Tests against the fake dynamic client (which syncs immediately) so
+// the close happens within the test's 3s budget.
+func TestEnsureResourceType_SyncChannelClosesAfterHasSynced(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), secretsListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("expected non-nil watcher")
+	}
+	defer rw.Stop()
+
+	_, ch := rw.EnsureResourceType(secretGVR)
+	if ch == nil {
+		t.Fatalf("nil sync channel")
+	}
+	select {
+	case <-ch:
+		// Closed.
+	case <-time.After(3 * time.Second):
+		t.Fatalf("sync channel did not close within 3s — sync-watcher goroutine not spawned or HasSynced never flipped")
+	}
+}
+
+// TestEnsureResourceType_PassthroughIsNoOp covers the modePassthrough
+// contract: EnsureResourceType MUST return (false, nil) and MUST NOT
+// register any informer (no factory in passthrough mode — would
+// nil-panic if we tried).
+func TestEnsureResourceType_PassthroughIsNoOp(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), rbacListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil || !rw.IsPassthrough() {
+		t.Fatalf("expected passthrough watcher")
+	}
+	defer rw.Stop()
+
+	added, ch := rw.EnsureResourceType(secretGVR)
+	if added {
+		t.Fatalf("passthrough EnsureResourceType: want added=false, got true")
+	}
+	if ch != nil {
+		t.Fatalf("passthrough EnsureResourceType: want nil sync channel, got %v", ch)
+	}
+}
+
+// TestEnsureResourceType_NilReceiverIsNoOp covers the cache-off path.
+// Production callers fetch rw via cache.Global() which returns nil
+// when the cache subsystem is disabled — the convenience wrapper in
+// dispatchers nil-checks before calling EnsureResourceType, but a
+// defensive nil-receiver guard inside EnsureResourceType protects
+// against future call-site regressions.
+func TestEnsureResourceType_NilReceiverIsNoOp(t *testing.T) {
+	var rw *cache.ResourceWatcher
+	added, ch := rw.EnsureResourceType(secretGVR)
+	if added {
+		t.Fatalf("nil-receiver EnsureResourceType: want added=false")
+	}
+	if ch != nil {
+		t.Fatalf("nil-receiver EnsureResourceType: want nil channel")
 	}
 }

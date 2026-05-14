@@ -78,10 +78,20 @@ func recordWidgetDeps(log *slog.Logger, l1Key string, gvr schema.GroupVersionRes
 
 	// Self-dep: widget CR → its own L1 entry. DELETE on the widget
 	// evicts the cache entry.
+	//
+	// 0.30.9 Sub-scope B: ensure the informer for gvr is registered
+	// BEFORE recording the dep edge. Without this, the dep tracker
+	// would record a forward edge whose corresponding DELETE/UPDATE
+	// events the watcher has never wired — eviction would be silent
+	// (the 0.30.8 dormancy bug). EnsureResourceType is idempotent +
+	// singleflight under rw.mu; concurrent first-readers share a
+	// single informer.
+	ensureWatcherInformerForGVR(gvr)
 	deps.Record(l1Key, gvr, w.GetNamespace(), w.GetName())
 
 	// Edge type 2: spec.apiRef → RestAction.
 	if apiRefName, apiRefNS, ok := readApiRef(w); ok {
+		ensureWatcherInformerForGVR(restActionGVR)
 		deps.Record(l1Key, restActionGVR, apiRefNS, apiRefName)
 	}
 
@@ -97,6 +107,7 @@ func recordWidgetDeps(log *slog.Logger, l1Key string, gvr schema.GroupVersionRes
 		if !ok {
 			continue
 		}
+		ensureWatcherInformerForGVR(refGVR)
 		if ref.Name == "" {
 			// List-scope dep (e.g., a ref that targets "all of kind X
 			// in namespace Y"). Record with name="*".
@@ -105,6 +116,32 @@ func recordWidgetDeps(log *slog.Logger, l1Key string, gvr schema.GroupVersionRes
 		}
 		deps.Record(l1Key, refGVR, ref.Namespace, ref.Name)
 	}
+}
+
+// ensureWatcherInformerForGVR is the dispatcher-side adapter to the
+// 0.30.9 Sub-scope B lazy-registration API. Looks up the global
+// watcher (returns silently if cache is disabled, i.e. nil watcher)
+// and calls EnsureResourceType so the informer for gvr is wired
+// before we record any dep edge that references it.
+//
+// Idempotent + singleflight (the watcher's rw.mu serialises
+// concurrent first-readers for the same GVR — the lock is the
+// singleflight primitive per plan §"Singleflight on
+// EnsureResourceType").
+//
+// The returned sync channel is intentionally discarded by the
+// dispatcher: per plan §"Critical constraint" (Revision 17 binding),
+// the FIRST read for a previously-unseen GVR uses the apiserver
+// result; the L1 entry is populated regardless of whether the
+// informer has synced, BUT the dep tracker records the forward edge
+// so the very next UPDATE/DELETE will fire correctly. Subsequent
+// warm reads see the now-live informer.
+func ensureWatcherInformerForGVR(gvr schema.GroupVersionResource) {
+	rw := cache.Global()
+	if rw == nil {
+		return
+	}
+	_, _ = rw.EnsureResourceType(gvr)
 }
 
 // recordRestActionSelfDep records the self-dep edge for a RestAction

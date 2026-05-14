@@ -82,7 +82,13 @@ func EagerRegisterAll(ctx context.Context, rw *ResourceWatcher, resourceTypes []
 					)
 				}
 			}()
-			rw.AddResourceType(g)
+			// 0.30.9 Sub-scope B: route eager-register through the
+			// new EnsureResourceType API so eager + lazy share a
+			// single registration code path. Sync channel discarded
+			// here because EagerRegisterAll's separate
+			// WaitForCacheSync below covers the bulk-sync semantics
+			// the eager-register caller actually wants.
+			_, _ = rw.EnsureResourceType(g)
 		}(gvr)
 	}
 	wg.Wait()

@@ -106,6 +106,32 @@ spec:
                     verb:
                       description: Verb is the request method (GET if omitted)
                       type: string
+                    userAccessFilter:
+                      description: |
+                        UserAccessFilter declares that this API call dispatches via
+                        the snowplow ServiceAccount (cluster-wide read) and that the
+                        returned result set is refiltered through EvaluateRBAC per
+                        object before being returned. Added at Tag 0.30.9. Optional.
+                      properties:
+                        verb:
+                          description: Verb is the Kubernetes RBAC verb checked per object.
+                          type: string
+                        group:
+                          description: Group is the API group ('' for the core group).
+                          type: string
+                        resource:
+                          description: Resource is the plural resource name.
+                          type: string
+                        namespaceFrom:
+                          description: |
+                            NamespaceFrom is a JQ path expression evaluated against each returned
+                            object to derive the per-object namespace for the EvaluateRBAC call.
+                          type: string
+                      required:
+                      - verb
+                      - group
+                      - resource
+                      type: object
                   required:
                   - name
                   type: object

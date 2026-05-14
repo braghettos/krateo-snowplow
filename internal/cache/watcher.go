@@ -89,6 +89,14 @@ type ResourceWatcher struct {
 	informers map[schema.GroupVersionResource]informers.GenericInformer
 	started   bool
 
+	// syncCh stores per-GVR sync channels. Closed when that GVR's
+	// informer has completed its initial WaitForCacheSync. Used by
+	// EnsureResourceType so concurrent first-readers can block until
+	// the informer is live, or proceed via the apiserver-fallback
+	// branch in the resolver hot path. Tag 0.30.9 Sub-scope B
+	// (lazy-register-on-resolver-touch).
+	syncCh map[schema.GroupVersionResource]chan struct{}
+
 	// eagerSet is the set of GVRs the caller passed to MarkEagerSet —
 	// the post-startup expectation is that NO AddResourceType call
 	// fires for a GVR in this set (because eager already registered
@@ -168,6 +176,7 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 			mode:      modePassthrough,
 			dyn:       dyn,
 			informers: map[schema.GroupVersionResource]informers.GenericInformer{},
+			syncCh:    map[schema.GroupVersionResource]chan struct{}{},
 			stopCh:    make(chan struct{}),
 		}, nil
 	}
@@ -192,6 +201,7 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		dyn:       dyn,
 		factory:   factory,
 		informers: map[schema.GroupVersionResource]informers.GenericInformer{},
+		syncCh:    map[schema.GroupVersionResource]chan struct{}{},
 		stopCh:    make(chan struct{}),
 	}
 	_ = ctx // reserved for future wiring (0.30.6 eager-registration caller may pass-through)
@@ -236,6 +246,20 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	rw.factory.Start(rw.stopCh)
 	rw.started = true
 
+	// 0.30.9 Sub-scope B: now that the factory has started the
+	// constructor-registered informers (the four RBAC GVRs),
+	// spawn one sync-watcher per GVR so EnsureResourceType callers
+	// for those GVRs (rare — only the test path; production callers
+	// go through ListTypedObjects / GetTypedObject) see a closed
+	// channel as soon as HasSynced flips.
+	for gvr, gi := range rw.informers {
+		ch := rw.syncCh[gvr]
+		if ch == nil {
+			continue
+		}
+		go waitInformerSync(gi.Informer().HasSynced, ch, rw.stopCh)
+	}
+
 	slog.Info("cache.plumbing_present=true cache.routed=true rbac.informer_started=true",
 		slog.String("subsystem", "cache"),
 		slog.Int64("list_page_limit", listPageLimit),
@@ -273,9 +297,12 @@ func (rw *ResourceWatcher) IsPassthrough() bool {
 // nothing to register and no informer to start.
 //
 // At 0.30.4 the constructor eagerly registers the four Role-Based
-// Access Control GVRs. Future tags will register additional resource
-// types lazily on first dispatch (0.30.6 eager registration covers
-// RestAction inventory).
+// Access Control GVRs. At 0.30.6 the inventory walker (gated behind
+// EAGER_REGISTER_ENABLED at 0.30.61) covered the RestAction-derived
+// inventory. At 0.30.9 (Sub-scope B), the canonical lazy-registration
+// API for resolver-hot-path callers is EnsureResourceType — it returns
+// the per-GVR sync channel so callers can singleflight first-reads.
+// AddResourceType is preserved for back-compat with EagerRegisterAll.
 func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 	if rw.mode == modePassthrough {
 		return
@@ -284,6 +311,84 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 	defer rw.mu.Unlock()
 
 	rw.addResourceTypeLocked(gvr)
+}
+
+// EnsureResourceType is the idempotent, sync-channel-returning lazy
+// registration API introduced at 0.30.9 (Sub-scope B). Behaviour:
+//
+//   - If gvr is already registered: returns (false, sync), where sync
+//     is the channel that was created on first registration. The
+//     channel is closed once that informer's initial WaitForCacheSync
+//     completes. Callers may either block on it (to wait for the
+//     informer cache to be live) or proceed via apiserver-fallback.
+//   - If gvr is not yet registered: registers it under rw.mu (which
+//     serves as the singleflight primitive — no separate sync.Once
+//     needed), kicks off the informer goroutine (late-registration
+//     branch), spawns a sync-watcher that closes sync on
+//     WaitForCacheSync completion, and returns (true, sync).
+//
+// In modePassthrough (0.30.71) this is a no-op: returns (false, nil).
+// Callers in passthrough mode never hit the informer code path —
+// every Get/List routes to apiserver via the dynamic client — so
+// there is no informer to register and no sync channel to honour.
+//
+// Per plan §"Singleflight on EnsureResourceType" (binding): rw.mu IS
+// the singleflight primitive. Concurrent first-reads for the same GVR
+// see exactly one factory.ForResource + Informer().Run call; every
+// subsequent caller receives the same sync channel and the same
+// informer (via the existing AddResourceType idempotence).
+//
+// Per feedback_l1_invalidation_delete_only.md + Revision 17 plan
+// constraint: the dep-tracker handlers (UpdateFunc/DeleteFunc) are
+// wired by addResourceTypeLocked at registration time. The sync
+// channel exists so callers in the resolver hot path can know when
+// the informer is live; the dep-tracker handlers themselves fire
+// independently of the channel state.
+//
+// Safe for concurrent use.
+func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (added bool, sync <-chan struct{}) {
+	if rw == nil {
+		return false, nil
+	}
+	if rw.mode == modePassthrough {
+		return false, nil
+	}
+
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if _, exists := rw.informers[gvr]; exists {
+		// Hit: return the existing sync channel. Defensive nil-check
+		// — the constructor's RBAC registrations always allocate a
+		// channel, but a future refactor could break this invariant.
+		if ch, ok := rw.syncCh[gvr]; ok {
+			return false, ch
+		}
+		// Defensive: invariant broken. Return a pre-closed channel
+		// so callers don't deadlock.
+		closed := make(chan struct{})
+		close(closed)
+		return false, closed
+	}
+
+	// Miss: register + allocate the sync channel + spawn the
+	// sync-watcher goroutine. addResourceTypeLocked allocates the
+	// channel and stores it in rw.syncCh; we read it here and
+	// spawn the watcher so the channel closes on HasSynced.
+	rw.addResourceTypeLocked(gvr)
+	ch := rw.syncCh[gvr]
+
+	// Falsifier per plan §"Pre-flight RUN protocol" step 2: emit a
+	// log line `cache.lazy_register fired gvr=...` on first
+	// registration. Distinct from `lazy-AddResourceType` (the
+	// 0.30.6 falsifier triggered by post-eager-done lazy adds).
+	slog.Info("cache.lazy_register",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("hint", "first resolver touch — informer registered + dep-tracker handlers wired"),
+	)
+
+	return true, ch
 }
 
 // addResourceTypeLocked is the lock-held implementation of
@@ -320,6 +425,18 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 
 	gi := rw.factory.ForResource(gvr)
 	rw.informers[gvr] = gi
+
+	// 0.30.9 Sub-scope B: allocate the sync channel BEFORE we spawn
+	// any goroutine that could close it. The channel is closed by
+	// the late-registration sync-watcher (below, in the rw.started
+	// branch) or by the constructor-driven post-Start sync watcher
+	// (registered in NewResourceWatcher's terminal block). We
+	// allocate the channel here unconditionally so EnsureResourceType
+	// can return it for either path.
+	if rw.syncCh == nil {
+		rw.syncCh = map[schema.GroupVersionResource]chan struct{}{}
+	}
+	rw.syncCh[gvr] = make(chan struct{})
 
 	resourceType := gvrResourceTypeString(gvr)
 	tf := StripBulkyFieldsForResourceType(resourceType, gvr)
@@ -381,6 +498,17 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		// Late registration after Start(): kick the new informer.
 		go gi.Informer().Run(rw.stopCh)
 
+		// 0.30.9 Sub-scope B: spawn the sync-watcher for this GVR.
+		// The watcher polls HasSynced (cheap atomic load in
+		// client-go) and closes the sync channel as soon as the
+		// informer's initial LIST is reconciled. We use a polling
+		// loop bounded by rw.stopCh so the goroutine exits when
+		// the watcher Stop()s. WaitForCacheSync (client-go) uses
+		// the same polling primitive internally — we re-implement
+		// it here so we don't need to allocate a context.
+		ch := rw.syncCh[gvr]
+		go waitInformerSync(gi.Informer().HasSynced, ch, rw.stopCh)
+
 		// 0.30.6 falsifier (plan §"Code-path falsifier"). If eager
 		// registration has already completed AND this GVR was in
 		// the eager set, the inventory walker missed it OR an
@@ -399,6 +527,43 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 					slog.String("resource_type", resourceType),
 					slog.String("hint", "not in eager inventory — likely post-startup RestAction"),
 				)
+			}
+		}
+	}
+}
+
+// waitInformerSync polls the informer's HasSynced predicate and
+// closes ch when it returns true OR stopCh is closed. Polled at
+// 50ms — same cadence client-go uses internally (cache.WaitForCacheSync
+// polls at 100ms; we use half that so callers see the live state a
+// tick earlier on the first read). The goroutine is bounded by
+// stopCh so Stop() reliably reaps it.
+//
+// Idempotent on ch close — we only close once. If stopCh fires before
+// the informer syncs, ch is closed anyway so callers blocked on it
+// unblock (they will see HasSynced()==false on a follow-up read and
+// fall back to the apiserver path).
+func waitInformerSync(hasSynced func() bool, ch chan struct{}, stopCh <-chan struct{}) {
+	defer func() {
+		select {
+		case <-ch:
+			// Already closed (e.g., constructor's bulk-sync path).
+		default:
+			close(ch)
+		}
+	}()
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	if hasSynced() {
+		return
+	}
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-t.C:
+			if hasSynced() {
+				return
 			}
 		}
 	}

@@ -6,12 +6,14 @@ import (
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"k8s.io/client-go/rest"
 )
 
@@ -119,25 +121,65 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			apiCall.Headers = []string{headerAcceptJSON}
 		}
 
-		if accessToken, _ := xcontext.AccessToken(ctx); accessToken != "" {
-			if apiCall.EndpointRef == nil || ptr.Deref(apiCall.ExportJWT, false) {
-				apiCall.Headers = append(apiCall.Headers,
-					fmt.Sprintf("Authorization: Bearer %s", accessToken))
+		// Tag 0.30.9 Sub-scope A: detect userAccessFilter.
+		// When set, the dispatch uses snowplow's ServiceAccount
+		// endpoint (cluster-wide read) — NOT the per-user
+		// clientconfig — and the response is in-process-refiltered
+		// per object through EvaluateRBAC. When unset, the dispatch
+		// path is unchanged from 0.30.8 (per-user-token via the
+		// endpointReferenceMapper). Per Revision 5 (binding): atomic
+		// ship — no gate flag. Portal RestActions opt in by adding
+		// the userAccessFilter stanza; the resolver branches
+		// per-stage.
+		uafActive := apiCall.UserAccessFilter != nil
+
+		// User-bearer-token append: only for non-UAF stages. When
+		// UAF is active the SA endpoint carries the SA token (no
+		// user-bearer override needed); appending the user token
+		// here would route the call through the user's credentials
+		// instead of the SA's — breaking the entire UAF mechanism.
+		if !uafActive {
+			if accessToken, _ := xcontext.AccessToken(ctx); accessToken != "" {
+				if apiCall.EndpointRef == nil || ptr.Deref(apiCall.ExportJWT, false) {
+					apiCall.Headers = append(apiCall.Headers,
+						fmt.Sprintf("Authorization: Bearer %s", accessToken))
+				}
 			}
 		}
 
-		// Resolve the endpoint
-		ep, err := mapper.resolveOne(ctx, apiCall.EndpointRef)
-		if err != nil {
-			log.Error("unable to resolve api endpoint reference",
-				slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
-			return dict
+		// Resolve the endpoint. UAF stages use the snowplow-SA
+		// endpoint; non-UAF stages go through the per-user
+		// clientconfig (or the named EndpointRef) as before.
+		var ep endpoints.Endpoint
+		if uafActive {
+			saEP, saErr := dynamic.ServiceAccountEndpoint()
+			if saErr != nil {
+				log.Error("userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
+					slog.String("name", id), slog.Any("err", saErr))
+				// Fail-closed-but-respond: per Revision 5 atomic
+				// ship there is no toggle to fall back to the
+				// per-user path correctly (we'd leak the user
+				// bearer token to a SA-marked stage). Returning
+				// an empty result for this stage and continuing.
+				dict[id] = map[string]any{"items": []any{}}
+				continue
+			}
+			ep = *saEP
+		} else {
+			resolved, err := mapper.resolveOne(ctx, apiCall.EndpointRef)
+			if err != nil {
+				log.Error("unable to resolve api endpoint reference",
+					slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
+				return dict
+			}
+			ep = resolved
 		}
 		if opts.Verbose {
 			ep.Debug = opts.Verbose
 		}
 		log.Debug("resolved endpoint for api call",
-			slog.String("name", id), slog.String("host", ep.ServerURL))
+			slog.String("name", id), slog.String("host", ep.ServerURL),
+			slog.Bool("uaf", uafActive))
 
 		tmp := createRequestOptions(log, apiCall, dict)
 		if len(tmp) == 0 {
@@ -183,6 +225,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
 				slog.Any("depth", mapDepth(dict)),
 			)
+		}
+
+		// Tag 0.30.9 Sub-scope A: refilter the SA-dispatched result
+		// in-process. Runs AFTER all dispatched calls for this API
+		// stage complete + their jsonHandler has populated dict[id].
+		// Per Revision 2 binding: EvaluateRBAC fires per object —
+		// this is the load-bearing security gate that turns cluster-
+		// wide-read into user-scoped result sets.
+		if uafActive {
+			rf := applyUserAccessFilter(ctx, dict, apiCall)
+			emitRefilterFalsifier(log, apiCall, user.Username, rf)
 		}
 	}
 

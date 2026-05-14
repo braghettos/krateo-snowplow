@@ -159,6 +159,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// through resolve.go, which is deferred to a future sub-ship.
 		// TTL remains the outer safety net for changes the dep
 		// tracker cannot see.
+		//
+		// 0.30.9 Sub-scope B: ensure the informer for got.GVR is
+		// registered BEFORE recording the dep. Without this, a
+		// previously-unseen RestAction GVR would record a forward
+		// edge whose DELETE/UPDATE events the watcher never wires.
+		ensureWatcherInformerForGVR(got.GVR)
 		cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 	}
 
