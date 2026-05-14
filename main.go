@@ -27,6 +27,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 )
 
@@ -137,6 +138,37 @@ func main() {
 				} else {
 					cacheWatcher = w
 					cache.SetGlobal(w)
+
+					// §0.30.93 (Revision 18): wire the metadata client
+					// for the metadata-only informer routing path.
+					// Composition GVRs (~50K objects at production
+					// scale) take this path to stay within the 1.8 GiB
+					// RSS budget; RBAC GVRs and customer CRDs without
+					// the `krateo.io/cache-mode: metadata` annotation
+					// continue on the dynamic full-informer path.
+					//
+					// Failure to construct the metadata client leaves
+					// rw.metaClient == nil — `EnsureResourceType` then
+					// emits `cache.lazy_register.metadata_only_unwired`
+					// for every Composition GVR touch (loud SRE signal
+					// without crash-looping the pod).
+					metaCli, metaErr := metadata.NewForConfig(rc)
+					if metaErr != nil {
+						log.Warn("cache: metadata.NewForConfig failed; metadata-only routing offline (full-informer fallback)",
+							slog.Any("err", metaErr))
+					} else {
+						w.SetMetadataClient(metaCli)
+					}
+
+					// §0.30.93 annotation discovery: one apiextensions
+					// LIST at startup to find CRDs carrying
+					// `krateo.io/cache-mode: metadata`. Bounded by
+					// 30 s; soft-fail (annotation set stays empty, the
+					// static seed in `internal/cache/cache_mode.go`
+					// still routes Composition GVRs to metadata-only).
+					discoCtx, discoCancel := context.WithTimeout(cacheCtx, 30*time.Second)
+					cache.DiscoverMetadataOnlyAnnotations(discoCtx, rc)
+					discoCancel()
 
 					// 0.30.8: wire the L1 resolved-output cache refresher.
 					// Order matters: register dispatcher handlers BEFORE

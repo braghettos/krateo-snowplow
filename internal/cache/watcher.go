@@ -15,6 +15,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/metadatainformer"
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
@@ -85,9 +87,35 @@ type ResourceWatcher struct {
 	dyn     dynamic.Interface
 	factory dynamicinformer.DynamicSharedInformerFactory
 
+	// metaClient + metaFactory back the §0.30.93 (Revision 18)
+	// metadata-only routing. Both are populated by SetMetadataClient
+	// AFTER NewResourceWatcher returns (the apiextensions LIST that
+	// also runs at startup needs the same rest.Config, so main.go
+	// builds the metadata client there and wires it in). nil-safe:
+	// EnsureResourceType falls back to the dynamic full-informer path
+	// when metaClient == nil — production code MUST set the metadata
+	// client to keep the OOM-safety property for Composition GVRs.
+	//
+	// metaFactory is created lazily on the first metadata-only
+	// EnsureResourceType so callers that never opt any GVR into the
+	// metadata-only set pay zero allocation cost. Concurrency: writes
+	// happen under rw.mu (same singleflight gate as the dynamic
+	// factory creation).
+	metaClient  metadata.Interface
+	metaFactory metadatainformer.SharedInformerFactory
+
 	mu        sync.RWMutex
 	informers map[schema.GroupVersionResource]informers.GenericInformer
 	started   bool
+
+	// metadataOnly is the set of GVRs that were registered via the
+	// metadata-only path. Kept so observability tools (logs, future
+	// metrics, the §0.30.93 stress falsifier's
+	// `cache.lazy_register.metadata_only` assertion) can distinguish
+	// "informer registered as PartialObjectMetadata" from "informer
+	// registered as full Unstructured". A GVR appears in
+	// rw.informers AND rw.metadataOnly when it took the metadata path.
+	metadataOnly map[schema.GroupVersionResource]struct{}
 
 	// syncCh stores per-GVR sync channels. Closed when that GVR's
 	// informer has completed its initial WaitForCacheSync. Used by
@@ -173,11 +201,12 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		)
 		_ = ctx
 		return &ResourceWatcher{
-			mode:      modePassthrough,
-			dyn:       dyn,
-			informers: map[schema.GroupVersionResource]informers.GenericInformer{},
-			syncCh:    map[schema.GroupVersionResource]chan struct{}{},
-			stopCh:    make(chan struct{}),
+			mode:         modePassthrough,
+			dyn:          dyn,
+			informers:    map[schema.GroupVersionResource]informers.GenericInformer{},
+			syncCh:       map[schema.GroupVersionResource]chan struct{}{},
+			metadataOnly: map[schema.GroupVersionResource]struct{}{},
+			stopCh:       make(chan struct{}),
 		}, nil
 	}
 
@@ -197,12 +226,13 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	)
 
 	rw := &ResourceWatcher{
-		mode:      modeInformer,
-		dyn:       dyn,
-		factory:   factory,
-		informers: map[schema.GroupVersionResource]informers.GenericInformer{},
-		syncCh:    map[schema.GroupVersionResource]chan struct{}{},
-		stopCh:    make(chan struct{}),
+		mode:         modeInformer,
+		dyn:          dyn,
+		factory:      factory,
+		informers:    map[schema.GroupVersionResource]informers.GenericInformer{},
+		syncCh:       map[schema.GroupVersionResource]chan struct{}{},
+		metadataOnly: map[schema.GroupVersionResource]struct{}{},
+		stopCh:       make(chan struct{}),
 	}
 	_ = ctx // reserved for future wiring (0.30.6 eager-registration caller may pass-through)
 
@@ -271,6 +301,35 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	return rw, nil
 }
 
+// SetMetadataClient wires the metadata.Interface used by the §0.30.93
+// (Revision 18) metadata-only informer routing. Called once at startup
+// from main.go AFTER NewResourceWatcher succeeds and BEFORE the first
+// /call dispatch (so the first EnsureResourceType invocation for a
+// metadata-only GVR has a live client).
+//
+// Passing nil clears the client (test-only path). In production, leaving
+// it nil means metadata-only-eligible GVRs (Composition family, plus
+// any annotation-discovered set) fall through to the dynamic
+// full-informer path — re-introducing the 0.30.92 OOM risk. The
+// constructor logs a one-shot WARN at EnsureResourceType time if it
+// detects that situation, so the regression is visible.
+//
+// Concurrency: takes rw.mu. Idempotent on a same-pointer re-call. The
+// metadata SharedInformerFactory is allocated lazily on the first
+// metadata-only EnsureResourceType invocation so callers that never opt
+// any GVR into metadata-only pay zero cost.
+//
+// Nil-receiver safe (test path: cache.Global() returns nil under
+// CACHE_ENABLED=false).
+func (rw *ResourceWatcher) SetMetadataClient(c metadata.Interface) {
+	if rw == nil {
+		return
+	}
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.metaClient = c
+}
+
 // Mode returns the operational discriminator (modeInformer or
 // modePassthrough). Exposed for falsifier-log diagnostics and unit
 // tests; production callers should rely on Disabled() / Get-List
@@ -327,6 +386,24 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 //     branch), spawns a sync-watcher that closes sync on
 //     WaitForCacheSync completion, and returns (true, sync).
 //
+// At §0.30.93 (Revision 18, Option D): the registration path is
+// selected via `shouldUseMetadataOnly(gvr)` (defined in
+// `internal/cache/cache_mode.go`). When the predicate returns true AND
+// a metadata client is wired (rw.metaClient != nil), the informer is
+// created against `metadatainformer.SharedInformerFactory`
+// (PartialObjectMetadata events — ~2.5 KiB per object). When false (or
+// the metadata client is nil), the registration takes the default
+// dynamic full-informer path (~20 KiB per object post-strip).
+//
+// Both paths register the SAME DepTracker handlers (`UpdateFunc` →
+// `Deps().OnUpdate`, `DeleteFunc` → `Deps().OnDelete`). The handlers
+// use `metaNSName(obj)` which extracts (namespace, name) via the
+// `nsNameAccessor` interface — `metav1.PartialObjectMetadata` embeds
+// `ObjectMeta` so it satisfies that interface. The DELETE-evict /
+// UPDATE-refresh semantics are byte-identical between the two paths.
+// Per `feedback_l1_invalidation_delete_only.md`: DELETE evicts, UPDATE
+// refreshes — preserved.
+//
 // In modePassthrough (0.30.71) this is a no-op: returns (false, nil).
 // Callers in passthrough mode never hit the informer code path —
 // every Get/List routes to apiserver via the dynamic client — so
@@ -338,12 +415,10 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 // subsequent caller receives the same sync channel and the same
 // informer (via the existing AddResourceType idempotence).
 //
-// Per feedback_l1_invalidation_delete_only.md + Revision 17 plan
-// constraint: the dep-tracker handlers (UpdateFunc/DeleteFunc) are
-// wired by addResourceTypeLocked at registration time. The sync
-// channel exists so callers in the resolver hot path can know when
-// the informer is live; the dep-tracker handlers themselves fire
-// independently of the channel state.
+// Per `feedback_no_special_cases.md`: the predicate
+// `shouldUseMetadataOnly(gvr)` is the SINGLE source of per-GVR routing
+// logic. EnsureResourceType is uniform plumbing — there is no
+// per-Resource if-elif in the routing code path.
 //
 // Safe for concurrent use.
 func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (added bool, sync <-chan struct{}) {
@@ -371,6 +446,40 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 		return false, closed
 	}
 
+	// §0.30.93 routing: consult the predicate. RBAC GVRs always take
+	// the full-informer path (the predicate hardcodes that exclusion);
+	// every other path is controlled by annotation + static seed.
+	//
+	// If the predicate selects metadata-only AND we have a metadata
+	// client, take the metadata path. Otherwise fall through to the
+	// dynamic full informer (the pre-§0.30.93 behaviour).
+	if shouldUseMetadataOnly(gvr) && rw.metaClient != nil {
+		rw.addResourceTypeMetadataOnlyLocked(gvr)
+		ch := rw.syncCh[gvr]
+		slog.Info("cache.lazy_register.metadata_only",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("path", "metadata-only"),
+			slog.String("reason", metadataOnlyReason(gvr)),
+			slog.String("hint", "PartialObjectMetadata informer — ~10x smaller than full Unstructured; DepTracker preserved"),
+		)
+		return true, ch
+	}
+	// Soft-fail observability: if the predicate WOULD have routed
+	// metadata-only but the metadata client is missing, log a one-shot
+	// WARN so SRE sees the regression (Composition GVRs would land on
+	// the full-Unstructured informer and re-introduce the 0.30.92 OOM).
+	if shouldUseMetadataOnly(gvr) && rw.metaClient == nil {
+		slog.Warn("cache.lazy_register.metadata_only_unwired",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("hint", "predicate matched metadata-only routing but metaClient is nil — falling back to dynamic full informer; OOM risk at 50K scale"),
+			slog.String("remediation", "main.go must call ResourceWatcher.SetMetadataClient(metadata.NewForConfig(rc)) at startup"),
+		)
+	}
+
+	// Default path: dynamic full-Unstructured informer.
+	//
 	// Miss: register + allocate the sync channel + spawn the
 	// sync-watcher goroutine. addResourceTypeLocked allocates the
 	// channel and stores it in rw.syncCh; we read it here and
@@ -385,10 +494,228 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	slog.Info("cache.lazy_register",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
+		slog.String("path", "full-unstructured"),
 		slog.String("hint", "first resolver touch — informer registered + dep-tracker handlers wired"),
 	)
 
 	return true, ch
+}
+
+// metadataOnlyReason renders a short label describing WHY the predicate
+// chose the metadata-only path for gvr. Used in the log line so SRE can
+// distinguish annotation-driven (preferred, long-term) routing from
+// seed-driven (current operational reality) routing. The label is best-
+// effort: a GVR matching both the annotation set AND the seed renders as
+// "annotation" (the annotation takes precedence in logging because it
+// is the customer-controlled lever).
+func metadataOnlyReason(gvr schema.GroupVersionResource) string {
+	if _, ok := annotatedGVRs.Load(gvr); ok {
+		return "annotation"
+	}
+	for _, pat := range metadataOnlyGVRSeed {
+		if matchesSeed(gvr, pat) {
+			return "static_seed"
+		}
+	}
+	return "unknown" // unreachable given the predicate fired
+}
+
+// addResourceTypeMetadataOnlyLocked is the §0.30.93 (Revision 18)
+// metadata-only registration path. Callers MUST hold rw.mu.Lock().
+//
+// Differences vs addResourceTypeLocked:
+//
+//  1. Uses metadatainformer.SharedInformerFactory (lazily created from
+//     rw.metaClient on first metadata-only registration) instead of the
+//     dynamic factory. The factory's `ForResource(gvr)` returns an
+//     `informers.GenericInformer` whose store holds
+//     `*metav1.PartialObjectMetadata` instead of
+//     `*unstructured.Unstructured`. ~10× memory reduction per object.
+//
+//  2. Skips SetTransform (the strip pipeline is designed for the full
+//     Unstructured shape — managedFields, last-applied annotation;
+//     PartialObjectMetadata already lacks both). Skipping is correct:
+//     transform on PartialObjectMetadata would only add CPU cost.
+//
+//  3. SAME DepTracker handlers wired (UpdateFunc → OnUpdate, DeleteFunc
+//     → OnDelete). The handlers call `metaNSName(obj)` which extracts
+//     (namespace, name) via the `nsNameAccessor` interface;
+//     `*metav1.PartialObjectMetadata` embeds `ObjectMeta` and therefore
+//     satisfies it. This is the binding property that makes Option D
+//     viable per plan §"Revision 18 redesign space" item 1.
+//
+//  4. Records the GVR in rw.metadataOnly so observability tools can
+//     distinguish the two paths.
+//
+// Per `feedback_l1_invalidation_delete_only.md`: DELETE evicts, UPDATE
+// refreshes — preserved byte-for-byte from the full-informer path.
+func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVersionResource) {
+	if rw.mode == modePassthrough {
+		return
+	}
+	if _, exists := rw.informers[gvr]; exists {
+		return
+	}
+	if rw.metaClient == nil {
+		// Defensive: caller should have checked, but if metaClient
+		// vanished between the EnsureResourceType predicate evaluation
+		// and here (impossible under rw.mu), bail out.
+		return
+	}
+
+	// Lazy factory construction. tweakListOptions matches the dynamic
+	// factory's bounded-paging policy (listPageLimit) — same apiserver
+	// pressure budget per LIST. resyncPeriod=0 ⇒ pure event-driven, no
+	// periodic full re-list.
+	if rw.metaFactory == nil {
+		tweak := func(opts *metav1.ListOptions) {
+			opts.Limit = listPageLimit
+		}
+		rw.metaFactory = metadatainformer.NewFilteredSharedInformerFactory(
+			rw.metaClient,
+			0, // resync period 0
+			metav1.NamespaceAll,
+			tweak,
+		)
+	}
+
+	gi := rw.metaFactory.ForResource(gvr)
+	rw.informers[gvr] = gi
+	if rw.metadataOnly == nil {
+		rw.metadataOnly = map[schema.GroupVersionResource]struct{}{}
+	}
+	rw.metadataOnly[gvr] = struct{}{}
+
+	if rw.syncCh == nil {
+		rw.syncCh = map[schema.GroupVersionResource]chan struct{}{}
+	}
+	rw.syncCh[gvr] = make(chan struct{})
+
+	resourceType := gvrResourceTypeString(gvr)
+
+	// DepTracker event handlers (per plan §"Revision 18
+	// implementation outline" item 3 + binding rule
+	// feedback_l1_invalidation_delete_only.md). Identical wiring to
+	// addResourceTypeLocked — the obj coming through here is a
+	// *metav1.PartialObjectMetadata, which embeds ObjectMeta and
+	// therefore satisfies the nsNameAccessor interface used by
+	// metaNSName.
+	if _, regErr := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(_, newObj interface{}) {
+			ns, name := metaNSName(newObj)
+			Deps().OnUpdate(gvr, ns, name)
+		},
+		DeleteFunc: func(obj interface{}) {
+			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
+				obj = tomb.Obj
+			}
+			ns, name := metaNSName(obj)
+			Deps().OnDelete(gvr, ns, name)
+		},
+		// AddFunc intentionally NOT wired — same rationale as
+		// addResourceTypeLocked.
+	}); regErr != nil {
+		slog.Warn("cache.deps.add_event_handler_failed",
+			slog.String("subsystem", "cache"),
+			slog.String("resource_type", resourceType),
+			slog.String("path", "metadata-only"),
+			slog.String("error", regErr.Error()),
+		)
+	}
+
+	// Start the metadata informer and spawn the sync-watcher. We
+	// always reach this branch post-Start (the constructor never
+	// metadata-registers; only lazy EnsureResourceType does), so the
+	// "late registration" path is the only one.
+	go gi.Informer().Run(rw.stopCh)
+	ch := rw.syncCh[gvr]
+	go waitInformerSync(gi.Informer().HasSynced, ch, rw.stopCh)
+}
+
+// EnsureResourceTypeMetadataOnly is the explicit, signature-preserving
+// metadata-only registration entry point introduced at §0.30.93
+// (Revision 18). Mirrors `EnsureResourceType` but bypasses the
+// predicate — the caller is asserting "I want PartialObjectMetadata
+// routing for this GVR regardless of cluster annotation state".
+//
+// Production callers MUST go through `EnsureResourceType` (which
+// consults the predicate). This explicit entry point exists for:
+//
+//   - Unit tests asserting metadata-only behaviour without touching
+//     the predicate state.
+//   - Future opt-in features where a caller knows a GVR is metadata-
+//     only-safe (e.g. a manual operator-set route).
+//
+// Returns:
+//
+//   - (false, sync) on hit (same channel semantics as EnsureResourceType).
+//     Note: a hit may have been the full-informer path; this method
+//     does NOT promote a previously-full registration to metadata-only.
+//     Promotion would require deleting the existing informer's store +
+//     reallocating, which is the OOM-causing branch in Option F. We
+//     deliberately do not implement promotion.
+//   - (true, sync) on miss. Caller can block on sync to wait for the
+//     initial LIST.
+//   - (false, nil) when the watcher is nil, in passthrough mode, or
+//     when no metadata client is wired. The (false, nil)-on-missing-
+//     metaClient case is loud-logged so SRE sees the regression.
+//
+// Safe for concurrent use. Uses rw.mu as the singleflight primitive.
+func (rw *ResourceWatcher) EnsureResourceTypeMetadataOnly(gvr schema.GroupVersionResource) (added bool, sync <-chan struct{}) {
+	if rw == nil {
+		return false, nil
+	}
+	if rw.mode == modePassthrough {
+		return false, nil
+	}
+
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if rw.metaClient == nil {
+		slog.Warn("cache.metadata_only.no_client",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("hint", "EnsureResourceTypeMetadataOnly called before SetMetadataClient — caller should use EnsureResourceType (predicate-routed) or wire the client at startup"),
+		)
+		return false, nil
+	}
+
+	if _, exists := rw.informers[gvr]; exists {
+		if ch, ok := rw.syncCh[gvr]; ok {
+			return false, ch
+		}
+		closed := make(chan struct{})
+		close(closed)
+		return false, closed
+	}
+
+	rw.addResourceTypeMetadataOnlyLocked(gvr)
+	ch := rw.syncCh[gvr]
+	slog.Info("cache.lazy_register.metadata_only",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("path", "metadata-only"),
+		slog.String("reason", "explicit"),
+		slog.String("hint", "PartialObjectMetadata informer — explicit caller, predicate bypassed"),
+	)
+	return true, ch
+}
+
+// IsMetadataOnly reports whether gvr was registered via the §0.30.93
+// metadata-only path (PartialObjectMetadata informer). Useful for unit
+// tests asserting routing decisions and for future observability metrics.
+//
+// Returns false for nil receivers, passthrough mode, or unknown GVRs.
+// Safe for concurrent use; takes rw.mu in read mode.
+func (rw *ResourceWatcher) IsMetadataOnly(gvr schema.GroupVersionResource) bool {
+	if rw == nil {
+		return false
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	_, ok := rw.metadataOnly[gvr]
+	return ok
 }
 
 // addResourceTypeLocked is the lock-held implementation of
