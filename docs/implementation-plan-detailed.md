@@ -1213,7 +1213,102 @@ The static-const form (~5 GVRs from static-path RAs) is bounded, predictable, an
 
 ---
 
-## Tag `0.30.9` — Step 5: userAccessFilter + ServiceAccount-dispatch + refilter (atomic ship)
+## Tag `0.30.9` — Step 5: userAccessFilter + ServiceAccount-dispatch + refilter (atomic ship) — **bundled with lazy-register-on-resolver-touch (Revision 17)**
+
+### Revision 17 preamble (binding, 2026-05-14)
+
+**Scope expansion:** the original 0.30.9 atomic UAF ship is bundled with an architectural fix for the 0.30.8 DELETE-evict mechanism. Three findings drive the amendment:
+
+1. **0.30.8 DELETE-evict is structurally dormant in production.** The dep-tracker `DeleteFunc`/`UpdateFunc` handlers wired in `internal/cache/watcher.go:353-378` only fire for GVRs registered via `AddResourceType`. The single non-test caller is `internal/cache/eager.go:85`, gated by `EAGER_REGISTER_ENABLED=true`. Helm rev 103 (0.30.8 deployed) leaves the env var unset; default at `main.go:188` is `false`. Result: the entire dep-tracker / refresher / DELETE-evict code path is dead code in the running binary. Probe `/tmp/snowplow-runs/0.30.8/validate/delete_stale_gap.txt` confirmed `evict_delete=0` after 86 min + 2 deliberate DELETEs. The 53 s admin stale-gap reduction observed at 0.30.8 is 100 % attributable to `RESOLVED_CACHE_TTL_SECONDS=60` (was 3600), NOT to DELETE-evict.
+
+2. **Enabling `EAGER_REGISTER_ENABLED=true` causes OOM crashloop** at the chart's 2Gi container limit. At 50K compositions across 49 bench namespaces, the startup_fanin=8 informer inventory burst exceeds the limit. Helm rev 105 rolled back to rev 103 content (eager-off).
+
+3. **Per `feedback_no_shortcuts_or_workarounds.md`,** raising the memory limit alone is a workaround that masks the cost; customers will hit the same wall at their scale. The architecturally correct fix is **lazy-register-on-resolver-touch**: informers come online on first dispatcher demand for a GVR, NOT pre-allocated at startup.
+
+**Atomic-ship rationale (extended):** UAF and lazy-register are bundled because they share the resolver/dispatcher hot path and a single PM gate + ledger row + falsifier surfaces both correctness changes together. Splitting risks a 0.30.9 (UAF) ship whose DELETE-evict is still dormant — the customer-visible stale-gap fix would land at 0.30.10. The two work-streams are independent in code (different files), so bundling adds no LoC coupling.
+
+### Bundled scope
+
+**Sub-scope A — UAF (original 0.30.9, unchanged):** atomic userAccessFilter CRD field + ServiceAccount-dispatch branch + in-process refilter + resolved-cache user-scoped keying. All details in the sections below.
+
+**Sub-scope B — lazy-register-on-resolver-touch (NEW):**
+- Resolver hot path detects an unseen-GVR dep edge on first read; triggers `cache.Global().EnsureResourceType(gvr)` (new idempotent API replacing the currently-error-returning `AddResourceType` semantics for already-registered GVRs).
+- Informer comes online; subsequent DELETE/UPDATE events fire dep-tracker handlers (`watcher.go:353-378`) correctly.
+- No startup-time fan-in. `EAGER_REGISTER_ENABLED` is preserved but becomes an OPTIONAL warm-start knob (not a mechanism prerequisite for DELETE-evict).
+- **Critical constraint** (binding from `feedback_l1_invalidation_delete_only.md` + Revision 17): on the FIRST read for a previously-unseen GVR, the resolver returns the apiserver result (NOT a cached value). The L1 entry for that first read is populated only AFTER the informer's initial `WaitForCacheSync` completes. Reason: writing an L1 entry before the dep-tracker has the informer's first-batch view means the tracker would record forward edges whose corresponding DELETE/UPDATE events the watcher has not yet seen — the entry could not be invalidated correctly. The first-read latency cost (one apiserver hop + sync delay before L1 turns on for that GVR) is absorbed only on the cold path; warm requests for the same GVR hit the now-live informer.
+
+### Files modified (Sub-scope B additions)
+
+- **`internal/cache/watcher.go` (MODIFY, ~30 LoC).** Add `EnsureResourceType(gvr) (added bool, sync <-chan struct{})` — idempotent wrapper around `addResourceTypeLocked` that returns `(true, syncCh)` on first registration and `(false, closedCh)` if the GVR was already registered. Caller can `<-syncCh` to wait for `WaitForCacheSync` or proceed via apiserver-fallback. Internally calls `factory.WaitForCacheSync` in a goroutine that closes `syncCh` on completion. The existing `AddResourceType` keeps its no-return signature for backward compatibility with `eager.go` callers.
+- **`internal/handlers/dispatchers/deps_extract.go` (MODIFY, ~15 LoC).** In `recordWidgetDeps`, every successful `parseGVR(ref.APIVersion, ref.Resource)` triggers `cache.Global().EnsureResourceType(refGVR)` BEFORE calling `deps.Record`. The self-dep call (`deps.Record(l1Key, gvr, w.GetNamespace(), w.GetName())`) and the apiRef edge (`deps.Record(l1Key, restActionGVR, apiRefNS, apiRefName)`) also call `EnsureResourceType` for their respective GVRs.
+- **`internal/handlers/dispatchers/restactions.go` (MODIFY, ~5 LoC).** At line 162 (the existing `cache.Deps().Record(cacheKey, got.GVR, ...)` call), add `cache.Global().EnsureResourceType(got.GVR)` immediately before — covers the RestAction self-dep.
+- **`internal/cache/eager.go` (MODIFY, ~5 LoC).** No semantic change to `EagerRegisterAll`; switch the inner `rw.AddResourceType(g)` call (line 85) to `rw.EnsureResourceType(g)` so callers don't need to know which API to pick. `EagerRegisterAll` remains the warm-start path; `EAGER_REGISTER_ENABLED=true` still wires it in.
+- **`main.go` (MODIFY, ~10 LoC).** Update the gate-flag log message at line 213-215 to clarify that lazy-register provides DELETE-evict regardless of `EAGER_REGISTER_ENABLED`; the env var now ONLY controls startup pre-allocation for warm-bench scenarios. Remove the "no consumer reads from eagerly-registered informers" comment; it's now obsolete because lazy-register IS that consumer.
+- **`internal/cache/watcher_test.go` (NEW test, ~80 LoC).** `TestEnsureResourceType_IdempotentParallel`: 100 concurrent goroutines calling `EnsureResourceType(samegvr)` produce exactly one informer; `TestEnsureResourceType_SyncChannel`: caller can block on the returned channel until `WaitForCacheSync`.
+- **`internal/handlers/dispatchers/deps_extract_test.go` (MODIFY, ~30 LoC).** Assert `EnsureResourceType` is invoked for every dep-edge GVR; assert no spurious calls for skip-set IDs.
+
+### Singleflight on `EnsureResourceType` (binding)
+
+Concurrent first-reads for the same GVR (e.g. 20 users dispatching the same widget simultaneously after a pod restart) MUST result in exactly one `factory.ForResource(gvr)` + `Informer().Run` invocation. Implementation: `EnsureResourceType` checks `rw.informers[gvr]` under `rw.mu`; on miss, it allocates the informer + the sync channel UNDER THE LOCK and stores both in the map; on hit, it returns the stored sync channel. The lock is the singleflight primitive; no separate `sync.Once` needed.
+
+### Acceptance criteria (Sub-scope B — binding)
+
+- With `CACHE_ENABLED=true` + `EAGER_REGISTER_ENABLED=false` (production default): a `kubectl delete` of a Composition (or any resource that participates in a recorded dep edge) results in `evict_delete > 0` within 5 s on the per-user L1 entry that referenced that resource. Measurement: `delete_stale_gap_v3.py` (spec below) shows non-zero `evict_delete` after the DELETE event.
+- With `CACHE_ENABLED=true` + `EAGER_REGISTER_ENABLED=true` (operational warm-start override): identical DELETE-evict behaviour PLUS startup pre-warm covers the bench-launch S6 case with no regression vs 0.30.61 pre-0.30.7 baselines.
+- Memory at 50K scale on the production default (`EAGER_REGISTER_ENABLED=false`) stays within the 2Gi container limit. Justification: lazy-register only allocates informers for GVRs the dispatcher actually touches, which is bounded by the deployed RestAction inventory (~10-15 GVRs at the customer's portal at production scale, NOT the full 49-namespace × per-GVR cartesian).
+- **Container RSS at 50K composition scale measured at three checkpoints (pod-Ready, post-first-10-dispatches, post-S6/S7) MUST be ≤ 1.8 Gi (15% headroom under 2 Gi limit). Captured in `/tmp/snowplow-runs/0.30.9/preflight/lazy_register_evict.txt` alongside the DELETE-evict assertions.** (PM-binding addendum 2026-05-14: today's eager-register OOM at 2Gi at 50K bench scale validates that the memory budget is a real binding constraint at customer scale. Customer is 10K compositions per `project_production_scale.md` — well below 50K — but the headroom assertion makes the pass criterion machine-checkable.)
+- First-read latency on a previously-unseen GVR: p50 ≤ 2 s, p99 ≤ 5 s (one apiserver hop + WaitForCacheSync). Only paid on the very first dispatch after a pod restart for that GVR; amortised to zero immediately after.
+- All Sub-scope A (UAF) acceptance criteria from the original 0.30.9 plan are preserved unchanged.
+
+### Pre-flight falsifier for Sub-scope B (binding per `feedback_falsifier_first_before_ship.md`)
+
+**Artifact path:** `/tmp/snowplow-runs/0.30.9/preflight/lazy_register_evict.txt`.
+
+**Script spec — `delete_stale_gap_v3.py`** (extension of v2):
+
+1. Helm install 0.30.9 image with `CACHE_ENABLED=true`, `EAGER_REGISTER_ENABLED=false` (production default), `RESOLVED_CACHE_TTL_SECONDS=3600` (long TTL so DELETE-evict is the ONLY mechanism that can clear stale entries).
+2. Wait for pod Ready. Issue baseline `/call` for an admin user against `restaction.compositions-list` — populates L1 entry, triggers `EnsureResourceType` for the Composition GVR. Capture log line `cache.lazy_register fired gvr=...` (NEW log emitted by `EnsureResourceType` on first registration).
+3. Capture pod startup metrics (`/metrics/runtime` if exposed; else log scrape): assert `informers_registered_at_startup == 0` (eager off + no requests yet) — proves no GVR pre-allocation.
+4. After step 2, assert `informers_registered_total >= 1` and the registered set contains exactly the GVRs the request touched (not the full RestAction inventory).
+5. `kubectl delete composition <name>` against one Composition.
+6. Poll `/metrics/runtime` `deps_evict_delete_total` for up to 10 s. Assert delta `evict_delete > 0` within the window.
+7. Re-issue the same `/call`; assert the previously-DELETEd composition is absent from the response (cache miss → re-resolve, since L1 entry was evicted).
+8. **RSS capture at three checkpoints (PM-binding addendum, 2026-05-14):** at each of (a) pod-Ready, (b) post-first-10-dispatches, (c) post-S6/S7-bench, sample container RSS via `kubectl top pod -n krateo-system <snowplow-pod>` (requires metrics-server; the bench cluster has it). Record raw output + parsed-MiB integer for each checkpoint. If metrics-server is unavailable, fall back to `/metrics/runtime` `process_resident_memory_bytes` (Go runtime gauge) — emit warning that this is process-VmRSS not container-cgroup-RSS, with ~2-3% delta tolerance. Embedded poller (bash):
+   ```bash
+   for label in pod_ready post_first_10 post_s7; do
+     read -r -d '' raw < <(kubectl top pod -n krateo-system "$POD" --no-headers 2>/dev/null || true)
+     mib=$(echo "$raw" | awk '{print $3}' | sed 's/Mi$//')
+     echo "rss_checkpoint=$label rss_mib=${mib:-unknown} raw=\"$raw\"" >> "$ARTIFACT"
+   done
+   ```
+   For each checkpoint, assert parsed-MiB ≤ 1843 (1.8 Gi = 1843 MiB rounded). Fail-fast: any sample > 1843 → ROLLBACK Sub-scope B and re-evaluate memory budget.
+9. Write all artefacts (logs, metrics deltas, response diff, timing, **all three RSS samples**) to `/tmp/snowplow-runs/0.30.9/preflight/lazy_register_evict.txt`.
+
+**Hard-gate fail conditions** (any one blocks ship):
+- `evict_delete == 0` after the DELETE → DELETE-evict still dormant → ROLLBACK Sub-scope B and root-cause.
+- `informers_registered_at_startup > 0` with eager off → contract violation; lazy-register wired wrong.
+- First-read p99 > 10 s → singleflight or sync-channel bug.
+- **Any of the three RSS checkpoints reports > 1.8 Gi (1843 MiB)** → memory budget breached at the 50K scale → ROLLBACK Sub-scope B and re-evaluate the per-GVR informer cost model (PM-binding addendum 2026-05-14).
+
+**Existing 0.30.8 falsifier (`delete_stale_gap_v2.py`)** runs unchanged at this tag and must produce `evict_delete > 0` (whereas at 0.30.8 it produced `evict_delete = 0`); this is the regression-fix witness.
+
+### Risks (Sub-scope B additions)
+
+- **First-read latency on new GVRs.** Apiserver fallback during WaitForCacheSync adds p99 ~2–5 s on the very first dispatch for that GVR after pod restart. Mitigation: this is a one-time cost per GVR per pod lifetime; warm requests amortise to zero. Operational override: set `EAGER_REGISTER_ENABLED=true` for benches that demand cold-zero on the first request (cost: startup memory burst — bench-only, not production).
+- **Multiple concurrent first-reads of the same GVR.** Without singleflight, N users each spawn `factory.ForResource(gvr)` for the same GVR → duplicate informers → dep-tracker handlers fire N times per event. Mitigation: singleflight via the existing `rw.mu` lock (see "Singleflight on EnsureResourceType" above). Test: `TestEnsureResourceType_IdempotentParallel`.
+- **Cyberjoker per-user-creds gap for refresher handler still NOT resolved.** Per `memory/project_0_30_8_refresher_noop_followup.md`: the refresher's UPDATE-path can't drive a re-resolve without per-user credentials, so cyberjoker UPDATE-paths remain TTL-bound at this tag. **Not in 0.30.9 scope** — separate sub-ship. DELETE-evict (the primary 0.30.9 fix) does NOT depend on per-user creds, so this gap doesn't block Sub-scope B.
+- **Risk overlap with Sub-scope A:** UAF refilter changes the user-keyed L1 layout; lazy-register changes which informers exist. The two paths share only the dep-tracker — adding edges (lazy-register) vs. consuming edges (refilter via cache-served reads) are different verbs. No shared state mutation; no race.
+
+### Three-pass expectations (Sub-scope B additions)
+
+- **Pass 1 (S6/S7/S8):** mild positive — S6 startup gets +500 ms to +2 s margin back (no eager-fan-in burst). S7/S8 unaffected.
+- **Pass 2 (Chrome MCP):** first cold-nav after pod restart: +200 to +1500 ms vs eager-on (the first-touch latency); every subsequent nav: unchanged from 0.30.8. Mix-weighted cold: ~ ±300 ms.
+- **Pass 3 (per-mutation convergence):** **PRIMARY MOVER FOR SUB-SCOPE B.** 0.30.8 measured admin stale-gap >180 s (TTL 3600 dominant); 0.30.9 with DELETE-evict live should land convergence_p99 < 5 s for DELETE events (informer-propagation-bound, not TTL-bound). UPDATE-path convergence remains gap-limited for cyberjoker (per-user-creds follow-up).
+
+### Estimated LoC and effort (Sub-scope B addition)
+
+- Code: ~65 production + ~110 test = ~175 LoC.
+- Combined with Sub-scope A (~670 LoC): ~845 LoC total at 0.30.9. PM-amendment-6 1-sprint-cap exception already granted for 0.30.9; the Sub-scope B addition is a +25 % increment over the existing exception. **Recommendation: bundle.** Splitting into 0.30.9 (lazy-register) + 0.30.10 (UAF) would push UAF a full sprint downstream, leaving Sub-scope B without the user-keyed refilter integration the Q-COLD-1 customer-mix story depends on. Bundle cost is one PM-gate evening of careful review; split cost is one sprint of customer-mix regression.
 
 ### Branch base
 `0.30.8`. Branch name: `ship-0.30.9-uaf-sa-dispatch`.
