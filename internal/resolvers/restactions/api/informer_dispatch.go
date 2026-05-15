@@ -233,16 +233,25 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]byte, bool) {
 	log := xcontext.Logger(ctx)
 
+	// 0.30.96: lazy-start the informer_dispatch.summary goroutine the
+	// first time the pivot is exercised (sync.Once-bounded; never
+	// started when RESOLVER_USE_INFORMER stays off for the process
+	// lifetime). The caller only invokes dispatchViaInformer when the
+	// flag is "true", so reaching here means the pivot is active.
+	startDispatchSummary()
+
 	// Gate 1: verb. Informer cache is read-only — POST/PUT/PATCH/
 	// DELETE all require the apiserver. The default verb is GET when
 	// call.Verb is nil (httpcall convention).
 	if v := ptr.Deref(call.Verb, http.MethodGet); v != http.MethodGet {
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 
 	// Gate 2: subresource path. Status/scale/log/exec/binding/proxy
 	// reads have no informer-cache shape and must hit the apiserver.
 	if hasSubresourceSuffix(call.Path) {
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 
@@ -251,6 +260,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// return ok=false from ParseAPIServerPathToDep and we fall back.
 	gvr, namespace, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)
 	if !parseOK {
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 
@@ -258,6 +268,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// to serve from. cache.Disabled() also implies no watcher.
 	rw := cache.Global()
 	if rw == nil || rw.IsPassthrough() || cache.Disabled() {
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 
@@ -266,6 +277,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// such a read would return shape-incompatible bytes. The pivot
 	// MUST fall through to the apiserver for these GVRs.
 	if rw.IsMetadataOnly(gvr) {
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 
@@ -289,6 +301,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			slog.String("name", name),
 			slog.String("path", call.Path),
 		)
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 
@@ -310,6 +323,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				slog.String("ns", namespace),
 				slog.Any("err", err),
 			)
+			dispatchInformerFallthrough.Add(1)
 			return nil, false
 		}
 		log.Debug("informer_dispatch.list_served",
@@ -318,6 +332,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			slog.Int("items", len(items)),
 			slog.Int("bytes", len(raw)),
 		)
+		dispatchInformerListServed.Add(1)
 		return raw, true
 	}
 
@@ -334,6 +349,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			slog.String("ns", namespace),
 			slog.String("name", name),
 		)
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 	raw, err := json.Marshal(obj.Object)
@@ -344,6 +360,7 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			slog.String("name", name),
 			slog.Any("err", err),
 		)
+		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
 	log.Debug("informer_dispatch.get_served",
@@ -352,5 +369,6 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		slog.String("name", name),
 		slog.Int("bytes", len(raw)),
 	)
+	dispatchInformerGetServed.Add(1)
 	return raw, true
 }

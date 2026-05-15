@@ -29,18 +29,82 @@ type Result struct {
 func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	log := xcontext.Logger(ctx)
 
-	// Cache routing gate. At 0.30.1 cache.Disabled() defaults to true
-	// and we always fall through to the apiserver branch below. The
-	// 0.30.2 ship lands the cache-served branch above this fall-through.
+	// Cache routing gate. When the cache subsystem is disabled
+	// (CACHE_ENABLED unset/false) there is no informer to serve from;
+	// every read goes straight to the apiserver. We do NOT increment the
+	// fallthrough counter here — the counters measure the 0.30.96 routed
+	// pivot's serve rate, and cache-disabled is "pivot inactive", not a
+	// pivot fallthrough.
 	if cache.Disabled() {
 		return getFromAPIServer(ctx, ref)
 	}
 
-	// Routed branch — placeholder for 0.30.2 wiring. Falls through to
-	// the apiserver branch at 0.30.1 because no consumer registered a
-	// ResourceWatcher with the relevant GVR yet.
-	log.Debug("objects.Get: cache routed but no watcher injected; falling back to apiserver",
-		slog.String("gvr", ref.APIVersion+"/"+ref.Resource))
+	// 0.30.96 Gap A — routed branch. Serve widget / entry-CR object GETs
+	// from the in-process informer cache. Gated by the SAME
+	// RESOLVER_USE_INFORMER flag as the 0.30.95 resolver pivot: with the
+	// flag unset this whole block is skipped and the binary is
+	// byte-identical to 0.30.95 (R-FALSE-1 invariant preserved).
+	//
+	// Per feedback_no_special_cases.md: the branch is uniform across
+	// every GVR — the gate is cache-mode + informer-state predicates,
+	// never a per-resource switch.
+	if useInformer() {
+		// Lazy-start the objects_get.summary goroutine the first time
+		// the pivot is exercised (sync.Once-bounded; never started when
+		// the flag stays off for the process lifetime).
+		startObjectsGetSummary()
+
+		gv, err := schema.ParseGroupVersion(ref.APIVersion)
+		if err == nil {
+			gvr := gv.WithResource(ref.Resource)
+			rw := cache.Global()
+			// Passthrough mode has no informers (cache=off diagnostic
+			// mode); metadata-only GVRs carry only ObjectMeta — neither
+			// can satisfy a full-object resolver read.
+			if rw != nil && !rw.IsPassthrough() && !rw.IsMetadataOnly(gvr) {
+				if !rw.IsSynced(gvr) {
+					// Not registered / not yet synced. Fire best-effort
+					// lazy registration so a SUBSEQUENT call can serve;
+					// EnsureResourceType is idempotent + singleflighted
+					// under rw.mu. This call still falls through to the
+					// apiserver — pre-sync reads would look identical to
+					// a real NotFound.
+					_, _ = rw.EnsureResourceType(gvr)
+					log.Debug("objects.Get: informer not synced; apiserver fallthrough",
+						slog.String("gvr", gvr.String()),
+						slog.String("ns", ref.Namespace),
+						slog.String("name", ref.Name))
+				} else if obj, hit := rw.GetObject(gvr, ref.Namespace, ref.Name); hit {
+					// Cache hit. DeepCopy so the strip never mutates the
+					// shared informer-store object, then apply the EXACT
+					// same field strips getFromAPIServer performs (see
+					// stripForServe — byte-equivalence is mandatory per
+					// feedback_cache_must_not_constrain_jq.md).
+					out := obj.DeepCopy()
+					stripForServe(out)
+					objectsGetInformerServed.Add(1)
+					log.Debug("objects.Get: served from informer",
+						slog.String("gvr", gvr.String()),
+						slog.String("ns", ref.Namespace),
+						slog.String("name", ref.Name))
+					res.GVR = gvr
+					res.Unstructured = out
+					return res
+				}
+				// GET-miss (informer synced, object absent): fall
+				// through to the apiserver so the caller sees the
+				// apiserver NotFound envelope shape.
+			}
+		}
+		// Any fall-through inside the routed branch — parse failure,
+		// nil/passthrough/metadata-only watcher, not-synced, GET-miss —
+		// is an apiserver-served call under the active pivot.
+		objectsGetApiserverFallthrough.Add(1)
+		return getFromAPIServer(ctx, ref)
+	}
+
+	// Flag off: pivot inactive. Take the apiserver branch unchanged from
+	// pre-0.30.96. No counter increment — see the cache.Disabled() note.
 	return getFromAPIServer(ctx, ref)
 }
 
