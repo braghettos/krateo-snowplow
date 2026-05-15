@@ -3,8 +3,13 @@ package api
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"runtime"
+	"strconv"
+	"sync"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -16,9 +21,37 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
+
+// iterParallelism returns the per-stage inner-call fan-out width.
+//
+// Default is GOMAXPROCS(0); env override RESOLVER_ITER_PARALLELISM
+// (positive integer) takes precedence when set. The value is clamped
+// to [1, 32] — the upper bound caps tail-latency damage from a
+// pathological stage (e.g. 5000 inner calls × 100ms apiserver latency
+// at unbounded width would saturate the apiserver, the snowplow pod's
+// HTTP client pool, AND the Go scheduler simultaneously).
+//
+// Per architect's design 0.30.95: bound is hard-capped at the resolver
+// boundary, NOT per-resource — no per-GVR carve-outs (feedback_no_special_cases.md).
+func iterParallelism() int {
+	n := runtime.GOMAXPROCS(0)
+	if s := os.Getenv("RESOLVER_ITER_PARALLELISM"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			n = v
+		}
+	}
+	if n > 32 {
+		n = 32
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
 
 // lazyRegisterSlowThreshold is the ceiling above which EnsureResourceType
 // emits a WARN log line. The call itself is just `rw.mu.Lock()` plus a
@@ -224,37 +257,46 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// 0.30.92 first-read-latency follow-up has a falsifier.
 		lazyRegisterInnerCallPaths(log, tmp)
 
-		for _, call := range tmp {
+		// 0.30.95 bounded-parallel inner-call iterator.
+		//
+		// Pre-0.30.95 the inner-call loop was sequential — N inner calls
+		// against the apiserver paid N × per-call latency. The architect's
+		// 0.30.95 design replaces it with a bounded errgroup whose width
+		// is iterParallelism() (GOMAXPROCS default, env-overridable, hard
+		// cap 32). dictMu serialises all writes against `dict` from
+		// concurrent goroutines (jsonHandler closure + error-branch
+		// inline). gctx flows into httpcall.Do so the first hard-error
+		// cancels in-flight peers when ContinueOnError=false.
+		//
+		// Edge type 3 dep-recording stays INLINE before g.Go (per the
+		// 0.30.94 contract — sync.Map under the hood, safe to call from
+		// the parent goroutine, no need to record from inside the worker).
+		//
+		// The success-branch log calls mapDepth(dict) which walks dict —
+		// that read must be serialised against concurrent jsonHandler
+		// writes too, so we take dictMu there as well.
+		var dictMu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(iterParallelism())
+
+		for i := range tmp {
+			call := tmp[i]
 			call.Endpoint = &ep
-			call.ResponseHandler = jsonHandler(ctx, jsonHandlerOptions{
+			// Wrap jsonHandler so every dict[id] mutation goes through
+			// dictMu. The inner closure is the per-call ResponseHandler
+			// that httpcall.Do invokes from inside its goroutine.
+			inner := jsonHandler(gctx, jsonHandlerOptions{
 				key: id, out: dict, filter: apiCall.Filter,
 			})
+			call.ResponseHandler = func(r io.ReadCloser) error {
+				dictMu.Lock()
+				defer dictMu.Unlock()
+				return inner(r)
+			}
 
-			// 0.30.94 Edge type 3: record a resolver-side dep edge so a
-			// future DELETE/UPDATE on the K8s object this inner call
-			// reads from will evict / refresh the L1 entry currently
-			// being populated.
-			//
-			// The dispatcher attached the L1 key via cache.WithL1KeyContext
-			// before calling restactions.Resolve. Empty L1 key means
-			// either L1 is disabled or the current request is a cache
-			// hit (which doesn't take this path anyway) — in both cases
-			// we skip recording.
-			//
-			// Verb filter: GET-only at this tag. PUT/POST/PATCH/DELETE
-			// are mutations and the response should not establish a dep
-			// edge against the mutation target (the edge would be on
-			// the GET response shape, not the mutation target). Per
-			// plan §0.30.94 "Verb filter rationale" — conservative
-			// allowlist; extend if HEAD-shaped reads surface later.
-			//
-			// Parser: ParseAPIServerPathToDep handles 8 canonical apiserver
-			// shapes uniformly (per feedback_no_special_cases.md — no
-			// per-resource carve-outs). name=="" signals list-scope.
-			//
-			// Idempotency: cache.Deps().Record / RecordList are sync.Map
-			// LoadOrStore — repeated edges (iterator pages, retried
-			// stages) are sub-microsecond no-ops.
+			// Edge type 3 dep recording — see 0.30.94 ship for full
+			// rationale. cache.Deps() is sync.Map-backed; idempotent
+			// LoadOrStore; safe from this (parent-goroutine) site.
 			if l1Key := cache.L1KeyFromContext(ctx); l1Key != "" && !cache.Disabled() {
 				if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
 					if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
@@ -275,38 +317,103 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 			}
 
-			log.Debug("calling api", slog.String("name", id),
-				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
-				slog.Any("out", dict),
-			)
+			g.Go(func() error {
+				log.Debug("calling api", slog.String("name", id),
+					slog.String("host", call.Endpoint.ServerURL),
+					slog.String("path", call.Path),
+				)
 
-			res := httpcall.Do(ctx, call)
-			if res.Status == response.StatusFailure {
-				log.Error("api call response failure", slog.String("name", id),
-					slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
-					slog.String("error", res.Message))
-
-				tmp, err := response.AsMap(res)
-				if err != nil {
-					log.Warn("unable to encode status as dict", slog.Any("err", err))
+				// 0.30.95 resolver pivot — dispatch GET reads to the
+				// informer cache when RESOLVER_USE_INFORMER=true.
+				// Flag default OFF: this branch is byte-identical to
+				// 0.30.94 with the flag unset (R-FALSE-1 invariant).
+				//
+				// The pivot returns served=true ONLY when the call is
+				// safely cache-servable (GET, parseable apiserver path,
+				// cache=on, full-Unstructured informer, synced). All
+				// other shapes (write verbs, subresources, external
+				// URLs, metadata-only GVRs, pre-sync, 404) fall through
+				// to the apiserver branch below unchanged.
+				//
+				// When served=true the call.ResponseHandler lambda
+				// (constructed above, line ~291) is invoked with the
+				// cache-served bytes. That lambda holds dictMu before
+				// delegating to jsonHandler, so the dict mutation
+				// contract is identical between pivot and apiserver
+				// branches — no second mutex path.
+				if resolverUseInformer() == "true" {
+					if raw, served := dispatchViaInformer(gctx, call); served {
+						if err := call.ResponseHandler(readerFromBytes(raw)); err != nil {
+							return err
+						}
+						dictMu.Lock()
+						depth := mapDepth(dict)
+						dictMu.Unlock()
+						log.Info("api successfully resolved",
+							slog.String("name", id),
+							slog.String("host", call.Endpoint.ServerURL),
+							slog.String("path", call.Path),
+							slog.Int("depth", depth),
+							slog.String("dispatch", "informer"),
+						)
+						return nil
+					}
 				}
 
-				if len(tmp) > 0 {
-					dict[call.ErrorKey] = tmp
-				} else {
-					dict[call.ErrorKey] = res.Message
+				res := httpcall.Do(gctx, call)
+				if res.Status == response.StatusFailure {
+					log.Error("api call response failure", slog.String("name", id),
+						slog.String("host", call.Endpoint.ServerURL),
+						slog.String("path", call.Path),
+						slog.String("error", res.Message))
+
+					asMap, mapErr := response.AsMap(res)
+					if mapErr != nil {
+						log.Warn("unable to encode status as dict", slog.Any("err", mapErr))
+					}
+
+					dictMu.Lock()
+					if len(asMap) > 0 {
+						dict[call.ErrorKey] = asMap
+					} else {
+						dict[call.ErrorKey] = res.Message
+					}
+					dictMu.Unlock()
+
+					if !call.ContinueOnError {
+						// Returning a non-nil error cancels gctx so
+						// in-flight peers short-circuit; g.Wait() picks
+						// up the first such error. dict already carries
+						// call.ErrorKey from the lock-protected write
+						// above, matching the pre-0.30.95 sequential
+						// early-return contract.
+						return fmt.Errorf("api %s failed: %s", id, res.Message)
+					}
+					// ContinueOnError: fall through to the success-log
+					// line (preserves pre-0.30.95 behaviour where the
+					// "successfully resolved" line emitted on every
+					// non-hard-error call).
 				}
 
-				if !call.ContinueOnError {
-					return dict
-				}
-			}
+				// mapDepth walks dict — serialise against concurrent
+				// jsonHandler writes by reading under dictMu.
+				dictMu.Lock()
+				depth := mapDepth(dict)
+				dictMu.Unlock()
+				log.Info("api successfully resolved",
+					slog.String("name", id),
+					slog.String("host", call.Endpoint.ServerURL),
+					slog.String("path", call.Path),
+					slog.Int("depth", depth),
+				)
+				return nil
+			})
+		}
 
-			log.Info("api successfully resolved",
-				slog.String("name", id),
-				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
-				slog.Any("depth", mapDepth(dict)),
-			)
+		if err := g.Wait(); err != nil {
+			log.Debug("api stage short-circuited on hard error",
+				slog.String("name", id), slog.Any("err", err))
+			return dict
 		}
 
 		// Tag 0.30.9 Sub-scope A: refilter the SA-dispatched result

@@ -718,6 +718,31 @@ func (rw *ResourceWatcher) IsMetadataOnly(gvr schema.GroupVersionResource) bool 
 	return ok
 }
 
+// IsSynced reports whether the informer for gvr has completed its
+// initial LIST. Returns false for nil receivers, passthrough mode,
+// unknown GVRs, or in-flight initial sync. Cheap (RLock + map lookup
+// + atomic HasSynced load).
+//
+// Used by the 0.30.95 resolver pivot (`dispatchViaInformer`) to gate
+// cache-served reads behind first-LIST completion — pre-sync reads
+// would return empty slices that look identical to "no objects exist",
+// silently breaking widget JQ filters. The pivot falls through to
+// apiserver until HasSynced flips true.
+//
+// Safe for concurrent use.
+func (rw *ResourceWatcher) IsSynced(gvr schema.GroupVersionResource) bool {
+	if rw == nil || rw.mode == modePassthrough {
+		return false
+	}
+	rw.mu.RLock()
+	gi, ok := rw.informers[gvr]
+	rw.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	return gi.Informer().HasSynced()
+}
+
 // addResourceTypeLocked is the lock-held implementation of
 // AddResourceType. Callers MUST hold rw.mu.Lock().
 //

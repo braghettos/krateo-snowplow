@@ -85,33 +85,28 @@ type gvrPattern struct {
 	ResourcePrefix string
 }
 
-// metadataOnlyGVRSeed is the static-seed allow-list per plan
-// §"Revision 18 implementation outline" item 2.2. It is GVR-pattern
-// (Group + Resource-prefix), explicit, finite, and audited at review.
+// metadataOnlyGVRSeed is intentionally empty. The static-seed mechanism
+// is retained so a future pattern can be added if a structural reason
+// emerges, but per Diego's 2026-05-15 directive — and the original
+// 2026-05-14 rejection of the composition.krateo.io seed as "still
+// business logic hardcoded" — no hardcoded GVR patterns ship in this
+// list. Metadata-only routing is opt-in via the CRD annotation
+// `krateo.io/cache-mode: metadata` only.
 //
-// Why every entry's Group is `composition.krateo.io`: that group is
-// where `core-provider` generates Composition CRDs from
-// CompositionDefinitions. Customer-supplied CRDs in other groups are
-// unaffected by this seed (they only opt into metadata-only via the
-// explicit annotation in item 2.1).
+// Trade-off accepted: composition.krateo.io now defaults to full
+// Unstructured informer. At 50K composition scale this adds ~1 GiB to
+// the indexer footprint. The 8 GiB chart limit (4 GiB request)
+// provides headroom; the 0.30.92 OOM at 2 GiB no longer applies. The
+// resolver pivot to lister-only reads benefits directly — without this
+// removal, compositions-list would fall back to apiserver. With it,
+// every K8s read shape A-D in the resolver can serve from the lister.
 //
-// Per `feedback_no_special_cases.md`: each entry is GVR-shaped, not a
-// per-Resource switch in the predicate code; future Composition
-// families ship as additional patterns here rather than as Go control
-// flow.
-var metadataOnlyGVRSeed = []gvrPattern{
-	{Group: "composition.krateo.io", ResourcePrefix: ""},
-	// Adding `ResourcePrefix: ""` matches every resource in
-	// `composition.krateo.io`. This is the Krateo Composition family,
-	// which is the single high-cardinality CRD group at production
-	// scale (50K compositions per `project_production_scale.md`).
-	// Customer CRDs in this group are part of the Krateo Composition
-	// product surface — if a customer needs a non-Composition CRD in
-	// this group AND wants full-Unstructured informer routing, they
-	// can omit the annotation AND we can refine this pattern. As of
-	// 2026-05-14 the seed conservatively routes the entire group to
-	// metadata-only to ensure OOM-safety on the 1.8 GiB budget.
-}
+// Per `feedback_no_special_cases.md`: the predicate stays a uniform
+// pattern matcher; what changes is that the data feeding it is now
+// empty. Adding patterns here is reserved for structural needs (e.g.,
+// a customer CRD whose annotation cannot be set upstream and that
+// presents an OOM-class footprint) — not for product-family carve-outs.
+var metadataOnlyGVRSeed = []gvrPattern{}
 
 // annotatedGVRs is the runtime-discovered set of GVRs whose CRD carries
 // `krateo.io/cache-mode: metadata`. Populated once at startup by

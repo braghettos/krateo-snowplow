@@ -30,11 +30,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// TestShouldUseMetadataOnly_StaticSeedComposition asserts that the
-// canonical Composition family GVR routes to metadata-only even with
-// the annotation set empty (the seed is operationally-required today
-// per plan §"Revision 18 implementation outline" item 2.2).
-func TestShouldUseMetadataOnly_StaticSeedComposition(t *testing.T) {
+// TestShouldUseMetadataOnly_StaticSeedEmpty asserts that the
+// composition.krateo.io family — previously hardcoded into the static
+// seed per 0.30.93 — now routes to the full Unstructured informer by
+// default. Per 2026-05-15 directive: no hardcoded GVR business logic
+// in the seed. Customer CRDs opt into metadata-only via the
+// `krateo.io/cache-mode: metadata` annotation only.
+func TestShouldUseMetadataOnly_StaticSeedEmpty(t *testing.T) {
 	resetMetadataOnlyAnnotationsForTest()
 
 	cases := []struct {
@@ -42,7 +44,7 @@ func TestShouldUseMetadataOnly_StaticSeedComposition(t *testing.T) {
 		gvr  schema.GroupVersionResource
 	}{
 		{
-			name: "githubscaffoldingwithcompositionpages v1-2-2",
+			name: "githubscaffoldingwithcompositionpages v1-2-2 (was seed-matched)",
 			gvr: schema.GroupVersionResource{
 				Group:    "composition.krateo.io",
 				Version:  "v1-2-2",
@@ -50,15 +52,7 @@ func TestShouldUseMetadataOnly_StaticSeedComposition(t *testing.T) {
 			},
 		},
 		{
-			name: "githubscaffoldingwithcompositionpages v12-8-3 (future version)",
-			gvr: schema.GroupVersionResource{
-				Group:    "composition.krateo.io",
-				Version:  "v12-8-3",
-				Resource: "githubscaffoldingwithcompositionpages",
-			},
-		},
-		{
-			name: "vmmigration (different Composition family)",
+			name: "vmmigration (was seed-matched)",
 			gvr: schema.GroupVersionResource{
 				Group:    "composition.krateo.io",
 				Version:  "v1",
@@ -68,13 +62,21 @@ func TestShouldUseMetadataOnly_StaticSeedComposition(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if !shouldUseMetadataOnly(tc.gvr) {
-				t.Fatalf("expected shouldUseMetadataOnly(%v) = true via static seed; got false", tc.gvr)
-			}
-			if got := metadataOnlyReason(tc.gvr); got != "static_seed" {
-				t.Fatalf("expected reason='static_seed' for %v; got %q", tc.gvr, got)
+			if shouldUseMetadataOnly(tc.gvr) {
+				t.Fatalf("expected shouldUseMetadataOnly(%v) = false (seed is now empty); got true", tc.gvr)
 			}
 		})
+	}
+}
+
+// TestStaticSeedIsEmpty is the binding falsifier for the 2026-05-15
+// rule: the seed slice must contain zero patterns. If a future
+// contributor adds a pattern back without the architectural review
+// path, this test fails loudly.
+func TestStaticSeedIsEmpty(t *testing.T) {
+	if len(metadataOnlyGVRSeed) != 0 {
+		t.Fatalf("metadataOnlyGVRSeed must be empty per 2026-05-15 directive; got %d entries: %v",
+			len(metadataOnlyGVRSeed), metadataOnlyGVRSeed)
 	}
 }
 

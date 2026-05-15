@@ -184,12 +184,12 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 	t.Fatalf("DepTracker.OnDelete did not evict L1 entry %s within 3s after metadata-only DELETE", l1Key)
 }
 
-// TestEnsureResourceType_RoutesCompositionToMetadataOnly verifies the
-// predicate-driven dispatch in EnsureResourceType selects the
-// metadata-only path for a composition.krateo.io GVR when the metadata
-// client is wired. This is the production code path; the explicit
-// entry point covered in the previous test is the test/diagnostic path.
-func TestEnsureResourceType_RoutesCompositionToMetadataOnly(t *testing.T) {
+// TestEnsureResourceType_RoutesCompositionToFullInformerByDefault asserts
+// the inverse of the prior 0.30.93 behavior: with the static seed now
+// empty (per 2026-05-15 directive), composition.krateo.io GVRs default
+// to the full Unstructured informer. Metadata-only routing is opt-in
+// via the `krateo.io/cache-mode: metadata` CRD annotation only.
+func TestEnsureResourceType_RoutesCompositionToFullInformerByDefault(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
@@ -203,11 +203,6 @@ func TestEnsureResourceType_RoutesCompositionToMetadataOnly(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		rw.Stop()
-		// Allow informer goroutines bounded by stopCh to exit BEFORE
-		// the next test in the package samples runtime.NumGoroutine
-		// (TestNewResourceWatcher_DormantWhenCacheDisabled). 100 ms
-		// exceeds the 50 ms waitInformerSync poll tick + observed
-		// metadata fake watch teardown latency.
 		time.Sleep(100 * time.Millisecond)
 	})
 
@@ -219,10 +214,18 @@ func TestEnsureResourceType_RoutesCompositionToMetadataOnly(t *testing.T) {
 	if !added {
 		t.Fatalf("first EnsureResourceType: want added=true; got false")
 	}
-	if !rw.IsMetadataOnly(compositionGVR) {
-		t.Fatalf("composition GVR MUST take metadata-only path via predicate; IsMetadataOnly=false")
+	if rw.IsMetadataOnly(compositionGVR) {
+		t.Fatalf("composition GVR MUST default to full Unstructured informer (seed empty, no annotation); IsMetadataOnly=true")
 	}
 }
+
+// Annotation-driven metadata-only routing is covered by
+// TestShouldUseMetadataOnly_AnnotationDiscovery in cache_mode_test.go
+// (internal package, can manipulate annotatedGVRs directly). The
+// watcher-level dispatch wiring is covered by
+// TestEnsureResourceType_RoutesCompositionToFullInformerByDefault
+// above (default path) and TestEnsureResourceType_RoutesNonSeedToFullInformer
+// below.
 
 // TestEnsureResourceType_RoutesNonSeedToFullInformer asserts that a
 // non-Composition, non-annotated GVR takes the dynamic full-informer
