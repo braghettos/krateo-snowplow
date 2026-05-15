@@ -108,6 +108,49 @@ type ResourceWatcher struct {
 	informers map[schema.GroupVersionResource]informers.GenericInformer
 	started   bool
 
+	// --- 0.30.98 Tag A: four-conjunct servability gate ---
+	//
+	// servable(gvr) := registered(gvr) AND HasSynced(gvr)
+	//                  AND watchHealthy(gvr) AND resourceTypeConfirmed(gvr)
+	//
+	// The two maps below back conjuncts 3 and 4. Both are guarded by
+	// rw.mu (same lock as rw.informers) — no separate mutex. Neither
+	// holds per-Resource policy: they are populated uniformly for every
+	// registered GVR (feedback_no_special_cases.md).
+
+	// watchBroken records GVRs whose informer reflector has dropped its
+	// WATCH connection (conjunct 3). Set by the SetWatchErrorHandler
+	// closure installed before Informer().Run; cleared by the discovery-
+	// refresh ticker once the informer's LastSyncResourceVersion advances
+	// (a successful relist). A broken-WATCH informer has a potentially
+	// stale store, so the pivot must fall through to apiserver until the
+	// reflector reconnects.
+	watchBroken map[schema.GroupVersionResource]struct{}
+
+	// confirmed records GVRs whose resource *type* has been verified to
+	// exist in the apiserver's currently-served API surface (conjunct 4 —
+	// THE S4 FIX). A GVR is confirmed only after the discovery-refresh
+	// ticker observes its group/version serving a non-empty
+	// APIResourceList. A registered+synced informer whose type was NOT
+	// served at initial-LIST time (a post-startup CRD) latches
+	// HasSynced=true over an empty result; without this conjunct the
+	// pivot would serve [] as servable=true (the S4 regression).
+	confirmed map[schema.GroupVersionResource]struct{}
+
+	// lastSyncRV tracks the per-GVR LastSyncResourceVersion observed by
+	// the most recent discovery refresh. Used to detect a successful
+	// relist (RV advanced) so watchBroken can be cleared. Guarded by
+	// rw.mu.
+	lastSyncRV map[schema.GroupVersionResource]string
+
+	// disco is the discovery client used by resourceTypeConfirmed. nil
+	// is a valid state: when no discovery client is wired,
+	// resourceTypeConfirmed defaults to true so the pivot keeps its
+	// pre-0.30.98 HasSynced-only behaviour rather than dying entirely.
+	// This is a uniform degradation policy, not a per-GVR carve-out.
+	// Set once at startup via SetDiscoveryClient. Guarded by rw.mu.
+	disco ResourceTypeDiscovery
+
 	// metadataOnly is the set of GVRs that were registered via the
 	// metadata-only path. Kept so observability tools (logs, future
 	// metrics, the §0.30.93 stress falsifier's
@@ -206,6 +249,9 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 			informers:    map[schema.GroupVersionResource]informers.GenericInformer{},
 			syncCh:       map[schema.GroupVersionResource]chan struct{}{},
 			metadataOnly: map[schema.GroupVersionResource]struct{}{},
+			watchBroken:  map[schema.GroupVersionResource]struct{}{},
+			confirmed:    map[schema.GroupVersionResource]struct{}{},
+			lastSyncRV:   map[schema.GroupVersionResource]string{},
 			stopCh:       make(chan struct{}),
 		}, nil
 	}
@@ -232,6 +278,9 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		informers:    map[schema.GroupVersionResource]informers.GenericInformer{},
 		syncCh:       map[schema.GroupVersionResource]chan struct{}{},
 		metadataOnly: map[schema.GroupVersionResource]struct{}{},
+		watchBroken:  map[schema.GroupVersionResource]struct{}{},
+		confirmed:    map[schema.GroupVersionResource]struct{}{},
+		lastSyncRV:   map[schema.GroupVersionResource]string{},
 		stopCh:       make(chan struct{}),
 	}
 	_ = ctx // reserved for future wiring (0.30.6 eager-registration caller may pass-through)
@@ -252,6 +301,11 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	// called Start yet, so the error path is unreachable. We log a
 	// WARN if it ever happens to surface the regression rather than
 	// failing the boot.
+	//
+	// 0.30.98 Tag A: install the WATCH-error handler in the SAME
+	// pre-Start window (conjunct 3). SetWatchErrorHandler returns an
+	// error once the informer has started — calling it here, before
+	// factory.Start, keeps the error path unreachable.
 	for gvr, gi := range rw.informers {
 		resourceType := gvrResourceTypeString(gvr)
 		tf := StripBulkyFieldsForResourceType(resourceType, gvr)
@@ -262,6 +316,7 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 				slog.String("error", err.Error()),
 			)
 		}
+		rw.installWatchErrorHandler(gvr, gi)
 	}
 
 	// 0.30.6 plan §Risks bullet 1 — startup assertion. The typed
@@ -623,6 +678,12 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 		)
 	}
 
+	// 0.30.98 Tag A: install the WATCH-error handler BEFORE Run
+	// (conjunct 3) — same uniform wiring as the dynamic full-informer
+	// path. The metadata-only reflector drops its WATCH on the same
+	// failure modes, so the servability gate must observe it.
+	rw.installWatchErrorHandler(gvr, gi)
+
 	// Start the metadata informer and spawn the sync-watcher. We
 	// always reach this branch post-Start (the constructor never
 	// metadata-registers; only lazy EnsureResourceType does), so the
@@ -847,6 +908,11 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	}
 
 	if rw.started {
+		// 0.30.98 Tag A: install the WATCH-error handler BEFORE Run
+		// (conjunct 3). SetWatchErrorHandler returns an error once the
+		// informer has started, so it must precede the Run goroutine.
+		rw.installWatchErrorHandler(gvr, gi)
+
 		// Late registration after Start(): kick the new informer.
 		go gi.Informer().Run(rw.stopCh)
 
@@ -1157,10 +1223,16 @@ func listFromIndexer(gi informers.GenericInformer, namespace string) []*unstruct
 // the registered/synced state could flip, or HasSynced() could report
 // true while the indexer partition was still draining, yielding a
 // transiently-empty slice served as `served=true`. The registered+synced
-// check and the indexer read now live behind ONE method: the indexer is
-// only read once HasSynced has been observed true on the SAME gi handle.
-// A genuinely-empty-but-synced informer still returns ([], true) — that
-// is a real answer the watcher can vouch for and MUST keep serving.
+// check and the indexer read now live behind ONE method.
+//
+// 0.30.98 Tag A: the servability check is the four-conjunct
+// servableLocked predicate — registered AND HasSynced AND watchHealthy
+// AND resourceTypeConfirmed. The indexer is read off the SAME gi handle
+// that servableLocked just vouched for, all under one rw.mu read hold.
+// A genuinely-empty-but-synced-confirmed informer still returns
+// ([], true) — that is a real answer the watcher can vouch for and MUST
+// keep serving. An unconfirmed post-startup-CRD GVR returns (nil, false)
+// — the S4 fix (regression journal 2026-05-15).
 //
 // Per `feedback_no_special_cases.md`: a uniform predicate over GVRs —
 // no per-GVR carve-out.
@@ -1174,33 +1246,38 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 		return rw.listPassthrough(gvr, namespace), true
 	}
 	rw.mu.RLock()
-	gi, ok := rw.informers[gvr]
-	rw.mu.RUnlock()
-	if !ok || !gi.Informer().HasSynced() {
+	defer rw.mu.RUnlock()
+	gi, ok := rw.servableLocked(gvr)
+	if !ok {
 		return nil, false
 	}
 	return listFromIndexer(gi, namespace), true
 }
 
 // IsServable reports whether the watcher can vouch for a cache-served
-// read of gvr: in modeInformer that means the GVR has a registered
-// informer whose initial LIST has completed (HasSynced). Returns false
-// for a nil receiver, passthrough mode (no informers exist — callers
-// route directly to the apiserver), an unregistered GVR, or an
-// in-flight initial sync.
+// read of gvr. Returns false for a nil receiver or passthrough mode (no
+// informers exist — callers route directly to the apiserver).
 //
-// 0.30.97: the GET-path analogue of ListObjectsServable's servability
-// gate. Callers (the resolver pivot's GET branch, objects.Get) MUST
-// only serve a GetObject hit when IsServable(gvr) holds — a
-// not-yet-fully-synced informer can otherwise serve a stale/partial
-// object or a miss indistinguishable from a real NotFound.
+// 0.30.98 Tag A: IsServable is the GET-path entry to the SINGLE
+// four-conjunct servability predicate (servableLocked):
+//
+//	servable(gvr) := registered(gvr) AND HasSynced(gvr)
+//	                 AND watchHealthy(gvr) AND resourceTypeConfirmed(gvr)
+//
+// The fourth conjunct is the S4 fix: a registered+synced informer whose
+// resource *type* did not exist at initial-LIST time (a post-startup
+// CRD) latches HasSynced=true over an empty result. Without
+// resourceTypeConfirmed the pivot served [] as servable=true, zeroing
+// the Compositions feature (regression journal 2026-05-15).
 //
 // IsServable is intentionally NOT a superset of IsMetadataOnly: the
 // metadata-only gate is a separate, orthogonal concern (it asks "does
 // this informer carry full spec/status, or only ObjectMeta?"). Every
 // current caller already checks IsMetadataOnly explicitly before the
 // servability check, so folding it in here would duplicate the gate.
-// IsServable stays purely "registered AND synced".
+//
+// Per feedback_no_special_cases.md: servableLocked is uniform over every
+// GVR — no per-Resource carve-out, no hardcoded business-GVR list.
 //
 // Safe for concurrent use; takes rw.mu in read mode.
 func (rw *ResourceWatcher) IsServable(gvr schema.GroupVersionResource) bool {
@@ -1208,9 +1285,54 @@ func (rw *ResourceWatcher) IsServable(gvr schema.GroupVersionResource) bool {
 		return false
 	}
 	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	_, ok := rw.servableLocked(gvr)
+	return ok
+}
+
+// servableLocked is the single four-conjunct servability predicate
+// shared by IsServable and ListObjectsServable. Callers MUST hold rw.mu
+// (read or write). Returns the resolved GenericInformer alongside the
+// bool so ListObjectsServable can read the indexer off the SAME gi
+// handle whose HasSynced was just observed true — no check-then-act gap.
+//
+// Conjuncts (all must hold):
+//  1. registered    — gvr has an entry in rw.informers.
+//  2. HasSynced      — the informer's initial LIST has reconciled.
+//  3. watchHealthy   — the reflector's WATCH connection is not broken
+//     (gvr absent from rw.watchBroken).
+//  4. typeConfirmed  — the resource *type* is verified present in the
+//     apiserver's served API surface, OR no discovery client is wired
+//     (degraded mode falls back to pre-0.30.98 HasSynced-only gating).
+func (rw *ResourceWatcher) servableLocked(gvr schema.GroupVersionResource) (informers.GenericInformer, bool) {
 	gi, ok := rw.informers[gvr]
-	rw.mu.RUnlock()
-	return ok && gi.Informer().HasSynced()
+	if !ok { // conjunct 1
+		return nil, false
+	}
+	if !gi.Informer().HasSynced() { // conjunct 2
+		return nil, false
+	}
+	if _, broken := rw.watchBroken[gvr]; broken { // conjunct 3
+		return nil, false
+	}
+	if !rw.resourceTypeConfirmedLocked(gvr) { // conjunct 4 — the S4 fix
+		return nil, false
+	}
+	return gi, true
+}
+
+// resourceTypeConfirmedLocked reports conjunct 4. Callers MUST hold
+// rw.mu. When no discovery client is wired (rw.disco == nil) it returns
+// true — a uniform degradation policy that preserves the pre-0.30.98
+// HasSynced-only behaviour rather than disabling the pivot entirely.
+// When a discovery client IS wired, a GVR is confirmed only after the
+// discovery-refresh ticker has observed its resource type being served.
+func (rw *ResourceWatcher) resourceTypeConfirmedLocked(gvr schema.GroupVersionResource) bool {
+	if rw.disco == nil {
+		return true
+	}
+	_, ok := rw.confirmed[gvr]
+	return ok
 }
 
 // listPassthrough is the modePassthrough implementation of ListObjects.

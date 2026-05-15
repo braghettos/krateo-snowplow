@@ -26,6 +26,7 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
@@ -158,6 +159,40 @@ func main() {
 							slog.Any("err", metaErr))
 					} else {
 						w.SetMetadataClient(metaCli)
+					}
+
+					// 0.30.98 Tag A: wire the discovery client for the
+					// four-conjunct servability gate's conjunct 4
+					// (resourceTypeConfirmed — the S4 fix). We use a RAW
+					// (uncached) discovery.DiscoveryClient deliberately:
+					// the discovery-refresh ticker MUST observe a
+					// post-startup CRD's group/version transitioning from
+					// un-served to served, and a memcache-backed client
+					// would mask that transition until an explicit
+					// Invalidate(). The ticker calls
+					// ServerResourcesForGroupVersion once per ~30s per
+					// registered group/version (deduped) — negligible
+					// apiserver load.
+					//
+					// Failure to construct the discovery client leaves
+					// rw.disco == nil; resourceTypeConfirmedLocked then
+					// defaults to true (the pivot keeps its pre-0.30.98
+					// HasSynced-only behaviour). The S4 fix is degraded
+					// but not crash-looping — a loud WARN flags it.
+					discoCli, discoErr := discovery.NewDiscoveryClientForConfig(rc)
+					if discoErr != nil {
+						log.Warn("cache: discovery.NewDiscoveryClientForConfig failed; resource-type confirmation offline (S4 gate degrades to HasSynced-only)",
+							slog.Any("err", discoErr))
+					} else {
+						w.SetDiscoveryClient(discoCli)
+						// Launch the ~30s discovery-refresh ticker. It
+						// primes confirmation once immediately, then
+						// re-confirms every registered GVR's resource
+						// type on each tick — flipping post-startup CRDs
+						// unconfirmed->confirmed and clearing watchBroken
+						// on a successful relist. Bound by cacheCtx +
+						// rw.stopCh.
+						w.StartDiscoveryRefresher(cacheCtx)
 					}
 
 					// §0.30.93 annotation discovery: one apiextensions
