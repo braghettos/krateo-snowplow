@@ -340,6 +340,50 @@ func TestGet_NotSynced_Fallthrough(t *testing.T) {
 	t.Fatalf("not-synced: EnsureResourceType side-effect — informer never reached synced within 3s")
 }
 
+// TestGet_UnservableGVR_Fallthrough — Tag 0.30.97. objects.Get gates
+// the informer-serve path on rw.IsServable (registered AND HasSynced),
+// the same uniform servability predicate the resolver pivot uses. A
+// GVR with no registered informer is not servable, so Get falls through
+// to the apiserver and increments ApiserverFallthrough — it must NOT
+// serve a stale/partial object or a miss indistinguishable from a real
+// NotFound. This is the objects.Get analogue of the 0.30.96 LIST
+// regression: the GET path carried the same (nil,false) overload.
+func TestGet_UnservableGVR_Fallthrough(t *testing.T) {
+	resetServeCounters()
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVER_USE_INFORMER", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		serveTestScheme(), serveTestListKinds())
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	t.Cleanup(func() {
+		rw.Stop()
+		time.Sleep(50 * time.Millisecond)
+	})
+	cache.SetGlobal(rw)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	// serveTestGVR is never registered — IsServable must be false.
+	if rw.IsServable(serveTestGVR) {
+		t.Fatalf("setup: serveTestGVR must NOT be servable (never registered)")
+	}
+
+	res := Get(context.Background(), serveTestRef("default", "alpha"))
+	if res.Unstructured != nil {
+		t.Fatalf("unservable GVR: expected apiserver fallthrough; got served object")
+	}
+	s := ObjectsGetStatsSnapshot()
+	if s.InformerServed != 0 {
+		t.Fatalf("unservable GVR: InformerServed must NOT increment; got %d", s.InformerServed)
+	}
+	if s.ApiserverFallthrough != 1 {
+		t.Fatalf("unservable GVR: ApiserverFallthrough want 1; got %d", s.ApiserverFallthrough)
+	}
+}
+
 // TestGet_MetadataOnly_Fallthrough — a GVR routed onto the
 // PartialObjectMetadata informer cannot satisfy a full-object read; Get
 // must fall through to apiserver. The informer is left untouched.

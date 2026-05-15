@@ -1108,7 +1108,15 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespac
 	if !ok {
 		return nil
 	}
+	return listFromIndexer(gi, namespace)
+}
 
+// listFromIndexer materializes the namespace-scoped slice for an
+// already-resolved informer. Pass empty namespace for cluster-wide.
+// Shared by ListObjects and ListObjectsServable so both render the
+// indexer partition identically (the byte-equivalence the resolver
+// pivot's JQ pipeline depends on — `feedback_cache_must_not_constrain_jq.md`).
+func listFromIndexer(gi informers.GenericInformer, namespace string) []*unstructured.Unstructured {
 	store := gi.Informer().GetIndexer()
 	var items []interface{}
 	if namespace == "" {
@@ -1129,6 +1137,80 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, namespac
 		}
 	}
 	return out
+}
+
+// ListObjectsServable returns (items, true) only when the watcher can
+// VOUCH for the answer: in modeInformer that means the GVR has a
+// registered informer AND its initial LIST has completed (HasSynced).
+// (nil, false) is returned for a nil receiver, an unregistered GVR, or
+// a registered-but-not-yet-synced informer — in every such case the
+// caller MUST fall through to the apiserver rather than emit an empty
+// list it cannot distinguish from a genuine "no objects" answer.
+//
+// In modePassthrough the call routes to the apiserver via the dynamic
+// client (listPassthrough) and the result is authoritative, so it
+// returns (routed-list, true).
+//
+// 0.30.97: this method exists to close the check-then-act gap in the
+// 0.30.95 resolver pivot. The pivot previously did IsSynced(gvr) then
+// ListObjects(gvr,...) as two separate lock acquisitions — between them
+// the registered/synced state could flip, or HasSynced() could report
+// true while the indexer partition was still draining, yielding a
+// transiently-empty slice served as `served=true`. The registered+synced
+// check and the indexer read now live behind ONE method: the indexer is
+// only read once HasSynced has been observed true on the SAME gi handle.
+// A genuinely-empty-but-synced informer still returns ([], true) — that
+// is a real answer the watcher can vouch for and MUST keep serving.
+//
+// Per `feedback_no_special_cases.md`: a uniform predicate over GVRs —
+// no per-GVR carve-out.
+//
+// Safe for concurrent use; takes rw.mu in read mode.
+func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, namespace string) ([]*unstructured.Unstructured, bool) {
+	if rw == nil {
+		return nil, false
+	}
+	if rw.mode == modePassthrough {
+		return rw.listPassthrough(gvr, namespace), true
+	}
+	rw.mu.RLock()
+	gi, ok := rw.informers[gvr]
+	rw.mu.RUnlock()
+	if !ok || !gi.Informer().HasSynced() {
+		return nil, false
+	}
+	return listFromIndexer(gi, namespace), true
+}
+
+// IsServable reports whether the watcher can vouch for a cache-served
+// read of gvr: in modeInformer that means the GVR has a registered
+// informer whose initial LIST has completed (HasSynced). Returns false
+// for a nil receiver, passthrough mode (no informers exist — callers
+// route directly to the apiserver), an unregistered GVR, or an
+// in-flight initial sync.
+//
+// 0.30.97: the GET-path analogue of ListObjectsServable's servability
+// gate. Callers (the resolver pivot's GET branch, objects.Get) MUST
+// only serve a GetObject hit when IsServable(gvr) holds — a
+// not-yet-fully-synced informer can otherwise serve a stale/partial
+// object or a miss indistinguishable from a real NotFound.
+//
+// IsServable is intentionally NOT a superset of IsMetadataOnly: the
+// metadata-only gate is a separate, orthogonal concern (it asks "does
+// this informer carry full spec/status, or only ObjectMeta?"). Every
+// current caller already checks IsMetadataOnly explicitly before the
+// servability check, so folding it in here would duplicate the gate.
+// IsServable stays purely "registered AND synced".
+//
+// Safe for concurrent use; takes rw.mu in read mode.
+func (rw *ResourceWatcher) IsServable(gvr schema.GroupVersionResource) bool {
+	if rw == nil || rw.mode == modePassthrough {
+		return false
+	}
+	rw.mu.RLock()
+	gi, ok := rw.informers[gvr]
+	rw.mu.RUnlock()
+	return ok && gi.Informer().HasSynced()
 }
 
 // listPassthrough is the modePassthrough implementation of ListObjects.

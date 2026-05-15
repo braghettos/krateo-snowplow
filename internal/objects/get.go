@@ -62,7 +62,16 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 			// mode); metadata-only GVRs carry only ObjectMeta — neither
 			// can satisfy a full-object resolver read.
 			if rw != nil && !rw.IsPassthrough() && !rw.IsMetadataOnly(gvr) {
-				if !rw.IsSynced(gvr) {
+				// 0.30.97: gate the served path on IsServable
+				// (registered AND HasSynced) — the uniform servability
+				// predicate also used by the resolver pivot. A
+				// not-yet-fully-synced widget GVR must never serve a
+				// stale/partial object: its indexer partition can still
+				// be draining even after HasSynced has flipped at the
+				// start of the processor drain, and a pre-sync miss is
+				// indistinguishable from a real NotFound. Anything
+				// non-servable falls through to the apiserver.
+				if !rw.IsServable(gvr) {
 					// Not registered / not yet synced. Fire best-effort
 					// lazy registration so a SUBSEQUENT call can serve;
 					// EnsureResourceType is idempotent + singleflighted
@@ -70,7 +79,7 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 					// apiserver — pre-sync reads would look identical to
 					// a real NotFound.
 					_, _ = rw.EnsureResourceType(gvr)
-					log.Debug("objects.Get: informer not synced; apiserver fallthrough",
+					log.Debug("objects.Get: informer not servable; apiserver fallthrough",
 						slog.String("gvr", gvr.String()),
 						slog.String("ns", ref.Namespace),
 						slog.String("name", ref.Name))

@@ -312,10 +312,29 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	}
 
 	if name == "" {
-		// LIST. namespace="" means cluster-wide. The indexer returns
-		// the full slice; we marshal as apiserver LIST envelope with
-		// the synthesized `<R>List` kind (PM-binding).
-		items := rw.ListObjects(gvr, namespace)
+		// LIST. namespace="" means cluster-wide. 0.30.97: serve via
+		// ListObjectsServable so the registered+synced check and the
+		// indexer read are ONE atomic-ish operation — no check-then-act
+		// gap between an IsSynced precheck and a separate ListObjects
+		// call. `servable=false` (unregistered GVR, or a registered
+		// informer whose initial LIST has not completed) MUST fall
+		// through to the apiserver: an empty slice from an unsynced or
+		// unregistered informer is indistinguishable from a genuine
+		// "no objects" answer, and silently serving it broke the
+		// Compositions feature at S4 (regression journal 2026-05-15).
+		// A genuinely-empty-but-synced informer still returns
+		// `servable=true` with an empty slice — that is a real answer
+		// the watcher can vouch for.
+		items, servable := rw.ListObjectsServable(gvr, namespace)
+		if !servable {
+			log.Debug("informer_dispatch.fallthrough.list_not_servable",
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", namespace),
+				slog.String("path", call.Path),
+			)
+			dispatchInformerFallthrough.Add(1)
+			return nil, false
+		}
 		raw, err := marshalAsList(apiVersion, listKindForResource(gvr.Resource), items)
 		if err != nil {
 			log.Warn("informer_dispatch.list_marshal_failed",
@@ -336,12 +355,29 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		return raw, true
 	}
 
-	// GET-by-name. The indexer returns (obj, true) on hit and
-	// (nil, false) on miss. A miss MUST fall through to apiserver
-	// — apiserver returns a 404 with a specific Status envelope that
-	// the JQ pipeline expects (Status kind, code:404). Serving a
-	// synthetic 404 here would either swallow the shape or duplicate
-	// it; the cleanest contract is "miss = let apiserver answer".
+	// GET-by-name. 0.30.97: re-check servability immediately before
+	// the indexer read. The Gate-6 IsSynced precheck above and this
+	// GetObject call are otherwise two separate lock acquisitions —
+	// the informer's registered/synced state could flip between them.
+	// IsServable (registered AND HasSynced) and GetObject share the
+	// same gi handle's HasSynced observation, so a not-yet-fully-synced
+	// GVR can never serve a stale/partial object here. `servable=false`
+	// falls through to the apiserver, same as the LIST branch.
+	if !rw.IsServable(gvr) {
+		log.Debug("informer_dispatch.fallthrough.get_not_servable",
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", namespace),
+			slog.String("name", name),
+		)
+		dispatchInformerFallthrough.Add(1)
+		return nil, false
+	}
+	// The indexer returns (obj, true) on hit and (nil, false) on
+	// miss. A miss MUST fall through to apiserver — apiserver returns
+	// a 404 with a specific Status envelope that the JQ pipeline
+	// expects (Status kind, code:404). Serving a synthetic 404 here
+	// would either swallow the shape or duplicate it; the cleanest
+	// contract is "miss = let apiserver answer".
 	obj, hit := rw.GetObject(gvr, namespace, name)
 	if !hit {
 		log.Debug("informer_dispatch.get_miss_fallthrough",

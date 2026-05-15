@@ -745,3 +745,172 @@ func TestListKindForResource(t *testing.T) {
 		})
 	}
 }
+
+// ----------------------------------------------------------------------
+// Tag 0.30.97 — servability fix for the pivot's handler-not-found
+// empty-list regression (regression journal 2026-05-15).
+//
+// 0.30.96 hard-failed Phase 6 at S4: the pivot routed a list of
+// `/api/v1/namespaces` through the informer for a GVR with NO
+// registered handler and returned an empty list as `served=true`,
+// zeroing the Compositions feature. The LIST branch now serves via
+// ListObjectsServable + the GET branch re-checks IsServable, so an
+// unregistered / not-yet-synced GVR yields `served=false` (apiserver
+// fallthrough) instead of a served-empty answer. A genuinely-empty but
+// synced informer MUST still serve `([], true)`.
+// ----------------------------------------------------------------------
+
+// namespacesGVR is the core-group GVR at the heart of the 0.30.96 S4
+// regression — `compositions-list`'s inner step lists it. It is never
+// registered by newDispatchWatcher, so it is the canonical "no handler"
+// GVR for the negative falsifier.
+var namespacesGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"}
+
+// dispatchTestListKindsWithNamespaces extends dispatchTestListKinds with
+// a NamespaceList entry so the LAZY informer that Gate 6 registers for
+// the never-registered namespaces GVR does not panic on its initial
+// LIST against the fake dynamic client.
+func dispatchTestListKindsWithNamespaces() map[schema.GroupVersionResource]string {
+	m := dispatchTestListKinds()
+	m[namespacesGVR] = "NamespaceList"
+	return m
+}
+
+// newDispatchWatcherWithNamespaces builds a synced cache=on watcher with
+// the test GVR registered but the namespaces GVR deliberately LEFT
+// UNREGISTERED. The dynamic fake knows the NamespaceList kind so Gate
+// 6's lazy EnsureResourceType side-effect is harmless.
+func newDispatchWatcherWithNamespaces(t *testing.T) *cache.ResourceWatcher {
+	t.Helper()
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		dispatchTestScheme(), dispatchTestListKindsWithNamespaces())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	t.Cleanup(func() {
+		rw.Stop()
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	added, syncCh := rw.EnsureResourceType(dispatchTestGVR)
+	if !added {
+		t.Fatalf("EnsureResourceType: want added=true")
+	}
+	select {
+	case <-syncCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("EnsureResourceType: informer did not sync within 5s")
+	}
+
+	cache.SetGlobal(rw)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+	return rw
+}
+
+// TestDispatchViaInformer_UnregisteredGVR_ListFallthrough is the
+// regression-binding test: a LIST for a GVR with NO registered informer
+// MUST take the apiserver fallthrough (served=false) — NOT a served-
+// empty answer. The fallthrough counter increments; list_served does
+// NOT (the negative falsifier — closes the 0.30.96 G3 blind spot).
+func TestDispatchViaInformer_UnregisteredGVR_ListFallthrough(t *testing.T) {
+	resetDispatchCounters()
+	rw := newDispatchWatcherWithNamespaces(t)
+
+	if rw.IsServable(namespacesGVR) {
+		t.Fatalf("setup: namespaces GVR must NOT be servable (never registered)")
+	}
+
+	// LIST /api/v1/namespaces — the exact shape that froze S4.
+	call := buildCall(http.MethodGet, "/api/v1/namespaces")
+	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	if served {
+		t.Fatalf("unregistered-GVR LIST: expected served=false (apiserver fallthrough); got served=true with %d bytes", len(raw))
+	}
+	if raw != nil {
+		t.Fatalf("unregistered-GVR LIST: expected nil raw on fallthrough; got %d bytes", len(raw))
+	}
+
+	s := DispatchInformerStatsSnapshot()
+	if s.ListServed != 0 {
+		t.Fatalf("negative falsifier: list_served must NOT increment for a never-registered GVR; got %d", s.ListServed)
+	}
+	if s.Fallthrough != 1 {
+		t.Fatalf("unregistered-GVR LIST: want Fallthrough=1; got %d", s.Fallthrough)
+	}
+}
+
+// TestDispatchViaInformer_UnregisteredGVR_GetFallthrough asserts the GET
+// branch is also defended: a GET-by-name for a never-registered GVR
+// takes the apiserver fallthrough (served=false). The GET path is a
+// latent instance of the same (nil,false) overload — fixed alongside
+// LIST in 0.30.97.
+func TestDispatchViaInformer_UnregisteredGVR_GetFallthrough(t *testing.T) {
+	resetDispatchCounters()
+	rw := newDispatchWatcherWithNamespaces(t)
+
+	if rw.IsServable(namespacesGVR) {
+		t.Fatalf("setup: namespaces GVR must NOT be servable")
+	}
+
+	call := buildCall(http.MethodGet, "/api/v1/namespaces/kube-system")
+	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	if served {
+		t.Fatalf("unregistered-GVR GET: expected served=false (apiserver fallthrough); got served=true with %d bytes", len(raw))
+	}
+	if raw != nil {
+		t.Fatalf("unregistered-GVR GET: expected nil raw on fallthrough; got %d bytes", len(raw))
+	}
+
+	s := DispatchInformerStatsSnapshot()
+	if s.GetServed != 0 {
+		t.Fatalf("negative falsifier: get_served must NOT increment for a never-registered GVR; got %d", s.GetServed)
+	}
+	if s.Fallthrough != 1 {
+		t.Fatalf("unregistered-GVR GET: want Fallthrough=1; got %d", s.Fallthrough)
+	}
+}
+
+// TestDispatchViaInformer_SyncedEmptyStillServes is the over-correction
+// guard: a registered + synced informer with a GENUINELY-EMPTY store
+// must STILL serve `served=true` with an empty `items:[]` envelope.
+// 0.30.97 must distinguish "no handler / not synced" (fall through)
+// from "synced, genuinely empty" (serve) — it must not regress the
+// latter into an apiserver fallthrough.
+func TestDispatchViaInformer_SyncedEmptyStillServes(t *testing.T) {
+	resetDispatchCounters()
+	// newDispatchWatcher registers dispatchTestGVR + waits for sync;
+	// with zero seeds the indexer is genuinely empty.
+	rw := newDispatchWatcher(t)
+	if !rw.IsServable(dispatchTestGVR) {
+		t.Fatalf("setup: test GVR must be registered + synced")
+	}
+
+	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
+	raw, served := dispatchViaInformer(dispatchCtx(), call)
+	if !served {
+		t.Fatalf("synced + genuinely-empty: expected served=true (over-correction guard); got served=false")
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("synced-empty LIST envelope is not valid JSON: %v\nbytes: %s", err, string(raw))
+	}
+	items, ok := envelope["items"].([]any)
+	if !ok {
+		t.Fatalf("synced-empty: items want []any; got %T", envelope["items"])
+	}
+	if len(items) != 0 {
+		t.Fatalf("synced-empty: want 0 items; got %d", len(items))
+	}
+
+	s := DispatchInformerStatsSnapshot()
+	if s.ListServed != 1 {
+		t.Fatalf("synced-empty: want ListServed=1 (genuinely-empty IS servable); got %d", s.ListServed)
+	}
+	if s.Fallthrough != 0 {
+		t.Fatalf("synced-empty: want Fallthrough=0 (no over-correction); got %d", s.Fallthrough)
+	}
+}
