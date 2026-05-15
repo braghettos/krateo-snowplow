@@ -143,6 +143,18 @@ type ResourceWatcher struct {
 	// rw.mu.
 	lastSyncRV map[schema.GroupVersionResource]string
 
+	// watchHandlerInstalled records GVRs whose informer has had the
+	// conjunct-3 WATCH-error handler successfully installed (0.30.99
+	// Tag B — watch-handler coverage guard). installWatchErrorHandler
+	// records into this set on a successful SetWatchErrorHandler call.
+	// The constructor's terminal block asserts every rw.informers entry
+	// appears here — so a future pre-Start lazy-register path that
+	// bypasses the constructor's install loop cannot silently drop
+	// watch-handler coverage (conjunct 3 would then never fire for that
+	// GVR and the pivot would serve a possibly-stale store). Guarded by
+	// rw.mu (same lock as rw.informers).
+	watchHandlerInstalled map[schema.GroupVersionResource]struct{}
+
 	// disco is the discovery client used by resourceTypeConfirmed. nil
 	// is a valid state: when no discovery client is wired,
 	// resourceTypeConfirmed defaults to true so the pivot keeps its
@@ -272,16 +284,17 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	)
 
 	rw := &ResourceWatcher{
-		mode:         modeInformer,
-		dyn:          dyn,
-		factory:      factory,
-		informers:    map[schema.GroupVersionResource]informers.GenericInformer{},
-		syncCh:       map[schema.GroupVersionResource]chan struct{}{},
-		metadataOnly: map[schema.GroupVersionResource]struct{}{},
-		watchBroken:  map[schema.GroupVersionResource]struct{}{},
-		confirmed:    map[schema.GroupVersionResource]struct{}{},
-		lastSyncRV:   map[schema.GroupVersionResource]string{},
-		stopCh:       make(chan struct{}),
+		mode:                  modeInformer,
+		dyn:                   dyn,
+		factory:               factory,
+		informers:             map[schema.GroupVersionResource]informers.GenericInformer{},
+		syncCh:                map[schema.GroupVersionResource]chan struct{}{},
+		metadataOnly:          map[schema.GroupVersionResource]struct{}{},
+		watchBroken:           map[schema.GroupVersionResource]struct{}{},
+		confirmed:             map[schema.GroupVersionResource]struct{}{},
+		lastSyncRV:            map[schema.GroupVersionResource]string{},
+		watchHandlerInstalled: map[schema.GroupVersionResource]struct{}{},
+		stopCh:                make(chan struct{}),
 	}
 	_ = ctx // reserved for future wiring (0.30.6 eager-registration caller may pass-through)
 
@@ -293,31 +306,23 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		rw.addResourceTypeLocked(gvr)
 	}
 
-	// 0.30.5: install the SetTransform strip BEFORE factory.Start
-	// (primer §4.7). The TransformFunc drops managedFields and the
-	// last-applied-configuration annotation from every object before
-	// it lands in the indexer. SetTransform returns an error only when
-	// the informer has already started — at this point we have not
-	// called Start yet, so the error path is unreachable. We log a
-	// WARN if it ever happens to surface the regression rather than
-	// failing the boot.
+	// 0.30.99 Tag B — watch-handler coverage assertion. The SetTransform
+	// strip (0.30.5, primer §4.7) and the conjunct-3 WATCH-error handler
+	// (0.30.98 Tag A) are BOTH installed by addResourceTypeLocked at
+	// registration time — for the RBAC GVRs that happened in the
+	// RBACResourceTypes loop above, pre-Start. Pre-0.30.99 this block
+	// re-installed both in a second loop; that duplication is removed
+	// (addResourceTypeLocked is the single install site).
 	//
-	// 0.30.98 Tag A: install the WATCH-error handler in the SAME
-	// pre-Start window (conjunct 3). SetWatchErrorHandler returns an
-	// error once the informer has started — calling it here, before
-	// factory.Start, keeps the error path unreachable.
-	for gvr, gi := range rw.informers {
-		resourceType := gvrResourceTypeString(gvr)
-		tf := StripBulkyFieldsForResourceType(resourceType, gvr)
-		if err := gi.Informer().SetTransform(tf); err != nil {
-			slog.Warn("cache.strip.set_transform_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("resource_type", resourceType),
-				slog.String("error", err.Error()),
-			)
-		}
-		rw.installWatchErrorHandler(gvr, gi)
-	}
+	// What remains here is the architect's Tag B guard: assert that
+	// every GVR in rw.informers had its WATCH-error handler installed
+	// (recorded in rw.watchHandlerInstalled). Since addResourceTypeLocked
+	// now installs unconditionally — not only in its post-Start branch —
+	// a pre-Start lazy-register that bypasses the constructor cannot
+	// silently drop conjunct-3 coverage. The assertion logs a loud WARN
+	// if the invariant is ever violated, so the regression is visible at
+	// boot rather than only under a dropped-WATCH incident.
+	rw.assertWatchHandlerCoverageLocked()
 
 	// 0.30.6 plan §Risks bullet 1 — startup assertion. The typed
 	// RBAC overrides MUST be registered BEFORE factory.Start so
@@ -907,12 +912,32 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		)
 	}
 
-	if rw.started {
-		// 0.30.98 Tag A: install the WATCH-error handler BEFORE Run
-		// (conjunct 3). SetWatchErrorHandler returns an error once the
-		// informer has started, so it must precede the Run goroutine.
-		rw.installWatchErrorHandler(gvr, gi)
+	// 0.30.99 Tag B — watch-handler coverage guard. Install the
+	// conjunct-3 WATCH-error handler UNCONDITIONALLY here, at
+	// registration time, NOT only in the post-Start branch below.
+	//
+	// Pre-0.30.99 the install lived inside `if rw.started`, so a
+	// pre-Start lazy-register (an EnsureResourceType call landing before
+	// NewResourceWatcher's factory.Start) would register an informer
+	// with NO handler — and the constructor's install-loop had already
+	// run, so nothing would ever install it. Moving the call out of the
+	// branch closes that gap STRUCTURALLY: every registration funnels
+	// through addResourceTypeLocked, so every informer gets a handler.
+	//
+	// SetWatchErrorHandler only errors if the informer has already
+	// started — pre-Start it has not, so the call succeeds; post-Start
+	// the informer's Run goroutine has not been spawned yet at THIS
+	// point (it is spawned a few lines below), so it likewise succeeds.
+	// The constructor-loop install for the RBAC GVRs already ran before
+	// addResourceTypeLocked is reachable post-Start, so a constructor
+	// GVR re-entering here would be a redundant (idempotent) install —
+	// but the constructor registers RBAC GVRs pre-Start via this same
+	// function, so this is in fact the single install site for them
+	// too once 0.30.99 lands. assertWatchHandlerCoverageLocked verifies
+	// the invariant at boot.
+	rw.installWatchErrorHandler(gvr, gi)
 
+	if rw.started {
 		// Late registration after Start(): kick the new informer.
 		go gi.Informer().Run(rw.stopCh)
 

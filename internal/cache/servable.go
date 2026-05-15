@@ -130,7 +130,67 @@ func (rw *ResourceWatcher) installWatchErrorHandler(gvr schema.GroupVersionResou
 			slog.String("gvr", gvr.String()),
 			slog.String("error", err.Error()),
 		)
+		return
 	}
+	// 0.30.99 Tag B — watch-handler coverage guard. Record the
+	// successful install so assertWatchHandlerCoverageLocked (run from
+	// the constructor's terminal block) can verify every registered GVR
+	// has a handler. Caller holds rw.mu, so this write is safe.
+	if rw.watchHandlerInstalled == nil {
+		rw.watchHandlerInstalled = map[schema.GroupVersionResource]struct{}{}
+	}
+	rw.watchHandlerInstalled[gvr] = struct{}{}
+}
+
+// assertWatchHandlerCoverageLocked verifies the 0.30.99 Tag B invariant:
+// every GVR in rw.informers has had its conjunct-3 WATCH-error handler
+// installed (recorded in rw.watchHandlerInstalled). Callers MUST hold
+// rw.mu.
+//
+// Why a guard at all (architect's Tag B note): Tag A wires
+// SetWatchErrorHandler on the three informer-creation paths, but its
+// constructor install-loop only covers informers PRESENT at construction
+// (the RBAC bootstrap set). A future pre-Start lazy-register path that
+// routes around the constructor loop — e.g. if EnsureResourceType were
+// ever invoked before NewResourceWatcher calls factory.Start — would
+// register an informer the loop never sees. Without conjunct 3 that
+// informer's pivot reads could serve a stale store after a dropped
+// WATCH.
+//
+// 0.30.99 closes the gap STRUCTURALLY: addResourceTypeLocked now calls
+// installWatchErrorHandler unconditionally at registration time (not
+// only in the post-Start branch); addResourceTypeMetadataOnlyLocked
+// already did. This assertion is the belt-and-braces check that the
+// structural fix held — it runs once at startup and logs a loud WARN
+// naming any GVR that slipped through, so a regression that reintroduces
+// a coverage gap is visible at every boot rather than only under a
+// dropped-WATCH incident.
+//
+// Logged-assertion (not panic): a missing handler degrades conjunct 3
+// for one GVR but does not corrupt state — failing the boot would be a
+// disproportionate response. The WARN is the SRE signal.
+func (rw *ResourceWatcher) assertWatchHandlerCoverageLocked() {
+	var missing []string
+	for gvr := range rw.informers {
+		if _, ok := rw.watchHandlerInstalled[gvr]; !ok {
+			missing = append(missing, gvr.String())
+		}
+	}
+	if len(missing) > 0 {
+		slog.Warn("cache.watch.handler_coverage_gap",
+			slog.String("subsystem", "cache"),
+			slog.Int("missing_count", len(missing)),
+			slog.Any("missing_gvrs", missing),
+			slog.String("effect", "conjunct 3 (watchHealthy) cannot fire for these GVRs — a dropped WATCH would not gate the pivot"),
+			slog.String("hint", "a registration path bypassed installWatchErrorHandler — audit addResourceTypeLocked / addResourceTypeMetadataOnlyLocked"),
+		)
+		return
+	}
+	slog.Info("cache.watch.handler_coverage_ok",
+		slog.String("subsystem", "cache"),
+		slog.Int("informers", len(rw.informers)),
+		slog.String("invariant", "every registered GVR has a WATCH-error handler (conjunct 3)"),
+	)
 }
 
 // RefreshDiscovery runs ONE pass of the conjunct-4 discovery check over
@@ -330,4 +390,27 @@ func (rw *ResourceWatcher) MarkWatchRecovered(gvr schema.GroupVersionResource) {
 	rw.mu.Lock()
 	delete(rw.watchBroken, gvr)
 	rw.mu.Unlock()
+}
+
+// HasWatchHandlerForTest reports whether gvr's informer had its
+// conjunct-3 WATCH-error handler installed (recorded in
+// rw.watchHandlerInstalled). It is the test surface for the 0.30.99
+// Tag B watch-handler coverage guard — a unit test asserts every
+// registered GVR, RBAC bootstrap and lazily-registered alike, returns
+// true here, proving installWatchErrorHandler ran on its registration
+// path. A fake dynamic client never drops a real WATCH, so this is the
+// only deterministic way to assert install-time coverage (FireWatchError
+// proves conjunct-3 GATING but writes watchBroken directly, bypassing
+// the installed handler).
+//
+// Returns false for nil receivers, passthrough mode, or unknown GVRs.
+// Safe for concurrent use; takes rw.mu in read mode.
+func (rw *ResourceWatcher) HasWatchHandlerForTest(gvr schema.GroupVersionResource) bool {
+	if rw == nil {
+		return false
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	_, ok := rw.watchHandlerInstalled[gvr]
+	return ok
 }

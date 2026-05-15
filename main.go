@@ -302,6 +302,67 @@ func main() {
 						// expected-lazy (no WARN spam from the eagerSet
 						// gate in watcher.AddResourceType).
 						w.MarkEagerSet([]schema.GroupVersionResource{})
+
+						// 0.30.99 Tag B — startup navigation GVR-walk,
+						// gated behind PREWARM_REGISTER_ENABLED (default
+						// OFF, mirrors EAGER_REGISTER_ENABLED). Not in the
+						// chart configmap — absent ⇒ OFF, so Tag B is
+						// chart-change-free and behavior-neutral for
+						// production.
+						//
+						// Why default OFF (architect REJECT of default-on,
+						// adjudicated): with RESOLVER_USE_INFORMER OFF by
+						// default the resolver pivot does NOT consume the
+						// informers a startup walk would register. A walk
+						// would register N informers nobody reads — each
+						// EnsureResourceType lands in the post-Start branch
+						// and immediately spawns a LIST+WATCH against
+						// apiserver. That is the exact "pure apiserver
+						// pressure, no consumer" regression the 0.30.6 /
+						// 0.30.61 post-mortems reverted (feature journal
+						// 0.30.61: "no consumer reads from the eagerly-
+						// registered informers ... eager-register = pure
+						// apiserver overhead"). The 0.30.8 (rev 104) and
+						// 0.30.92 OOM-at-50K modes are also unmitigated:
+						// composition GVRs route to the FULL-Unstructured
+						// informer because metadataOnlyGVRSeed is empty and
+						// customer core-provider CRDs are not annotated
+						// krateo.io/cache-mode: metadata.
+						//
+						// Promotion to ON-by-default requires a
+						// PREWARM_REGISTER_ENABLED=true bench at 50K
+						// measuring apiserver QPS + RSS-under-load,
+						// alongside RESOLVER_USE_INFORMER=true so the pivot
+						// consumer is actually present.
+						if os.Getenv("PREWARM_REGISTER_ENABLED") == "true" {
+							log.Info("prewarm-register: enabled via PREWARM_REGISTER_ENABLED=true",
+								slog.String("subsystem", "cache"),
+								slog.String("hint", "startup navigation GVR-walk active; opt-in only — costs apiserver QPS while RESOLVER_USE_INFORMER is off"),
+							)
+							// Soft failure: a LIST error is logged +
+							// ignored — the lazy register-on-navigation
+							// fallback still covers every GVR on first
+							// request. Bound by a fresh timeout so a
+							// stalled apiserver cannot wedge boot.
+							pwCtx, pwCancel := context.WithTimeout(cacheCtx,
+								time.Duration(env.Int("STARTUP_TIMEOUT_SECONDS", 120))*time.Second)
+							reg, present, pwErr := w.PrewarmRegisterFromNavigation(pwCtx, dynCli)
+							pwCancel()
+							if pwErr != nil {
+								log.Warn("cache: startup navigation GVR-walk incomplete; lazy register-on-navigation covers the gap",
+									slog.Any("err", pwErr))
+							} else {
+								log.Info("cache: startup navigation GVR-walk done",
+									slog.String("subsystem", "cache"),
+									slog.Int("registered", reg),
+									slog.Int("already_present", present))
+							}
+						} else {
+							log.Info("prewarm-register: disabled (default); set PREWARM_REGISTER_ENABLED=true to opt-in",
+								slog.String("subsystem", "cache"),
+								slog.String("rationale", "startup walk registers informers the pivot does not consume while RESOLVER_USE_INFORMER is off — re-arms the 0.30.61 no-consumer apiserver-QPS regression + the unmitigated 0.30.8/0.30.92 OOM modes"),
+							)
+						}
 					}
 				}
 			}
