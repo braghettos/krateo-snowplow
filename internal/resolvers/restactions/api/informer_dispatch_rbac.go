@@ -123,6 +123,13 @@ func filterListByRBAC(
 			dropped++
 			continue
 		}
+		// Verb is "list" (this is the served-LIST branch); a
+		// resourceNames-scoped rule must NOT grant a list, so the
+		// per-item Name is supplied for completeness but is, by
+		// Kubernetes ResourceNameMatches semantics, only consulted for
+		// name-specific verbs. Threading it keeps the call sites
+		// uniform with filterGetByRBAC and lets the evaluator stay the
+		// single source of verb-vs-resourceNames truth (0.30.109, G1).
 		allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 			Username:  user.Username,
 			Groups:    user.Groups,
@@ -130,6 +137,7 @@ func filterListByRBAC(
 			Group:     gvr.Group,
 			Resource:  gvr.Resource,
 			Namespace: it.GetNamespace(),
+			Name:      it.GetName(),
 		})
 		if err != nil {
 			// FAIL-CLOSED: an evaluator hiccup never permits a leak.
@@ -175,10 +183,10 @@ func filterListByRBAC(
 //   - false — caller MUST NOT serve; fall through to the apiserver
 //     (whose per-user token gate narrows correctly — a denied GET
 //     becomes a 403). false covers every fail-closed path:
-//       * NO identity on the context (xcontext.UserInfo error);
-//       * EvaluateRBAC returned an error (evaluator hiccup never
-//         permits a serve);
-//       * EvaluateRBAC returned deny.
+//   - NO identity on the context (xcontext.UserInfo error);
+//   - EvaluateRBAC returned an error (evaluator hiccup never
+//     permits a serve);
+//   - EvaluateRBAC returned deny.
 //     Under no path does an unauthorized informer object reach the
 //     caller.
 //
@@ -220,6 +228,9 @@ func filterGetByRBAC(
 		return false
 	}
 
+	// Verb is "get" — a name-specific verb. The object's OWN name is
+	// threaded so a resourceNames-scoped rule (resourceNames: ["foo"])
+	// grants `get foo` but not `get bar` (0.30.109, G1).
 	allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 		Username:  user.Username,
 		Groups:    user.Groups,
@@ -227,6 +238,7 @@ func filterGetByRBAC(
 		Group:     gvr.Group,
 		Resource:  gvr.Resource,
 		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
 	})
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.

@@ -45,6 +45,21 @@ type EvaluateOptions struct {
 	Resource string
 	// Namespace is the request namespace. Empty string = cluster-wide.
 	Namespace string
+	// Name is the request object's name. For name-specific verbs
+	// ("get"/"update"/"patch"/"delete" and similar) it is the name of
+	// the single object the request targets — e.g. for a per-item check
+	// on a served LIST it is that item's metadata.name. Empty string
+	// means "no single named object" (the request is a collection-verb
+	// such as "list"/"watch"/"create"/"deletecollection", or the caller
+	// did not thread a name).
+	//
+	// Name is consumed by Kubernetes `resourceNames` semantics
+	// (ResourceNameMatches): a PolicyRule with a non-empty
+	// rule.ResourceNames only matches a request whose Name is in that
+	// list — and only for name-specific verbs. A resourceNames-scoped
+	// rule NEVER grants a collection verb. See rulesPermit /
+	// resourceNameMatches below.
+	Name string
 }
 
 // well-known RBAC GVRs — must match cache.RBACResourceTypes.
@@ -246,6 +261,13 @@ func roleRefPermits(rw *cache.ResourceWatcher, namespace string, ref rbacv1.Role
 // rulesPermit returns true iff any PolicyRule in rules permits opts.
 // Wildcard semantics match Kubernetes: "*" in Verbs, Resources or
 // APIGroups matches everything.
+//
+// 0.30.109 (G1) — rule.ResourceNames is now honoured. A rule scoped to
+// specific named objects (resourceNames: ["foo"]) must NOT be treated
+// as granting every object of that GVR. resourceNameMatches implements
+// the Kubernetes `ResourceNameMatches` semantics — see its doc comment.
+// Before 0.30.109 this check was absent: a resourceNames-scoped rule
+// over-exposed every object (cross-user leak in filterListByRBAC).
 func rulesPermit(rules []rbacv1.PolicyRule, opts EvaluateOptions) bool {
 	for _, rule := range rules {
 		if !stringSliceMatches(rule.Verbs, opts.Verb) {
@@ -257,7 +279,62 @@ func rulesPermit(rules []rbacv1.PolicyRule, opts EvaluateOptions) bool {
 		if !stringSliceMatches(rule.Resources, opts.Resource) {
 			continue
 		}
+		if !resourceNameMatches(rule, opts) {
+			continue
+		}
 		return true
+	}
+	return false
+}
+
+// nameSpecificVerbs is the set of RBAC verbs that act on a single named
+// object — the only verbs for which a resourceNames-scoped rule can
+// grant access. Mirrors the Kubernetes RBAC authorizer: the collection
+// verbs ("list", "watch", "create", "deletecollection") have no single
+// named object, so a rule with a non-empty ResourceNames must never
+// match them. (rbac/v1's authorizer scopes resourceNames to exactly
+// these verbs; "get"/"update"/"patch"/"delete" — and the "*" wildcard,
+// handled separately — are name-specific.)
+var nameSpecificVerbs = map[string]struct{}{
+	"get":    {},
+	"update": {},
+	"patch":  {},
+	"delete": {},
+}
+
+// resourceNameMatches implements Kubernetes `ResourceNameMatches`
+// semantics for a single PolicyRule (0.30.109, G1):
+//
+//   - rule.ResourceNames empty  → matches all objects (unchanged
+//     behaviour for unscoped rules).
+//   - rule.ResourceNames non-empty → the rule is scoped to specific
+//     named objects:
+//   - It can only ever match a name-specific verb
+//     ("get"/"update"/"patch"/"delete", or the verb wildcard "*").
+//     For a collection verb ("list"/"watch"/"create"/
+//     "deletecollection") it does NOT match — a resourceNames-scoped
+//     rule never grants `list`.
+//   - The request's object name (opts.Name) must appear in
+//     rule.ResourceNames.
+//
+// opts.Verb is already known to satisfy the rule's Verbs list by the
+// time this is called (rulesPermit checks Verbs first). We re-derive
+// the name-specific predicate from opts.Verb itself rather than the
+// rule's Verbs so that a wildcard-verb rule with resourceNames is still
+// correctly denied for a collection-verb request.
+func resourceNameMatches(rule rbacv1.PolicyRule, opts EvaluateOptions) bool {
+	if len(rule.ResourceNames) == 0 {
+		return true
+	}
+	// Non-empty ResourceNames: only name-specific verbs can match.
+	if _, nameSpecific := nameSpecificVerbs[opts.Verb]; !nameSpecific {
+		return false
+	}
+	// The targeted object's name must be in the list.
+	for _, n := range rule.ResourceNames {
+		if n == opts.Name {
+			return true
+		}
 	}
 	return false
 }
@@ -277,8 +354,20 @@ func stringSliceMatches(allowed []string, want string) bool {
 // (as Kind="Group") or the system-authenticated group appears in subjects.
 // ServiceAccount subjects are matched when opts.Username has the
 // canonical "system:serviceaccount:<ns>:<name>" form.
+//
+// 0.30.109 (G3/G6) — ServiceAccount synthetic groups. Kubernetes
+// implicitly places every ServiceAccount in two synthetic groups:
+//   - "system:serviceaccounts"            (all ServiceAccounts)
+//   - "system:serviceaccounts:<ns>"       (all SAs in the SA's namespace)
+//
+// A binding granting a Group subject of either name must therefore
+// match a request whose Username is a canonical ServiceAccount in the
+// matching namespace. effectiveGroups (below) computes the augmented
+// group set; anySubjectMatches consults it for every Group subject.
+// This mirrors k8s.io/apiserver's serviceaccount.UserInfo.
 func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
 	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
+	groups := effectiveGroups(opts, isSA, saNS)
 
 	for _, s := range subjects {
 		switch s.Kind {
@@ -287,7 +376,7 @@ func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
 				return true
 			}
 		case rbacv1.GroupKind:
-			for _, g := range opts.Groups {
+			for _, g := range groups {
 				if s.Name == g {
 					return true
 				}
@@ -305,6 +394,37 @@ func anySubjectMatches(subjects []rbacv1.Subject, opts EvaluateOptions) bool {
 		}
 	}
 	return false
+}
+
+// well-known ServiceAccount synthetic group names (0.30.109, G3/G6).
+// Mirrors k8s.io/apiserver/pkg/authentication/serviceaccount.
+const (
+	allServiceAccountsGroup     = "system:serviceaccounts"
+	serviceAccountsNamespacePfx = "system:serviceaccounts:"
+)
+
+// effectiveGroups returns the group set used for Group-subject matching.
+// It is opts.Groups plus, when the request identity is a canonical
+// ServiceAccount, the two synthetic ServiceAccount groups Kubernetes
+// adds implicitly:
+//
+//	system:serviceaccounts
+//	system:serviceaccounts:<the-SA's-namespace>
+//
+// For a non-ServiceAccount identity the synthetic groups are not added
+// and the function returns opts.Groups unchanged (no allocation when
+// there is nothing to add).
+func effectiveGroups(opts EvaluateOptions, isSA bool, saNS string) []string {
+	if !isSA {
+		return opts.Groups
+	}
+	groups := make([]string, 0, len(opts.Groups)+2)
+	groups = append(groups, opts.Groups...)
+	groups = append(groups,
+		allServiceAccountsGroup,
+		serviceAccountsNamespacePfx+saNS,
+	)
+	return groups
 }
 
 // parseServiceAccountUsername decodes the
