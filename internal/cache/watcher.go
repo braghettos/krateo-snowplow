@@ -659,28 +659,14 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 
 	resourceType := gvrResourceTypeString(gvr)
 
-	// DepTracker event handlers (per plan §"Revision 18
-	// implementation outline" item 3 + binding rule
-	// feedback_l1_invalidation_delete_only.md). Identical wiring to
-	// addResourceTypeLocked — the obj coming through here is a
-	// *metav1.PartialObjectMetadata, which embeds ObjectMeta and
-	// therefore satisfies the nsNameAccessor interface used by
-	// metaNSName.
-	if _, regErr := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(_, newObj interface{}) {
-			ns, name := metaNSName(newObj)
-			Deps().OnUpdate(gvr, ns, name)
-		},
-		DeleteFunc: func(obj interface{}) {
-			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
-				obj = tomb.Obj
-			}
-			ns, name := metaNSName(obj)
-			Deps().OnDelete(gvr, ns, name)
-		},
-		// AddFunc intentionally NOT wired — same rationale as
-		// addResourceTypeLocked.
-	}); regErr != nil {
+	// DepTracker event handlers (Ship A 0.30.110). Identical wiring to
+	// addResourceTypeLocked — the SHARED depEventHandlers builder. The
+	// obj coming through here is a *metav1.PartialObjectMetadata, which
+	// embeds ObjectMeta and therefore satisfies the nsNameAccessor
+	// interface used by metaNSName. ADD post-sync gate, UPDATE
+	// dirty-mark, DELETE classify+evict-via-worker are byte-identical
+	// to the full-informer path.
+	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandlers(gvr)); regErr != nil {
 		slog.Warn("cache.deps.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),
@@ -873,13 +859,16 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		)
 	}
 
-	// 0.30.8: dep-tracker event hooks for the L1 resolved-output
-	// cache. Installed at registration time so every newly-added
-	// informer gains wiring on first use (covers both eager + lazy
-	// AddResourceType paths). Per
-	// feedback_l1_invalidation_delete_only.md, DELETE evicts, UPDATE
-	// enqueues refresh, ADD is a deliberate no-op for dep-tracking
-	// (the informer still consumes ADD for its own LIST/WATCH state).
+	// 0.30.8 / 0.30.110: dep-tracker event hooks for the L1
+	// resolved-output cache. Installed at registration time so every
+	// newly-added informer gains wiring on first use (covers both
+	// eager + lazy AddResourceType paths).
+	//
+	// Ship A (0.30.110): the handler set is now built by the SHARED
+	// depEventHandlers — ADD is wired (post-sync gated), UPDATE
+	// dirty-marks, DELETE classifies + evicts self-representations via
+	// a worker goroutine. Per feedback_l1_invalidation_delete_only.md
+	// eviction stays DELETE-only; ADD/UPDATE only dirty-mark.
 	//
 	// Mode-gating (0.30.71 + 0.30.8): these handlers are wired ONLY
 	// in modeInformer. In modePassthrough the early-return at the
@@ -888,29 +877,11 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// would record forward edges that the watcher could never
 	// invalidate — wiring them at all in passthrough is wasted work.
 	//
-	// The handlers run on the informer's processor goroutine. Both
-	// OnDelete and OnUpdate complete in O(deps-for-this-tuple); the
-	// hot path is sync.Map operations.
-	if _, regErr := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
-		UpdateFunc: func(_, newObj interface{}) {
-			ns, name := metaNSName(newObj)
-			Deps().OnUpdate(gvr, ns, name)
-		},
-		DeleteFunc: func(obj interface{}) {
-			// DeletedFinalStateUnknown wraps the last-known object
-			// when the watcher missed the explicit DELETE. Unwrap
-			// so we still get the (ns, name) tuple.
-			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
-				obj = tomb.Obj
-			}
-			ns, name := metaNSName(obj)
-			Deps().OnDelete(gvr, ns, name)
-		},
-		// AddFunc is intentionally NOT wired. Pre-flight falsifier
-		// (probe.log 2026-05-13) showed the scale-up CREATE-event
-		// transient does not reproduce on 0.30.7; the Revision 16
-		// scope expansion was rolled back.
-	}); regErr != nil {
+	// The handlers run on the informer's processor goroutine. ADD and
+	// UPDATE complete in O(deps-for-this-tuple); DELETE classification
+	// is likewise cheap and the eviction burst is handed to the R3
+	// worker so it never blocks the processor.
+	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandlers(gvr)); regErr != nil {
 		slog.Warn("cache.deps.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("resource_type", resourceType),

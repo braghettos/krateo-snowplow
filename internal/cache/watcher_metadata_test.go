@@ -130,13 +130,27 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 	rw.SetMetadataClient(metaCli)
 
 	// L1 cache must exist so DepTracker.OnDelete actually evicts.
-	// Put a marker entry whose dep edge points at the victim.
+	// Put a marker entry whose OWN dispatched object IS the victim — a
+	// self-representation, so the R2/R7 (0.30.110) three-way OnDelete
+	// classifies the DELETE as an eviction (not a dirty-mark). This
+	// keeps the test exercising the metadata-only DeleteFunc → OnDelete
+	// plumbing while conforming to the post-0.30.110 contract.
 	rc := cache.ResolvedCache()
 	if rc == nil {
 		t.Fatalf("ResolvedCache nil — CACHE_ENABLED test setup broken")
 	}
 	const l1Key = "test:composition-evict"
-	rc.Put(l1Key, &cache.ResolvedEntry{RawJSON: []byte(`{"items":["before"]}`)})
+	rc.Put(l1Key, &cache.ResolvedEntry{
+		RawJSON: []byte(`{"items":["before"]}`),
+		Inputs: &cache.ResolvedKeyInputs{
+			HandlerKind: "restactions",
+			Group:       compositionGVR.Group,
+			Version:     compositionGVR.Version,
+			Resource:    compositionGVR.Resource,
+			Namespace:   "bench-ns-01",
+			Name:        "victim",
+		},
+	})
 	cache.Deps().Record(l1Key, compositionGVR, "bench-ns-01", "victim")
 
 	// Trigger metadata-only registration. We use the explicit entry

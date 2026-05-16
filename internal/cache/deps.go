@@ -71,15 +71,53 @@ var ctxKeyL1Record = ctxKeyL1RecordType{}
 // returned unchanged (saves an allocation and keeps the no-record
 // invariant explicit at the call site).
 //
+// O15 (0.30.110): an empty l1Key is also a loud-fail signal. A caller
+// reaching WithL1KeyContext with "" usually means the L1 key was never
+// threaded through — a silent dep-recording regression. In production
+// this WARNs and bumps recordDroppedNoKey; in test mode it panics so the
+// regression cannot ship. The parent context is still returned unchanged
+// either way so the no-record invariant downstream is preserved.
+//
 // Per plan §0.30.94 / Revision 19 "Resolver-side dep recording threaded
 // via context.Context". Threading via context.Value avoids adding a
 // *RecordingDeps parameter to every signature in the resolver call
 // chain (api.Resolve → restactions.Resolve → httpcall.Do).
 func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
-	if ctx == nil || l1Key == "" {
+	if l1Key == "" {
+		loudFailEmptyL1Key("WithL1KeyContext")
+		return ctx
+	}
+	if ctx == nil {
 		return ctx
 	}
 	return context.WithValue(ctx, ctxKeyL1Record, l1Key)
+}
+
+// loudFailEmptyL1Key implements the O15 empty-l1Key contract: panic in
+// test mode (so a missing-key regression cannot ship), WARN + counter in
+// production (the TTL outer net keeps the cache correct). The counter
+// lives on the Deps() singleton; Deps() is always non-nil.
+func loudFailEmptyL1Key(callsite string) {
+	Deps().recordDroppedNoKey.Add(1)
+	if depsTestMode.Load() {
+		panic("cache.deps: " + callsite + " called with empty l1Key — " +
+			"the L1 key was not threaded through (O15 loud-fail, test mode)")
+	}
+	slog.Warn("deps.empty_l1_key",
+		slog.String("subsystem", "cache"),
+		slog.String("callsite", callsite),
+		slog.String("hint", "dep edge dropped — L1 key was not threaded through; "+
+			"TTL purge keeps cache correct but stale-while-revalidate is degraded for this entry"),
+	)
+}
+
+// SetDepsTestMode flips the O15 test-mode toggle. Exported for the
+// cross-package _test.go shim; production code MUST NOT call it. When
+// true, an empty-l1Key Record/RecordList/WithL1KeyContext panics instead
+// of WARNing. The toggle is a Go variable, never an env var, so a
+// customer deployment can never enable process-killing behaviour.
+func SetDepsTestMode(on bool) {
+	depsTestMode.Store(on)
 }
 
 // L1KeyFromContext returns the L1 key attached to ctx by
@@ -105,6 +143,13 @@ const (
 	// there is no namespace collision.
 	listWildcard = "*"
 )
+
+// depsTestMode, when true, makes the empty-l1Key loud-fail (O15) panic
+// instead of WARN+counter. It is a package-private Go variable flipped
+// ONLY by the *_test.go shim SetDepsTestMode — never read from an env
+// var, so a customer can never accidentally turn process-killing
+// behaviour on in production. Default false (production semantics).
+var depsTestMode atomic.Bool
 
 // DepKey identifies a (gvr, namespace, name) tuple in the dependency map.
 // Name == "*" indicates the bucket is a list-scope dependency rather
@@ -145,11 +190,13 @@ type DepTracker struct {
 	maxRecords   int64
 
 	// Falsifier counters (atomic; safe to read without holding anything).
-	recordTotal       atomic.Uint64
-	recordDroppedCap  atomic.Uint64
-	evictDeleteTotal  atomic.Uint64 // L1 evictions triggered by OnDelete
+	recordTotal        atomic.Uint64
+	recordDroppedCap   atomic.Uint64
+	recordDroppedNoKey atomic.Uint64 // O15: Record*/WithL1KeyContext with empty l1Key
+	evictDeleteTotal   atomic.Uint64 // L1 self-representation evictions (OnDelete)
+	dirtyMarkTotal     atomic.Uint64 // dirty-marks (OnAdd/OnUpdate + OnDelete non-self)
 	enqueueUpdateTotal atomic.Uint64 // refresh enqueues triggered by OnUpdate
-	removeL1Total     atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
+	removeL1Total      atomic.Uint64 // RemoveL1Key calls (LRU + DELETE cleanup)
 
 	// One-shot WARN flag for cap reached. We only want to log once
 	// (process lifetime) so the log file doesn't fill with the same
@@ -235,7 +282,13 @@ func (d *DepTracker) SetRefreshHook(fn func(l1Key string)) {
 // (counter `record_dropped_cap_total` increments). The first cap-hit
 // also emits a one-shot WARN log line.
 func (d *DepTracker) Record(l1Key string, gvr schema.GroupVersionResource, namespace, name string) {
-	if d == nil || l1Key == "" {
+	if d == nil {
+		return
+	}
+	if l1Key == "" {
+		// O15: a Record call with no L1 key is an unambiguous bug — a
+		// DepKey with nowhere to attach it. Loud-fail.
+		loudFailEmptyL1Key("Record")
 		return
 	}
 	if name == "" {
@@ -251,7 +304,13 @@ func (d *DepTracker) Record(l1Key string, gvr schema.GroupVersionResource, names
 // every object of (gvr) in namespace (or cluster-wide when namespace is
 // ""). Internally encodes the bucket as (gvr, namespace, "*").
 func (d *DepTracker) RecordList(l1Key string, gvr schema.GroupVersionResource, namespace string) {
-	if d == nil || l1Key == "" {
+	if d == nil {
+		return
+	}
+	if l1Key == "" {
+		// O15: same loud-fail as Record — a list-scope edge with no L1
+		// key cannot be attached anywhere.
+		loudFailEmptyL1Key("RecordList")
 		return
 	}
 	d.recordInternal(l1Key, DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
@@ -294,62 +353,38 @@ func (d *DepTracker) recordInternal(l1Key string, dk DepKey) {
 	}
 }
 
-// OnDelete is invoked by the watcher when an informer DELETE event
-// arrives for (gvr, namespace, name). It evicts every L1 cache key that
-// depends on this tuple OR on any of the three other bucket forms
-// (ns-list, cluster-name, cluster-list).
+// OnAdd is invoked by the watcher when an informer ADD event arrives
+// for (gvr, namespace, name) — gated post-sync by the watcher's
+// AddFunc (initial-replay ADDs are dropped before they reach here).
 //
-// Returns the number of L1 keys evicted. >0 under DELETE churn is the
-// falsifier signal per the plan.
+// R1 (0.30.110): ADD == UPDATE. A freshly-created object can satisfy a
+// LIST-scope dependency that resolved to an empty/partial result before
+// the object existed; the dependent L1 entry is now stale and must be
+// dirty-marked (enqueued into the refresher). ADD NEVER evicts —
+// per feedback_l1_invalidation_delete_only.md eviction is DELETE-only.
 //
-// Per feedback_l1_invalidation_delete_only.md, DELETE is the ONLY
-// authorised eviction trigger.
-func (d *DepTracker) OnDelete(gvr schema.GroupVersionResource, namespace, name string) int {
-	if d == nil {
-		return 0
-	}
-	matched := d.collectMatches(gvr, namespace, name)
-	if len(matched) == 0 {
-		return 0
-	}
-	d.storeMu.RLock()
-	store := d.store
-	d.storeMu.RUnlock()
-
-	evicted := 0
-	for l1Key := range matched {
-		if store != nil {
-			if store.deleteForDep(l1Key) {
-				evicted++
-			}
-		}
-		d.RemoveL1Key(l1Key) // clear forward + reverse records
-	}
-	if evicted > 0 {
-		d.evictDeleteTotal.Add(uint64(evicted))
-	}
-	slog.Info("cache_event.consumed",
-		slog.String("subsystem", "cache"),
-		slog.String("type", "DELETE"),
-		slog.String("gvr", gvr.String()),
-		slog.String("ns", namespace),
-		slog.String("name", name),
-		slog.String("action", "evict"),
-		slog.Int("l1_keys", len(matched)),
-		slog.Int("evicted", evicted),
-	)
-	return evicted
+// Returns the number of dependent L1 keys dirty-marked.
+func (d *DepTracker) OnAdd(gvr schema.GroupVersionResource, namespace, name string) int {
+	return d.onChange("ADD", gvr, namespace, name)
 }
 
 // OnUpdate is invoked by the watcher when an informer UPDATE/PATCH
-// event arrives for (gvr, namespace, name). It enqueues every dependent
-// L1 key into the refresher (stale-while-revalidate). Returns the
-// number of L1 keys enqueued. NEVER evicts.
+// event arrives for (gvr, namespace, name). It dirty-marks every
+// dependent L1 key into the refresher (stale-while-revalidate). Returns
+// the number of L1 keys dirty-marked. NEVER evicts.
 //
 // Per feedback_l1_invalidation_delete_only.md, UPDATE/PATCH use
 // stale-while-revalidate via the refresher; eviction would violate the
 // rule.
 func (d *DepTracker) OnUpdate(gvr schema.GroupVersionResource, namespace, name string) int {
+	return d.onChange("UPDATE", gvr, namespace, name)
+}
+
+// onChange is the shared body of OnAdd + OnUpdate (R1: ADD == UPDATE).
+// It dirty-marks every dependent L1 key — both exact-object deps and
+// LIST-scope deps — by enqueuing them into the refresher. It NEVER
+// evicts.
+func (d *DepTracker) onChange(eventType string, gvr schema.GroupVersionResource, namespace, name string) int {
 	if d == nil {
 		return 0
 	}
@@ -361,32 +396,163 @@ func (d *DepTracker) OnUpdate(gvr schema.GroupVersionResource, namespace, name s
 	enqueue := d.enqueueFn
 	d.enqueueMu.RUnlock()
 
-	enqueued := 0
+	marked := 0
 	for l1Key := range matched {
 		if enqueue != nil {
 			enqueue(l1Key)
 		}
-		enqueued++
+		marked++
 	}
-	if enqueued > 0 {
-		d.enqueueUpdateTotal.Add(uint64(enqueued))
+	if marked > 0 {
+		d.dirtyMarkTotal.Add(uint64(marked))
+		// enqueueUpdateTotal is retained as the pre-0.30.110 falsifier
+		// name the resolved_cache.summary log + existing tests read.
+		d.enqueueUpdateTotal.Add(uint64(marked))
 	}
 	slog.Info("cache_event.consumed",
 		slog.String("subsystem", "cache"),
-		slog.String("type", "UPDATE"),
+		slog.String("type", eventType),
 		slog.String("gvr", gvr.String()),
 		slog.String("ns", namespace),
 		slog.String("name", name),
 		slog.String("action", "refresh"),
-		slog.Int("l1_keys", enqueued),
+		slog.Int("l1_keys", marked),
 	)
-	return enqueued
+	return marked
 }
 
-// collectMatches returns the union of dependent L1 keys across the
-// four bucket forms.
+// OnDelete is invoked by the watcher when an informer DELETE event
+// arrives for (gvr, namespace, name).
+//
+// R2/R7 (0.30.110) — three-way classification. Every matched L1 entry
+// falls into exactly one of three buckets:
+//
+//   1. self-representation — the entry's OWN dispatched object is the
+//      deleted object. The cached output is the resolution of an object
+//      that no longer exists → EVICT (the only authorised eviction
+//      trigger, per feedback_l1_invalidation_delete_only.md).
+//
+//   2. LIST-dep — the entry matched via the (gvr, ns, "*") wildcard
+//      bucket. The entry's own object still exists; one member of a list
+//      it depends on went away → DIRTY-MARK (stale-while-revalidate).
+//
+//   3. dependent-GET-dep — the entry matched via an exact (gvr, ns,
+//      name) bucket but its own object is a DIFFERENT object (e.g. a
+//      widget that GET-depends on a deleted RESTAction) → DIRTY-MARK.
+//
+// Returns the number of L1 keys EVICTED (self-representations only).
+// dirtyMarkTotal counts buckets 2 + 3.
+//
+// OnDelete itself is synchronous — classification + eviction both run on
+// the calling goroutine. R3 (the "never on the informer processor
+// goroutine" requirement) is satisfied at the watcher boundary: the
+// informer DeleteFunc hands OnDelete to the deps eviction worker (see
+// watcher.go submitDeleteEvent), so the eviction burst never blocks
+// event delivery. Unit tests call OnDelete directly and observe a
+// deterministic synchronous result.
+func (d *DepTracker) OnDelete(gvr schema.GroupVersionResource, namespace, name string) int {
+	if d == nil {
+		return 0
+	}
+	matched := d.collectMatchesWithDep(gvr, namespace, name)
+	if len(matched) == 0 {
+		return 0
+	}
+	d.storeMu.RLock()
+	store := d.store
+	d.storeMu.RUnlock()
+	d.enqueueMu.RLock()
+	enqueue := d.enqueueFn
+	d.enqueueMu.RUnlock()
+
+	deleted := DepKey{GVR: gvr, Namespace: namespace, Name: name}
+
+	// matched is map[l1Key]DepKey. The DepKey (LIST wildcard vs exact)
+	// distinguishes bucket 2 from bucket 3, but the ACTION for both
+	// non-self buckets is identical — dirty-mark — so OnDelete only needs
+	// the self-vs-non-self split, computed from the entry's own Inputs.
+	var toEvict []string
+	dirtyMarked := 0
+	for l1Key := range matched {
+		if d.isSelfRepresentation(store, l1Key, deleted) {
+			// Bucket 1: self-representation → evict.
+			toEvict = append(toEvict, l1Key)
+			continue
+		}
+		// Bucket 2 (LIST-dep) or bucket 3 (dependent-GET-dep) → dirty-mark.
+		if enqueue != nil {
+			enqueue(l1Key)
+		}
+		dirtyMarked++
+	}
+	if dirtyMarked > 0 {
+		d.dirtyMarkTotal.Add(uint64(dirtyMarked))
+	}
+
+	evictCount := len(toEvict)
+	if evictCount > 0 {
+		d.runEvictionBatch(toEvict)
+	}
+
+	slog.Info("cache_event.consumed",
+		slog.String("subsystem", "cache"),
+		slog.String("type", "DELETE"),
+		slog.String("gvr", gvr.String()),
+		slog.String("ns", namespace),
+		slog.String("name", name),
+		slog.String("action", "evict+refresh"),
+		slog.Int("l1_keys", len(matched)),
+		slog.Int("evicted", evictCount),
+		slog.Int("dirty_marked", dirtyMarked),
+	)
+	return evictCount
+}
+
+// isSelfRepresentation reports whether the L1 entry under l1Key is the
+// resolved output of the `deleted` object itself (bucket 1). It reads
+// the entry's Inputs from the store and compares (Group/Version/
+// Resource, Namespace, Name).
+//
+// When the store is nil or the entry / its Inputs are unavailable, it
+// returns false — the conservative direction: a non-self classification
+// dirty-marks (stale-while-revalidate) rather than evicts. Missing an
+// eviction merely leaves a stale entry until TTL; an over-eviction is
+// the regression F2 catches.
+func (d *DepTracker) isSelfRepresentation(store *ResolvedCacheStore, l1Key string, deleted DepKey) bool {
+	if store == nil {
+		return false
+	}
+	entry, ok := store.Get(l1Key)
+	if !ok || entry == nil || entry.Inputs == nil {
+		return false
+	}
+	in := entry.Inputs
+	return in.Group == deleted.GVR.Group &&
+		in.Version == deleted.GVR.Version &&
+		in.Resource == deleted.GVR.Resource &&
+		in.Namespace == deleted.Namespace &&
+		in.Name == deleted.Name
+}
+
+// collectMatches returns the union of dependent L1 keys across the four
+// bucket forms. Retained as the bare-set form for onChange (ADD/UPDATE),
+// which dirty-marks every match uniformly and has no need for the
+// matching DepKey.
 func (d *DepTracker) collectMatches(gvr schema.GroupVersionResource, namespace, name string) map[string]struct{} {
 	out := map[string]struct{}{}
+	for k := range d.collectMatchesWithDep(gvr, namespace, name) {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// collectMatchesWithDep returns the union of dependent L1 keys across
+// the four bucket forms, each paired with the DepKey it matched
+// through. When an L1 key matches more than one bucket, an EXACT-object
+// bucket takes precedence over a LIST wildcard bucket — so OnDelete's
+// classification sees the most specific dependency form.
+func (d *DepTracker) collectMatchesWithDep(gvr schema.GroupVersionResource, namespace, name string) map[string]DepKey {
+	out := map[string]DepKey{}
 	addAll := func(dk DepKey) {
 		ksI, ok := d.forward.Load(dk)
 		if !ok {
@@ -394,17 +560,49 @@ func (d *DepTracker) collectMatches(gvr schema.GroupVersionResource, namespace, 
 		}
 		ks := ksI.(*keySet)
 		ks.keys.Range(func(k, _ any) bool {
-			out[k.(string)] = struct{}{}
+			l1 := k.(string)
+			prev, seen := out[l1]
+			// Exact (Name != listWildcard) beats wildcard; once an
+			// exact match is recorded it is never downgraded.
+			if !seen || (prev.Name == listWildcard && dk.Name != listWildcard) {
+				out[l1] = dk
+			}
 			return true
 		})
 	}
+	// Exact buckets first so they win the precedence check; wildcard
+	// buckets only fill in keys not already matched exactly.
 	addAll(DepKey{GVR: gvr, Namespace: namespace, Name: name})
-	addAll(DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
 	if namespace != "" {
 		addAll(DepKey{GVR: gvr, Namespace: "", Name: name})
+	}
+	addAll(DepKey{GVR: gvr, Namespace: namespace, Name: listWildcard})
+	if namespace != "" {
 		addAll(DepKey{GVR: gvr, Namespace: "", Name: listWildcard})
 	}
 	return out
+}
+
+// runEvictionBatch drops each self-representation L1 key from the store
+// and clears its dep records. Counts evictDeleteTotal — self-evictions
+// only, per the R2/R7 counter contract.
+func (d *DepTracker) runEvictionBatch(keys []string) {
+	d.storeMu.RLock()
+	store := d.store
+	d.storeMu.RUnlock()
+
+	evicted := 0
+	for _, l1Key := range keys {
+		if store != nil {
+			if store.deleteForDep(l1Key) {
+				evicted++
+			}
+		}
+		d.RemoveL1Key(l1Key) // clear forward + reverse records
+	}
+	if evicted > 0 {
+		d.evictDeleteTotal.Add(uint64(evicted))
+	}
 }
 
 // RemoveL1Key drops every dep record associated with l1Key. Invoked by
@@ -448,13 +646,15 @@ func (d *DepTracker) RemoveL1Key(l1Key string) {
 // DepStats is a snapshot of the falsifier counters. All numbers are
 // atomic and may drift by a single call between fields.
 type DepStats struct {
-	TotalRecords      int64
-	MaxRecords        int64
-	RecordTotal       uint64
-	RecordDroppedCap  uint64
-	EvictDeleteTotal  uint64
+	TotalRecords       int64
+	MaxRecords         int64
+	RecordTotal        uint64
+	RecordDroppedCap   uint64
+	RecordDroppedNoKey uint64 // O15: empty-l1Key Record*/WithL1KeyContext
+	EvictDeleteTotal   uint64 // self-representation evictions only
+	DirtyMarkTotal     uint64 // dirty-marks (ADD/UPDATE + DELETE non-self)
 	EnqueueUpdateTotal uint64
-	RemoveL1Total     uint64
+	RemoveL1Total      uint64
 }
 
 func (d *DepTracker) Stats() DepStats {
@@ -466,7 +666,9 @@ func (d *DepTracker) Stats() DepStats {
 		MaxRecords:         d.maxRecords,
 		RecordTotal:        d.recordTotal.Load(),
 		RecordDroppedCap:   d.recordDroppedCap.Load(),
+		RecordDroppedNoKey: d.recordDroppedNoKey.Load(),
 		EvictDeleteTotal:   d.evictDeleteTotal.Load(),
+		DirtyMarkTotal:     d.dirtyMarkTotal.Load(),
 		EnqueueUpdateTotal: d.enqueueUpdateTotal.Load(),
 		RemoveL1Total:      d.removeL1Total.Load(),
 	}
@@ -474,10 +676,12 @@ func (d *DepTracker) Stats() DepStats {
 
 // resetDepsForTest tears the singleton down so each test sees a clean
 // tracker. Exported only via the *_test.go shim — production code MUST
-// NOT call this.
+// NOT call this. Also clears the O15 test-mode toggle so a test that
+// forgot to reset it cannot leak panic-on-empty-key into the next test.
 func resetDepsForTest() {
 	depsInstance = nil
 	depsOnce = sync.Once{}
+	depsTestMode.Store(false)
 }
 
 // ResetDepsForTest is the exported variant that lives outside _test.go
@@ -485,8 +689,13 @@ func resetDepsForTest() {
 // reset the singleton between cases. Production code MUST NOT call
 // this; build tags would be cleaner but Go's module layout makes
 // cross-package test helpers via _test.go awkward.
+//
+// Also tears down the informer→DepTracker bridge (0.30.110) so a
+// cross-package test cannot leak the DELETE-eviction worker goroutine
+// or stale bridge counters into the next case.
 func ResetDepsForTest() {
 	resetDepsForTest()
+	resetDepWatchForTest()
 }
 
 // CollectMatchesForTest exposes the package-private collectMatches for

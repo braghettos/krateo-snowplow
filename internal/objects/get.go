@@ -26,6 +26,20 @@ type Result struct {
 }
 
 func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
+	// R5 (0.30.110): resolver-side dep recording. When this Get runs
+	// under a cache.WithL1KeyContext ctx, the fetched object becomes a
+	// dependency of the L1 entry being populated — record the edge so a
+	// later DELETE / ADD / UPDATE of the object invalidates that entry.
+	//
+	// Gated hard on !cache.Disabled(): with the cache subsystem off
+	// there is no DepTracker store to invalidate and no L1 entry to key
+	// against; recording would be dead weight. The deferred call reads
+	// the FINAL res (after whichever path produced the object) so it
+	// covers both the informer-served and apiserver-served branches.
+	if !cache.Disabled() {
+		defer recordGetDep(ctx, &res)
+	}
+
 	log := xcontext.Logger(ctx)
 
 	// Cache routing gate. When the cache subsystem is disabled
@@ -207,4 +221,30 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 	res.Unstructured = uns
 	res.Err = nil
 	return
+}
+
+// recordGetDep registers an exact-object dependency edge for a
+// successful objects.Get, keyed by the L1 key carried in ctx.
+//
+// R5 (0.30.110): invoked deferred from Get, only when the cache
+// subsystem is enabled (the caller gates on !cache.Disabled()). It is a
+// no-op when:
+//
+//   - ctx carries no L1 key (cache.L1KeyFromContext == "") — the Get is
+//     not populating a cacheable L1 entry; recording would be a stray
+//     edge. This is the AC-R5 negative case.
+//   - the Get did not produce an object (res.Err set or res.Unstructured
+//     nil) — there is nothing to depend on.
+//
+// The recorded tuple is (res.GVR, namespace, name): a DELETE of that
+// object self-evicts the L1 entry; an ADD/UPDATE dirty-marks it.
+func recordGetDep(ctx context.Context, res *Result) {
+	l1Key := cache.L1KeyFromContext(ctx)
+	if l1Key == "" {
+		return
+	}
+	if res == nil || res.Err != nil || res.Unstructured == nil {
+		return
+	}
+	cache.Deps().Record(l1Key, res.GVR, res.Unstructured.GetNamespace(), res.Unstructured.GetName())
 }

@@ -92,51 +92,111 @@ func TestDeps_FourBucketLookup(t *testing.T) {
 	}
 }
 
-// --- OnDelete ----------------------------------------------------------------
+// --- OnDelete (R2/R7 three-way classification, 0.30.110) --------------------
 
-func TestDeps_OnDelete_EvictsAndClearsReverse(t *testing.T) {
+// inputsFor builds a ResolvedKeyInputs whose dispatched-object identity
+// equals (gvr, ns, name) — used to make a store entry a SELF-
+// representation of that object so OnDelete classifies it as evict.
+func inputsFor(gvr schema.GroupVersionResource, ns, name string) *ResolvedKeyInputs {
+	return &ResolvedKeyInputs{
+		HandlerKind: "restactions",
+		Group:       gvr.Group,
+		Version:     gvr.Version,
+		Resource:    gvr.Resource,
+		Namespace:   ns,
+		Name:        name,
+	}
+}
+
+// TestDeps_OnDelete_EvictsSelfRepresentation — an entry whose OWN
+// dispatched object is the deleted object is a self-representation and
+// MUST be evicted.
+func TestDeps_OnDelete_EvictsSelfRepresentation(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
 
 	gvr := gvrCompositions()
-	// Two L1 entries, both depending on (gvr, ns, "app-1").
-	store.Put("L1A", &ResolvedEntry{RawJSON: []byte(`{"a":1}`)})
-	store.Put("L1B", &ResolvedEntry{RawJSON: []byte(`{"b":2}`)})
+	// L1A's own object IS (gvr, bench-ns-01, app-1).
+	store.Put("L1A", &ResolvedEntry{
+		RawJSON: []byte(`{"a":1}`),
+		Inputs:  inputsFor(gvr, "bench-ns-01", "app-1"),
+	})
 	d.Record("L1A", gvr, "bench-ns-01", "app-1")
-	d.Record("L1B", gvr, "bench-ns-01", "app-1")
 
 	got := d.OnDelete(gvr, "bench-ns-01", "app-1")
-	if got != 2 {
-		t.Fatalf("OnDelete returned %d evicted, want 2", got)
+	if got != 1 {
+		t.Fatalf("OnDelete returned %d evicted, want 1 (self-representation)", got)
 	}
 	if _, ok := store.Get("L1A"); ok {
-		t.Errorf("L1A should have been evicted by DELETE")
-	}
-	if _, ok := store.Get("L1B"); ok {
-		t.Errorf("L1B should have been evicted by DELETE")
+		t.Errorf("L1A (self-representation) should have been evicted by DELETE")
 	}
 	if d.totalRecords.Load() != 0 {
-		t.Errorf("reverse cleanup didn't run: totalRecords=%d", d.totalRecords.Load())
+		t.Errorf("reverse cleanup didn't run for the evicted key: totalRecords=%d", d.totalRecords.Load())
 	}
-	if d.evictDeleteTotal.Load() != 2 {
-		t.Errorf("evictDeleteTotal=%d want 2", d.evictDeleteTotal.Load())
+	if d.evictDeleteTotal.Load() != 1 {
+		t.Errorf("evictDeleteTotal=%d want 1", d.evictDeleteTotal.Load())
+	}
+}
+
+// TestDeps_OnDelete_DirtyMarksDependentGet — an entry that exact-GET-
+// depends on a DIFFERENT object must be dirty-marked, not evicted
+// (the F2 falsifier as a permanent regression test).
+func TestDeps_OnDelete_DirtyMarksDependentGet(t *testing.T) {
+	d := newTestDepTracker(t, 1_000)
+	store := newResolvedCache(100, 1<<20, time.Hour)
+	d.SetStore(store)
+
+	gvr := gvrCompositions()
+	// L1A's own object is (gvr, ns, "owner") — but it GET-depends on
+	// the SEPARATE object (gvr, ns, "dependency").
+	store.Put("L1A", &ResolvedEntry{
+		RawJSON: []byte(`{}`),
+		Inputs:  inputsFor(gvr, "ns", "owner"),
+	})
+	d.Record("L1A", gvr, "ns", "dependency")
+
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
+	got := d.OnDelete(gvr, "ns", "dependency")
+	if got != 0 {
+		t.Fatalf("OnDelete evicted %d, want 0 (dependent-GET, not self)", got)
+	}
+	if _, ok := store.Get("L1A"); !ok {
+		t.Fatalf("L1A over-evicted — dependent-GET entry must survive")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 1 || marked[0] != "L1A" {
+		t.Fatalf("dependent-GET entry not dirty-marked: %v", marked)
+	}
+	if d.dirtyMarkTotal.Load() != 1 {
+		t.Errorf("dirtyMarkTotal=%d want 1", d.dirtyMarkTotal.Load())
+	}
+	if d.evictDeleteTotal.Load() != 0 {
+		t.Errorf("evictDeleteTotal=%d want 0 (no self-representation)", d.evictDeleteTotal.Load())
 	}
 }
 
 func TestDeps_OnDelete_NilStoreIsNoOp(t *testing.T) {
 	// Dep tracker should never panic when no store is wired (unit
-	// tests can exercise it standalone). It still cleans up dep
-	// records — the L1 layer is the only side it can't touch.
+	// tests can exercise it standalone). With no store, isSelf-
+	// Representation cannot read Inputs → every match is conservatively
+	// dirty-marked (0 evicted). No self-eviction → RemoveL1Key does not
+	// run, so the dep records are deliberately preserved for the
+	// (degraded) refresher path.
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
 	d.Record("L1A", gvr, "ns", "n")
 	if got := d.OnDelete(gvr, "ns", "n"); got != 0 {
 		t.Fatalf("expected 0 evictions with no store, got %d", got)
 	}
-	// But the dep records ARE cleaned (RemoveL1Key runs anyway).
-	if d.totalRecords.Load() != 0 {
-		t.Fatalf("totalRecords=%d after OnDelete; cleanup didn't fire", d.totalRecords.Load())
+	// dirty-marked → records preserved (the entry, as far as the tracker
+	// can tell, still exists; only a non-store consumer can confirm).
+	if d.dirtyMarkTotal.Load() != 1 {
+		t.Fatalf("dirtyMarkTotal=%d want 1 (no-store match dirty-marks)", d.dirtyMarkTotal.Load())
 	}
 }
 
@@ -239,6 +299,103 @@ func TestDeps_CapDropsAndWarnsOnce(t *testing.T) {
 	}
 }
 
+// --- AC-O10 — cap metering --------------------------------------------------
+
+// TestACO10_CapMeteredAgainstMaxRecords asserts totalRecords is metered
+// against DEPS_MAX_RECORDS: once the cap is hit, new edges are dropped
+// (recordDroppedCap ticks) and totalRecords never exceeds the cap.
+func TestACO10_CapMeteredAgainstMaxRecords(t *testing.T) {
+	const cap = 5
+	d := newTestDepTracker(t, cap)
+	gvr := gvrCompositions()
+
+	// Record 8 distinct edges under one L1 key — 5 land, 3 drop.
+	for i := 0; i < 8; i++ {
+		d.Record("L1A", gvr, "ns", "n"+itoa(i))
+	}
+	if got := d.totalRecords.Load(); got != cap {
+		t.Fatalf("AC-O10: totalRecords=%d want %d (capped)", got, cap)
+	}
+	if got := d.recordDroppedCap.Load(); got != 3 {
+		t.Fatalf("AC-O10: recordDroppedCap=%d want 3", got)
+	}
+	// The cap-drop WARN is one-shot.
+	if !d.capWarned.Load() {
+		t.Fatalf("AC-O10: capWarned flag never set — one-shot WARN did not fire")
+	}
+	if got := d.Stats().RecordDroppedCap; got != 3 {
+		t.Fatalf("AC-O10: Stats().RecordDroppedCap=%d want 3", got)
+	}
+}
+
+// --- AC-O15 — empty-l1Key loud-fail -----------------------------------------
+
+// TestACO15_EmptyKeyProdCounterAndNoPanic asserts that in production
+// mode (depsTestMode false — the default) an empty-l1Key Record /
+// RecordList / WithL1KeyContext bumps recordDroppedNoKey and does NOT
+// panic.
+func TestACO15_EmptyKeyProdCounterAndNoPanic(t *testing.T) {
+	resetDepsForTest() // also clears depsTestMode → production semantics
+	d := Deps()
+	gvr := gvrCompositions()
+
+	d.Record("", gvr, "ns", "n")
+	d.RecordList("", gvr, "ns")
+	_ = WithL1KeyContext(context.Background(), "")
+
+	if got := d.Stats().RecordDroppedNoKey; got != 3 {
+		t.Fatalf("AC-O15: recordDroppedNoKey=%d want 3 (Record+RecordList+WithL1KeyContext)", got)
+	}
+	if got := d.Stats().RecordTotal; got != 0 {
+		t.Fatalf("AC-O15: an empty-key call recorded an edge; RecordTotal=%d want 0", got)
+	}
+}
+
+// TestACO15_EmptyKeyTestModePanics asserts that with the test-only
+// toggle on, an empty-l1Key call panics.
+func TestACO15_EmptyKeyTestModePanics(t *testing.T) {
+	resetDepsForTest()
+	SetDepsTestMode(true)
+	defer SetDepsTestMode(false)
+
+	d := Deps()
+	gvr := gvrCompositions()
+
+	assertPanics(t, "Record", func() { d.Record("", gvr, "ns", "n") })
+	assertPanics(t, "RecordList", func() { d.RecordList("", gvr, "ns") })
+	assertPanics(t, "WithL1KeyContext", func() { _ = WithL1KeyContext(context.Background(), "") })
+}
+
+func assertPanics(t *testing.T, label string, fn func()) {
+	t.Helper()
+	defer func() {
+		if rec := recover(); rec == nil {
+			t.Fatalf("AC-O15: %s with empty l1Key did not panic in test mode", label)
+		}
+	}()
+	fn()
+}
+
+// TestACO15_TestModeToggleIsNotEnvDriven asserts the test-mode toggle is
+// a Go variable, not an env var — a customer cannot enable
+// process-killing behaviour via the environment.
+func TestACO15_TestModeToggleIsNotEnvDriven(t *testing.T) {
+	resetDepsForTest()
+	// Setting any plausible env var must NOT enable test mode.
+	t.Setenv("DEPS_TEST_MODE", "true")
+	t.Setenv("TEST_MODE", "true")
+	if depsTestMode.Load() {
+		t.Fatalf("AC-O15: depsTestMode is env-driven — it must only be flipped by SetDepsTestMode")
+	}
+	// The empty-key call must take the prod (counter) path, not panic.
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("AC-O15: empty-key call panicked despite env vars only — toggle leaked to env")
+		}
+	}()
+	Deps().Record("", gvrCompositions(), "ns", "n")
+}
+
 // --- Concurrency -----------------------------------------------------------
 
 func TestDeps_ConcurrentRecordAndDelete_RaceFree(t *testing.T) {
@@ -322,7 +479,8 @@ func TestL1KeyContextHelpers(t *testing.T) {
 // TestRecordingInnerCallDep_ListScope mimics the resolver loop: the
 // resolver derives (gvr, ns, name="") from an apiserver list-form path
 // and calls RecordList. A subsequent OnDelete on ANY object in that GVR
-// + ns must evict the L1 key.
+// + ns DIRTY-MARKS the L1 key (R2/R7: list-dep → dirty-mark, not evict —
+// the dependent entry's own object still exists).
 func TestRecordingInnerCallDep_ListScope(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
@@ -351,29 +509,47 @@ func TestRecordingInnerCallDep_ListScope(t *testing.T) {
 	}
 	d.RecordList("L1_admin_list", gvr, ns)
 
-	// OnDelete for ANY object of that GVR in ns evicts via list-scope.
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
+	// OnDelete for ANY object of that GVR in ns dirty-marks via list-scope.
 	got := d.OnDelete(gvr, "bench-ns-02", "bench-app-02-XX")
-	if got != 1 {
-		t.Fatalf("OnDelete returned %d evicted, want 1 (list-scope match)", got)
+	if got != 0 {
+		t.Fatalf("OnDelete evicted %d, want 0 (list-dep dirty-marks)", got)
 	}
-	if _, exists := store.Get("L1_admin_list"); exists {
-		t.Errorf("L1_admin_list should have been evicted via list-scope dep")
+	if _, exists := store.Get("L1_admin_list"); !exists {
+		t.Errorf("L1_admin_list must SURVIVE — list-dep is dirty-marked, not evicted")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 1 || marked[0] != "L1_admin_list" {
+		t.Errorf("L1_admin_list should have been dirty-marked via list-scope dep; got %v", marked)
 	}
 }
 
 // TestRecordingInnerCallDep_ExactObject mimics the resolver loop for a
-// path with a named object: /apis/.../<resource>/<name>. Records an
-// exact-object dep. Verifies four-bucket union: a DELETE for the same
-// (gvr, ns, name) matches the exact bucket, and a separate list-scope
-// dep recorded under a different L1 key also matches per the
-// 4-bucket-union spec at deps.go:348.
+// path with a named object: /apis/.../<resource>/<name>. The widget A
+// entry GET-depends on the named object as a SEPARATE dependency; a
+// list-scope dep is recorded under widget B. A DELETE of the named
+// object DIRTY-MARKS both (R2/R7) — neither is the deleted object's own
+// self-representation.
 func TestRecordingInnerCallDep_ExactObject(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
 
-	store.Put("L1_widget_a", &ResolvedEntry{RawJSON: []byte(`{}`)})
-	store.Put("L1_widget_b", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	rGVR := gvrCompositions()
+	// Widget A's own object is (rGVR, ns, "widget-a-owner") — it merely
+	// GET-depends on the composition object below.
+	store.Put("L1_widget_a", &ResolvedEntry{
+		RawJSON: []byte(`{}`),
+		Inputs:  inputsFor(rGVR, "bench-ns-02", "widget-a-owner"),
+	})
+	store.Put("L1_widget_b", &ResolvedEntry{
+		RawJSON: []byte(`{}`),
+		Inputs:  inputsFor(rGVR, "bench-ns-02", "widget-b-owner"),
+	})
 
 	// Resolver records exact-object dep for the named GET call.
 	gvr, ns, name, ok := ParseAPIServerPathToDep(
@@ -388,16 +564,26 @@ func TestRecordingInnerCallDep_ExactObject(t *testing.T) {
 	// A second entry depends on the list-scope bucket for the same gvr+ns.
 	d.RecordList("L1_widget_b", gvr, ns)
 
-	// DELETE the exact object — both deps must match (exact + ns-list).
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
+	// DELETE the named object — neither widget is its self-representation,
+	// so both are dirty-marked (exact-GET-dep + list-dep).
 	got := d.OnDelete(gvr, "bench-ns-02", "bench-app-02-06")
-	if got != 2 {
-		t.Fatalf("OnDelete returned %d evicted, want 2 (exact + ns-list union)", got)
+	if got != 0 {
+		t.Fatalf("OnDelete evicted %d, want 0 (both deps are non-self)", got)
 	}
-	if _, exists := store.Get("L1_widget_a"); exists {
-		t.Errorf("L1_widget_a (exact dep) should have been evicted")
+	if _, exists := store.Get("L1_widget_a"); !exists {
+		t.Errorf("L1_widget_a (exact-GET-dep) must survive — dirty-mark, not evict")
 	}
-	if _, exists := store.Get("L1_widget_b"); exists {
-		t.Errorf("L1_widget_b (list-scope dep) should have been evicted")
+	if _, exists := store.Get("L1_widget_b"); !exists {
+		t.Errorf("L1_widget_b (list-scope dep) must survive — dirty-mark, not evict")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 2 {
+		t.Errorf("expected 2 dirty-marks (widget A + widget B); got %v", marked)
 	}
 }
 
@@ -454,46 +640,66 @@ func TestIteratorEmitsPerNamespaceEdges(t *testing.T) {
 		}
 	}
 
-	// DELETE in one of the 49 namespaces evicts the admin L1 entry.
+	// DELETE in one of the 49 namespaces DIRTY-MARKS the admin L1 entry
+	// (R2/R7: list-dep → dirty-mark — the admin entry itself still
+	// exists; one composition in one of its 49 listed namespaces went
+	// away, so the entry is stale-while-revalidate, not evicted).
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
 	got := d.OnDelete(iterGVR, "bench-ns-25", "bench-app-XX")
-	if got != 1 {
-		t.Fatalf("OnDelete returned %d evicted, want 1 (any-of-49 list-scope)", got)
+	if got != 0 {
+		t.Fatalf("OnDelete evicted %d, want 0 (any-of-49 list-scope dirty-marks)", got)
 	}
-	if _, exists := store.Get(adminL1); exists {
-		t.Errorf("admin L1 entry should have been evicted")
+	if _, exists := store.Get(adminL1); !exists {
+		t.Errorf("admin L1 entry must SURVIVE — list-dep is dirty-marked, not evicted")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 1 || marked[0] != adminL1 {
+		t.Errorf("admin L1 entry should have been dirty-marked; got %v", marked)
 	}
 }
 
-// TestOnDelete_EvictsViaListScope is the load-bearing Gate 1 unit-test:
-// the dep tracker is populated with a list-scope dep (mimicking the
-// resolver-side Edge type 3 recording), a DELETE is fired on a specific
-// (gvr, ns, name) tuple in that scope, and the evict counter MUST tick.
-// This is the failure mode the 0.30.92 probe captured at evict_delete=0.
-func TestOnDelete_EvictsViaListScope(t *testing.T) {
+// TestOnDelete_DirtyMarksViaListScope: a DELETE on a member of a
+// list-scope dependency dirty-marks the dependent entry (R2/R7) and
+// leaves evictDeleteTotal at 0 — list-deps are never self-evictions.
+func TestOnDelete_DirtyMarksViaListScope(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	store := newResolvedCache(100, 1<<20, time.Hour)
 	d.SetStore(store)
 
 	gvr := gvrCompositions()
-	const l1Key = "L1_admin_list_evict"
+	const l1Key = "L1_admin_list_dirty"
 	store.Put(l1Key, &ResolvedEntry{RawJSON: []byte(`{"items":[]}`)})
 	d.RecordList(l1Key, gvr, "bench-ns-02")
 
-	// Pre-condition: evict counter is zero.
 	if got := d.evictDeleteTotal.Load(); got != 0 {
 		t.Fatalf("evictDeleteTotal=%d (must start at 0)", got)
 	}
 
-	// Fire OnDelete — list-scope dep MUST match.
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
 	evicted := d.OnDelete(gvr, "bench-ns-02", "bench-app-02-06")
-	if evicted != 1 {
-		t.Fatalf("OnDelete evicted=%d want 1", evicted)
+	if evicted != 0 {
+		t.Fatalf("OnDelete evicted=%d want 0 (list-dep dirty-marks)", evicted)
 	}
-	if got := d.evictDeleteTotal.Load(); got != 1 {
-		t.Fatalf("evictDeleteTotal=%d want 1 (this counter is the Gate 1 falsifier)", got)
+	if got := d.evictDeleteTotal.Load(); got != 0 {
+		t.Fatalf("evictDeleteTotal=%d want 0 — list-dep is not a self-eviction", got)
 	}
-	if _, ok := store.Get(l1Key); ok {
-		t.Fatalf("L1 entry not removed from store after OnDelete")
+	if got := d.dirtyMarkTotal.Load(); got != 1 {
+		t.Fatalf("dirtyMarkTotal=%d want 1", got)
+	}
+	if _, ok := store.Get(l1Key); !ok {
+		t.Fatalf("L1 entry must survive — list-dep is dirty-marked")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 1 || marked[0] != l1Key {
+		t.Fatalf("L1 entry should have been dirty-marked; got %v", marked)
 	}
 }
 

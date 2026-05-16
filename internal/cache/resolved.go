@@ -536,6 +536,7 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 			s := c.Stats()
 			d := Deps().Stats()
 			r := refresherStatsSnapshot()
+			dw := DepWatchStatsSnapshot()
 			// Falsifier shape per plan §"Code-path falsifier" (0.30.8):
 			//   resolved_cache.summary entries=N bytes=B hit_rate=0.NN
 			//   evict_lru=X evict_delete=Y refresh_enqueued=M refresh_completed=K
@@ -555,6 +556,10 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Int64("dep_map_size", d.TotalRecords),
 				slog.Uint64("dep_record_total", d.RecordTotal),
 				slog.Uint64("dep_record_dropped_cap", d.RecordDroppedCap),
+				slog.Uint64("dep_record_dropped_no_key", d.RecordDroppedNoKey),
+				slog.Uint64("dep_dirty_mark_total", d.DirtyMarkTotal),
+				slog.Uint64("dep_add_dropped_pre_sync", dw.AddDroppedPreSync),
+				slog.Uint64("dep_add_propagated", dw.AddPropagated),
 				slog.Uint64("hit_total", s.HitTotal),
 				slog.Uint64("miss_total", s.MissTotal),
 				slog.Uint64("store_total", s.StoreTotal),
