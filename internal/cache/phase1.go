@@ -490,34 +490,3 @@ func InternalRESTConfigFromContext(ctx context.Context) (any, bool) {
 	}
 	return v, true
 }
-
-// IsInternalDispatch reports whether ctx is driven by an internal/startup
-// driver — today, Phase 1's SA-credentialed resolution walk. It is true
-// iff WithInternalRESTConfig attached an internal-dispatch *rest.Config
-// (the SINGLE marker the walk sets on every resolution context it builds;
-// see resolveNavigationRoot in dispatchers/phase1_walk.go).
-//
-// WHY a dedicated predicate: the resolver pivot's per-user RBAC narrowing
-// (filterListByRBAC / filterGetByRBAC) is keyed on the REQUEST USER
-// identity against the Krateo Role/RoleBinding CRs. Phase 1 resolves
-// under the snowplow service account, which carries NO Krateo RBAC CRs,
-// so that narrowing default-denies and silently empties every
-// informer-served LIST inside an apiRef RESTAction — the navmenu's
-// `navmenuitems` LIST returns zero items and the navigation descent dies
-// before it reaches the Compositions DataGrid. Phase 1 is identity-
-// independent informer DISCOVERY, not per-user rendering: the pivot's
-// RBAC filter must NOT narrow an internal-dispatch read. The per-user
-// `allowed` render gate is correctly applied later, at real request time.
-//
-// SECURITY — this can NEVER widen a real user's view: an ordinary
-// per-user request never calls WithInternalRESTConfig, so
-// IsInternalDispatch is false on every request path. Only Phase 1's
-// startup walk sets the marker, and Phase 1 DISCARDS its resolution
-// output (it populates no L1, persists no status) — the unfiltered
-// bytes never reach a user. The bypass is uniform over every GVR
-// (feedback_no_special_cases.md): one context-state predicate, no
-// per-resource carve-out.
-func IsInternalDispatch(ctx context.Context) bool {
-	_, ok := InternalRESTConfigFromContext(ctx)
-	return ok
-}

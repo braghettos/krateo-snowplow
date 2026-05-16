@@ -38,16 +38,20 @@
 //      privileged service-account credentials — issue a DESTRUCTIVE
 //      apiserver mutation. The walk MUST stay strictly read-only.
 //
-//      WHY the `allowed` flag is NOT a recursion gate: it is snowplow's
-//      typed-RBAC evaluator (EvaluateRBAC) keyed on the REQUEST USER
-//      identity against the Krateo Role/RoleBinding CRs — NOT the
-//      apiserver's RBAC. The Phase 1 SA-walk context carries no Krateo
-//      RBAC CRs, so EvaluateRBAC default-denies and every child resolves
-//      allowed=false. Gating on it prunes the whole tree at the first
-//      Route and the composition informer never registers. Phase 1 is
-//      identity-independent informer DISCOVERY, not per-user rendering;
-//      the `allowed` render gate belongs at real request time. See
-//      walkShouldRecurse for the full rationale.
+//      WHY the `allowed` flag is NOT a recursion gate: Phase 1 walks the
+//      FULL GET-navigation structure for informer DISCOVERY — informer
+//      registration is identity-independent (the composition informer the
+//      Compositions Page needs is the same object set no matter which user
+//      can see it). The per-user `allowed` RENDER gate (which widgets to
+//      show a logged-in user) belongs at real request time, not startup
+//      warmup. Note: Phase 1 resolves under the snowplow service account's
+//      CANONICAL username (system:serviceaccount:<ns>:<name>, derived from
+//      the SA token's JWT `sub` claim — 0.30.108), and that SA holds a
+//      native ClusterRoleBinding granting `*/*` get/list/watch, so
+//      EvaluateRBAC correctly AUTHORIZES it; `allowed` is therefore true
+//      for the navigation widgets anyway. It is still not used as the
+//      recursion gate because discovery must not depend on render
+//      authorization at all. See walkShouldRecurse for the full rationale.
 //   3. As the RESTAction resolver processes inner-call paths (fired when
 //      the recursion reaches an apiRef-bearing leaf such as the
 //      Compositions Page DataGrid), the flag-independent
@@ -98,17 +102,67 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// snowplowSAUsername is the identity Phase 1 resolves under. It is the
-// snowplow service account — the same identity dynamic.ServiceAccountEndpoint
-// authenticates as. The resolver's RESTAction inner-call path keys its
-// per-user clientconfig lookup on the username; Phase 1 overrides that
-// lookup via cache.WithInternalEndpoint so no `<sa>-clientconfig` Secret
-// is required.
+// phase1SAUsername resolves the CANONICAL Kubernetes ServiceAccount
+// username for the pod Phase 1 runs as — the form
+// `system:serviceaccount:<namespace>:<name>`.
 //
-// Per feedback_no_special_cases.md: this is an IDENTITY label, not a
-// per-resource policy — it names WHO Phase 1 resolves as, exactly as a
-// real request names its user.
-const snowplowSAUsername = "snowplow-serviceaccount"
+// WHY canonical (0.30.108 — the bug 0.30.105–107 misdiagnosed): the
+// resolution-context identity flows into snowplow's RBAC evaluator
+// (rbac.EvaluateRBAC). Its subject matcher (anySubjectMatches →
+// parseServiceAccountUsername) can only match a ServiceAccount-kind RBAC
+// subject when the username carries the `system:serviceaccount:` prefix.
+// The snowplow SA genuinely holds a native ClusterRoleBinding granting
+// `*/*` get/list/watch — but that binding's subject is ServiceAccount-kind
+// (name + namespace). A bare label like "snowplow-serviceaccount" has no
+// prefix, so parseServiceAccountUsername returns isSA=false, the
+// ServiceAccount-kind subject can never fire, and EvaluateRBAC DENIES a
+// fully-authorized SA. The fix is to pass the canonical form so the
+// evaluator can connect Phase 1's identity to the SA's real binding.
+//
+// DERIVATION (no hardcoded ns/name literals — feedback_no_special_cases.md):
+// the in-cluster projected SA token is a JWT whose `sub` claim is EXACTLY
+// `system:serviceaccount:<ns>:<name>`. Phase 1 already loads that token
+// (idynamic.ServiceAccountEndpoint puts the raw JWT in saEP.Token), so we
+// decode `sub` from it via jwtutil.ExtractUserInfo — the canonical
+// username arrives verbatim from the runtime identity, never a Go literal.
+// The pod's namespace and SA name are NOT named in code; they are whatever
+// the apiserver minted into the token snowplow runs with.
+//
+// Returns ("", false) when the token is absent or its `sub` is not a
+// canonical ServiceAccount username; the caller logs and proceeds (Phase 1
+// is best-effort warmup — see resolveNavigationRoot).
+func phase1SAUsername(saToken string) (string, bool) {
+	if saToken == "" {
+		return "", false
+	}
+	ui, err := jwtutil.ExtractUserInfo(saToken)
+	if err != nil {
+		return "", false
+	}
+	if _, _, isSA := splitCanonicalSAUsername(ui.Username); !isSA {
+		return "", false
+	}
+	return ui.Username, true
+}
+
+// splitCanonicalSAUsername reports whether u is a canonical
+// `system:serviceaccount:<ns>:<name>` username and, if so, returns its ns
+// and name. It mirrors rbac.parseServiceAccountUsername so phase1SAUsername
+// can VERIFY the JWT-decoded subject is the canonical form the RBAC
+// evaluator will actually match — keeping the two in lockstep without an
+// import cycle.
+func splitCanonicalSAUsername(u string) (string, string, bool) {
+	const prefix = "system:serviceaccount:"
+	if !strings.HasPrefix(u, prefix) {
+		return "", "", false
+	}
+	rest := u[len(prefix):]
+	i := strings.Index(rest, ":")
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", false
+	}
+	return rest[:i], rest[i+1:], true
+}
 
 // rootsLister abstracts the cluster-wide LIST of the navigation-root CRs
 // so the no-hardcode falsifier test can substitute an in-memory inventory
@@ -405,23 +459,38 @@ const phase1MaxWalkDepth = 32
 // lister (the ConfigMap read + root-CR fetch) and resolveNavigationRoot
 // (the per-root recursive walk) so both run under exactly one identity.
 //
-// The internal-dispatch markers it installs:
+// The context it installs:
 //   - xcontext.WithUserConfig(saEP)   — the endpoint shape the resolver
 //     expects on the context.
-//   - xcontext.WithUserInfo({snowplow SA}) — the identity label.
+//   - xcontext.WithUserInfo({canonical SA username}) — the identity. The
+//     username is the CANONICAL `system:serviceaccount:<ns>:<name>` form
+//     (0.30.108) so rbac.EvaluateRBAC's ServiceAccount-kind subject
+//     matcher can connect Phase 1's identity to the snowplow SA's real
+//     ClusterRoleBinding (`*/*` get/list/watch). Derived from the SA
+//     token's JWT `sub` claim — see phase1SAUsername.
 //   - cache.WithInternalEndpoint(&saEP) — the RESTAction resolver's
-//     non-UAF inner-call endpoint resolution.
-//   - cache.WithInternalRESTConfig(saRC) — the SA *rest.Config used
-//     verbatim by the object-fetch sites; ALSO the marker
-//     cache.IsInternalDispatch keys on, so the pivot's per-user RBAC
-//     narrowing is bypassed for Phase 1 discovery (0.30.107 — see
-//     cache.IsInternalDispatch).
+//     non-UAF inner-call endpoint resolution returns the SA endpoint
+//     instead of looking up a (non-existent) `<sa>-clientconfig` Secret.
+//   - cache.WithInternalRESTConfig(saRC) — the SA *rest.Config built by
+//     main.go from rest.InClusterConfig; the resolver's object-fetch
+//     sites (objects.Get, resourcesrefs.Resolve) use it verbatim instead
+//     of rebuilding a client from saEP through kubeconfig.NewClientConfig
+//     (the LOAD-BEARING 0.30.103 fix — the SA's raw-PEM CA cannot survive
+//     the base64/cert-only kubeconfig path).
 func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
-	rctx := xcontext.BuildContext(ctx,
+	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserConfig(saEP),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: snowplowSAUsername}),
 		xcontext.WithLogger(slog.Default()),
-	)
+	}
+	// The CANONICAL SA username: derived from the JWT `sub` claim of the
+	// projected SA token saEP already carries. Without it (token absent /
+	// malformed) Phase 1 still runs — it is best-effort warmup — but the
+	// RBAC evaluator then has no SA subject to match; that degraded case
+	// is logged at the call site (resolveNavigationRoot / the lister).
+	if u, ok := phase1SAUsername(saEP.Token); ok {
+		opts = append(opts, xcontext.WithUserInfo(jwtutil.UserInfo{Username: u}))
+	}
+	rctx := xcontext.BuildContext(ctx, opts...)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 	return rctx
@@ -563,10 +632,9 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// that carry a path. walkShouldRecurse is the single auditable
 		// predicate — see its doc for why verb=="GET" is the load-bearing
 		// read-only invariant and why `allowed` is deliberately NOT a
-		// gate here. (`allowed` is set by snowplow's OWN typed-RBAC
-		// evaluator keyed on the REQUEST USER identity; the SA walk
-		// carries no such identity, so it default-denies — the SA's
-		// broad apiserver permissions are not the cause.)
+		// gate here (Phase 1 is informer DISCOVERY, which is identity-
+		// independent; the per-user `allowed` render gate belongs at real
+		// request time).
 		if !walkShouldRecurse(child) {
 			continue
 		}
@@ -646,37 +714,46 @@ type navChildRef struct {
 //	the walk stays strictly read-only: a GET is non-destructive
 //	regardless of any RBAC verdict.
 //
-// WHY `allowed` is DELIBERATELY NOT a recursion gate (0.30.105
-// on-cluster finding):
+// WHY `allowed` is DELIBERATELY NOT a recursion gate:
 //
 //	The `allowed` flag a resolved resourcesRefs item carries is set by
 //	resourcesrefs.resolveOne via rbac.UserCan -> EvaluateRBAC — snowplow's
-//	OWN typed-RBAC evaluator, keyed on the REQUEST USER IDENTITY
-//	(username + groups extracted from the context) against the
-//	informer-cached Krateo Role/RoleBinding CRs. It is NOT the apiserver's
-//	RBAC and NOT the walk identity's apiserver permissions.
+//	in-process evaluator of NATIVE Kubernetes RBAC (Role / RoleBinding /
+//	ClusterRole / ClusterRoleBinding) keyed on the resolution-context
+//	identity. It is the same answer the apiserver's RBAC would give, just
+//	served from the informer cache.
 //
-//	The Phase 1 walk's context identity is the snowplow service account.
-//	That identity HAS broad apiserver get/list/watch (so objects.Get
-//	below succeeds) — but it carries no Krateo Role/RoleBinding CRs, so
-//	EvaluateRBAC evaluates an effectively-empty subject and default-denies:
-//	every navigation child resolves allowed=false. Gating the recursion on
-//	allowed==true therefore prunes the ENTIRE tree at the first Route
-//	level: the walk never reaches the Compositions Page DataGrid and the
-//	composition.krateo.io informer is never registered (exactly the
-//	0.30.104 failure this release exists to fix; the first 0.30.105
-//	on-cluster bench reproduced it when this gate was applied).
+//	Phase 1 resolves under the snowplow service account's CANONICAL
+//	username (system:serviceaccount:<ns>:<name>, derived from the SA
+//	token's JWT `sub` claim — 0.30.108 — see phase1SAUsername). That SA
+//	holds a native ClusterRoleBinding granting `*/*` get/list/watch, and
+//	with the canonical username EvaluateRBAC's ServiceAccount-kind subject
+//	matcher connects the identity to that binding — so EvaluateRBAC
+//	correctly AUTHORIZES every navigation read and `allowed` is true for
+//	the navigation widgets.
 //
-//	The frontend WidgetRenderer applies items.filter(({allowed})=>allowed)
-//	because a denied widget must not RENDER for that logged-in user. But
-//	Phase 1 is informer DISCOVERY, not rendering — informer registration
-//	is identity-independent: the composition informer the Compositions
-//	Page needs is the same object set no matter which user can see it.
-//	The walk must discover the full GET-navigation STRUCTURE; the
-//	per-user `allowed` render gate is correctly applied later, at real
-//	request time, not during startup warmup. Dropping `allowed` here
-//	does NOT weaken the read-only guarantee — verb == "GET" is the sole
-//	safety invariant and it is independent of RBAC.
+//	`allowed` is STILL not used as the recursion gate: Phase 1 is informer
+//	DISCOVERY, and discovery is identity-independent — the composition
+//	informer the Compositions Page needs is the same object set no matter
+//	which user can see it. The walk must register the informer for the
+//	full GET-navigation STRUCTURE regardless of any per-user render
+//	verdict. The frontend WidgetRenderer applies
+//	items.filter(({allowed})=>allowed) because a denied widget must not
+//	RENDER for a logged-in user — that per-user render gate is correctly
+//	applied later, at real request time, not during startup warmup.
+//	Gating discovery on a render verdict would couple two concerns that
+//	must stay independent. Dropping `allowed` here does NOT weaken the
+//	read-only guarantee — verb == "GET" is the sole safety invariant and
+//	it is independent of RBAC.
+//
+//	(HISTORICAL: 0.30.105 misdiagnosed this as "the SA walk is
+//	RBAC-denied because it carries no Krateo RBAC CRs" — there are no
+//	"Krateo RBAC CRs"; EvaluateRBAC evaluates native Kubernetes RBAC. The
+//	actual 0.30.105–107 defect was a MALFORMED SA username
+//	("snowplow-serviceaccount", no system:serviceaccount: prefix) that
+//	parseServiceAccountUsername could not resolve, so the SA's real
+//	ClusterRoleBinding never matched and a fully-authorized SA was
+//	silently denied. 0.30.108 fixes the username; see phase1SAUsername.)
 //
 // Also requires a non-empty path — nothing to fetch/recurse into
 // otherwise.
