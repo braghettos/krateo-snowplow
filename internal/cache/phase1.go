@@ -1,0 +1,382 @@
+// phase1.go — 0.30.102 Tag B: startup informer-warmup state + the
+// hardcoded meta-query seed budget + the all-informer sync-wait.
+//
+// Tag B premise (resting on Tag A 0.30.100): the resolver pivot
+// (RESOLVER_USE_INFORMER=true) can only serve a GVR whose informer is
+// registered AND synced. 0.30.99's bench failed because the navigated
+// informers were registered lazily-late and never synced inside the
+// navigation window — the pivot served nothing cold.
+//
+// Tag B closes that cold window with a startup PHASE 1: at boot, before
+// traffic, the navigation root (the `routesloaders` widget CR) is LISTed
+// cluster-wide and every CR is resolved with the snowplow SERVICE-
+// ACCOUNT identity through the standard widget/RESTAction resolver. As
+// the resolver walks inner-call paths it auto-registers an informer for
+// every GVR it touches via the flag-independent `lazyRegisterInnerCallPaths`
+// hook. After the walk, Phase 1 BLOCKS until every registered informer
+// reaches HasSynced, then signals Phase1Done. The /readyz probe gates
+// pod readiness on Phase1Done so traffic only arrives once the navigated
+// informers are warm.
+//
+// CRITICAL — feedback_no_special_cases.md: Phase 1 does NOT consult any
+// configured GVR / RESTAction list. The ONLY hardcoded budget is the 7
+// meta-query seeds below — bare anchors needed to bootstrap discovery,
+// not per-resource policy. Every BUSINESS GVR (widgets, panels,
+// compositions) is discovered by resolving the routesloaders roots.
+//
+// BEHAVIOR-NEUTRAL — PrewarmEnabled() gates the whole feature behind
+// PREWARM_ENABLED (default OFF), mirroring PREWARM_REGISTER_ENABLED.
+// When OFF: Phase 1 never runs and Phase1Done is pre-set true at startup
+// so /readyz is an immediate-200 no-op. The flag is NOT in the chart
+// configmap — absent => OFF.
+
+package cache
+
+import (
+	"context"
+	"os"
+	"sync/atomic"
+	"time"
+
+	"log/slog"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	clientcache "k8s.io/client-go/tools/cache"
+)
+
+// envPrewarmEnabled is the opt-in gate for the Tag B startup warmup
+// (Phase 1 + CRD-watch). Default OFF — absent / "" / anything but
+// "true" => the feature is dormant and behavior-neutral.
+const envPrewarmEnabled = "PREWARM_ENABLED"
+
+// PrewarmEnabled reports whether the Tag B startup warmup is opted in.
+// Read once at startup by main.go; cheap enough to read per call.
+func PrewarmEnabled() bool {
+	return os.Getenv(envPrewarmEnabled) == "true"
+}
+
+// phase1Done is the process-wide atomic that flips true exactly once,
+// when the Phase 1 SA-credentialed resolution walk has finished AND
+// every registered informer (including the CRD-watch-spawned composition
+// informers that exist at boot) has reached HasSynced.
+//
+// When PrewarmEnabled()==false the startup sequence calls
+// MarkPhase1Done immediately (nothing to wait for) so /readyz is a
+// no-op. When true, MarkPhase1Done is called only at the END of
+// Phase1Warmup. /readyz returns 200 iff phase1Done.Load()==true.
+var phase1Done atomic.Bool
+
+// MarkPhase1Done flips the process-wide Phase1Done signal to true. Safe
+// to call multiple times — atomic store is idempotent. Called once by
+// the startup sequence (immediately when PREWARM_ENABLED is OFF, or at
+// the tail of Phase1Warmup when ON).
+func MarkPhase1Done() {
+	phase1Done.Store(true)
+}
+
+// IsPhase1Done reports whether the Tag B startup warmup has completed.
+// The /readyz probe handler returns 200 iff this is true. Liveness
+// (/health) does NOT consult this — a not-yet-warm pod is alive.
+func IsPhase1Done() bool {
+	return phase1Done.Load()
+}
+
+// ResetPhase1DoneForTest clears the Phase1Done signal. TEST-ONLY — the
+// production lifecycle is set-once. Exported so the readyz handler test
+// in another package can drive the gate deterministically.
+func ResetPhase1DoneForTest() {
+	phase1Done.Store(false)
+}
+
+// customResourceDefinitionGVR is the GVR of the apiextensions
+// CustomResourceDefinition resource — the navigation root the CRD-watch
+// (Part 2) registers an informer against to discover composition GVRs
+// as their CRDs appear.
+//
+// Per feedback_no_special_cases.md: NOT a per-resource policy. It is one
+// of the 7 bare meta-query anchors — the CRD-watch needs SOMETHING to
+// LIST/WATCH to learn about composition CRDs, and that something is the
+// CRD type itself.
+var customResourceDefinitionGVR = schema.GroupVersionResource{
+	Group:    "apiextensions.k8s.io",
+	Version:  "v1",
+	Resource: "customresourcedefinitions",
+}
+
+// routesLoadersGVR is the GVR of the `routesloaders` widget CR — the
+// navigation root. Phase 1 LISTs every routesloaders CR cluster-wide and
+// resolves each; the resolution discovers all downstream business GVRs.
+//
+// Per feedback_no_special_cases.md: the routesloaders GVR is the bare
+// navigation-root anchor, not a per-resource carve-out. It is hardcoded
+// because the navigation surface HAS to start somewhere — the frontend's
+// route loader is that fixed entry point. Every GVR reached FROM it is
+// discovered, never named.
+var routesLoadersGVR = schema.GroupVersionResource{
+	Group:    "widgets.templates.krateo.io",
+	Version:  "v1beta1",
+	Resource: "routesloaders",
+}
+
+// RoutesLoadersGVR exposes the navigation-root GVR to the Phase 1 walk
+// driver (which lives in the dispatchers package — widget resolution is
+// there). Read-only accessor; the value is a hardcoded meta-query seed.
+func RoutesLoadersGVR() schema.GroupVersionResource {
+	return routesLoadersGVR
+}
+
+// CustomResourceDefinitionGVR exposes the CRD meta-query anchor.
+func CustomResourceDefinitionGVR() schema.GroupVersionResource {
+	return customResourceDefinitionGVR
+}
+
+// MetaQuerySeeds returns the COMPLETE hardcoded seed budget for Tag B —
+// EXACTLY these 7 GVRs, nothing else (feedback_no_special_cases.md is a
+// hard requirement here):
+//
+//  1. routesloaders            — the navigation root Phase 1 LISTs.
+//  2. restactions              — the restActionGVR anchor (already cited
+//     by inventory.go; the resolver's apiRef edges target it).
+//  3. customresourcedefinitions — the CRD-watch root (Part 2).
+//  4-7. the 4 RBACResourceTypes — roles / rolebindings / clusterroles /
+//     clusterrolebindings (already bootstrap-registered in
+//     NewResourceWatcher; included here so the seed set is the single
+//     auditable source of truth).
+//
+// Every BUSINESS GVR — widgets, panels, compositions — is ABSENT from
+// this set by construction. Those are discovered by RESOLVING the
+// routesloaders roots, never named in code. A test asserts this slice
+// has exactly 7 entries and that none of them is a composition/widget/
+// panel business GVR.
+func MetaQuerySeeds() []schema.GroupVersionResource {
+	seeds := []schema.GroupVersionResource{
+		routesLoadersGVR,
+		restActionGVR,
+		customResourceDefinitionGVR,
+	}
+	seeds = append(seeds, RBACResourceTypes...)
+	return seeds
+}
+
+// RegisterMetaQuerySeeds registers an informer for each of the 3
+// non-RBAC meta-query seeds (routesloaders, restactions,
+// customresourcedefinitions) plus re-confirms the 4 RBAC GVRs (already
+// registered by NewResourceWatcher — EnsureResourceType observes
+// added=false for those) — 7 seeds total. Idempotent + singleflighted
+// under rw.mu.
+//
+// This is the ONLY code that hands a hardcoded GVR to EnsureResourceType
+// at startup. The Phase 1 walk registers everything else by resolution.
+//
+// Returns the count newly registered. Nil-receiver / passthrough are
+// no-ops.
+func (rw *ResourceWatcher) RegisterMetaQuerySeeds() int {
+	if rw == nil || rw.mode == modePassthrough {
+		return 0
+	}
+	registered := 0
+	for _, gvr := range MetaQuerySeeds() {
+		added, _ := rw.EnsureResourceType(gvr)
+		if added {
+			registered++
+		}
+	}
+	slog.Info("cache.phase1.meta_query_seeds_registered",
+		slog.String("subsystem", "cache"),
+		slog.Int("seed_count", len(MetaQuerySeeds())),
+		slog.Int("newly_registered", registered),
+		slog.String("note", "bare meta-query anchors only — every business GVR is discovered by resolution"),
+	)
+	return registered
+}
+
+// WaitAllInformersSynced blocks until EVERY registered informer reaches
+// HasSynced AND no new informer was registered DURING the wait, or ctx
+// is cancelled. This is the Phase 1 sync barrier: after the SA-credentialed
+// resolution walk has fanned out (registering an informer per touched
+// GVR via lazyRegisterInnerCallPaths) AND the CRD-watch has spawned its
+// composition informers, this call guarantees the navigated set is warm
+// before Phase1Done flips.
+//
+// RE-SNAPSHOT LOOP — the load-bearing concurrency property. A single
+// snapshot+wait has a race: a CRD-add (the CRD-watch's per-GVR
+// EnsureResourceType) that lands AFTER the snapshot is taken but while
+// WaitForCacheSync is blocked would NOT be in the sync set — Phase1Done
+// could then flip while that composition informer is still cold, the
+// exact premature-Ready failure /readyz exists to prevent. So this loop
+// re-snapshots after every WaitForCacheSync pass and only returns when a
+// full pass completed with the registered-informer count UNCHANGED
+// across it (no registration occurred during the wait). client-go's
+// HasSynced is monotonic — once true it stays true — so a stable count
+// across a pass means every informer observed at the start of the pass
+// is synced AND nothing new appeared, hence every informer is synced.
+//
+// It does NOT layer its own timeout — the caller (Phase1Warmup) owns the
+// deadline via ctx so the PHASE1_TIMEOUT_SECONDS budget is the single
+// source of truth and also bounds a pathological never-stabilizing loop
+// (a cluster that keeps adding CRDs forever).
+//
+// INVARIANT the count-equality test depends on: the registered-informer
+// set is append-only — informers are never de-registered (there is no
+// delete from rw.informers; the CRD-watch deliberately omits DeleteFunc).
+// So an unchanged COUNT across a pass implies an unchanged SET. If a
+// future change adds a de-registration path, this proxy breaks and the
+// loop must compare the GVR set, not the count.
+//
+// Returns nil on success, ctx.Err()/DeadlineExceeded on cancellation. In
+// modePassthrough there are no informers — returns nil immediately.
+func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
+	if rw == nil || rw.mode == modePassthrough {
+		return nil
+	}
+
+	start := time.Now()
+	for pass := 1; ; pass++ {
+		if ctx.Err() != nil {
+			slog.Warn("cache.phase1.sync_wait_incomplete",
+				slog.String("subsystem", "cache"),
+				slog.Int("pass", pass),
+				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
+				slog.Any("err", ctx.Err()),
+			)
+			return ctx.Err()
+		}
+
+		// Snapshot the informer set + count under the lock.
+		rw.mu.RLock()
+		countBefore := len(rw.informers)
+		syncs := make([]clientcache.InformerSynced, 0, countBefore)
+		for _, gi := range rw.informers {
+			syncs = append(syncs, gi.Informer().HasSynced)
+		}
+		rw.mu.RUnlock()
+
+		if len(syncs) == 0 {
+			// Nothing registered — vacuously synced.
+			return nil
+		}
+
+		// Wait for this snapshot's informers to sync (outside the lock,
+		// so concurrent registrations are not blocked).
+		if !clientcache.WaitForCacheSync(ctx.Done(), syncs...) {
+			slog.Warn("cache.phase1.sync_wait_incomplete",
+				slog.String("subsystem", "cache"),
+				slog.Int("pass", pass),
+				slog.Int("informer_count", countBefore),
+				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
+				slog.Any("err", ctx.Err()),
+			)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return context.DeadlineExceeded
+		}
+
+		// Re-snapshot: if the count is unchanged, NO informer was
+		// registered during the WaitForCacheSync pass — the barrier is
+		// genuinely complete. If it grew, a CRD-add (or a late resolver
+		// touch) landed mid-wait; loop and re-wait so the new informer
+		// is included.
+		countAfter := rw.RegisteredCount()
+		if countAfter == countBefore {
+			slog.Info("cache.phase1.sync_wait_complete",
+				slog.String("subsystem", "cache"),
+				slog.Int("passes", pass),
+				slog.Int("informer_count", countAfter),
+				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
+			)
+			return nil
+		}
+		slog.Info("cache.phase1.sync_wait_repass",
+			slog.String("subsystem", "cache"),
+			slog.Int("pass", pass),
+			slog.Int("count_before", countBefore),
+			slog.Int("count_after", countAfter),
+			slog.String("reason", "informer registered mid-wait — re-snapshotting so the new informer is in the barrier"),
+		)
+	}
+}
+
+// RegisteredGVRs returns a snapshot of every GVR with a registered
+// informer. The no-hardcode falsifier asserts over this full set that
+// the orphan GVR is absent — a stronger check than a single-GVR probe.
+func (rw *ResourceWatcher) RegisteredGVRs() []schema.GroupVersionResource {
+	if rw == nil || rw.mode == modePassthrough {
+		return nil
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	out := make([]schema.GroupVersionResource, 0, len(rw.informers))
+	for gvr := range rw.informers {
+		out = append(out, gvr)
+	}
+	return out
+}
+
+// IsRegistered reports whether an informer exists for gvr. Convenience
+// over RegisteredGVRs for single-GVR assertions (falsifier tests).
+func (rw *ResourceWatcher) IsRegistered(gvr schema.GroupVersionResource) bool {
+	if rw == nil || rw.mode == modePassthrough {
+		return false
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	_, ok := rw.informers[gvr]
+	return ok
+}
+
+// RegisteredCount returns the number of registered informers without
+// allocating a slice. The Phase 1 walk driver polls this to detect when
+// the CRD-watch + resolution fan-out has settled.
+func (rw *ResourceWatcher) RegisteredCount() int {
+	if rw == nil || rw.mode == modePassthrough {
+		return 0
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	return len(rw.informers)
+}
+
+// ctxKeyInternalEndpointType is the typed empty-struct context key for
+// WithInternalEndpoint / InternalEndpointFromContext.
+type ctxKeyInternalEndpointType struct{}
+
+var ctxKeyInternalEndpoint = ctxKeyInternalEndpointType{}
+
+// WithInternalEndpoint attaches an internal-dispatch apiserver endpoint
+// to ctx. The RESTAction resolver's endpoint-resolution step consults
+// this when a non-UAF api[] stage has NO EndpointRef AND the request is
+// driven by an internal/startup path that has no per-user `-clientconfig`
+// Secret to read.
+//
+// This is a GENERAL mechanism, not a per-resource carve-out
+// (feedback_no_special_cases.md): any internal driver — Phase 1's
+// SA-credentialed resolution walk today, a future background refresher
+// tomorrow — can tell the standard resolver which endpoint to dispatch
+// against instead of the per-user clientconfig lookup. The resolver
+// stays one code path; only the endpoint SOURCE is parameterised.
+//
+// ep is carried as `any` so the cache package does not couple to the
+// plumbing endpoints type; the resolver type-asserts to its endpoint
+// type. nil ep returns the parent context unchanged.
+func WithInternalEndpoint(ctx context.Context, ep any) context.Context {
+	if ctx == nil || ep == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyInternalEndpoint, ep)
+}
+
+// InternalEndpointFromContext returns the internal-dispatch endpoint
+// attached by WithInternalEndpoint, or (nil, false) when none was set
+// (the ordinary per-user request path — the resolver then takes its
+// standard per-user clientconfig lookup).
+func InternalEndpointFromContext(ctx context.Context) (any, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	v := ctx.Value(ctxKeyInternalEndpoint)
+	if v == nil {
+		return nil, false
+	}
+	return v, true
+}

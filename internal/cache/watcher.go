@@ -191,6 +191,12 @@ type ResourceWatcher struct {
 	eagerSet     map[schema.GroupVersionResource]struct{}
 	eagerDone    bool
 
+	// crdWatchStarted is the idempotence guard for StartCRDWatch
+	// (0.30.102 Tag B Part 2). Set true on the first StartCRDWatch
+	// call so a duplicate call cannot double-install the CRD informer's
+	// event handler. Guarded by rw.mu.
+	crdWatchStarted bool
+
 	stopCh chan struct{}
 }
 

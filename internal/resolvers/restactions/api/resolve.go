@@ -460,6 +460,23 @@ func lazyRegisterInnerCallPaths(log *slog.Logger, opts []httpcall.RequestOptions
 	seen := map[schema.GroupVersionResource]struct{}{}
 	for i := range opts {
 		path := opts[i].Path
+
+		// 0.30.102 Tag B Part 2 — CRD-watch group feed. Composition
+		// apiserver paths are JQ-templated (`/apis/<group>/${.v}/...`)
+		// so ParseAPIServerPathToGVR (which rejects any `${`) cannot
+		// derive their GVR here. The GROUP segment is static, though —
+		// extract it and feed the CRD-watch's navigation-derived
+		// auto-discover set. Gated by PREWARM_ENABLED so a flag-OFF
+		// process is byte-identical (the auto-discover set stays empty
+		// and the CRD-watch never runs). Non-templated paths also flow
+		// through here harmlessly — their group is added too, which is
+		// correct (it IS navigation-reached).
+		if cache.PrewarmEnabled() {
+			if grp, grpOK := cache.ExtractAPIServerGroupFromTemplatedPath(path); grpOK {
+				cache.AddAutoDiscoverGroup(grp)
+			}
+		}
+
 		gvr, ok := cache.ParseAPIServerPathToGVR(path)
 		if !ok {
 			continue

@@ -363,6 +363,67 @@ func main() {
 								slog.String("rationale", "startup walk registers informers the pivot does not consume while RESOLVER_USE_INFORMER is off — re-arms the 0.30.61 no-consumer apiserver-QPS regression + the unmitigated 0.30.8/0.30.92 OOM modes"),
 							)
 						}
+
+						// 0.30.102 Tag B — Phase 1 SA-credentialed
+						// resolution walk + CRD-watch + probe-gated
+						// readiness. Gated behind PREWARM_ENABLED
+						// (default OFF). Distinct from the 0.30.99
+						// PREWARM_REGISTER_ENABLED GVR-walk above: Tag B
+						// resolves the routesloaders navigation roots
+						// under SA identity (discovering GVRs by
+						// resolution, not from a configured list) and
+						// BLOCKS readiness on every navigated informer
+						// reaching HasSynced.
+						//
+						// Phase1Warmup BLOCKS on the informer sync
+						// barrier, so it runs on its own goroutine — the
+						// HTTP server (incl. /readyz) must come up while
+						// Phase 1 is still warming so the readinessProbe
+						// observes 503 during warmup. The goroutine's
+						// lifecycle is bounded by both the derived timeout
+						// context AND cacheCtx; it terminates when
+						// Phase1Warmup returns.
+						//
+						// When PREWARM_ENABLED is OFF the goroutine is not
+						// spawned and cache.MarkPhase1Done() is called
+						// immediately — /readyz then returns 200 from the
+						// first probe (no-op gate; behavior-neutral
+						// default). PREWARM_ENABLED is NOT in the chart
+						// configmap — absent => OFF.
+						if cache.PrewarmEnabled() {
+							log.Info("prewarm: Phase 1 startup warmup enabled via PREWARM_ENABLED=true",
+								slog.String("subsystem", "cache"),
+								slog.String("hint", "SA-credentialed routesloaders resolution walk + CRD-watch; /readyz gates on Phase1Done"),
+							)
+							// PHASE1_TIMEOUT_SECONDS bounds the whole walk +
+							// sync barrier. Default 900s — aligned with the
+							// chart's startupProbe budget (failureThreshold
+							// 90 * periodSeconds 10). A separate knob from
+							// STARTUP_TIMEOUT_SECONDS (120s) because Phase 1
+							// resolves the full navigation surface and may
+							// legitimately take minutes at production scale.
+							phase1Timeout := time.Duration(env.Int("PHASE1_TIMEOUT_SECONDS", 900)) * time.Second
+							go func() {
+								p1Ctx, p1Cancel := context.WithTimeout(cacheCtx, phase1Timeout)
+								defer p1Cancel()
+								if err := dispatchers.Phase1Warmup(p1Ctx, rc, *authnNS); err != nil {
+									log.Warn("cache: Phase 1 startup warmup incomplete",
+										slog.String("subsystem", "cache"),
+										slog.Any("err", err))
+								}
+								// Phase1Warmup always calls
+								// cache.MarkPhase1Done internally before it
+								// returns — /readyz is now 200.
+							}()
+						} else {
+							log.Info("prewarm: Phase 1 startup warmup disabled (default); set PREWARM_ENABLED=true to opt-in",
+								slog.String("subsystem", "cache"),
+								slog.String("rationale", "Tag B is behavior-neutral by default — Phase 1 does not run and /readyz returns 200 immediately"),
+							)
+							// Nothing to warm — flip the readiness gate now
+							// so /readyz is an immediate-200 no-op.
+							cache.MarkPhase1Done()
+						}
 					}
 				}
 			}
@@ -413,12 +474,28 @@ func main() {
 		}
 	}()
 
+	// 0.30.102 Tag B — readiness-gate safety net. The Tag B block above
+	// flips the Phase1Done gate (immediately when PREWARM_ENABLED is OFF,
+	// or asynchronously at the tail of Phase1Warmup when ON). But several
+	// startup paths bypass that block entirely: CACHE_ENABLED=false
+	// (diagnostic passthrough), or a cache-setup failure (nil watcher).
+	// On any such path there is nothing to warm, so /readyz must still
+	// return 200. When PREWARM_ENABLED is ON AND a watcher exists, the
+	// Phase1Warmup goroutine owns the flip — do NOT pre-flip here, or the
+	// premature-Ready invariant breaks. cacheWatcher==nil with
+	// PREWARM_ENABLED ON also has nothing to warm (no informer factory),
+	// so flip it.
+	if !cache.PrewarmEnabled() || cacheWatcher == nil {
+		cache.MarkPhase1Done()
+	}
+
 	mux := http.NewServeMux()
 
 	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
 	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
 
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
+	mux.Handle("GET /readyz", handlers.ReadyCheck())
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
 	mux.Handle("GET /list", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.List()))
 
