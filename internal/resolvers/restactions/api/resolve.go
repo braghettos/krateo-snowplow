@@ -360,6 +360,81 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 				}
 
+				// 0.30.104 Phase-1 TLS-CA fix — when an internal-dispatch
+				// *rest.Config is on the context (Phase 1's SA-credentialed
+				// startup walk attaches its rest.InClusterConfig() config
+				// via cache.WithInternalRESTConfig), route apiserver-path
+				// GET/LIST calls through a client-go dynamic client built
+				// from that *rest.Config instead of plumbing's httpcall.Do.
+				//
+				// WHY: plumbing's httpcall.Do builds the HTTP client from
+				// the Endpoint shape; its tlsConfigFor installs a custom CA
+				// pool ONLY in the HasCertAuth() branch. The snowplow SA
+				// endpoint is TOKEN-auth, so the SA's cluster CA is dropped
+				// and the apiserver TLS handshake fails with
+				// "x509: certificate signed by unknown authority" — Phase 1
+				// never discovers the composition GVR. The context-carried
+				// *rest.Config is the rest.InClusterConfig() value, which
+				// carries the cluster CA verbatim; client-go's transport
+				// installs it correctly. See internal_dispatch.go.
+				//
+				// BEHAVIOR-NEUTRAL: ordinary per-user requests never set
+				// cache.WithInternalRESTConfig, so dispatchViaInternalRESTConfig
+				// returns served=false for them and this block is a no-op —
+				// the path is byte-identical to pre-0.30.104.
+				//
+				// A non-nil err here is the REAL apiserver error (a 403, a
+				// genuine connectivity fault). We do NOT fall through to
+				// httpcall.Do on error — that would just re-hit the broken
+				// plumbing TLS path and mask the real error behind a second
+				// x509 failure. We surface it exactly as an httpcall.Do
+				// StatusFailure: write call.ErrorKey under dictMu, then
+				// honour ContinueOnError.
+				if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
+					if ierr != nil {
+						log.Error("api call response failure", slog.String("name", id),
+							slog.String("host", call.Endpoint.ServerURL),
+							slog.String("path", call.Path),
+							slog.String("dispatch", "internal-rest-config"),
+							slog.String("error", ierr.Error()))
+						dictMu.Lock()
+						dict[call.ErrorKey] = ierr.Error()
+						dictMu.Unlock()
+						if !call.ContinueOnError {
+							// Cancel gctx so in-flight peers short-circuit —
+							// same contract as the httpcall.Do StatusFailure
+							// hard-error branch below.
+							return fmt.Errorf("api %s failed: %s", id, ierr.Error())
+						}
+						// ContinueOnError: the internal dispatcher OWNED this
+						// call (an internal *rest.Config is on the context).
+						// We must NOT fall through to httpcall.Do — that would
+						// re-hit the broken plumbing TLS path and mask the
+						// real error behind a second x509 failure. Emit the
+						// success-log line and return, mirroring the
+						// httpcall.Do ContinueOnError fall-through.
+					} else {
+						if err := call.ResponseHandler(readerFromBytes(raw)); err != nil {
+							return err
+						}
+					}
+					dictMu.Lock()
+					depth := mapDepth(dict)
+					dictMu.Unlock()
+					dispatch := "internal-rest-config"
+					if ierr != nil {
+						dispatch = "internal-rest-config-error"
+					}
+					log.Info("api successfully resolved",
+						slog.String("name", id),
+						slog.String("host", call.Endpoint.ServerURL),
+						slog.String("path", call.Path),
+						slog.Int("depth", depth),
+						slog.String("dispatch", dispatch),
+					)
+					return nil
+				}
+
 				res := httpcall.Do(gctx, call)
 				if res.Status == response.StatusFailure {
 					log.Error("api call response failure", slog.String("name", id),
