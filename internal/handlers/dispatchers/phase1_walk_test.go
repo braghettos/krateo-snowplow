@@ -73,6 +73,7 @@ func phase1TestWatcher(t *testing.T) *cache.ResourceWatcher {
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:         "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 		cache.RoutesLoadersGVR():            "RoutesLoaderList",
+		cache.NavMenusGVR():                 "NavMenuList",
 		cache.CustomResourceDefinitionGVR(): "CustomResourceDefinitionList",
 		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}: "RESTActionList",
 		gvrReached: "GithubScaffoldingList",

@@ -8,21 +8,26 @@
 // navigation window — the pivot served nothing cold.
 //
 // Tag B closes that cold window with a startup PHASE 1: at boot, before
-// traffic, the navigation root (the `routesloaders` widget CR) is LISTed
-// cluster-wide and every CR is resolved with the snowplow SERVICE-
-// ACCOUNT identity through the standard widget/RESTAction resolver. As
-// the resolver walks inner-call paths it auto-registers an informer for
-// every GVR it touches via the flag-independent `lazyRegisterInnerCallPaths`
-// hook. After the walk, Phase 1 BLOCKS until every registered informer
-// reaches HasSynced, then signals Phase1Done. The /readyz probe gates
-// pod readiness on Phase1Done so traffic only arrives once the navigated
-// informers are warm.
+// traffic, the TWO navigation roots (the `routesloaders` and `navmenus`
+// widget CRs) are LISTed cluster-wide and every CR is RECURSIVELY
+// resolved with the snowplow SERVICE-ACCOUNT identity through the
+// standard widget/RESTAction resolver (0.30.105: the walk recurses
+// Root -> Route -> Page -> Row/Column -> DataGrid/Table leaf via each
+// resolved widget's status.resourcesRefs.items[]). As the resolver walks
+// inner-call paths it auto-registers an informer for every GVR it
+// touches via the flag-independent `lazyRegisterInnerCallPaths` hook —
+// including the heavy `composition.krateo.io` informer behind the
+// Compositions Page DataGrid. After the walk, Phase 1 BLOCKS until every
+// registered informer reaches HasSynced, then signals Phase1Done. The
+// /readyz probe gates pod readiness on Phase1Done so traffic only
+// arrives once the navigated informers are warm.
 //
 // CRITICAL — feedback_no_special_cases.md: Phase 1 does NOT consult any
-// configured GVR / RESTAction list. The ONLY hardcoded budget is the 7
+// configured GVR / RESTAction list. The ONLY hardcoded budget is the 8
 // meta-query seeds below — bare anchors needed to bootstrap discovery,
 // not per-resource policy. Every BUSINESS GVR (widgets, panels,
-// compositions) is discovered by resolving the routesloaders roots.
+// compositions) is discovered by recursively resolving the two
+// navigation roots.
 //
 // BEHAVIOR-NEUTRAL — PrewarmEnabled() gates the whole feature behind
 // PREWARM_ENABLED (default OFF), mirroring PREWARM_REGISTER_ENABLED.
@@ -103,9 +108,10 @@ var customResourceDefinitionGVR = schema.GroupVersionResource{
 	Resource: "customresourcedefinitions",
 }
 
-// routesLoadersGVR is the GVR of the `routesloaders` widget CR — the
-// navigation root. Phase 1 LISTs every routesloaders CR cluster-wide and
-// resolves each; the resolution discovers all downstream business GVRs.
+// routesLoadersGVR is the GVR of the `routesloaders` widget CR — one of
+// the two navigation roots. Phase 1 LISTs every routesloaders CR
+// cluster-wide and resolves each; the resolution discovers all
+// downstream business GVRs.
 //
 // Per feedback_no_special_cases.md: the routesloaders GVR is the bare
 // navigation-root anchor, not a per-resource carve-out. It is hardcoded
@@ -118,11 +124,44 @@ var routesLoadersGVR = schema.GroupVersionResource{
 	Resource: "routesloaders",
 }
 
-// RoutesLoadersGVR exposes the navigation-root GVR to the Phase 1 walk
-// driver (which lives in the dispatchers package — widget resolution is
-// there). Read-only accessor; the value is a hardcoded meta-query seed.
+// navMenusGVR is the GVR of the `navmenus` widget CR — the SECOND
+// navigation root (0.30.105). The portal frontend `/call`s exactly two
+// entry-point widget CRs on login:
+//
+//	INIT          = navmenus/sidebar-nav-menu   (the sidebar nav tree)
+//	ROUTES_LOADER = routesloaders/routes-loader (the route tree)
+//
+// (see frontend src/components/Sidebar/Sidebar.tsx + src/widgets/NavMenu/
+// NavMenu.tsx.) Phase 1's pre-0.30.105 walk seeded ONLY routesLoadersGVR
+// and resolved just the navigation ROOT — it never recursed route→page→
+// widget→apiRef, so the heavy `composition.krateo.io` informer behind the
+// Compositions Page DataGrid was never registered. 0.30.105 adds this
+// second root AND a recursive widget-tree walker.
+//
+// Per feedback_no_special_cases.md: navmenus is an ENTRY-POINT GVR in the
+// `widgets.templates.krateo.io` group derived from the frontend config
+// contract — NOT a business GVR. It is the bare anchor for the other
+// half of the navigation surface, exactly as routesLoadersGVR is for the
+// first. Every GVR reached FROM either root is discovered, never named.
+var navMenusGVR = schema.GroupVersionResource{
+	Group:    "widgets.templates.krateo.io",
+	Version:  "v1beta1",
+	Resource: "navmenus",
+}
+
+// RoutesLoadersGVR exposes the routesloaders navigation-root GVR to the
+// Phase 1 walk driver (which lives in the dispatchers package — widget
+// resolution is there). Read-only accessor; the value is a hardcoded
+// meta-query seed.
 func RoutesLoadersGVR() schema.GroupVersionResource {
 	return routesLoadersGVR
+}
+
+// NavMenusGVR exposes the navmenus navigation-root GVR to the Phase 1
+// walk driver. Read-only accessor; the value is a hardcoded meta-query
+// seed (the second entry-point root, 0.30.105).
+func NavMenusGVR() schema.GroupVersionResource {
+	return navMenusGVR
 }
 
 // CustomResourceDefinitionGVR exposes the CRD meta-query anchor.
@@ -131,26 +170,31 @@ func CustomResourceDefinitionGVR() schema.GroupVersionResource {
 }
 
 // MetaQuerySeeds returns the COMPLETE hardcoded seed budget for Tag B —
-// EXACTLY these 7 GVRs, nothing else (feedback_no_special_cases.md is a
+// EXACTLY these 8 GVRs, nothing else (feedback_no_special_cases.md is a
 // hard requirement here):
 //
-//  1. routesloaders            — the navigation root Phase 1 LISTs.
-//  2. restactions              — the restActionGVR anchor (already cited
+//  1. routesloaders            — the first navigation root Phase 1 LISTs.
+//  2. navmenus                 — the second navigation root (0.30.105).
+//     Both are entry-point widget CRs in the widgets.templates.krateo.io
+//     group, derived from the frontend config contract (INIT +
+//     ROUTES_LOADER) — NOT business GVRs.
+//  3. restactions              — the restActionGVR anchor (already cited
 //     by inventory.go; the resolver's apiRef edges target it).
-//  3. customresourcedefinitions — the CRD-watch root (Part 2).
-//  4-7. the 4 RBACResourceTypes — roles / rolebindings / clusterroles /
+//  4. customresourcedefinitions — the CRD-watch root (Part 2).
+//  5-8. the 4 RBACResourceTypes — roles / rolebindings / clusterroles /
 //     clusterrolebindings (already bootstrap-registered in
 //     NewResourceWatcher; included here so the seed set is the single
 //     auditable source of truth).
 //
 // Every BUSINESS GVR — widgets, panels, compositions — is ABSENT from
-// this set by construction. Those are discovered by RESOLVING the
-// routesloaders roots, never named in code. A test asserts this slice
-// has exactly 7 entries and that none of them is a composition/widget/
-// panel business GVR.
+// this set by construction. Those are discovered by RESOLVING the two
+// navigation roots, never named in code. A test asserts this slice has
+// exactly 8 entries and that none of them is a composition/widget/panel
+// business GVR.
 func MetaQuerySeeds() []schema.GroupVersionResource {
 	seeds := []schema.GroupVersionResource{
 		routesLoadersGVR,
+		navMenusGVR,
 		restActionGVR,
 		customResourceDefinitionGVR,
 	}
@@ -158,11 +202,11 @@ func MetaQuerySeeds() []schema.GroupVersionResource {
 	return seeds
 }
 
-// RegisterMetaQuerySeeds registers an informer for each of the 3
-// non-RBAC meta-query seeds (routesloaders, restactions,
+// RegisterMetaQuerySeeds registers an informer for each of the 4
+// non-RBAC meta-query seeds (routesloaders, navmenus, restactions,
 // customresourcedefinitions) plus re-confirms the 4 RBAC GVRs (already
 // registered by NewResourceWatcher — EnsureResourceType observes
-// added=false for those) — 7 seeds total. Idempotent + singleflighted
+// added=false for those) — 8 seeds total. Idempotent + singleflighted
 // under rw.mu.
 //
 // This is the ONLY code that hands a hardcoded GVR to EnsureResourceType

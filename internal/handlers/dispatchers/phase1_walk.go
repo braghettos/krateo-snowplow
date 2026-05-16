@@ -1,5 +1,6 @@
-// phase1_walk.go — 0.30.102 Tag B Part 1: the startup SA-credentialed
-// resolution walk that warms the navigation-reached informers.
+// phase1_walk.go — 0.30.102 Tag B Part 1 (recursive walker added in
+// 0.30.105): the startup SA-credentialed resolution walk that warms the
+// navigation-reached informers.
 //
 // This file lives in the dispatchers package because the widget /
 // RESTAction resolution machinery (widgets.Resolve, the api resolver's
@@ -8,28 +9,48 @@
 // meta-query seed budget, and the CRD-watch (Part 2); main.go owns the
 // startup wiring.
 //
-// THE WALK (Part 1):
-//   1. LIST every `routesloaders` widget CR cluster-wide (SA dyn client).
-//   2. Resolve each through the STANDARD widget resolver under the
-//      snowplow service-account identity. The resolution recursively
-//      reaches every downstream RESTAction + widget the navigation
-//      surface touches.
-//   3. As the RESTAction resolver processes inner-call paths, the
-//      flag-independent lazyRegisterInnerCallPaths hook auto-registers
-//      an informer for every GVR the inner-call path touches AND feeds
-//      the CRD-watch's auto-discover group set. Informer registration is
-//      a free side-effect — no separate GVR-collection step.
+// THE WALK (Part 1, recursive as of 0.30.105):
+//   1. LIST every navigation-root widget CR cluster-wide (SA dyn client).
+//      There are TWO roots — `routesloaders` and `navmenus` — both
+//      entry-point widget CRs in the widgets.templates.krateo.io group.
+//      They are the frontend's two `/call` login entry points
+//      (ROUTES_LOADER + INIT).
+//   2. Recursively resolve the navigation widget tree under the snowplow
+//      service-account identity through the STANDARD widget resolver.
+//      Each resolved widget returns `status.resourcesRefs.items[]`; every
+//      item whose `verb == "GET"` (and `allowed == true`) is itself a
+//      `/call?...` widget endpoint — the walker fetches that child widget
+//      CR and recurses into it. Recursion proceeds Root -> Route -> Page
+//      -> Row/Column -> DataGrid/Table leaf. A visited-set keyed on the
+//      child widget endpoint dedupes shared subtrees and prevents cycles.
+//
+//      WHY verb == "GET" ONLY (load-bearing — correctness AND safety):
+//      a non-GET resourcesRefs item is a mutation/action endpoint
+//      (POST/PUT/PATCH/DELETE) bound to a widget's `actions`, never part
+//      of the navigation/render tree. Following one would (a) walk an
+//      edge that is not navigation and (b) — the SA walk runs with
+//      privileged service-account credentials — issue a DESTRUCTIVE
+//      apiserver mutation. The walk MUST stay strictly read-only.
+//   3. As the RESTAction resolver processes inner-call paths (fired when
+//      the recursion reaches an apiRef-bearing leaf such as the
+//      Compositions Page DataGrid), the flag-independent
+//      lazyRegisterInnerCallPaths hook auto-registers an informer for
+//      every GVR the inner-call path touches AND feeds the CRD-watch's
+//      auto-discover group set (e.g. composition.krateo.io). Informer
+//      registration is a free side-effect — no separate GVR-collection
+//      step.
 //   4. The resolution OUTPUT is DISCARDED — Phase 1 is discovery-only.
 //      It does NOT populate L1 (that is Phase 2, deferred). The resolver
 //      mutates the in-memory CR copy but never persists status back to
 //      the apiserver.
 //
 // CRITICAL — feedback_no_special_cases.md: Phase 1 seeds ONLY from the
-// resolved routesloaders roots. There is NO configured widget-GVR list
+// two resolved navigation roots. There is NO configured widget-GVR list
 // and NO configured RESTAction list. RESTActions + downstream GVRs are
-// discovered purely by resolving the routesloaders roots — an orphan
-// RESTAction wired to no routesloaders page is never reached and never
-// registers an informer.
+// discovered purely by recursively resolving the routesloaders / navmenus
+// roots — an orphan RESTAction wired to no navigation page is never
+// reached and never registers an informer. The ONLY named GVRs are the
+// two entry-point roots; they ARE the frontend config contract.
 //
 // BEHAVIOR-NEUTRAL — the whole walk runs only when cache.PrewarmEnabled()
 // (PREWARM_ENABLED=true). main.go does not call Phase1Warmup otherwise.
@@ -39,16 +60,22 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
+	"net/url"
+	"strings"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jwtutil"
+	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateoplatformops/plumbing/maps"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -65,31 +92,34 @@ import (
 // real request names its user.
 const snowplowSAUsername = "snowplow-serviceaccount"
 
-// routesLoadersLister abstracts the cluster-wide LIST of routesloaders
-// CRs so the no-hardcode falsifier test can substitute an in-memory
-// inventory without a cluster.
-type routesLoadersLister func(ctx context.Context) ([]*unstructured.Unstructured, error)
+// rootsLister abstracts the cluster-wide LIST of the navigation-root CRs
+// so the no-hardcode falsifier test can substitute an in-memory inventory
+// without a cluster. Production lists BOTH routesloaders and navmenus.
+type rootsLister func(ctx context.Context) ([]*unstructured.Unstructured, error)
 
-// rootResolver abstracts resolving a single routesloaders CR. Production
-// passes resolveRoutesLoaderRoot (the standard widget resolver);
-// the falsifier test substitutes a stub that drives the same
+// rootResolver abstracts resolving a single navigation-root CR (and, in
+// production, recursively walking its widget subtree). Production passes
+// resolveNavigationRoot (the standard widget resolver + recursive
+// walker); the falsifier tests substitute a stub that drives the same
 // informer-registration side effects deterministically.
 type rootResolver func(ctx context.Context, root *unstructured.Unstructured) error
 
-// Phase1Warmup runs the Tag B Part 1 SA-credentialed resolution walk,
-// then blocks on the Phase 1 sync barrier and signals cache.Phase1Done.
+// Phase1Warmup runs the Tag B Part 1 SA-credentialed recursive resolution
+// walk, then blocks on the Phase 1 sync barrier and signals
+// cache.Phase1Done.
 //
 // Sequence:
-//   - register the 7 meta-query seeds (routesloaders / restactions /
-//     customresourcedefinitions + the 4 RBAC GVRs already present);
+//   - register the 8 meta-query seeds (routesloaders / navmenus /
+//     restactions / customresourcedefinitions + the 4 RBAC GVRs);
 //   - start the CRD-watch (Part 2) so composition informers spawn as
 //     their CRDs are observed for navigation-discovered groups;
-//   - LIST every routesloaders CR and resolve each under SA identity —
-//     the resolution auto-registers an informer per touched GVR;
+//   - LIST every routesloaders AND navmenus CR and recursively resolve
+//     each navigation tree under SA identity — the resolution
+//     auto-registers an informer per touched GVR;
 //   - let the registered set settle (the CRD-watch may still be adding
 //     composition informers after the walk's last resolve);
 //   - WaitAllInformersSynced — block until every registered informer
-//     (including the CRD-watch-spawned ones present at boot) is synced;
+//     (including the CRD-watch-spawned composition informer) is synced;
 //   - cache.MarkPhase1Done — flips the /readyz gate to 200.
 //
 // ctx bounds the whole walk + sync barrier (main.go gives it the
@@ -131,17 +161,17 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	}
 
 	lister := func(lctx context.Context) ([]*unstructured.Unstructured, error) {
-		return listRoutesLoaders(lctx, dynCli)
+		return listNavigationRoots(lctx, dynCli)
 	}
 	resolver := func(rctx context.Context, root *unstructured.Unstructured) error {
-		return resolveRoutesLoaderRoot(rctx, root, *saEP, rc, authnNS)
+		return resolveNavigationRoot(rctx, root, *saEP, rc, authnNS)
 	}
 
 	return phase1WarmupWith(ctx, rw, lister, resolver)
 }
 
 // phase1WarmupWith is the testable core: it takes the watcher, the
-// routesloaders lister, and the per-root resolver as injected
+// navigation-roots lister, and the per-root resolver as injected
 // dependencies. Production wires the real cluster-backed versions;
 // the no-hardcode + premature-Ready falsifier tests wire in-memory
 // stubs.
@@ -154,7 +184,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 // /readyz should gate on. A walk error (one root failed to resolve) is
 // returned for logging but does not by itself withhold readiness — the
 // other roots' informers are warm.
-func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister routesLoadersLister, resolve rootResolver) error {
+func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -167,10 +197,10 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rou
 	// for groups Phase 1's walk has fed into the auto-discover set.
 	rw.StartCRDWatch(ctx)
 
-	// Step 3 — LIST the routesloaders roots.
+	// Step 3 — LIST the navigation roots (routesloaders + navmenus).
 	roots, listErr := lister(ctx)
 	if listErr != nil {
-		log.Warn("phase1.warmup.routesloaders_list_failed",
+		log.Warn("phase1.warmup.roots_list_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", listErr),
 			slog.String("effect", "no roots to walk; lazy register-on-navigation still covers GVRs on first request"),
@@ -184,14 +214,15 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rou
 
 	log.Info("phase1.warmup.roots_discovered",
 		slog.String("subsystem", "cache"),
-		slog.Int("routesloaders_count", len(roots)),
+		slog.Int("roots_count", len(roots)),
 	)
 
-	// Step 4 — resolve each root under SA identity. The resolution's
-	// inner-call walk auto-registers an informer per touched GVR
-	// (lazyRegisterInnerCallPaths) and feeds the CRD-watch auto-discover
-	// set. Output discarded. Resolution errors are collected, not fatal:
-	// one broken root must not block warming the rest.
+	// Step 4 — recursively resolve each navigation root under SA identity.
+	// The resolution's inner-call walk auto-registers an informer per
+	// touched GVR (lazyRegisterInnerCallPaths) and feeds the CRD-watch
+	// auto-discover set. Output discarded. Resolution errors are
+	// collected, not fatal: one broken root must not block warming the
+	// rest.
 	var walkErr error
 	resolved := 0
 	for _, root := range roots {
@@ -277,7 +308,7 @@ func settleRegisteredSet(ctx context.Context, rw *cache.ResourceWatcher) {
 	}
 }
 
-// rootKey renders a routesloaders CR's namespace/name for logging.
+// rootKey renders a navigation-root CR's namespace/name for logging.
 func rootKey(root *unstructured.Unstructured) string {
 	if root == nil {
 		return "<nil>"
@@ -289,22 +320,56 @@ func rootKey(root *unstructured.Unstructured) string {
 	return ns + "/" + root.GetName()
 }
 
-// routesLoadersListPageLimit bounds each page of the routesloaders LIST
+// navigationRootListPageLimit bounds each page of a navigation-root LIST
 // so the apiserver does not stream an unbounded response — mirrors the
 // listPageLimit policy the informer factory uses.
-const routesLoadersListPageLimit int64 = 500
+const navigationRootListPageLimit int64 = 500
 
-// listRoutesLoaders LISTs every routesloaders CR cluster-wide via the SA
-// dynamic client, paging with a bounded limit.
-func listRoutesLoaders(ctx context.Context, dynCli k8sdynamic.Interface) ([]*unstructured.Unstructured, error) {
-	gvr := cache.RoutesLoadersGVR()
+// listNavigationRoots LISTs every navigation-root CR cluster-wide via the
+// SA dynamic client: BOTH the routesloaders GVR and the navmenus GVR
+// (0.30.105). A LIST error on one root GVR does not suppress the other —
+// the per-GVR error is returned only if BOTH fail; a partial result is
+// still walkable.
+func listNavigationRoots(ctx context.Context, dynCli k8sdynamic.Interface) ([]*unstructured.Unstructured, error) {
+	gvrs := []schema.GroupVersionResource{
+		cache.RoutesLoadersGVR(),
+		cache.NavMenusGVR(),
+	}
+	var (
+		out     []*unstructured.Unstructured
+		lastErr error
+		okAny   bool
+	)
+	for _, gvr := range gvrs {
+		items, err := listAllOfGVR(ctx, dynCli, gvr)
+		if err != nil {
+			slog.Warn("phase1.warmup.root_gvr_list_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.Any("err", err),
+			)
+			lastErr = err
+			continue
+		}
+		okAny = true
+		out = append(out, items...)
+	}
+	if !okAny && lastErr != nil {
+		return nil, lastErr
+	}
+	return out, nil
+}
+
+// listAllOfGVR LISTs every CR of one GVR cluster-wide via the SA dynamic
+// client, paging with a bounded limit.
+func listAllOfGVR(ctx context.Context, dynCli k8sdynamic.Interface, gvr schema.GroupVersionResource) ([]*unstructured.Unstructured, error) {
 	var (
 		out           []*unstructured.Unstructured
 		continueToken string
 	)
 	for {
 		list, err := dynCli.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-			Limit:    routesLoadersListPageLimit,
+			Limit:    navigationRootListPageLimit,
 			Continue: continueToken,
 		})
 		if err != nil {
@@ -322,8 +387,16 @@ func listRoutesLoaders(ctx context.Context, dynCli k8sdynamic.Interface) ([]*uns
 	return out, nil
 }
 
-// resolveRoutesLoaderRoot resolves one routesloaders CR through the
-// STANDARD widget resolver under the snowplow SA identity. The resolved
+// phase1MaxWalkDepth bounds the recursive widget-tree descent. The portal
+// navigation tree is shallow (Root -> Route -> Page -> Row/Column ->
+// DataGrid/Table is ~5 levels); this cap is a defensive guard against a
+// pathological CR graph that the visited-set somehow fails to dedupe. It
+// is NOT a per-resource policy — it is a uniform recursion-safety bound.
+const phase1MaxWalkDepth = 32
+
+// resolveNavigationRoot resolves one navigation-root CR through the
+// STANDARD widget resolver under the snowplow SA identity, then
+// RECURSIVELY walks the resolved widget tree (0.30.105). The resolved
 // output is discarded — Phase 1 is discovery-only. The resolution's side
 // effects (informer auto-registration via lazyRegisterInnerCallPaths,
 // CRD-watch group feed) are the whole point.
@@ -343,12 +416,8 @@ func listRoutesLoaders(ctx context.Context, dynCli k8sdynamic.Interface) ([]*uns
 //     the correct in-cluster semantics. The resolver's object-fetch sites
 //     (objects.Get, resourcesrefs.Resolve) use it verbatim via
 //     cache.ClientConfigFor instead of rebuilding a client from saEP
-//     through kubeconfig.NewClientConfig — which CANNOT carry the SA's
-//     raw-PEM CA (it base64-decodes the CA field) nor the SA's bearer
-//     token (the kubeconfig user block is cert-auth-only). Without saRC
-//     the root fetch fails with "illegal base64 data at input byte 0"
-//     and Phase 1 warms nothing (the 0.30.102 bug).
-func resolveRoutesLoaderRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
+//     through kubeconfig.NewClientConfig.
+func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(saEP),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: snowplowSAUsername}),
@@ -357,21 +426,237 @@ func resolveRoutesLoaderRoot(ctx context.Context, root *unstructured.Unstructure
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 
-	// Resolve the routesloaders CR. The widget resolver recursively
-	// reaches every downstream RESTAction + child widget; each inner
-	// RESTAction call auto-registers its GVR's informer. We deliberately
-	// do NOT page-bound (PerPage/Page = -1): Phase 1 wants the FULL
-	// navigation fan-out registered, not just the first visible page.
-	_, err := widgets.Resolve(rctx, widgets.ResolveOptions{
-		In:      root,
-		AuthnNS: authnNS,
+	w := &phase1Walker{
+		authnNS: authnNS,
+		visited: map[string]struct{}{},
+	}
+	return w.walk(rctx, root, 0)
+}
+
+// phase1Walker carries the per-root recursive-walk state. A fresh walker
+// is created per navigation root so the visited-set never crosses roots
+// — but because the two roots can share Page subtrees, dedupe WITHIN a
+// root is what matters for cycle-safety; cross-root re-resolves are
+// harmless (idempotent informer registration) and rare.
+type phase1Walker struct {
+	authnNS string
+	// visited dedupes by the child widget endpoint (resource+apiVersion+
+	// namespace+name) so a shared subtree is resolved once and a cyclic
+	// reference cannot loop forever.
+	visited map[string]struct{}
+}
+
+// walk resolves widget `in` through the standard widget resolver under
+// the SA-credentialed ctx, then recurses into every resolved
+// `status.resourcesRefs.items[]` child whose verb == "GET" (and which is
+// allowed). Resolution side effects (informer registration) are the
+// point; the resolved output is read only to discover children, never
+// persisted.
+//
+// Errors are NON-FATAL and not propagated upward past the immediate
+// resolve: a single broken child widget must not abort warming the rest
+// of the navigation tree. The function returns an error ONLY for the
+// top-level root resolve failure, so the caller (phase1WarmupWith) can
+// log a root as failed.
+func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, depth int) error {
+	log := slog.Default()
+	if in == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if depth > phase1MaxWalkDepth {
+		log.Warn("phase1.walk.max_depth",
+			slog.String("subsystem", "cache"),
+			slog.Int("depth", depth),
+			slog.String("widget", rootKey(in)),
+			slog.String("effect", "recursion capped — deeper navigation widgets covered by lazy register-on-navigation"),
+		)
+		return nil
+	}
+
+	// Resolve this widget. The resolver recursively reaches this widget's
+	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any
+	// apiRef-bearing leaf such as the Compositions Page DataGrid) and
+	// returns status.resourcesRefs.items[] — the child widget endpoints.
+	// PerPage/Page = -1: Phase 1 wants the FULL navigation fan-out, not
+	// just the first visible page.
+	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
+		In:      in,
+		AuthnNS: w.authnNS,
 		PerPage: -1,
 		Page:    -1,
 	})
-	// The resolver returns the (mutated-in-memory) CR plus a possible
-	// error. The output is discarded — Phase 1 never writes status back
-	// and never populates L1. A resolution error is returned so the
-	// caller can log it; informer registration for whatever the walk
-	// DID reach has already happened as a side effect.
-	return err
+	if err != nil {
+		// A resolution error at depth>0 is non-fatal — log and stop
+		// descending this branch. At depth 0 the caller treats a non-nil
+		// return as a failed root.
+		if depth == 0 {
+			return err
+		}
+		log.Warn("phase1.walk.child_resolve_failed",
+			slog.String("subsystem", "cache"),
+			slog.Int("depth", depth),
+			slog.String("widget", rootKey(in)),
+			slog.Any("err", err),
+		)
+		return nil
+	}
+	if res == nil {
+		return nil
+	}
+
+	// Read status.resourcesRefs.items[] — the child widget endpoints.
+	children := extractResourcesRefsItems(res.Object)
+	for _, child := range children {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// SAFETY + CORRECTNESS gate: recurse ONLY into GET refs that are
+		// allowed and carry a path. walkShouldRecurse is the single
+		// auditable predicate (see its doc).
+		if !walkShouldRecurse(child) {
+			continue
+		}
+
+		ref, ok := parseCallPathToObjectRef(child.Path)
+		if !ok {
+			// A child path that is not a /call?... widget endpoint
+			// (external link, malformed) — nothing to recurse into.
+			continue
+		}
+		key := navWidgetEndpointKey(ref)
+		if _, seen := w.visited[key]; seen {
+			continue
+		}
+		w.visited[key] = struct{}{}
+
+		// Fetch the child widget CR under the SA-credentialed ctx. The
+		// resolver mutates the object in place, so a fresh fetch per
+		// child is required.
+		got := objects.Get(ctx, ref)
+		if got.Err != nil {
+			log.Warn("phase1.walk.child_fetch_failed",
+				slog.String("subsystem", "cache"),
+				slog.Int("depth", depth),
+				slog.String("child", key),
+				slog.Any("err", got.Err),
+			)
+			continue
+		}
+		if got.Unstructured == nil {
+			continue
+		}
+		// Recurse into the child widget subtree.
+		_ = w.walk(ctx, got.Unstructured, depth+1)
+	}
+	return nil
+}
+
+// navChildRef is the subset of a resolved status.resourcesRefs item the
+// walker needs: the navigation edge to a child widget. It mirrors the
+// templatesv1.ResourceRefResult fields (id/path/verb/allowed) — the same
+// shape the frontend ResourceRef carries.
+type navChildRef struct {
+	ID      string
+	Path    string
+	Verb    string
+	Allowed bool
+}
+
+// walkShouldRecurse is the single, auditable predicate the recursive
+// walk applies before descending into a resourcesRefs child. It is
+// load-bearing on BOTH correctness and safety:
+//
+//   - verb == "GET" (case-insensitive): a non-GET resourcesRefs item is
+//     a mutation/action endpoint (POST/PUT/PATCH/DELETE) bound to a
+//     widget's `actions`, never part of the navigation/render tree.
+//     Recursing into it is wrong navigation — AND, because the Phase 1
+//     walk runs with the snowplow service account's PRIVILEGED
+//     credentials, following such a ref would issue a DESTRUCTIVE
+//     apiserver mutation. The walk MUST stay strictly read-only.
+//   - allowed == true: mirrors the frontend WidgetRenderer's
+//     items.filter(({allowed})=>allowed) — a not-allowed child is not
+//     rendered, so it is not part of the navigation surface to warm.
+//   - a non-empty path: nothing to fetch/recurse into otherwise.
+func walkShouldRecurse(child navChildRef) bool {
+	return strings.EqualFold(child.Verb, "GET") && child.Allowed && child.Path != ""
+}
+
+// extractResourcesRefsItems reads status.resourcesRefs.items[] from a
+// resolved widget object and returns the navigation child refs. The
+// resolver stores items as a []any of map[string]any (the marshalled
+// ResourceRefResult slice); this reads them defensively without coupling
+// to the resolver's internal marshalling.
+func extractResourcesRefsItems(obj map[string]any) []navChildRef {
+	items, ok, err := maps.NestedSlice(obj, "status", "resourcesRefs", "items")
+	if !ok || err != nil {
+		return nil
+	}
+	out := make([]navChildRef, 0, len(items))
+	for _, raw := range items {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		ref := navChildRef{}
+		if v, ok := m["id"].(string); ok {
+			ref.ID = v
+		}
+		if v, ok := m["path"].(string); ok {
+			ref.Path = v
+		}
+		if v, ok := m["verb"].(string); ok {
+			ref.Verb = v
+		}
+		if v, ok := m["allowed"].(bool); ok {
+			ref.Allowed = v
+		}
+		out = append(out, ref)
+	}
+	return out
+}
+
+// parseCallPathToObjectRef parses a `/call?resource=...&apiVersion=...&
+// name=...&namespace=...` widget endpoint into the ObjectReference the
+// objects.Get fetch needs. Returns ok=false for any path that is not a
+// /call widget endpoint (external link, missing resource/apiVersion).
+//
+// This mirrors the frontend recursion contract: every navigation child's
+// `path` is itself a /call?... widget endpoint. It is NOT a hardcoded
+// resource/path special-case — it is the generic /call query-param
+// decoder, the same params util.ParseGVR / util.ParseNamespacedName read
+// off a real HTTP request.
+func parseCallPathToObjectRef(path string) (templatesv1.ObjectReference, bool) {
+	u, err := url.Parse(path)
+	if err != nil {
+		return templatesv1.ObjectReference{}, false
+	}
+	// Only a /call endpoint carries a widget CR. The trimmed path must
+	// end in "/call" (it may be host-qualified or root-relative).
+	trimmed := strings.TrimRight(u.Path, "/")
+	if trimmed != "" && !strings.HasSuffix(trimmed, "/call") {
+		return templatesv1.ObjectReference{}, false
+	}
+	q := u.Query()
+	resource := q.Get("resource")
+	apiVersion := q.Get("apiVersion")
+	if resource == "" || apiVersion == "" {
+		return templatesv1.ObjectReference{}, false
+	}
+	return templatesv1.ObjectReference{
+		Reference: templatesv1.Reference{
+			Name:      q.Get("name"),
+			Namespace: q.Get("namespace"),
+		},
+		Resource:   resource,
+		APIVersion: apiVersion,
+	}, true
+}
+
+// navWidgetEndpointKey renders an ObjectReference into the stable dedupe
+// key the visited-set is keyed on.
+func navWidgetEndpointKey(ref templatesv1.ObjectReference) string {
+	return ref.APIVersion + "|" + ref.Resource + "|" + ref.Namespace + "|" + ref.Name
 }
