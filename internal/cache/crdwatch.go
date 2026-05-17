@@ -199,9 +199,13 @@ func (rw *ResourceWatcher) StartCRDWatch(ctx context.Context) {
 	if _, err := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { rw.registerCRDObject(obj, "crd-event") },
 		UpdateFunc: func(_, newObj interface{}) { rw.registerCRDObject(newObj, "crd-event") },
-		// DeleteFunc intentionally omitted: a CRD deletion is rare and
-		// the informer for its GVR going stale is harmless — the pivot's
-		// servable() gate falls through on an unconfirmed resource type.
+		// D2 (Ship D, 0.30.114): a CRD removal dirty-marks every L1 entry
+		// that LIST- or GET-depends on the vanished GVR. ACCEPTED
+		// LIMITATION — the per-GVR informer is NOT stopped: client-go
+		// cannot cleanly stop one factory informer mid-flight; a stale
+		// informer for a vanished type is harmless because the pivot's
+		// servable() gate already falls through on an unconfirmed type.
+		DeleteFunc: func(obj interface{}) { rw.unregisterCRDObject(obj, "crd-event") },
 	}); err != nil {
 		slog.Warn("cache.crdwatch.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
@@ -224,6 +228,24 @@ func (rw *ResourceWatcher) StartCRDWatch(ctx context.Context) {
 // already-registered GVR. Shared by the CRD informer's event handler
 // (AddFunc/UpdateFunc) and the post-walk ReconcileAutoDiscoverCRDs scan.
 //
+// D1 (Ship D, 0.30.114): when EnsureResourceType reports added==true (a
+// genuinely-new GVR), the CRD just appeared at runtime. A
+// compositions-list resolve that ran BEFORE the CRD existed cached a
+// stale-negative `0 items` result keyed by a LIST-scope dep — so we
+// dirty-mark every such entry via Deps().OnResourceTypeAvailable. The
+// refresher then re-resolves it within its window.
+//
+// CRITICAL — the dirty-mark fires ONLY on added==true. An added==false
+// re-register (a CRD UpdateFunc, or the post-walk ReconcileAutoDiscover-
+// CRDs re-scan finding an already-registered GVR) does NOT dirty-mark:
+// the type was already known, so no LIST entry is stale-negative on its
+// account (AC-D4 — an added==false re-register must not spuriously
+// dirty-mark).
+//
+// Because the dirty-mark routes through registerCRDObject, the post-walk
+// ReconcileAutoDiscoverCRDs re-scan automatically fires D1 for any CRD
+// it registers for the first time (D3 — no extra wiring needed).
+//
 // `via` is a log-only tag distinguishing the trigger (crd-event vs
 // post-walk-reconcile).
 func (rw *ResourceWatcher) registerCRDObject(obj interface{}, via string) {
@@ -237,13 +259,51 @@ func (rw *ResourceWatcher) registerCRDObject(obj interface{}, via string) {
 	}
 	added, _ := rw.EnsureResourceType(gvr)
 	if added {
+		// D1: a genuinely-new GVR — dirty-mark every stale-negative
+		// LIST-scope dependent so the refresher re-resolves it.
+		marked := Deps().OnResourceTypeAvailable(gvr)
 		slog.Info("cache.crdwatch.registered",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("via", via),
-			slog.String("note", "composition informer spawned — group is navigation-discovered"),
+			slog.Int("l1_keys_dirty_marked", marked),
+			slog.String("note", "composition informer spawned — group is navigation-discovered; stale-negative LIST deps dirty-marked"),
 		)
 	}
+}
+
+// unregisterCRDObject is the single per-CRD-object de-registration step:
+// derive the CRD's GVR and, IFF its group is in the navigation-derived
+// auto-discover set, dirty-mark every L1 entry that LIST-depends — or
+// GET-depends — on that GVR (D2, Ship D 0.30.114). Wired into the CRD
+// informer's DeleteFunc.
+//
+// It deliberately does NOT stop the per-GVR informer: client-go cannot
+// cleanly stop one factory informer mid-flight, and a stale informer for
+// a vanished type is harmless — the pivot's servable() gate already
+// falls through on an unconfirmed resource type. Dirty-mark only — NEVER
+// evicts: a CRD removal is a TYPE-removal, not a single object's DELETE,
+// so feedback_l1_invalidation_delete_only.md's eviction authorisation
+// does not apply (mirrors OnDelete's non-self dependent-bucket handling).
+//
+// `via` is a log-only tag distinguishing the trigger.
+func (rw *ResourceWatcher) unregisterCRDObject(obj interface{}, via string) {
+	gvr, gvrOK := compositionGVRFromCRDObject(obj)
+	if !gvrOK {
+		return
+	}
+	if !matchesAutoDiscoverGroup(gvr.Group) {
+		// CRD whose group is not navigation-discovered — ignored.
+		return
+	}
+	marked := Deps().OnResourceTypeRemoved(gvr)
+	slog.Info("cache.crdwatch.unregistered",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("via", via),
+		slog.Int("l1_keys_dirty_marked", marked),
+		slog.String("note", "CRD removed — LIST + dependent-GET deps dirty-marked; informer left running (accepted limitation)"),
+	)
 }
 
 // ReconcileAutoDiscoverCRDs re-scans the CRD informer's local store and

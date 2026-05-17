@@ -703,6 +703,164 @@ func TestOnDelete_DirtyMarksViaListScope(t *testing.T) {
 	}
 }
 
+// --- Ship D (0.30.114) — CRD-lifecycle dep-tracker hooks --------------------
+
+// TestDeps_OnResourceTypeAvailable_DirtyMarksListDeps asserts D1: when a
+// CRD newly appears, OnResourceTypeAvailable dirty-marks every LIST-scope
+// dep for that GVR (any namespace + cluster-wide) and NOTHING else — an
+// exact-object GET-dep is NOT a stale-negative LIST and must be left
+// alone.
+func TestDeps_OnResourceTypeAvailable_DirtyMarksListDeps(t *testing.T) {
+	d := newTestDepTracker(t, 1_000)
+	gvr := gvrCompositions()
+
+	d.RecordList("L1_nslist", gvr, "bench-ns-01")  // ns LIST-dep — must mark
+	d.RecordList("L1_clusterlist", gvr, "")        // cluster LIST-dep — must mark
+	d.Record("L1_exact", gvr, "bench-ns-01", "n1") // exact GET-dep — must NOT mark
+
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
+	got := d.OnResourceTypeAvailable(gvr)
+	if got != 2 {
+		t.Fatalf("OnResourceTypeAvailable marked %d, want 2 (ns-list + cluster-list)", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := map[string]bool{"L1_nslist": true, "L1_clusterlist": true}
+	for _, k := range marked {
+		if !want[k] {
+			t.Fatalf("OnResourceTypeAvailable dirty-marked unexpected key %q (got %v)", k, marked)
+		}
+		delete(want, k)
+	}
+	if len(want) != 0 {
+		t.Fatalf("OnResourceTypeAvailable missed LIST-deps %v (marked %v)", want, marked)
+	}
+	if d.dirtyMarkTotal.Load() != 2 {
+		t.Fatalf("dirtyMarkTotal=%d want 2", d.dirtyMarkTotal.Load())
+	}
+}
+
+// TestDeps_OnResourceTypeAvailable_NoMatchIsNoOp asserts AC-D4: a CRD-add
+// for a GVR with no LIST-dep dirty-marks nothing, and a repeat call is
+// also a no-op (idempotent — no LIST-dep was consumed/removed).
+func TestDeps_OnResourceTypeAvailable_NoMatchIsNoOp(t *testing.T) {
+	d := newTestDepTracker(t, 1_000)
+	gvr := gvrCompositions()
+	other := schema.GroupVersionResource{Group: gvr.Group, Version: "v1", Resource: "others"}
+
+	d.RecordList("L1_other", other, "ns") // LIST-dep for a different GVR
+
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
+	if got := d.OnResourceTypeAvailable(gvr); got != 0 {
+		t.Fatalf("OnResourceTypeAvailable marked %d, want 0 (no matching LIST-dep)", got)
+	}
+	// Idempotent: a second call is still a no-op.
+	if got := d.OnResourceTypeAvailable(gvr); got != 0 {
+		t.Fatalf("repeated OnResourceTypeAvailable marked %d, want 0", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 0 {
+		t.Fatalf("OnResourceTypeAvailable dirty-marked %v, want none", marked)
+	}
+	if d.dirtyMarkTotal.Load() != 0 {
+		t.Fatalf("dirtyMarkTotal=%d want 0", d.dirtyMarkTotal.Load())
+	}
+}
+
+// TestDeps_OnResourceTypeRemoved_DirtyMarksListAndGetDeps asserts D2: a
+// CRD removal dirty-marks BOTH LIST-deps AND dependent GET-deps for the
+// GVR, and NEVER evicts (a CRD removal is a type-removal, not a single
+// object's DELETE — feedback_l1_invalidation_delete_only.md).
+func TestDeps_OnResourceTypeRemoved_DirtyMarksListAndGetDeps(t *testing.T) {
+	d := newTestDepTracker(t, 1_000)
+	store := newResolvedCache(100, 1<<20, time.Hour)
+	d.SetStore(store)
+	gvr := gvrCompositions()
+
+	store.Put("L1_list", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	store.Put("L1_get", &ResolvedEntry{RawJSON: []byte(`{}`)})
+	// A self-representation of the GVR — even THIS must be dirty-marked,
+	// not evicted: a CRD removal is never a single-object DELETE.
+	store.Put("L1_self", &ResolvedEntry{
+		RawJSON: []byte(`{}`),
+		Inputs:  inputsFor(gvr, "ns", "self-obj"),
+	})
+
+	d.RecordList("L1_list", gvr, "ns")          // LIST-dep
+	d.Record("L1_get", gvr, "ns", "thing-1")    // dependent GET-dep
+	d.Record("L1_self", gvr, "ns", "self-obj")  // self-representation GET-dep
+
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
+	got := d.OnResourceTypeRemoved(gvr)
+	if got != 3 {
+		t.Fatalf("OnResourceTypeRemoved marked %d, want 3 (LIST + GET + self)", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 3 {
+		t.Fatalf("OnResourceTypeRemoved marked %v, want 3 keys", marked)
+	}
+	for _, k := range []string{"L1_list", "L1_get", "L1_self"} {
+		if _, ok := store.Get(k); !ok {
+			t.Fatalf("OnResourceTypeRemoved EVICTED %q — CRD removal must dirty-mark, never evict", k)
+		}
+	}
+	if d.evictDeleteTotal.Load() != 0 {
+		t.Fatalf("evictDeleteTotal=%d want 0 — CRD removal must never evict", d.evictDeleteTotal.Load())
+	}
+	if d.dirtyMarkTotal.Load() != 3 {
+		t.Fatalf("dirtyMarkTotal=%d want 3", d.dirtyMarkTotal.Load())
+	}
+}
+
+// TestDeps_OnResourceTypeRemoved_NoMatchIsNoOp asserts AC-D4: a CRD
+// removal for a GVR with no deps is a no-op and idempotent on repeat.
+func TestDeps_OnResourceTypeRemoved_NoMatchIsNoOp(t *testing.T) {
+	d := newTestDepTracker(t, 1_000)
+	gvr := gvrCompositions()
+	other := schema.GroupVersionResource{Group: gvr.Group, Version: "v1", Resource: "others"}
+	d.RecordList("L1_other", other, "ns")
+
+	var marked []string
+	var mu sync.Mutex
+	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+
+	if got := d.OnResourceTypeRemoved(gvr); got != 0 {
+		t.Fatalf("OnResourceTypeRemoved marked %d, want 0 (no matching dep)", got)
+	}
+	if got := d.OnResourceTypeRemoved(gvr); got != 0 {
+		t.Fatalf("repeated OnResourceTypeRemoved marked %d, want 0", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(marked) != 0 {
+		t.Fatalf("OnResourceTypeRemoved dirty-marked %v, want none", marked)
+	}
+}
+
+// TestDeps_OnResourceType_NilReceiverSafe asserts the Ship D hooks are
+// nil-receiver-safe (the no-op tracker contract under CACHE_ENABLED=false
+// — AC-D5).
+func TestDeps_OnResourceType_NilReceiverSafe(t *testing.T) {
+	var d *DepTracker
+	if got := d.OnResourceTypeAvailable(gvrCompositions()); got != 0 {
+		t.Fatalf("nil-receiver OnResourceTypeAvailable returned %d, want 0", got)
+	}
+	if got := d.OnResourceTypeRemoved(gvrCompositions()); got != 0 {
+		t.Fatalf("nil-receiver OnResourceTypeRemoved returned %d, want 0", got)
+	}
+}
+
 // --- helpers ---------------------------------------------------------------
 
 func itoa(i int) string {

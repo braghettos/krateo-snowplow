@@ -534,6 +534,120 @@ func (d *DepTracker) isSelfRepresentation(store *ResolvedCacheStore, l1Key strin
 		in.Name == deleted.Name
 }
 
+// OnResourceTypeAvailable is invoked by the CRD-watch when a CRD newly
+// appears at runtime (EnsureResourceType returned added==true for a
+// genuinely-new GVR). D1 (Ship D, 0.30.114).
+//
+// A compositions-list resolve that ran BEFORE the CRD existed records a
+// LIST-scope dep and caches `0 items`; once the CRD appears the cached
+// result is stale-negative. This scans the forward index for every
+// LIST-scope bucket matching gvr (every namespace AND the cluster-wide
+// "" namespace) and dirty-marks the dependent L1 keys via the same
+// refreshHook onChange uses.
+//
+// It deliberately ignores EXACT-object GET-dep buckets: an exact GET-dep
+// for a named object that did not resolve before the CRD existed is not
+// a stale-negative LIST and is left to OnAdd when the object itself
+// arrives. Dirty-mark only — NEVER evicts.
+//
+// Returns the number of dependent L1 keys dirty-marked. AC-D4: a no-op
+// (and idempotent) when no LIST-dep matches gvr.
+func (d *DepTracker) OnResourceTypeAvailable(gvr schema.GroupVersionResource) int {
+	if d == nil {
+		return 0
+	}
+	matched := d.collectTypeMatches(gvr, true /* listOnly */)
+	return d.dirtyMarkResourceType("CRD_ADD", gvr, matched)
+}
+
+// OnResourceTypeRemoved is invoked by the CRD-watch when a CRD is removed
+// at runtime. D2 (Ship D, 0.30.114).
+//
+// Unlike OnDelete (a single object's DELETE), a CRD removal is a
+// TYPE-removal — every L1 entry that LIST-depends on the GVR, OR
+// GET-depends on any named object of the GVR, is now stale. This scans
+// every forward bucket whose DepKey.GVR == gvr (LIST wildcard AND exact
+// GET buckets, all namespaces) and dirty-marks the dependent L1 keys.
+//
+// Dirty-mark only — NEVER evicts, even a self-representation entry:
+// feedback_l1_invalidation_delete_only.md authorises eviction ONLY for a
+// single object's DELETE. A CRD removal mirrors OnDelete's non-self
+// dependent-bucket handling (stale-while-revalidate).
+//
+// Returns the number of dependent L1 keys dirty-marked. AC-D4: a no-op
+// (and idempotent) when no dep matches gvr.
+func (d *DepTracker) OnResourceTypeRemoved(gvr schema.GroupVersionResource) int {
+	if d == nil {
+		return 0
+	}
+	matched := d.collectTypeMatches(gvr, false /* listOnly */)
+	return d.dirtyMarkResourceType("CRD_DELETE", gvr, matched)
+}
+
+// dirtyMarkResourceType dirty-marks every L1 key in matched via the
+// refreshHook — the shared body of OnResourceTypeAvailable +
+// OnResourceTypeRemoved. NEVER evicts. Returns the number marked.
+func (d *DepTracker) dirtyMarkResourceType(eventType string, gvr schema.GroupVersionResource, matched map[string]struct{}) int {
+	if len(matched) == 0 {
+		return 0
+	}
+	d.enqueueMu.RLock()
+	enqueue := d.enqueueFn
+	d.enqueueMu.RUnlock()
+
+	marked := 0
+	for l1Key := range matched {
+		if enqueue != nil {
+			enqueue(l1Key)
+		}
+		marked++
+	}
+	if marked > 0 {
+		d.dirtyMarkTotal.Add(uint64(marked))
+	}
+	slog.Info("cache_event.consumed",
+		slog.String("subsystem", "cache"),
+		slog.String("type", eventType),
+		slog.String("gvr", gvr.String()),
+		slog.String("action", "refresh"),
+		slog.Int("l1_keys", marked),
+	)
+	return marked
+}
+
+// collectTypeMatches scans the forward index for every bucket whose
+// GVR == gvr and returns the union of dependent L1 keys. The CRD-watch
+// lifecycle scan — it matches by GVR alone (every namespace), unlike
+// collectMatches which point-looks-up a specific (gvr, ns, name) tuple.
+//
+//   - listOnly == true (D1, CRD-add): only LIST-scope buckets
+//     (Name == listWildcard) — a stale-negative LIST is the only entry
+//     a CRD-add can invalidate.
+//   - listOnly == false (D2, CRD-delete): every bucket — LIST wildcard
+//     AND exact GET — since a type-removal invalidates both.
+//
+// A forward-index Range is O(distinct DepKeys); CRD-add/delete is a rare
+// event so the scan cost is paid only at CRD-lifecycle time, never on a
+// resolver hot path.
+func (d *DepTracker) collectTypeMatches(gvr schema.GroupVersionResource, listOnly bool) map[string]struct{} {
+	out := map[string]struct{}{}
+	d.forward.Range(func(k, v any) bool {
+		dk := k.(DepKey)
+		if dk.GVR != gvr {
+			return true
+		}
+		if listOnly && dk.Name != listWildcard {
+			return true
+		}
+		v.(*keySet).keys.Range(func(kk, _ any) bool {
+			out[kk.(string)] = struct{}{}
+			return true
+		})
+		return true
+	})
+	return out
+}
+
 // collectMatches returns the union of dependent L1 keys across the four
 // bucket forms. Retained as the bare-set form for onChange (ADD/UPDATE),
 // which dirty-marks every match uniformly and has no need for the
