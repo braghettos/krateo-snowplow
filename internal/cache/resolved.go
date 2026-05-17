@@ -552,7 +552,7 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Uint64("refresh_enqueued", d.EnqueueUpdateTotal),
 				slog.Uint64("refresh_completed", r.completed),
 				slog.Uint64("refresh_failed", r.failed),
-				slog.Uint64("refresh_skipped_dedup", r.skippedDedup),
+				slog.Uint64("refresh_retried", r.retried),
 				slog.Int64("dep_map_size", d.TotalRecords),
 				slog.Uint64("dep_record_total", d.RecordTotal),
 				slog.Uint64("dep_record_dropped_cap", d.RecordDroppedCap),
@@ -577,6 +577,25 @@ func resetResolvedCacheForTest() {
 	resolvedCacheInstance = nil
 	resolvedCacheOnce = sync.Once{}
 	resolvedCacheStarted.Store(false)
+}
+
+// ResetResolvedCacheForTest is the exported variant for cross-package
+// tests (e.g. internal/handlers/dispatchers' Ship C falsifier).
+// Production code MUST NOT call it.
+func ResetResolvedCacheForTest() {
+	resetResolvedCacheForTest()
+}
+
+// DeleteForTest removes key from the resolved cache. Cross-package
+// test-only seam — Ship C's resurrect-guard test emulates a DELETE-evict
+// landing mid-refresh. Production eviction MUST flow through the dep
+// tracker (deleteForDep) so dep records are cleaned alongside; this
+// helper deliberately bypasses that and is therefore TEST-ONLY.
+func (c *ResolvedCacheStore) DeleteForTest(key string) {
+	if c == nil {
+		return
+	}
+	c.deleteForDep(key)
 }
 
 // intFromEnv parses an env var as int with a default fallback. We
