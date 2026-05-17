@@ -9,11 +9,26 @@
 //
 // IDENTITY (PM directive, AC-C7): the re-resolve runs under the entry's
 // OWN Inputs identity — Username + Groups from the ResolvedKeyInputs.
-// There is NO ServiceAccount fallback and NO shared identity: a refresh
-// of user U's entry resolves as U, so RBAC narrowing and the resolved
-// content stay user-correct. The re-resolve context also carries
+// A refresh of user U's entry resolves as U, so RBAC narrowing and the
+// resolved content stay user-correct. The re-resolve context also carries
 // WithL1KeyContext(key) so the resolver re-records dep edges (the inner
 // object set may have changed since the original resolve).
+//
+// SA TRANSPORT (Ship 0.30.113 Part B): a background refresh has no live
+// per-user bearer token — the original request's Endpoint is long gone.
+// The widget resolver (widgets.Resolve) reads xcontext.UserConfig(ctx)
+// directly and fails "user *Endpoint not found in context" if only the
+// identity (WithUserInfo) is supplied. With the informer pivot ON
+// (RESOLVER_USE_INFORMER=true) every K8s read is informer-served and
+// RBAC-narrowed IN-PROCESS from WithUserInfo — never from the user's
+// token — so the user's Endpoint is needed ONLY as a transport. We
+// therefore supply the snowplow ServiceAccount endpoint + *rest.Config
+// as that transport (WithUserConfig + WithInternalEndpoint +
+// WithInternalRESTConfig) while keeping WithUserInfo{Username,Groups}
+// for per-user correctness. No per-user token is stored. This is the
+// EXACT pattern Phase 1 uses (withPhase1SAContext, phase1_walk.go) — the
+// load-bearing 0.30.103 SA-CA seam. When saEP/saRC are nil (no SA creds
+// — unit test / outside-cluster) the context is identity-only as before.
 //
 // Per feedback_l1_invalidation_delete_only.md: this path only ever
 // Put()s — it never evicts. A refresh that lands after the entry was
@@ -27,6 +42,7 @@ import (
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/snowplow/apis"
@@ -36,6 +52,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 )
 
 // resolveOnceFn is the resolve-and-encode seam. It re-fetches the CR
@@ -54,14 +71,22 @@ var resolveOnceFn = resolveOnceProd
 //  1. computes the canonical L1 key from inputs (must equal the key the
 //     entry is filed under — ComputeKey is deterministic);
 //  2. builds the re-resolve context: the entry's own Username+Groups
-//     identity, plus WithL1KeyContext(key) so dep edges are re-recorded;
+//     identity, the SA transport (saEP/saRC) so the resolver's
+//     UserConfig/object-fetch sites have an apiserver client-config,
+//     plus WithL1KeyContext(key) so dep edges are re-recorded;
 //  3. re-resolves + encodes via the resolveOnce seam;
 //  4. re-checks the entry is still live (a DELETE-evict may have raced
 //     the refresh) and, if so, Put()s the fresh bytes.
 //
+// saEP/saRC are the process-singleton snowplow ServiceAccount endpoint +
+// *rest.Config — supplied as TRANSPORT only (see the file header). When
+// nil (no SA creds) the context is identity-only and a widget re-resolve
+// that reads xcontext.UserConfig fails; the refresher's bounded retry
+// then drops the key to TTL.
+//
 // Returns an error on resolve failure so the refresher can retry with
 // backoff; returns nil (no-op) for an Inputs the path cannot drive.
-func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs) error {
+func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, saEP *endpoints.Endpoint, saRC *rest.Config) error {
 	log := xcontext.Logger(ctx)
 
 	c := cache.ResolvedCache()
@@ -73,15 +98,38 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs) e
 	key := cache.ComputeKey(inputs)
 
 	// AC-C7: re-resolve under the entry's OWN identity. Username+Groups
-	// come straight off the cached Inputs — no SA, no shared identity.
-	// WithL1KeyContext threads the L1 key so the resolver's inner-call
-	// recording site re-records dep edges for this refresh.
-	rctx := xcontext.BuildContext(ctx,
+	// come straight off the cached Inputs — that is what makes refresh #N
+	// resolve as user U (RBAC narrowing stays user-correct).
+	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: inputs.Username,
 			Groups:   inputs.Groups,
 		}),
-	)
+	}
+	// Ship 0.30.113 Part B — SA transport. A background refresh has no
+	// per-user token; the widget resolver reads xcontext.UserConfig
+	// directly. Supply the SA endpoint as the transport so that read
+	// succeeds. Under the informer pivot every K8s read is RBAC-narrowed
+	// in-process from WithUserInfo above, never from this endpoint's
+	// token — so this is transport-only, no per-user-token storage.
+	// Mirrors withPhase1SAContext (phase1_walk.go).
+	if saEP != nil {
+		opts = append(opts, xcontext.WithUserConfig(*saEP))
+	}
+	rctx := xcontext.BuildContext(ctx, opts...)
+	// WithInternalEndpoint / WithInternalRESTConfig make cache.ClientConfigFor
+	// (internal_client.go) return the pre-built SA *rest.Config verbatim
+	// for the objects.Get apiserver fall-through and resourcesrefs.Resolve
+	// — the load-bearing 0.30.103 SA-CA seam (the SA's raw-PEM CA cannot
+	// survive the base64/cert-only kubeconfig path).
+	if saEP != nil {
+		rctx = cache.WithInternalEndpoint(rctx, saEP)
+	}
+	if saRC != nil {
+		rctx = cache.WithInternalRESTConfig(rctx, saRC)
+	}
+	// WithL1KeyContext threads the L1 key so the resolver's inner-call
+	// recording site re-records dep edges for this refresh.
 	rctx = cache.WithL1KeyContext(rctx, key)
 
 	encoded, err := resolveOnceFn(rctx, inputs)

@@ -59,6 +59,19 @@ const (
 	// each requeue, capped at maxDelay. 500ms -> 1s -> 2s -> ... -> 60s.
 	defaultRefresherBaseDelayMS = 500
 	defaultRefresherMaxDelayMS  = 60_000
+
+	// maxRefreshRequeues caps how many times a single key may be
+	// re-enqueued via AddRateLimited before the refresher gives up on it
+	// (Ship 0.30.113 Part A — the poison-pill bound). This is the standard
+	// client-go controller idiom: a key whose handler keeps failing is
+	// almost always a DETERMINISTIC failure (a deleted CR, a malformed
+	// spec, a missing dependency) — re-enqueuing it forever just spins the
+	// worker pool with no chance of success. Once NumRequeues exceeds the
+	// cap, the key is Forgotten and DROPPED: the entry falls back to its
+	// TTL outer-net (no resurrection, no spin). The bound is GENERAL — it
+	// is not specific to any one handler kind or failure; it protects
+	// against ANY future deterministic refresh failure.
+	maxRefreshRequeues = 5
 )
 
 // RefreshFunc is the callback the cache package invokes on a refresh.
@@ -89,6 +102,7 @@ type refresher struct {
 	completedTotal      atomic.Uint64
 	failedTotal         atomic.Uint64
 	retriedTotal        atomic.Uint64 // keys re-enqueued via AddRateLimited
+	droppedTotal        atomic.Uint64 // keys dropped after exceeding maxRefreshRequeues
 	skippedNoEntryTotal atomic.Uint64
 	skippedNoHandler    atomic.Uint64
 
@@ -219,8 +233,13 @@ func (r *refresher) enqueue(l1Key string) {
 // worker loop should continue (false once the queue has ShutDown).
 //
 //   - success: Forget(key) — clear the backoff — then Done(key).
-//   - error:   AddRateLimited(key) — requeue after exponential backoff
-//              — then Done(key). The key WILL be retried.
+//   - error, under the requeue cap: AddRateLimited(key) — requeue after
+//     exponential backoff — then Done(key). The key WILL be retried.
+//   - error, requeue cap exceeded: Forget(key) and DROP the key — then
+//     Done(key). The key is NOT retried; the entry falls back to its TTL
+//     outer-net. This is the Ship 0.30.113 Part A poison-pill bound — a
+//     deterministic failure (one that can never succeed on retry) must
+//     not re-enqueue forever and spin the worker pool.
 //
 // Done(key) is always called (deferred) so the queue can release the
 // key for re-add; Forget/AddRateLimited only touch the rate limiter.
@@ -233,6 +252,24 @@ func (r *refresher) processNext(ctx context.Context) bool {
 
 	if err := r.processOne(ctx, key); err != nil {
 		r.failedTotal.Add(1)
+		// Poison-pill bound (Part A). NumRequeues is how many times this
+		// exact key has already been AddRateLimited. Once it exceeds the
+		// cap the failure is treated as deterministic: Forget the key
+		// (clear the rate limiter so a FUTURE genuine dirty-mark of the
+		// same key starts clean) and DROP it — no AddRateLimited. The
+		// entry stays in L1, stale, until its TTL purges it; a later
+		// informer event can re-enqueue it fresh.
+		if r.queue.NumRequeues(key) >= maxRefreshRequeues {
+			r.queue.Forget(key)
+			r.droppedTotal.Add(1)
+			slog.Warn("refresher.refresh_dropped",
+				slog.String("subsystem", "cache"),
+				slog.String("key_hash", key),
+				slog.Int("requeues", maxRefreshRequeues),
+				slog.String("effect", "deterministic refresh failure — key dropped to TTL outer-net, not retried"),
+			)
+			return true
+		}
 		r.retriedTotal.Add(1)
 		// Bounded exponential-backoff retry. The key is NOT Forgotten,
 		// so the rate limiter's NumRequeues climbs and the next delay
@@ -298,6 +335,7 @@ type refresherStats struct {
 	completed        uint64
 	failed           uint64
 	retried          uint64
+	dropped          uint64
 	skippedNoEntry   uint64
 	skippedNoHandler uint64
 }
@@ -312,6 +350,7 @@ func refresherStatsSnapshot() refresherStats {
 		completed:        r.completedTotal.Load(),
 		failed:           r.failedTotal.Load(),
 		retried:          r.retriedTotal.Load(),
+		dropped:          r.droppedTotal.Load(),
 		skippedNoEntry:   r.skippedNoEntryTotal.Load(),
 		skippedNoHandler: r.skippedNoHandler.Load(),
 	}

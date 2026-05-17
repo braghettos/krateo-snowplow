@@ -553,6 +553,7 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Uint64("refresh_completed", r.completed),
 				slog.Uint64("refresh_failed", r.failed),
 				slog.Uint64("refresh_retried", r.retried),
+				slog.Uint64("refresh_dropped", r.dropped),
 				slog.Int64("dep_map_size", d.TotalRecords),
 				slog.Uint64("dep_record_total", d.RecordTotal),
 				slog.Uint64("dep_record_dropped_cap", d.RecordDroppedCap),

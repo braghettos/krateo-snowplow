@@ -74,7 +74,10 @@ func TestFalsifierFNoop_RefreshFuncReallyReResolves(t *testing.T) {
 	seededStores := c.Stats().StoreTotal // == 1
 
 	// Register the Ship C handlers and retrieve the "widgets" one.
-	RegisterRefreshHandlers()
+	// saRC nil: outside-cluster, SA transport unavailable — the stubbed
+	// resolveOnceFn does not need it (the falsifier exercises the
+	// resolve-and-store plumbing, not a live resolver).
+	RegisterRefreshHandlers(nil)
 	fn := cache.RefreshFuncForTest("widgets")
 	if fn == nil {
 		t.Fatalf("F-noop: no RefreshFunc registered for kind=widgets")

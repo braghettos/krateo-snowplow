@@ -186,6 +186,114 @@ func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
 	}
 }
 
+// --- Ship 0.30.113 Part A — poison-pill bounded retry -----------------------
+
+// TestRefresher_PoisonPillDroppedAfterCap asserts the Part A bound: a
+// DETERMINISTIC failure (a handler that always errors) is re-enqueued at
+// most maxRefreshRequeues times, then the key is Forgotten and DROPPED —
+// the retry loop stops, droppedTotal ticks, and the entry stays in L1
+// (TTL outer-net) rather than being resurrected or evicted.
+func TestRefresher_PoisonPillDroppedAfterCap(t *testing.T) {
+	cleanup := withCleanRefresher(t, 1, 0)
+	defer cleanup()
+	// Tight backoff so the cap is reached fast.
+	t.Setenv(envRefresherBaseDelayMS, "5")
+	t.Setenv(envRefresherMaxDelayMS, "20")
+	resetRefresherForTest()
+
+	c := ResolvedCache()
+	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "poison"}
+	key := ComputeKey(inputs)
+	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+
+	var attempts atomic.Int32
+	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error {
+		attempts.Add(1)
+		return errors.New("deterministic failure — never succeeds")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+
+	enqueueRefreshForTest(key)
+
+	// The key is dropped once it has been AddRateLimited maxRefreshRequeues
+	// times. attempts == initial processing + maxRefreshRequeues retries.
+	waitFor(t, 5*time.Second, "key dropped after requeue cap",
+		func() bool { return refresherSingleton().droppedTotal.Load() == 1 })
+
+	// Bounded — attempts must STOP climbing once dropped (no unbounded spin).
+	settled := attempts.Load()
+	time.Sleep(400 * time.Millisecond)
+	if got := attempts.Load(); got != settled {
+		t.Fatalf("poison-pill NOT bounded: attempts kept climbing %d -> %d after drop",
+			settled, got)
+	}
+	// Total attempts == 1 initial + maxRefreshRequeues retries.
+	if int(settled) != 1+maxRefreshRequeues {
+		t.Fatalf("attempts=%d; want %d (1 initial + %d capped retries)",
+			settled, 1+maxRefreshRequeues, maxRefreshRequeues)
+	}
+	r := refresherSingleton()
+	if r.failedTotal.Load() != uint64(1+maxRefreshRequeues) {
+		t.Errorf("failedTotal=%d want %d", r.failedTotal.Load(), 1+maxRefreshRequeues)
+	}
+	if r.retriedTotal.Load() != uint64(maxRefreshRequeues) {
+		t.Errorf("retriedTotal=%d want %d", r.retriedTotal.Load(), maxRefreshRequeues)
+	}
+	if r.droppedTotal.Load() != 1 {
+		t.Errorf("droppedTotal=%d want 1", r.droppedTotal.Load())
+	}
+	if r.completedTotal.Load() != 0 {
+		t.Errorf("completedTotal=%d want 0 (poison pill never completes)", r.completedTotal.Load())
+	}
+	// The entry must still be in L1 — dropped to TTL, NOT evicted.
+	if _, ok := c.Get(key); !ok {
+		t.Fatalf("poison-pill drop evicted the entry — must fall back to TTL, not be removed")
+	}
+}
+
+// TestRefresher_TransientUnderCapStillSucceeds guards the Part A bound
+// against over-reach: a transient failure that recovers WITHIN the
+// requeue cap must still succeed normally and NOT be dropped.
+func TestRefresher_TransientUnderCapStillSucceeds(t *testing.T) {
+	cleanup := withCleanRefresher(t, 1, 0)
+	defer cleanup()
+	t.Setenv(envRefresherBaseDelayMS, "5")
+	t.Setenv(envRefresherMaxDelayMS, "20")
+	resetRefresherForTest()
+
+	c := ResolvedCache()
+	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "transient"}
+	key := ComputeKey(inputs)
+	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+
+	var attempts atomic.Int32
+	// Fail maxRefreshRequeues-1 times (strictly under the cap), then OK.
+	failTimes := int32(maxRefreshRequeues - 1)
+	RegisterRefreshFunc("widgets", func(context.Context, string, ResolvedKeyInputs) error {
+		if attempts.Add(1) <= failTimes {
+			return errors.New("transient failure")
+		}
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	StartRefresher(ctx)
+
+	enqueueRefreshForTest(key)
+	waitFor(t, 5*time.Second, "transient failure recovered",
+		func() bool { return refresherSingleton().completedTotal.Load() == 1 })
+
+	r := refresherSingleton()
+	if r.droppedTotal.Load() != 0 {
+		t.Fatalf("droppedTotal=%d want 0 — a sub-cap transient failure must NOT be dropped",
+			r.droppedTotal.Load())
+	}
+}
+
 // AC-C3 — a failing refresh must NOT evict the entry.
 func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
 	cleanup := withCleanRefresher(t, 1, 0)

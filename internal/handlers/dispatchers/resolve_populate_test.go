@@ -17,7 +17,9 @@ import (
 	"testing"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"k8s.io/client-go/rest"
 )
 
 // --- AC-C7 — re-resolve identity + WithL1KeyContext -------------------------
@@ -56,7 +58,7 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 	})
 	t.Cleanup(restore)
 
-	if err := resolveAndPopulateL1(context.Background(), inputs); err != nil {
+	if err := resolveAndPopulateL1(context.Background(), inputs, nil, nil); err != nil {
 		t.Fatalf("resolveAndPopulateL1 error: %v", err)
 	}
 
@@ -101,7 +103,7 @@ func TestACC5_ResolveSeamDeclineIsCleanSkip(t *testing.T) {
 	})
 	t.Cleanup(restore)
 
-	if err := resolveAndPopulateL1(context.Background(), inputs); err != nil {
+	if err := resolveAndPopulateL1(context.Background(), inputs, nil, nil); err != nil {
 		t.Fatalf("declined resolve must be a nil-error skip; got %v", err)
 	}
 	if got := c.Stats().StoreTotal; got != before {
@@ -130,13 +132,127 @@ func TestResolvePopulate_EvictedDuringResolveNotResurrected(t *testing.T) {
 	})
 	t.Cleanup(restore)
 
-	if err := resolveAndPopulateL1(context.Background(), inputs); err != nil {
+	if err := resolveAndPopulateL1(context.Background(), inputs, nil, nil); err != nil {
 		t.Fatalf("resolveAndPopulateL1 error: %v", err)
 	}
 	// The post-resolve liveness re-check must have dropped the fresh
 	// bytes — the evicted entry stays gone.
 	if _, ok := c.Get(key); ok {
 		t.Fatalf("resurrect-guard failed: a refresh re-created an evicted entry")
+	}
+}
+
+// --- Ship 0.30.113 Part B — SA transport on the re-resolve context ---------
+
+// TestPartB_SATransportOnContext asserts that when resolveAndPopulateL1 is
+// given a non-nil SA endpoint + *rest.Config it installs them on the
+// re-resolve context: WithUserConfig (so widgets.Resolve's
+// xcontext.UserConfig succeeds) AND WithInternalEndpoint/RESTConfig (so
+// cache.ClientConfigFor returns the pre-built SA config). The entry's OWN
+// identity (Username+Groups) must STILL be the WithUserInfo on the
+// context — the SA pair is transport-only, not an identity swap.
+func TestPartB_SATransportOnContext(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	cache.ResetResolvedCacheForTest()
+	t.Cleanup(cache.ResetResolvedCacheForTest)
+
+	c := cache.ResolvedCache()
+	inputs := cache.ResolvedKeyInputs{
+		HandlerKind: "widgets",
+		Group:       "widgets.templates.krateo.io",
+		Version:     "v1beta1",
+		Resource:    "panels",
+		Namespace:   "demo",
+		Name:        "compositions-panel",
+		Username:    "cyberjoker",
+		Groups:      []string{"devs"},
+	}
+	key := cache.ComputeKey(inputs)
+	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
+
+	saEP := &endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: "sa-token"}
+	saRC := &rest.Config{Host: "https://kubernetes.default.svc"}
+
+	var (
+		gotUser     string
+		gotUserCfg  endpoints.Endpoint
+		userCfgOK   bool
+		gotIntEP    any
+		intEPOK     bool
+		gotIntRC    any
+		intRCOK     bool
+	)
+	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
+		if ui, err := xcontext.UserInfo(ctx); err == nil {
+			gotUser = ui.Username
+		}
+		if ep, err := xcontext.UserConfig(ctx); err == nil {
+			gotUserCfg, userCfgOK = ep, true
+		}
+		gotIntEP, intEPOK = cache.InternalEndpointFromContext(ctx)
+		gotIntRC, intRCOK = cache.InternalRESTConfigFromContext(ctx)
+		return []byte(`{"fresh":1}`), nil
+	})
+	t.Cleanup(restore)
+
+	if err := resolveAndPopulateL1(context.Background(), inputs, saEP, saRC); err != nil {
+		t.Fatalf("resolveAndPopulateL1 error: %v", err)
+	}
+
+	// Identity is STILL the entry's own user — SA is transport, not identity.
+	if gotUser != "cyberjoker" {
+		t.Fatalf("Part B: re-resolve identity=%q; want the entry's own %q (SA must not replace identity)",
+			gotUser, "cyberjoker")
+	}
+	// WithUserConfig present — this is the fix for "user *Endpoint not found in context".
+	if !userCfgOK {
+		t.Fatalf("Part B: re-resolve ctx has NO UserConfig — widgets.Resolve would fail "+
+			"%q", "user *Endpoint not found in context")
+	}
+	if gotUserCfg.ServerURL != saEP.ServerURL {
+		t.Fatalf("Part B: UserConfig ServerURL=%q; want the SA endpoint %q",
+			gotUserCfg.ServerURL, saEP.ServerURL)
+	}
+	// Internal endpoint + REST config installed — the 0.30.103 SA-CA seam.
+	if !intEPOK || gotIntEP == nil {
+		t.Fatalf("Part B: re-resolve ctx missing WithInternalEndpoint")
+	}
+	if !intRCOK {
+		t.Fatalf("Part B: re-resolve ctx missing WithInternalRESTConfig")
+	}
+	if rc, ok := gotIntRC.(*rest.Config); !ok || rc != saRC {
+		t.Fatalf("Part B: WithInternalRESTConfig did not carry the supplied SA *rest.Config verbatim")
+	}
+}
+
+// TestPartB_NilSATransportIsIdentityOnly asserts the graceful-degradation
+// path: with nil SA pair the re-resolve context carries the entry's
+// identity but NO UserConfig — identical to pre-0.30.113 behaviour.
+func TestPartB_NilSATransportIsIdentityOnly(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	cache.ResetResolvedCacheForTest()
+	t.Cleanup(cache.ResetResolvedCacheForTest)
+
+	c := cache.ResolvedCache()
+	inputs := cache.ResolvedKeyInputs{HandlerKind: "widgets", Name: "no-sa", Username: "u"}
+	key := cache.ComputeKey(inputs)
+	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
+
+	var userCfgOK bool
+	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
+		_, err := xcontext.UserConfig(ctx)
+		userCfgOK = err == nil
+		return []byte(`{"fresh":1}`), nil
+	})
+	t.Cleanup(restore)
+
+	if err := resolveAndPopulateL1(context.Background(), inputs, nil, nil); err != nil {
+		t.Fatalf("resolveAndPopulateL1 error: %v", err)
+	}
+	if userCfgOK {
+		t.Fatalf("Part B: nil SA pair must leave the context UserConfig-free (identity-only)")
 	}
 }
 
@@ -157,7 +273,7 @@ func TestResolvePopulate_SeamErrorPropagates(t *testing.T) {
 	})
 	t.Cleanup(restore)
 
-	err := resolveAndPopulateL1(context.Background(), inputs)
+	err := resolveAndPopulateL1(context.Background(), inputs, nil, nil)
 	if err == nil {
 		t.Fatalf("a resolve-seam error must propagate so the refresher can retry")
 	}

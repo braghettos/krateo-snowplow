@@ -213,7 +213,12 @@ func main() {
 					// doing — NewResourceWatcher calls factory.Start
 					// internally for the RBAC GVRs). Idempotent on
 					// duplicate calls.
-					dispatchers.RegisterRefreshHandlers()
+					//
+					// 0.30.113 Part B: pass the in-cluster *rest.Config as
+					// the background-refresh SA transport — a refresh has
+					// no live per-user token; the widget resolver needs an
+					// apiserver client-config on the context.
+					dispatchers.RegisterRefreshHandlers(rc)
 					cache.StartRefresher(cacheCtx)
 
 					// Block until RBAC informer LISTs complete so the
