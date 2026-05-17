@@ -26,6 +26,15 @@ import (
 // (Q-OOM-WARMER, ship/0.25.320).
 const listPageLimit int64 = 500
 
+// listOptionsTweak is the single bounded-paging TweakListOptionsFunc
+// applied to EVERY informer LIST — shared factories AND the R6
+// (0.30.115) standalone per-GVR informers. Centralising it guarantees
+// the standalone informers carry byte-identical paging policy to the
+// factory-built ones (the architect's "same tweakListOptions" rule).
+func listOptionsTweak(opts *metav1.ListOptions) {
+	opts.Limit = listPageLimit
+}
+
 // watcherMode discriminates the two ResourceWatcher operational modes
 // introduced at 0.30.71 ("extended CACHE_ENABLED"):
 //
@@ -197,6 +206,20 @@ type ResourceWatcher struct {
 	// event handler. Guarded by rw.mu.
 	crdWatchStarted bool
 
+	// informerStop holds the per-GVR stop channel passed to each
+	// informer's Run (and its sync-watcher) — the R6 (0.30.115)
+	// informer-lifecycle change. Pre-0.30.115 every informer shared the
+	// single process-wide rw.stopCh, so there was no way to cancel ONE
+	// informer; RemoveResourceType needs exactly that.
+	//
+	// Each channel is closed exactly once — either by RemoveResourceType
+	// (per-GVR teardown) or by Stop() (global shutdown, reaping every
+	// channel still present). closePerGVRStopLocked is the single close
+	// site; it guards the close with a closed-check under rw.mu so a
+	// RemoveResourceType racing a Stop() cannot double-close (AC-R6.5).
+	// Guarded by rw.mu (same lock as rw.informers).
+	informerStop map[schema.GroupVersionResource]chan struct{}
+
 	stopCh chan struct{}
 }
 
@@ -278,15 +301,11 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		return nil, fmt.Errorf("cache: NewResourceWatcher requires non-nil dynamic.Interface")
 	}
 
-	tweak := func(opts *metav1.ListOptions) {
-		opts.Limit = listPageLimit
-	}
-
 	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(
 		dyn,
 		0, // resync period 0 — pure event-driven; no periodic full re-list
 		metav1.NamespaceAll,
-		tweak,
+		listOptionsTweak,
 	)
 
 	rw := &ResourceWatcher{
@@ -629,23 +648,41 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 		return
 	}
 
-	// Lazy factory construction. tweakListOptions matches the dynamic
-	// factory's bounded-paging policy (listPageLimit) — same apiserver
-	// pressure budget per LIST. resyncPeriod=0 ⇒ pure event-driven, no
-	// periodic full re-list.
-	if rw.metaFactory == nil {
-		tweak := func(opts *metav1.ListOptions) {
-			opts.Limit = listPageLimit
-		}
-		rw.metaFactory = metadatainformer.NewFilteredSharedInformerFactory(
+	// R6 (0.30.115): removable GVRs get a STANDALONE metadata informer,
+	// not a shared-metaFactory one — same rationale as the dynamic
+	// full-informer path (the shared factory caches by GVR with no
+	// eviction API, so a torn-down factory informer would be handed
+	// back stopped + frozen on CRD recreate). NewFilteredMetadataInformer
+	// is the exact constructor the shared metaFactory calls internally
+	// (client-go metadatainformer/informer.go:113), with the SAME
+	// listOptionsTweak. The composition family routes through the
+	// metadata-only path when annotated/static-seeded, so this is the
+	// common path for the GVRs RemoveResourceType actually tears down.
+	var gi informers.GenericInformer
+	standalone := matchesAutoDiscoverGroup(gvr.Group)
+	if standalone {
+		gi = metadatainformer.NewFilteredMetadataInformer(
 			rw.metaClient,
-			0, // resync period 0
+			gvr,
 			metav1.NamespaceAll,
-			tweak,
+			0, // resync period 0 — pure event-driven, matches the factory
+			clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc},
+			listOptionsTweak,
 		)
+	} else {
+		// Lazy shared-factory construction. resyncPeriod=0 ⇒ pure
+		// event-driven, no periodic full re-list; listOptionsTweak
+		// matches the dynamic factory's bounded-paging policy.
+		if rw.metaFactory == nil {
+			rw.metaFactory = metadatainformer.NewFilteredSharedInformerFactory(
+				rw.metaClient,
+				0, // resync period 0
+				metav1.NamespaceAll,
+				listOptionsTweak,
+			)
+		}
+		gi = rw.metaFactory.ForResource(gvr)
 	}
-
-	gi := rw.metaFactory.ForResource(gvr)
 	rw.informers[gvr] = gi
 	if rw.metadataOnly == nil {
 		rw.metadataOnly = map[schema.GroupVersionResource]struct{}{}
@@ -656,6 +693,11 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 		rw.syncCh = map[schema.GroupVersionResource]chan struct{}{}
 	}
 	rw.syncCh[gvr] = make(chan struct{})
+
+	// R6 (0.30.115): per-GVR stop channel — same rationale as the
+	// dynamic full-informer path. RemoveResourceType cancels this
+	// metadata informer alone.
+	rw.perGVRStopLocked(gvr)
 
 	resourceType := gvrResourceTypeString(gvr)
 
@@ -684,10 +726,12 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// Start the metadata informer and spawn the sync-watcher. We
 	// always reach this branch post-Start (the constructor never
 	// metadata-registers; only lazy EnsureResourceType does), so the
-	// "late registration" path is the only one.
-	go gi.Informer().Run(rw.stopCh)
+	// "late registration" path is the only one. R6 (0.30.115): both
+	// goroutines are bound by the per-GVR stop channel.
+	stop := rw.informerStop[gvr]
+	go gi.Informer().Run(stop)
 	ch := rw.syncCh[gvr]
-	go waitInformerSync(gi.Informer().HasSynced, ch, rw.stopCh)
+	go waitInformerSync(gi.Informer().HasSynced, ch, stop)
 }
 
 // EnsureResourceTypeMetadataOnly is the explicit, signature-preserving
@@ -833,7 +877,36 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		return
 	}
 
-	gi := rw.factory.ForResource(gvr)
+	// R6 (0.30.115): removable GVRs get a STANDALONE informer, not a
+	// shared-factory one. The shared dynamicSharedInformerFactory caches
+	// informers by GVR with no eviction API, so a factory-built informer
+	// torn down by RemoveResourceType would be handed back — stopped and
+	// frozen — by a later EnsureResourceType (CRD delete→recreate). A
+	// standalone informer is owned outright: RemoveResourceType drops it
+	// and a re-register constructs a fresh one. NewFilteredDynamicInformer
+	// is the exact constructor the shared factory calls internally
+	// (client-go dynamicinformer/informer.go:84), with the SAME
+	// listOptionsTweak — paging/strip policy is byte-identical.
+	//
+	// The removable discriminator is matchesAutoDiscoverGroup — the
+	// existing navigation-derived predicate. No new per-resource
+	// special-case (feedback_no_special_cases.md): a GVR is removable iff
+	// its group is one the CRD-watch auto-registers, which is exactly the
+	// set RemoveResourceType is ever wired to tear down.
+	var gi informers.GenericInformer
+	standalone := matchesAutoDiscoverGroup(gvr.Group)
+	if standalone {
+		gi = dynamicinformer.NewFilteredDynamicInformer(
+			rw.dyn,
+			gvr,
+			metav1.NamespaceAll,
+			0, // resync period 0 — pure event-driven, matches the factory
+			clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc},
+			listOptionsTweak,
+		)
+	} else {
+		gi = rw.factory.ForResource(gvr)
+	}
 	rw.informers[gvr] = gi
 
 	// 0.30.9 Sub-scope B: allocate the sync channel BEFORE we spawn
@@ -847,6 +920,13 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		rw.syncCh = map[schema.GroupVersionResource]chan struct{}{}
 	}
 	rw.syncCh[gvr] = make(chan struct{})
+
+	// R6 (0.30.115): allocate the per-GVR stop channel. Both the
+	// informer's Run goroutine and its sync-watcher are bound by THIS
+	// channel — not the process-wide rw.stopCh — so RemoveResourceType
+	// can cancel exactly this GVR. Stop() reaps every channel still
+	// present, so global shutdown is unchanged.
+	rw.perGVRStopLocked(gvr)
 
 	resourceType := gvrResourceTypeString(gvr)
 	tf := StripBulkyFieldsForResourceType(resourceType, gvr)
@@ -916,18 +996,23 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 
 	if rw.started {
 		// Late registration after Start(): kick the new informer.
-		go gi.Informer().Run(rw.stopCh)
+		// R6 (0.30.115): bound by the per-GVR stop channel, NOT
+		// rw.stopCh, so RemoveResourceType can cancel this informer
+		// alone. Stop() closes every per-GVR channel still present, so
+		// global shutdown reaps this goroutine just as before.
+		stop := rw.informerStop[gvr]
+		go gi.Informer().Run(stop)
 
 		// 0.30.9 Sub-scope B: spawn the sync-watcher for this GVR.
 		// The watcher polls HasSynced (cheap atomic load in
 		// client-go) and closes the sync channel as soon as the
 		// informer's initial LIST is reconciled. We use a polling
-		// loop bounded by rw.stopCh so the goroutine exits when
-		// the watcher Stop()s. WaitForCacheSync (client-go) uses
-		// the same polling primitive internally — we re-implement
-		// it here so we don't need to allocate a context.
+		// loop bounded by the per-GVR stop channel so the goroutine
+		// exits on RemoveResourceType OR Stop(). WaitForCacheSync
+		// (client-go) uses the same polling primitive internally — we
+		// re-implement it here so we don't need to allocate a context.
 		ch := rw.syncCh[gvr]
-		go waitInformerSync(gi.Informer().HasSynced, ch, rw.stopCh)
+		go waitInformerSync(gi.Informer().HasSynced, ch, stop)
 
 		// 0.30.6 falsifier (plan §"Code-path falsifier"). If eager
 		// registration has already completed AND this GVR was in
@@ -950,6 +1035,125 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 			}
 		}
 	}
+}
+
+// perGVRStopLocked returns the per-GVR stop channel for gvr, allocating
+// it (and the backing map) on first use. Callers MUST hold rw.mu.Lock().
+//
+// R6 (0.30.115): the channel is the per-informer canceller — the
+// informer's Run goroutine and its sync-watcher are both bound by it, so
+// RemoveResourceType can stop exactly one informer. It is closed exactly
+// once, by closePerGVRStopLocked, whether via RemoveResourceType
+// (per-GVR teardown) or Stop() (global shutdown).
+func (rw *ResourceWatcher) perGVRStopLocked(gvr schema.GroupVersionResource) chan struct{} {
+	if rw.informerStop == nil {
+		rw.informerStop = map[schema.GroupVersionResource]chan struct{}{}
+	}
+	if ch, ok := rw.informerStop[gvr]; ok {
+		return ch
+	}
+	ch := make(chan struct{})
+	rw.informerStop[gvr] = ch
+	return ch
+}
+
+// closePerGVRStopLocked closes gvr's per-GVR stop channel exactly once.
+// Callers MUST hold rw.mu.Lock(). The closed-check under the lock is the
+// AC-R6.5 double-close guard: RemoveResourceType and Stop() both route
+// every close through here, and rw.mu serialises them, so a
+// RemoveResourceType racing a Stop() can never close the same channel
+// twice (a double-close panics). A no-op when gvr has no channel.
+func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource) {
+	ch, ok := rw.informerStop[gvr]
+	if !ok {
+		return
+	}
+	select {
+	case <-ch:
+		// Already closed — nothing to do.
+	default:
+		close(ch)
+	}
+}
+
+// RemoveResourceType tears down exactly one GVR's informer — the R6
+// (0.30.115) per-GVR informer-lifecycle teardown. It closes the GVR's
+// per-GVR stop channel (which exits the informer's Run goroutine and its
+// sync-watcher) and purges the GVR from every per-GVR map. The dep
+// event handlers die with the informer goroutine — no separate
+// unregistration needed.
+//
+// Wired into the CRD-watch's DeleteFunc (crdwatch.go's
+// unregisterCRDObject): when a CRD is removed at runtime, the informer
+// for its GVR is no longer needed and would otherwise leak a goroutine
+// for the process lifetime.
+//
+// Idempotent (AC-R6.1): a second call for the same GVR, or a call for an
+// unknown GVR, is a no-op — closePerGVRStopLocked tolerates a missing /
+// already-closed channel, and the map deletes are no-ops.
+//
+// Nil-receiver / passthrough are no-ops (AC-R6.4): in modePassthrough no
+// informer exists. GVR-keyed throughout — no per-resource switch
+// (feedback_no_special_cases.md).
+//
+// Re-add correctness (R6 Option 1): removable GVRs run a STANDALONE
+// informer (addResourceTypeLocked's matchesAutoDiscoverGroup branch),
+// NOT a shared-factory one. Deleting the GVR from rw.informers here
+// drops the only reference to that standalone informer — nothing pins
+// it. A later EnsureResourceType for the same GVR (a CRD delete→recreate)
+// therefore constructs a FRESH standalone informer that lists + watches
+// from scratch; it does not resurrect a stopped, frozen one. R6 is thus
+// strictly more correct than pre-R6: no leaked goroutine AND no frozen
+// store on recreate.
+//
+// Note: RemoveResourceType is wired ONLY to CRD-delete, which always
+// targets a lazily-registered composition GVR (the CRD-watch fires after
+// factory.Start). Lazy registrations run their (standalone) informer on
+// the per-GVR channel, so closing it genuinely stops the Run goroutine.
+// The four RBAC bootstrap GVRs are factory-driven on rw.stopCh and are
+// structurally never removed.
+func (rw *ResourceWatcher) RemoveResourceType(gvr schema.GroupVersionResource) {
+	if rw == nil || rw.mode == modePassthrough {
+		return
+	}
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if _, ok := rw.informers[gvr]; !ok {
+		// Unknown GVR — nothing registered. Still attempt the channel
+		// close + map deletes so a partial-state GVR is fully purged;
+		// all are no-ops when the GVR is genuinely absent.
+		rw.closePerGVRStopLocked(gvr)
+		rw.deletePerGVRStateLocked(gvr)
+		return
+	}
+
+	// Close the per-GVR stop channel — exits the informer's Run
+	// goroutine and its sync-watcher.
+	rw.closePerGVRStopLocked(gvr)
+	// Purge every per-GVR map entry so no state outlives the informer.
+	rw.deletePerGVRStateLocked(gvr)
+
+	slog.Info("cache.resource_type.removed",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("note", "per-GVR informer torn down — Run goroutine + sync-watcher reaped, per-GVR state purged"),
+	)
+}
+
+// deletePerGVRStateLocked removes gvr from every per-GVR map. Callers
+// MUST hold rw.mu.Lock(). The single de-registration site so a future
+// per-GVR map cannot be forgotten — every map keyed by GVR is purged
+// here uniformly (feedback_no_special_cases.md: no map gets a carve-out).
+func (rw *ResourceWatcher) deletePerGVRStateLocked(gvr schema.GroupVersionResource) {
+	delete(rw.informers, gvr)
+	delete(rw.syncCh, gvr)
+	delete(rw.confirmed, gvr)
+	delete(rw.watchBroken, gvr)
+	delete(rw.informerStop, gvr)
+	delete(rw.metadataOnly, gvr)
+	delete(rw.lastSyncRV, gvr)
+	delete(rw.watchHandlerInstalled, gvr)
 }
 
 // waitInformerSync polls the informer's HasSynced predicate and
@@ -1531,7 +1735,36 @@ func (rw *ResourceWatcher) MatchingObjects(gvr schema.GroupVersionResource, name
 	return out
 }
 
+// everyPerGVRMapClearForTest reports whether gvr is absent from every
+// per-GVR map. TEST-ONLY surface for the R6 falsifier's leak assertion.
+func (rw *ResourceWatcher) everyPerGVRMapClearForTest(gvr schema.GroupVersionResource) bool {
+	if rw == nil {
+		return true
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	_, inInformers := rw.informers[gvr]
+	_, inSync := rw.syncCh[gvr]
+	_, inConfirmed := rw.confirmed[gvr]
+	_, inBroken := rw.watchBroken[gvr]
+	_, inStop := rw.informerStop[gvr]
+	_, inMeta := rw.metadataOnly[gvr]
+	_, inRV := rw.lastSyncRV[gvr]
+	_, inWHI := rw.watchHandlerInstalled[gvr]
+	return !inInformers && !inSync && !inConfirmed && !inBroken &&
+		!inStop && !inMeta && !inRV && !inWHI
+}
+
 // Stop signals every informer goroutine to exit. Idempotent.
+//
+// R6 (0.30.115): closing rw.stopCh reaps the factory-driven bootstrap
+// informers (started via factory.Start(rw.stopCh)); the per-GVR
+// channels reap the lazily-registered informers (whose Run is bound by
+// rw.informerStop[gvr]). Stop() therefore closes BOTH — rw.stopCh once,
+// then every per-GVR channel still present (RemoveResourceType already
+// closed + purged the ones it tore down). closePerGVRStopLocked's
+// closed-check makes a remaining-channel close a no-op if it somehow
+// raced shut, so global shutdown stays exactly-once.
 func (rw *ResourceWatcher) Stop() {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
@@ -1541,6 +1774,14 @@ func (rw *ResourceWatcher) Stop() {
 		// Already closed.
 	default:
 		close(rw.stopCh)
+	}
+
+	// Reap every per-GVR informer channel still present. A channel a
+	// RemoveResourceType already closed was also deleted from the map,
+	// so it is not revisited here; closePerGVRStopLocked's closed-check
+	// is the belt-and-braces guard against any residual race.
+	for gvr := range rw.informerStop {
+		rw.closePerGVRStopLocked(gvr)
 	}
 }
 

@@ -199,12 +199,10 @@ func (rw *ResourceWatcher) StartCRDWatch(ctx context.Context) {
 	if _, err := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { rw.registerCRDObject(obj, "crd-event") },
 		UpdateFunc: func(_, newObj interface{}) { rw.registerCRDObject(newObj, "crd-event") },
-		// D2 (Ship D, 0.30.114): a CRD removal dirty-marks every L1 entry
-		// that LIST- or GET-depends on the vanished GVR. ACCEPTED
-		// LIMITATION — the per-GVR informer is NOT stopped: client-go
-		// cannot cleanly stop one factory informer mid-flight; a stale
-		// informer for a vanished type is harmless because the pivot's
-		// servable() gate already falls through on an unconfirmed type.
+		// D2 (Ship D, 0.30.114) + R6 (Ship 0.30.115): a CRD removal
+		// dirty-marks every L1 entry that LIST- or GET-depends on the
+		// vanished GVR AND tears down the per-GVR informer
+		// (RemoveResourceType) so its Run goroutine does not leak.
 		DeleteFunc: func(obj interface{}) { rw.unregisterCRDObject(obj, "crd-event") },
 	}); err != nil {
 		slog.Warn("cache.crdwatch.add_event_handler_failed",
@@ -274,17 +272,22 @@ func (rw *ResourceWatcher) registerCRDObject(obj interface{}, via string) {
 
 // unregisterCRDObject is the single per-CRD-object de-registration step:
 // derive the CRD's GVR and, IFF its group is in the navigation-derived
-// auto-discover set, dirty-mark every L1 entry that LIST-depends — or
-// GET-depends — on that GVR (D2, Ship D 0.30.114). Wired into the CRD
-// informer's DeleteFunc.
+// auto-discover set, react to the CRD removal in two independent ways:
 //
-// It deliberately does NOT stop the per-GVR informer: client-go cannot
-// cleanly stop one factory informer mid-flight, and a stale informer for
-// a vanished type is harmless — the pivot's servable() gate already
-// falls through on an unconfirmed resource type. Dirty-mark only — NEVER
-// evicts: a CRD removal is a TYPE-removal, not a single object's DELETE,
-// so feedback_l1_invalidation_delete_only.md's eviction authorisation
-// does not apply (mirrors OnDelete's non-self dependent-bucket handling).
+//   - D2 (Ship D, 0.30.114): dirty-mark every L1 entry that LIST-depends
+//     — or GET-depends — on that GVR via Deps().OnResourceTypeRemoved.
+//     Dirty-mark only — NEVER evicts: a CRD removal is a TYPE-removal,
+//     not a single object's DELETE, so
+//     feedback_l1_invalidation_delete_only.md's eviction authorisation
+//     does not apply (mirrors OnDelete's non-self dependent-bucket
+//     handling).
+//
+//   - R6 (Ship 0.30.115): tear down the per-GVR informer via
+//     RemoveResourceType so its Run goroutine + sync-watcher do not leak
+//     for the process lifetime. R6 ADDS the teardown; it does not
+//     replace the D2 dirty-mark — both fire, independently.
+//
+// Wired into the CRD informer's DeleteFunc.
 //
 // `via` is a log-only tag distinguishing the trigger.
 func (rw *ResourceWatcher) unregisterCRDObject(obj interface{}, via string) {
@@ -297,12 +300,13 @@ func (rw *ResourceWatcher) unregisterCRDObject(obj interface{}, via string) {
 		return
 	}
 	marked := Deps().OnResourceTypeRemoved(gvr)
+	rw.RemoveResourceType(gvr)
 	slog.Info("cache.crdwatch.unregistered",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
 		slog.String("via", via),
 		slog.Int("l1_keys_dirty_marked", marked),
-		slog.String("note", "CRD removed — LIST + dependent-GET deps dirty-marked; informer left running (accepted limitation)"),
+		slog.String("note", "CRD removed — LIST + dependent-GET deps dirty-marked; per-GVR informer torn down"),
 	)
 }
 
