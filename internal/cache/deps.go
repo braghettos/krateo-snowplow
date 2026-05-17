@@ -131,47 +131,104 @@ func L1KeyFromContext(ctx context.Context) string {
 	return v
 }
 
-// ctxKeyRefreshBypassType is the typed empty-struct context key for the
-// Ship 0.30.118 refresh-bypass marker. Distinct unexported type — same
-// collision-safety as ctxKeyL1RecordType.
-type ctxKeyRefreshBypassType struct{}
+// NOTE — the Ship 0.30.118 WithRefreshBypass / RefreshBypassFromContext
+// machinery was REMOVED in Ship F1 (0.30.119). It existed only because
+// the Ship E api-stage entry was per-STAGE and the refresher's
+// whole-RESTAction re-resolve self-hit it through its own stage loop.
+// F1's api-stage entry is per-K8s-CALL content: the refresher
+// re-dispatches the one K8s call directly (resolve_populate.go) — it
+// never self-Gets a content entry — so the self-hit is structurally
+// eliminated and the marker is dead code. Removed in F1, not left inert
+// (team decision — no dead code).
 
-var ctxKeyRefreshBypass = ctxKeyRefreshBypassType{}
+// ctxKeyApistageContentResolveType is the typed context key for the
+// Ship F1 (0.30.119) apistage-content-resolve marker. Distinct
+// unexported type — same collision-safety as the other ctx keys.
+type ctxKeyApistageContentResolveType struct{}
 
-// WithRefreshBypass returns a child context marked as a REFRESH-driven
-// re-resolve (Ship 0.30.118 — the api-stage self-hit fix). The refresher
-// sets it on the re-resolve context for an apistage entry; the api-stage
-// resolver consults it via RefreshBypassFromContext.
+var ctxKeyApistageContentResolve = ctxKeyApistageContentResolveType{}
+
+// WithApistageContentResolve returns a child context marked as an
+// api-stage CONTENT resolve (Ship F1 — content-keyed cache + serve-time
+// RBAC gate). The api-stage resolver sets it on the per-stage resolve
+// context when apistage L1 is active; dispatchViaInformer consults it
+// via ApistageContentResolveFromContext.
 //
-// THE INVARIANT it restores: the resolve that feeds a refresh must not
-// consult the entry being refreshed. The apistage refresh routes through
-// the whole-RESTAction stage loop, whose per-stage Get(stageKey) reads
-// the resolved-output L1 — so without this marker the refresh re-resolve
-// self-hits the dirty-but-resident entry it is refreshing, skips the K8s
-// call, and never re-Puts. With the marker the stage loop SKIPS the Get
-// for exactly the stage key being refreshed (L1KeyFromContext) — that
-// stage recomputes from K8s and the key-swap Put writes the fresh value.
-// Sibling stages still Get-hit normally (they are not being refreshed).
+// THE INVARIANT it establishes: the api-stage L1 entry is IDENTITY-FREE
+// content (Ship F1 ComputeKey drops Username/Groups from the apistage
+// key) — it must therefore store UN-GATED content, never one user's
+// RBAC-narrowed view. When this marker is set dispatchViaInformer SKIPS
+// its inline filterListByRBAC / filterGetByRBAC so the dispatch returns
+// the raw, un-narrowed indexer items / object. The per-user RBAC gate
+// then runs at a SINGLE site in the stage loop — on BOTH the Get-hit and
+// the fresh-dispatch-miss path — before the content lands in dict[id].
+// That closes the hit-path leak (pre-F1 the inline gate fired only on a
+// miss; a Get-hit served the previous resolver's narrowed view).
 //
-// Mirrors WithL1KeyContext: a context.Value flag, no parameter threaded
+// Request-path resolves without apistage L1 never carry this marker, so
+// dispatchViaInformer gates inline exactly as before — byte-identical.
+//
+// Mirrors WithRefreshBypass: a context.Value flag, no parameter threaded
 // through the resolver call chain. A nil ctx is returned unchanged.
-func WithRefreshBypass(ctx context.Context) context.Context {
+func WithApistageContentResolve(ctx context.Context) context.Context {
 	if ctx == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, ctxKeyRefreshBypass, true)
+	return context.WithValue(ctx, ctxKeyApistageContentResolve, true)
 }
 
-// RefreshBypassFromContext reports whether ctx was marked by
-// WithRefreshBypass — i.e. whether this resolve is a refresh-driven
-// re-resolve. The api-stage stage loop combines this with a stage-key
-// equality check (stageKey == L1KeyFromContext(ctx)) so the bypass
-// applies ONLY to the exact stage entry being refreshed.
-func RefreshBypassFromContext(ctx context.Context) bool {
+// ApistageContentResolveFromContext reports whether ctx was marked by
+// WithApistageContentResolve — i.e. whether this dispatch feeds an
+// identity-free api-stage content entry and must therefore return
+// UN-GATED content (the per-user gate runs later, at the stage loop's
+// single gate site).
+func ApistageContentResolveFromContext(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
-	v, _ := ctx.Value(ctxKeyRefreshBypass).(bool)
+	v, _ := ctx.Value(ctxKeyApistageContentResolve).(bool)
+	return v
+}
+
+// ctxKeyApistagePrewarmType is the typed context key for the Ship F1
+// prewarm skip-hook marker. F1 only defines it; Ship F2's SA prewarm
+// walk sets it.
+type ctxKeyApistagePrewarmType struct{}
+
+var ctxKeyApistagePrewarm = ctxKeyApistagePrewarmType{}
+
+// WithApistagePrewarm returns a child context marked as an api-stage
+// PREWARM resolve — Ship F1 defines the marker; Ship F2's SA prewarm
+// walk sets it.
+//
+// A prewarm resolve has NO requester: it resolves navigation as the
+// snowplow ServiceAccount purely to POPULATE the identity-free content
+// layer. The api-stage content pipeline (apistageContentServe) consults
+// this via ApistagePrewarmFromContext: when set it does the content Get
+// / un-gated dispatch / Put but SKIPS the per-user RBAC gate and the
+// dict[id] assembly — there is no identity to gate against and the
+// prewarm discards the resolved dict. Mirrors Ship E's
+// (nil,nil)-on-refresh contract: the side effect (a warmed content
+// entry) is the whole point; the resolved output is thrown away.
+//
+// In F1 itself nothing sets this — every resolve is a real request and
+// the gate always runs. The marker + the skip-point exist now so F2 is
+// a thin, low-risk addition.
+func WithApistagePrewarm(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyApistagePrewarm, true)
+}
+
+// ApistagePrewarmFromContext reports whether ctx was marked by
+// WithApistagePrewarm — i.e. whether this is an SA prewarm resolve that
+// populates the content layer without a per-user gate.
+func ApistagePrewarmFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyApistagePrewarm).(bool)
 	return v
 }
 

@@ -368,10 +368,22 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// identity returns served=false → apiserver fallthrough (the
 		// apiserver's per-user token narrows correctly); a per-item
 		// EvaluateRBAC error drops that item.
-		items, identityOK := filterListByRBAC(ctx, gvr, items)
-		if !identityOK {
-			dispatchInformerFallthrough.Add(1)
-			return nil, false
+		//
+		// Ship F1 (0.30.119): SKIP the inline gate for an api-stage
+		// CONTENT resolve (cache.ApistageContentResolveFromContext). The
+		// api-stage L1 entry is identity-free and must store UN-GATED
+		// content; gating here would bake one user's narrowed view into
+		// the shared entry. The api-stage stage loop runs the gate at a
+		// single site — on the Get-hit AND the miss path — before the
+		// content reaches dict[id]. Marked dispatches return the raw
+		// indexer items.
+		if !cache.ApistageContentResolveFromContext(ctx) {
+			var identityOK bool
+			items, identityOK = filterListByRBAC(ctx, gvr, items)
+			if !identityOK {
+				dispatchInformerFallthrough.Add(1)
+				return nil, false
+			}
 		}
 
 		raw, err := marshalAsList(apiVersion, listKindForResource(gvr.Resource), items)
@@ -438,9 +450,15 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// in-process typed-RBAC indexer. FAIL-CLOSED: a denied GET, a missing
 	// identity, or an evaluator error all return false → apiserver
 	// fallthrough (the apiserver's per-user token correctly 403s).
-	if !filterGetByRBAC(ctx, gvr, obj) {
-		dispatchInformerFallthrough.Add(1)
-		return nil, false
+	//
+	// Ship F1 (0.30.119): SKIP the inline gate for an api-stage CONTENT
+	// resolve (same rationale as the LIST branch above) — the api-stage
+	// stage loop gates the Get-hit and the miss path at a single site.
+	if !cache.ApistageContentResolveFromContext(ctx) {
+		if !filterGetByRBAC(ctx, gvr, obj) {
+			dispatchInformerFallthrough.Add(1)
+			return nil, false
+		}
 	}
 
 	raw, err := json.Marshal(obj.Object)

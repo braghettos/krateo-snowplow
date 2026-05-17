@@ -297,17 +297,37 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	h.Write([]byte{0})
 	h.Write([]byte(in.Name))
 	h.Write([]byte{0})
-	h.Write([]byte(in.Username))
-	h.Write([]byte{0})
 
-	// Groups: sort for stability across binding renderers.
-	sortedGroups := append([]string(nil), in.Groups...)
-	sort.Strings(sortedGroups)
-	for _, g := range sortedGroups {
-		h.Write([]byte(g))
+	// Identity (Username + Groups). Ship F1 (0.30.119): the api-stage
+	// content layer is IDENTITY-FREE — an api-stage entry's resolved
+	// content (a per-object GET / per-namespace LIST K8s call result) is
+	// identity-invariant: K8s RBAC is a binary gate on (gvr, ns, [name])
+	// units, it never filters items or shapes content, so the SAME
+	// content unit is shared by every user the gate admits. Omitting the
+	// identity fields makes the apistage key (gvr, ns, name-or-list,
+	// filter-hash, stage-input-hash) shared across users. The per-user
+	// narrowing moves to the SERVE-TIME RBAC gate (dispatcher path).
+	//
+	// This is a per-CLASS key shape, NOT a per-resource switch
+	// (feedback_no_special_cases): the discriminant is the entry class,
+	// uniform for every apistage entry of every GVR. "restactions" /
+	// "widgets" keys hash Username+Groups exactly as before — byte-
+	// identical, no key-space rotation. apistage is flag-off in prod
+	// (RESOLVED_CACHE_APISTAGE_ENABLED default off), so this key change
+	// rotates nothing live.
+	if in.CacheEntryClass != CacheEntryClassApistage {
+		h.Write([]byte(in.Username))
 		h.Write([]byte{0})
+
+		// Groups: sort for stability across binding renderers.
+		sortedGroups := append([]string(nil), in.Groups...)
+		sort.Strings(sortedGroups)
+		for _, g := range sortedGroups {
+			h.Write([]byte(g))
+			h.Write([]byte{0})
+		}
+		h.Write([]byte{0xff}) // groups terminator
 	}
-	h.Write([]byte{0xff}) // groups terminator
 
 	h.Write([]byte(strconv.Itoa(in.PerPage)))
 	h.Write([]byte{0})

@@ -166,19 +166,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 	log.Info("base dict for api resolver", slog.Any("dict", dict))
 
-	// Ship E (0.30.116): the per-api-stage L1 key-swap is active only
+	// Ship F1 (0.30.119): the content-keyed api-stage L1 is active only
 	// when RESOLVED_CACHE_APISTAGE_ENABLED=true (default off). Read the
 	// gate + the store handle ONCE before the loop; flag-off both stay
-	// inert and every stage runs the byte-identical 0.30.115 path.
+	// inert and every call runs the byte-identical 0.30.118 path.
 	//
-	// The api-stage L1 caches resolved STAGE OUTPUT in the
-	// ResolvedCacheStore — it does not depend on the informer pivot, so
-	// opts.Watcher is not consulted here (ApistageL1Enabled already
-	// gates CACHE_ENABLED + RESOLVED_CACHE_ENABLED). RESTActionName
-	// being empty means the caller did not thread the owning
-	// RESTAction's identity — without it the stage key cannot be scoped,
-	// so the key-swap no-ops (degrades to the 0.30.115 path).
-	apistageEnabled := cache.ApistageL1Enabled() && opts.RESTActionName != ""
+	// Unlike Ship E's per-stage, per-user key, the F1 content layer keys
+	// each K8s CALL by its (gvr, namespace, name-or-empty) — identity-
+	// free, shared. No owning-RESTAction scoping is needed (the call
+	// tuple fully identifies the content unit), so RESTActionName is no
+	// longer consulted.
+	apistageEnabled := cache.ApistageL1Enabled()
 	var apistageStore *cache.ResolvedCacheStore
 	if apistageEnabled {
 		apistageStore = cache.ResolvedCache()
@@ -196,71 +194,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 		if apiCall.Headers == nil {
 			apiCall.Headers = []string{headerAcceptJSON}
-		}
-
-		// Ship E (0.30.116) — per-api-stage L1 key-swap. Gated by
-		// apistageEnabled (RESOLVED_CACHE_APISTAGE_ENABLED=true). The
-		// stage key is per-user-keyed (Username+Groups — never cohort),
-		// scoped to the owning RESTAction GVR/namespace/name, and folds
-		// in the O5 canonical filter-hash + the stage's effective dict
-		// input. A hit serves dict[id] from L1 and skips the stage's
-		// K8s call(s) entirely; a miss runs the stage under the stage
-		// key's WithL1KeyContext so the inner-call dep-recording
-		// attributes this stage's LIST/GET to the stage entry (O4), then
-		// stores dict[id] under the stage key.
-		//
-		// stageCtx is the context the stage body resolves under: on the
-		// apistage path it carries WithL1KeyContext(stageKey); flag-off
-		// it is the unchanged request ctx.
-		stageCtx := ctx
-		var stageKey string
-		var stageInputs cache.ResolvedKeyInputs
-		if apistageEnabled {
-			stageInputs = stageKeyInputs(
-				opts.RESTActionNamespace, opts.RESTActionName,
-				user.Username, user.Groups, apiCall, dict, opts.PerPage, opts.Page)
-			stageKey = cache.ComputeKey(stageInputs)
-
-			// Ship 0.30.118 — refresh self-hit fix. When this resolve is a
-			// REFRESH-driven re-resolve (WithRefreshBypass set by the
-			// refresher) AND this stage's key is EXACTLY the refresh's
-			// target stage key, SKIP the Get: the whole point of the
-			// refresh is to recompute THIS stage from K8s. Without the
-			// skip the stage would self-hit the dirty-but-resident entry
-			// it is refreshing (Get honors only TTL, not the dirty flag),
-			// the K8s call would be skipped, and no fresh value re-Put.
-			// The skip is scoped to the EXACT target stage key — sibling
-			// stages of the same refresh still Get-hit normally (they are
-			// not being refreshed). Request-path resolves never carry the
-			// marker, so this is byte-identical to 0.30.117 for them.
-			bypassThisStage := cache.RefreshBypassFromContext(ctx) &&
-				stageKey == cache.L1KeyFromContext(ctx)
-
-			if !bypassThisStage {
-				if entry, hit := apistageStore.Get(stageKey); hit && entry != nil {
-					if v, decoded := decodeStageValue(entry.RawJSON); decoded {
-						dict[id] = v
-						log.Info("apistage.l1_hit",
-							slog.String("subsystem", "cache"),
-							slog.String("name", id),
-							slog.String("key_hash", stageKey),
-							slog.String("hint", "stage served from api-stage L1 — K8s call skipped"),
-						)
-						continue
-					}
-				}
-			} else {
-				log.Info("apistage.refresh_bypass",
-					slog.String("subsystem", "cache"),
-					slog.String("name", id),
-					slog.String("key_hash", stageKey),
-					slog.String("hint", "refresh-driven re-resolve of this exact stage — Get skipped, recomputing from K8s"),
-				)
-			}
-			// Miss (or bypass) — resolve the stage under the stage key so
-			// the existing inner-call dep-recording (resolve.go ~line 300)
-			// attributes this stage's K8s LIST/GET to the stage entry.
-			stageCtx = cache.WithL1KeyContext(ctx, stageKey)
 		}
 
 		// Tag 0.30.9 Sub-scope A: detect userAccessFilter.
@@ -373,12 +306,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// that read must be serialised against concurrent jsonHandler
 		// writes too, so we take dictMu there as well.
 		var dictMu sync.Mutex
-		// Ship E (0.30.116): errgroup derives from stageCtx — on the
-		// apistage path that carries WithL1KeyContext(stageKey), so the
-		// inner-call dep-recording below attributes this stage's K8s
-		// LIST/GET to the stage entry (O4). Flag-off stageCtx == ctx,
-		// so this is byte-identical to 0.30.115.
-		g, gctx := errgroup.WithContext(stageCtx)
+		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(iterParallelism())
 
 		for i := range tmp {
@@ -400,14 +328,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// rationale. cache.Deps() is sync.Map-backed; idempotent
 			// LoadOrStore; safe from this (parent-goroutine) site.
 			//
-			// Ship E (0.30.116): read the L1 key from stageCtx. Flag-on,
-			// that is the api-stage stageKey — so the dep edge attaches
-			// to the STAGE entry (O4: an informer event on this GVR
-			// dirty-marks the stage entry and the refresher re-resolves
-			// it). Flag-off stageCtx == ctx, so the edge attaches to
-			// whatever L1 key the request path threaded — byte-identical
-			// to 0.30.115.
-			if l1Key := cache.L1KeyFromContext(stageCtx); l1Key != "" && !cache.Disabled() {
+			// Ship F1 (0.30.119): the dep edge attaches to whatever L1
+			// key the request path threaded (the per-user resolved-output
+			// key). The CONTENT-keyed api-stage entry records its OWN dep
+			// edge inside the worker, keyed by the per-call content key
+			// (gvr,ns,[name]) — so an informer event on a K8s call's GVR
+			// dirty-marks the matching content entry and the refresher
+			// re-dispatches that one call.
+			if l1Key := cache.L1KeyFromContext(ctx); l1Key != "" && !cache.Disabled() {
 				if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
 					if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
 						if name == "" {
@@ -445,14 +373,56 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// URLs, metadata-only GVRs, pre-sync, 404) fall through
 				// to the apiserver branch below unchanged.
 				//
-				// When served=true the call.ResponseHandler lambda
-				// (constructed above, line ~291) is invoked with the
-				// cache-served bytes. That lambda holds dictMu before
-				// delegating to jsonHandler, so the dict mutation
-				// contract is identical between pivot and apiserver
-				// branches — no second mutex path.
+				// Ship F1 (0.30.119) — content-keyed api-stage L1. When
+				// apistageEnabled, the pivot-served raw envelope is
+				// cached identity-free under the per-call content key
+				// (gvr, namespace, name-or-empty):
+				//
+				//   1. content Get(contentKey) — HIT: use the stored raw
+				//      envelope, skip the dispatch entirely. MISS:
+				//      dispatch UN-GATED (WithApistageContentResolve makes
+				//      dispatchViaInformer skip its inline RBAC gate) and
+				//      Put the raw envelope under contentKey.
+				//   2. GATE the raw envelope (hit OR miss) with the
+				//      REQUEST identity — gateContentEnvelope runs
+				//      filterListByRBAC/filterGetByRBAC, the single F1
+				//      gate site. served=false here is fail-closed (no
+				//      identity / GET denied) → fall through to apiserver.
+				//   3. feed the GATED envelope to call.ResponseHandler →
+				//      jsonHandler/apiCall.Filter → dict[id], unchanged.
+				//
+				// The content entry holds only un-gated content; the
+				// per-user narrowing is the fresh per-request gate at
+				// step 2 — no cross-user leak, the hit path is gated too.
+				// Flag-off (apistageEnabled false) this is byte-identical
+				// to the 0.30.118 pivot path.
 				if resolverUseInformer() == "true" {
-					if raw, served := dispatchViaInformer(gctx, call); served {
+					if apistageEnabled {
+						if raw, served, ok := apistageContentServe(gctx, apistageStore, call); ok {
+							if served {
+								if err := call.ResponseHandler(readerFromBytes(raw)); err != nil {
+									return err
+								}
+								dictMu.Lock()
+								depth := mapDepth(dict)
+								dictMu.Unlock()
+								log.Info("api successfully resolved",
+									slog.String("name", id),
+									slog.String("host", call.Endpoint.ServerURL),
+									slog.String("path", call.Path),
+									slog.Int("depth", depth),
+									slog.String("dispatch", "apistage-content"),
+								)
+								return nil
+							}
+							// served=false — fail-closed (no identity / GET
+							// denied): fall through to the apiserver branch,
+							// whose per-user token narrows correctly.
+						}
+						// ok=false — the content layer could not serve this
+						// call (not pivot-servable: write verb, external URL,
+						// metadata-only GVR, pre-sync). Fall through.
+					} else if raw, served := dispatchViaInformer(gctx, call); served {
 						if err := call.ResponseHandler(readerFromBytes(raw)); err != nil {
 							return err
 						}
@@ -612,35 +582,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			emitRefilterFalsifier(log, apiCall, user.Username, rf)
 		}
 
-		// Ship E (0.30.116): store the resolved stage output under the
-		// stage key. Reached ONLY on the apistage path and ONLY after
-		// g.Wait() succeeded + the UAF refilter ran — a stage that
-		// short-circuited on a hard error returned `dict` above and
-		// never reaches here, so a failed stage is never cached. The
-		// stored value is the post-refilter dict[id] — byte-identical
-		// to what a subsequent hit serves. The entry's Inputs identify
-		// it as an "apistage" entry of the owning RESTAction so the
-		// refresher's resolve-once seam can re-run this single stage.
-		if apistageEnabled {
-			if encoded, encErr := encodeStageValue(dict[id]); encErr == nil {
-				inputsCopy := stageInputs
-				apistageStore.Put(stageKey, &cache.ResolvedEntry{
-					RawJSON: encoded,
-					Inputs:  &inputsCopy,
-				})
-				log.Info("apistage.l1_store",
-					slog.String("subsystem", "cache"),
-					slog.String("name", id),
-					slog.String("key_hash", stageKey),
-				)
-			} else {
-				log.Warn("apistage.encode_failed",
-					slog.String("subsystem", "cache"),
-					slog.String("name", id),
-					slog.Any("err", encErr),
-				)
-			}
-		}
+		// Ship F1 (0.30.119): the api-stage L1 is now CONTENT-keyed —
+		// the per-K8s-call Put happens inside the g.Go worker (each call
+		// stores its own raw envelope under its (gvr,ns,[name]) content
+		// key). There is NO per-stage Put here — the Ship E per-stage
+		// entry is gone; an iterator stage produces N content entries,
+		// one per call, assembled into dict[id] by the N jsonHandler
+		// merges exactly as before.
 	}
 
 	removeManagedFields(dict)
