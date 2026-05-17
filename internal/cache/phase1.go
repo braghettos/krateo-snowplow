@@ -382,6 +382,42 @@ func (rw *ResourceWatcher) RegisteredCount() int {
 	return len(rw.informers)
 }
 
+// ctxKeyPhase1Resolution is the typed empty-struct context key marking a
+// context as a Phase-1 (startup-warmup) resolution. Distinct unexported
+// type so external packages cannot collide via a raw key.
+type ctxKeyPhase1Resolution struct{}
+
+// WithPhase1Resolution returns a child context marked as a Phase-1
+// resolution. The marker is single-purpose: it tells the RESTAction
+// resolver that the current resolve is the startup-warmup walk, not a
+// real `/call`, so the resolver may cap `dependsOn.iterator` fan-out at
+// phase1IteratorCap (warmup only needs to discover informers, not
+// materialise every iterated element).
+//
+// The SOLE production setter is withPhase1SAContext in
+// internal/handlers/dispatchers/phase1_walk.go — a grep-able invariant.
+// Every real `/call` leaves the marker absent, so IsPhase1Resolution is
+// false and resolver behaviour is byte-identical to pre-0.30.111.
+//
+// nil ctx is returned unchanged (defensive — production never passes nil).
+func WithPhase1Resolution(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyPhase1Resolution{}, true)
+}
+
+// IsPhase1Resolution reports whether ctx was marked by
+// WithPhase1Resolution. False for every real `/call` context (the marker
+// is never set off the Phase-1 walk).
+func IsPhase1Resolution(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyPhase1Resolution{}).(bool)
+	return v
+}
+
 // ctxKeyInternalEndpointType is the typed empty-struct context key for
 // WithInternalEndpoint / InternalEndpointFromContext.
 type ctxKeyInternalEndpointType struct{}

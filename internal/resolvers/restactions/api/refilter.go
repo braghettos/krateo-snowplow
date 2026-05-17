@@ -146,39 +146,68 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 // refilterSlice walks items[] and returns (kept, droppedCount, calls).
 // Idempotent on input — items slice is treated as immutable; a fresh
 // kept slice is allocated.
+//
+// Item shapes (0.30.111 Part 1 fix):
+//   - map[string]any — a K8s object. NamespaceFrom (e.g. ".metadata.name")
+//     resolves against the object. The pre-0.30.111 path, unchanged.
+//   - string — a bare scalar. This is the namespaces-stage shape: the
+//     stage's own `filter: "[.namespaces.items[] | .metadata.name]"`
+//     has already projected the namespace LIST down to a name-string
+//     array, so refilterSlice sees ["ns-01","ns-02",…]. namespaceFrom:"."
+//     resolves to the name itself (jq `.` on a string). WITHOUT this
+//     branch the scalar failed the map type-assert → conservative-deny
+//     → every namespace dropped → empty Compositions page for everyone.
+//   - any other type (int, nil, nested array, …) — conservative-deny:
+//     a shape the refilter cannot reason about must never be served.
+//
+// RBAC fail-closed is preserved on every branch: a NamespaceFrom JQ
+// error denies the item; an EvaluateRBAC error denies the item; a
+// scalar the user has no grant for is dropped by EvaluateRBAC.
 func refilterSlice(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, items []any) ([]any, int, int) {
 	kept := make([]any, 0, len(items))
 	dropped := 0
 	calls := 0
 	for _, item := range items {
-		obj, ok := item.(map[string]any)
-		if !ok {
-			// Non-object item (e.g., bare string). Conservative-deny.
-			dropped++
-			continue
-		}
-		permitted := evalSingle(ctx, log, username, groups, uaf, obj)
-		calls++
-		if permitted {
-			kept = append(kept, item)
-		} else {
+		switch item.(type) {
+		case map[string]any, string:
+			// Object OR bare scalar — both reach the evaluator. evalSingle
+			// resolves NamespaceFrom against the item (jq handles a string
+			// receiver fine) and calls EvaluateRBAC.
+			permitted := evalSingle(ctx, log, username, groups, uaf, item)
+			calls++
+			if permitted {
+				kept = append(kept, item)
+			} else {
+				dropped++
+			}
+		default:
+			// Unhandleable item type (int, nil, nested array, …).
+			// Conservative-deny — the refilter cannot vouch for a shape
+			// it does not understand.
 			dropped++
 		}
 	}
 	return kept, dropped, calls
 }
 
-// evalSingle resolves NamespaceFrom against obj and calls EvaluateRBAC.
+// evalSingle resolves NamespaceFrom against item and calls EvaluateRBAC.
 // Returns true iff RBAC permits the (verb, group, resource, ns) tuple
 // for (username, groups).
 //
+// item is any (0.30.111 Part 1): a K8s object (map[string]any) OR a
+// bare scalar (string — the namespaces-stage name-array shape). jq
+// evaluates a string receiver fine, so namespaceFrom:"." on "ns-01"
+// yields "ns-01". The single-object caller (applyUserAccessFilter's
+// no-"items"-wrapper branch) still passes a map — the widened any
+// parameter accepts it with no behaviour change.
+//
 // JQ-eval errors and RBAC errors both fail closed.
-func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, obj map[string]any) bool {
+func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, item any) bool {
 	namespace := ""
 	if uaf.NamespaceFrom != "" {
-		ns, err := evalJQString(ctx, uaf.NamespaceFrom, obj)
+		ns, err := evalJQString(ctx, uaf.NamespaceFrom, item)
 		if err != nil {
-			log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating object as denied",
+			log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
 				slog.String("expr", uaf.NamespaceFrom),
 				slog.Any("err", err),
 			)
@@ -196,7 +225,7 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 		Namespace: namespace,
 	})
 	if err != nil {
-		log.Warn("userAccessFilter: EvaluateRBAC error; treating object as denied",
+		log.Warn("userAccessFilter: EvaluateRBAC error; treating item as denied",
 			slog.String("user", username),
 			slog.String("verb", uaf.Verb),
 			slog.String("group", uaf.Group),
@@ -209,14 +238,18 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 	return allowed
 }
 
-// evalJQString evaluates expr against obj and returns a Go string. The
+// evalJQString evaluates expr against data and returns a Go string. The
 // jqutil.Eval returns a JSON-encoded result, so a JQ expression like
 // ".metadata.name" produces `"some-name"` (a JSON string literal); we
 // strip the surrounding quotes here.
-func evalJQString(ctx context.Context, expr string, obj map[string]any) (string, error) {
+//
+// data is any (0.30.111 Part 1): jqutil.EvalOptions.Data is already
+// declared `any`, so a bare-string receiver needs no jqutil change —
+// jq `.` on a string yields the string. A map receiver is unchanged.
+func evalJQString(ctx context.Context, expr string, data any) (string, error) {
 	s, err := jqutil.Eval(ctx, jqutil.EvalOptions{
 		Query:        expr,
-		Data:         obj,
+		Data:         data,
 		ModuleLoader: jqsupport.ModuleLoader(),
 	})
 	if err != nil {

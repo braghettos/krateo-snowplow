@@ -493,6 +493,13 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	rctx := xcontext.BuildContext(ctx, opts...)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
+	// 0.30.111 Part 2 — mark this as a Phase-1 (startup-warmup)
+	// resolution. This is the SOLE production setter of the marker (a
+	// grep-able invariant): the RESTAction resolver's createRequestOptions
+	// caps `dependsOn.iterator` fan-out at phase1IteratorCap only when
+	// cache.IsPhase1Resolution(ctx) is true. Every real `/call` leaves
+	// the marker absent.
+	rctx = cache.WithPhase1Resolution(rctx)
 	return rctx
 }
 

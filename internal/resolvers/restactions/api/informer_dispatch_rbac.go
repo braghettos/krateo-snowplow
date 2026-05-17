@@ -113,6 +113,27 @@ func filterListByRBAC(
 		return nil, false
 	}
 
+	// 0.30.111 Part 3 — namespace-keyed EvaluateRBAC memo. The verb is
+	// fixed "list"; a `list` decision is NAMESPACE-scoped and
+	// NAME-INDEPENDENT (Kubernetes ResourceNameMatches consults
+	// rule.ResourceNames only for name-specific verbs — never for a
+	// collection verb such as `list`). So every item in the same
+	// namespace yields the identical permit/deny verdict. The memo turns
+	// an N-item LIST spanning K distinct namespaces into K EvaluateRBAC
+	// calls instead of N.
+	//
+	// AC-6 (PM gate #113): the memoized call DROPS Name. For verb:"list"
+	// Name is inert at the evaluator (a resourceNames rule cannot grant a
+	// list), and omitting it makes the namespace-keyed memo correct BY
+	// CONSTRUCTION — two same-namespace items with different names cannot
+	// diverge because Name never enters the evaluated tuple.
+	//
+	// rbacMemo is a LOCAL variable scoped to this single filterListByRBAC
+	// invocation — never a struct field, never package-scoped. It is
+	// discarded at return: no persistence, no invalidation, no staleness.
+	// A subsequent LIST builds a fresh memo against the live RBAC store.
+	rbacMemo := make(map[string]bool, len(items))
+
 	kept := make([]*unstructured.Unstructured, 0, len(items))
 	dropped := 0
 	for _, it := range items {
@@ -123,34 +144,38 @@ func filterListByRBAC(
 			dropped++
 			continue
 		}
-		// Verb is "list" (this is the served-LIST branch); a
-		// resourceNames-scoped rule must NOT grant a list, so the
-		// per-item Name is supplied for completeness but is, by
-		// Kubernetes ResourceNameMatches semantics, only consulted for
-		// name-specific verbs. Threading it keeps the call sites
-		// uniform with filterGetByRBAC and lets the evaluator stay the
-		// single source of verb-vs-resourceNames truth (0.30.109, G1).
-		allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-			Username:  user.Username,
-			Groups:    user.Groups,
-			Verb:      "list",
-			Group:     gvr.Group,
-			Resource:  gvr.Resource,
-			Namespace: it.GetNamespace(),
-			Name:      it.GetName(),
-		})
-		if err != nil {
-			// FAIL-CLOSED: an evaluator hiccup never permits a leak.
-			log.Warn("informer_dispatch.rbac_filter.evaluate_error",
-				slog.String("subsystem", "cache"),
-				slog.String("user", user.Username),
-				slog.String("gvr", gvr.String()),
-				slog.String("namespace", it.GetNamespace()),
-				slog.Any("err", err),
-				slog.String("action", "drop_item"),
-			)
-			dropped++
-			continue
+		ns := it.GetNamespace()
+		allowed, memoized := rbacMemo[ns]
+		if !memoized {
+			// Verb is "list" — Name is deliberately omitted (AC-6): it is
+			// inert for a collection verb and dropping it keeps the
+			// namespace-keyed memo sound.
+			ok, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+				Username:  user.Username,
+				Groups:    user.Groups,
+				Verb:      "list",
+				Group:     gvr.Group,
+				Resource:  gvr.Resource,
+				Namespace: ns,
+			})
+			if err != nil {
+				// FAIL-CLOSED: an evaluator hiccup never permits a leak.
+				// The error is NOT memoized — a transient evaluator
+				// failure must not poison every later item in this
+				// namespace; the next same-namespace item retries.
+				log.Warn("informer_dispatch.rbac_filter.evaluate_error",
+					slog.String("subsystem", "cache"),
+					slog.String("user", user.Username),
+					slog.String("gvr", gvr.String()),
+					slog.String("namespace", ns),
+					slog.Any("err", err),
+					slog.String("action", "drop_item"),
+				)
+				dropped++
+				continue
+			}
+			allowed = ok
+			rbacMemo[ns] = ok
 		}
 		if allowed {
 			kept = append(kept, it)

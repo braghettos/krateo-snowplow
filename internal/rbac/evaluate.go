@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -25,6 +26,28 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// evaluateRBACCallCount is a process-scoped counter of EvaluateRBAC
+// invocations. It exists so tests can assert call-count properties (the
+// 0.30.111 namespace-keyed memo falsifier asserts an N-namespace LIST
+// makes exactly N EvaluateRBAC calls). One atomic add per call — the
+// production cost is negligible and the counter is never read on a hot
+// path. Mirrors the established api-package metrics-counter pattern
+// (dispatchInformerRBACDropped).
+var evaluateRBACCallCount atomic.Uint64
+
+// EvaluateRBACCallCount returns the number of EvaluateRBAC calls since
+// process start (or since the last ResetEvaluateRBACCallCount). Exported
+// for test instrumentation; production code has no reason to read it.
+func EvaluateRBACCallCount() uint64 {
+	return evaluateRBACCallCount.Load()
+}
+
+// ResetEvaluateRBACCallCount zeroes the EvaluateRBAC call counter.
+// TEST-ONLY — production code MUST NOT call it.
+func ResetEvaluateRBACCallCount() {
+	evaluateRBACCallCount.Store(0)
+}
 
 // EvaluateOptions captures every input the evaluator needs to make a
 // permit/deny decision. Mirrors authorizationv1.ResourceAttributes so
@@ -96,6 +119,7 @@ var (
 // internal evaluator error (failed type assertion etc.).
 func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 	log := xcontext.Logger(ctx)
+	evaluateRBACCallCount.Add(1)
 
 	if cache.Disabled() {
 		// Cache=off correctness baseline. UserCan reads the user's

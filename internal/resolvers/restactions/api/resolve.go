@@ -226,7 +226,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			slog.String("name", id), slog.String("host", ep.ServerURL),
 			slog.Bool("uaf", uafActive))
 
-		tmp := createRequestOptions(log, apiCall, dict)
+		tmp := createRequestOptions(ctx, log, apiCall, dict)
 		if len(tmp) == 0 {
 			log.Warn("empty request options for http call", slog.Any("name", id))
 			continue

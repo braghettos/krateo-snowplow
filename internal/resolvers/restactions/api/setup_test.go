@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -20,7 +21,7 @@ func Example_createRequestOptions() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	all := createRequestOptions(logger, &templates.API{
+	all := createRequestOptions(context.Background(), logger, &templates.API{
 		Name: "example",
 		Path: `${ "/api/v1/namespaces/" + (.) + "/pods" }`,
 		DependsOn: &templates.Dependency{
@@ -55,7 +56,7 @@ func Example_createRequestOptions_no_iter() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	all := createRequestOptions(logger, &templates.API{
+	all := createRequestOptions(context.Background(), logger, &templates.API{
 		Name: "example",
 		Path: `${ "/api/v1/namespaces/" + (.namespaces[2]) + "/pods" }`,
 		Verb: ptr.To(string(http.MethodPost)),
