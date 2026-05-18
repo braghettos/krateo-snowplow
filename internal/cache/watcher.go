@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/metadata/metadatainformer"
+	"k8s.io/client-go/rest"
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
@@ -220,6 +221,18 @@ type ResourceWatcher struct {
 	// Guarded by rw.mu (same lock as rw.informers).
 	informerStop map[schema.GroupVersionResource]chan struct{}
 
+	// restConfig is the in-cluster *rest.Config — Ship 0.30.122 R4
+	// Lever 1. The streaming ListWatch (streaming_list.go) builds a
+	// rest.RESTClient from it to issue the paged composition LIST as a
+	// raw HTTP request whose response body it streams through a
+	// json.Decoder, instead of materialising the whole 48,999-object
+	// list. Wired by SetRESTConfig AFTER NewResourceWatcher returns —
+	// main.go already holds rest.InClusterConfig() at watcher
+	// construction (same wiring pattern as SetMetadataClient). nil-safe:
+	// when restConfig is nil OR the streaming-list flag is off, the
+	// composition GVR falls back to the standard NewFilteredDynamicInformer.
+	restConfig *rest.Config
+
 	stopCh chan struct{}
 }
 
@@ -413,6 +426,26 @@ func (rw *ResourceWatcher) SetMetadataClient(c metadata.Interface) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	rw.metaClient = c
+}
+
+// SetRESTConfig wires the in-cluster *rest.Config — Ship 0.30.122 R4
+// Lever 1. The streaming ListWatch (streaming_list.go) needs raw HTTP
+// access to the apiserver to stream a paged LIST response body through a
+// json.Decoder; the dynamic.Interface only returns a fully-materialised
+// *UnstructuredList. main.go calls this right after NewResourceWatcher,
+// passing the same rest.InClusterConfig() it already built — mirroring
+// SetMetadataClient's post-construction wiring.
+//
+// Nil-receiver safe. When restConfig is never wired the streaming-list
+// path is unavailable and addResourceTypeLocked falls back to the
+// standard NewFilteredDynamicInformer for every GVR.
+func (rw *ResourceWatcher) SetRESTConfig(rc *rest.Config) {
+	if rw == nil {
+		return
+	}
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.restConfig = rc
 }
 
 // Mode returns the operational discriminator (modeInformer or
@@ -896,14 +929,41 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	var gi informers.GenericInformer
 	standalone := matchesAutoDiscoverGroup(gvr.Group)
 	if standalone {
-		gi = dynamicinformer.NewFilteredDynamicInformer(
-			rw.dyn,
-			gvr,
-			metav1.NamespaceAll,
-			0, // resync period 0 — pure event-driven, matches the factory
-			clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc},
-			listOptionsTweak,
-		)
+		indexers := clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc}
+
+		// Ship 0.30.122 R4 Lever 1: route a streaming-list GVR (the
+		// composition group) through the streaming ListWatch — its
+		// ListFunc streams the paged LIST body item-by-item instead of
+		// materialising the whole 48,999-object pre-transform set (the
+		// ~17.7 GiB relist transient that OOMKilled 0.30.121). Gated by
+		// RESOLVER_COMPOSITION_STREAMING_LIST (default ON) AND a wired
+		// *rest.Config. When either is absent, OR newStreamingDynamicInformer
+		// fails to build its REST client, we fall back to the standard
+		// NewFilteredDynamicInformer below — byte-identical to 0.30.121
+		// (AC-7 toggle).
+		if matchesStreamingListGroup(gvr) && compositionStreamingListEnabled() {
+			if sgi, ok := newStreamingDynamicInformer(
+				rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
+			); ok {
+				gi = sgi
+				slog.Info("cache.streaming_list.informer_routed",
+					slog.String("subsystem", "cache"),
+					slog.String("gvr", gvr.String()),
+					slog.String("path", "streaming-listwatch"),
+					slog.String("hint", "R4 Lever 1 — composition LIST streamed item-by-item"),
+				)
+			}
+		}
+		if gi == nil {
+			gi = dynamicinformer.NewFilteredDynamicInformer(
+				rw.dyn,
+				gvr,
+				metav1.NamespaceAll,
+				0, // resync period 0 — pure event-driven, matches the factory
+				indexers,
+				listOptionsTweak,
+			)
+		}
 	} else {
 		gi = rw.factory.ForResource(gvr)
 	}

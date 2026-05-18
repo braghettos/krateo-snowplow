@@ -836,3 +836,20 @@ func int64FromEnv(key string, def int64) int64 {
 	}
 	return n
 }
+
+// boolFromEnv parses an env var as a bool with a default fallback.
+// Recognises the canonical false set ("false", "0", "no") and the
+// canonical true set ("true", "1", "yes"); any unset or unrecognised
+// value returns def. Used by R4's RESOLVER_COMPOSITION_STREAMING_LIST
+// (default true) — env-knob misconfiguration is a deploy issue, so an
+// unrecognised value falls back silently to the default.
+func boolFromEnv(key string, def bool) bool {
+	switch os.Getenv(key) {
+	case "false", "0", "no":
+		return false
+	case "true", "1", "yes":
+		return true
+	default:
+		return def
+	}
+}

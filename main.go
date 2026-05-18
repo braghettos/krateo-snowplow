@@ -140,6 +140,16 @@ func main() {
 					cacheWatcher = w
 					cache.SetGlobal(w)
 
+					// Ship 0.30.122 R4 Lever 1: wire the in-cluster
+					// *rest.Config so the composition GVR's streaming
+					// ListWatch can issue raw paged-LIST HTTP requests and
+					// stream the response body item-by-item (the dynamic
+					// client only returns a fully-materialised list). Same
+					// post-construction wiring pattern as SetMetadataClient.
+					// When unset the composition GVR falls back to the
+					// standard NewFilteredDynamicInformer.
+					w.SetRESTConfig(rc)
+
 					// §0.30.93 (Revision 18): wire the metadata client
 					// for the metadata-only informer routing path.
 					// Composition GVRs (~50K objects at production
