@@ -90,6 +90,20 @@ const (
 	// real headline data source while still tripping on a pathological
 	// over-large one.
 	defaultPrewarmContentMaxBytes = 32 * 1024 * 1024
+
+	// envPrewarmPageLimit (Ship 0.30.127) is the bounded per-widget
+	// pagination DEFAULT the Phase-1 discovery walk resolves a widget
+	// under WHEN that widget's `/call` Path carries no explicit
+	// page/perPage `slice`. A widget that DOES declare a slice overrides
+	// it. It is never -1 — -1 is the unbounded value that, with the
+	// iterator cap removed, drives the 49K-row resolution storm.
+	envPrewarmPageLimit = "PREWARM_PAGE_LIMIT"
+
+	// defaultPrewarmPageLimit — a small bounded default. The discovery
+	// walk only needs to traverse navigation STRUCTURE + discover
+	// informers (GVR-scoped); a handful of resolved rows per widget
+	// exercises the apiRef chain as well as the full LIST would.
+	defaultPrewarmPageLimit = 5
 )
 
 // PrewarmContentEnabled reports whether the F2 Step-7.5 content pass is
@@ -102,6 +116,18 @@ func PrewarmContentEnabled() bool {
 // observability threshold, defaulting to defaultPrewarmContentMaxBytes.
 func prewarmContentMaxBytes() int {
 	return env.Int(envPrewarmContentMaxBytes, defaultPrewarmContentMaxBytes)
+}
+
+// prewarmPageLimit returns the bounded per-widget pagination default the
+// Phase-1 discovery walk uses for a widget whose `/call` Path declares no
+// explicit page/perPage slice (Ship 0.30.127). A non-positive env value
+// falls back to defaultPrewarmPageLimit — the walk is NEVER unbounded.
+func prewarmPageLimit() int {
+	n := env.Int(envPrewarmPageLimit, defaultPrewarmPageLimit)
+	if n <= 0 {
+		return defaultPrewarmPageLimit
+	}
+	return n
 }
 
 // contentPrewarmHarvester accumulates the deduplicated data-source
@@ -164,23 +190,23 @@ func (h *contentPrewarmHarvester) snapshot() []templatesv1.ObjectReference {
 // withContentPrewarmSAContext builds the context the F2 content pass
 // resolves under. It is a clone of withPhase1SAContext (SA identity,
 // canonical system:serviceaccount: username, the SA-transport seam:
-// WithUserConfig / WithInternalEndpoint / WithInternalRESTConfig) with
-// TWO deliberate differences:
+// WithUserConfig / WithInternalEndpoint / WithInternalRESTConfig) plus
+// the content-pass markers:
 //
-//   - it does NOT call cache.WithPhase1Resolution — so the resolver's
-//     `dependsOn.iterator` runs UNCAPPED (phase1IteratorCap is gated on
-//     IsPhase1Resolution; absent ⇒ full per-namespace fan-out). The
-//     content pass must warm the WHOLE data set, not the discovery
-//     sample.
-//   - it DOES call cache.WithApistagePrewarm — so apistageContentServe
-//     populates the identity-free content L1 and skips the per-user gate
-//     (there is no requester; the resolved dict is discarded, the warmed
-//     content entry is the whole point).
+//   - cache.WithApistagePrewarm — so apistageContentServe populates the
+//     identity-free content L1 and skips the per-user gate (there is no
+//     requester; the resolved dict is discarded, the warmed content
+//     entry is the whole point).
+//   - cache.WithPrewarmIterSerial — so iterParallelism returns 1 (OOM
+//     mitigation 2 / Fork B's serial side): the content pass materializes
+//     the 49K-row JSON and is the genuine OOM risk, so its inner-call
+//     fan-out runs serially. Behind the 503 readiness gate there is no
+//     latency budget to protect.
 //
-// It also sets cache.WithPrewarmIterSerial so iterParallelism returns 1
-// — the uncapped fan-out runs serially to hold peak RSS down (OOM
-// mitigation 2). Behind the 503 readiness gate there is no latency
-// budget to protect.
+// The `dependsOn.iterator` runs FULLY for every resolve since Ship
+// 0.30.127 deleted phase1IteratorCap — the content pass warms the WHOLE
+// data set; the discovery walk relies on the resolver's default bounded
+// errgroup as its storm guard (Fork B — see withPhase1SAContext).
 func withContentPrewarmSAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserConfig(saEP),
@@ -192,10 +218,8 @@ func withContentPrewarmSAContext(ctx context.Context, saEP endpoints.Endpoint, s
 	rctx := xcontext.BuildContext(ctx, opts...)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
-	// NOTE — deliberately NO cache.WithPhase1Resolution: the iterator
-	// must run uncapped so the content pass warms the full data set.
 	rctx = cache.WithApistagePrewarm(rctx)   // populate content L1, skip the per-user gate
-	rctx = cache.WithPrewarmIterSerial(rctx) // OOM mitigation 2 — serial inner-call fan-out
+	rctx = cache.WithPrewarmIterSerial(rctx) // OOM mitigation 2 / Fork B serial — serial inner-call fan-out
 	return rctx
 }
 
@@ -301,9 +325,18 @@ func runContentPrewarmPass(ctx context.Context, h *contentPrewarmHarvester,
 // returned only so the caller can emit the oversize-data-source WARN.
 //
 // rctx already carries withContentPrewarmSAContext (SA identity, SA
-// transport, WithApistagePrewarm, WithPrewarmIterSerial). PerPage/Page
-// = -1: F1's content key is (gvr,ns,name) — pagination-free — so a full
-// resolve warms exactly the entries any-perPage /call will hit.
+// transport, WithApistagePrewarm, WithPrewarmIterSerial).
+//
+// PerPage:-1 is DELIBERATE here — and, unlike the discovery walk, NOT a
+// bug. The content cache keys K8s calls (gvr,ns,name); the warmed
+// ENTRIES are slice-invariant. PerPage only narrows the K8s-call SET
+// when a stage iterator is gated on dict["slice"], which NO current
+// data-source RESTAction does (compositions-panels iterates namespaces;
+// compositions-list has no slice). Resolving at -1 warms the COMPLETE
+// first-paint-reachable content set; a bounded PerPage here would warm
+// fewer entries and re-introduce cold misses. (The discovery walk is the
+// opposite case — it must honour the declared per-widget slice; see
+// phase1_walk.go.)
 func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference, authnNS string) (int, error) {
 	got := objects.Get(rctx, ref)
 	if got.Err != nil {

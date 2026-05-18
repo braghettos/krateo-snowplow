@@ -19,6 +19,7 @@ package util
 
 import (
 	"net/url"
+	"strconv"
 	"strings"
 
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
@@ -57,4 +58,29 @@ func ParseCallPathToObjectRef(path string) (templatesv1.ObjectReference, bool) {
 		Resource:   resource,
 		APIVersion: apiVersion,
 	}, true
+}
+
+// ParseCallPathPagination extracts the `page` and `perPage` query
+// parameters a `/call?...` widget endpoint carries — Ship 0.30.127.
+//
+// A widget's resolved resourcesRefs child Path carries page/perPage when
+// the parent widget declared a `slice` (resourcesrefs/resolve.go writes
+// them from spec.slice). The Phase-1 discovery walk reads them so it can
+// honour the declared per-widget pagination instead of resolving every
+// child unbounded.
+//
+// Returns ok=false when either param is absent or non-positive — the
+// caller then applies its own bounded default (never the unbounded -1).
+func ParseCallPathPagination(path string) (page, perPage int, ok bool) {
+	u, err := url.Parse(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	q := u.Query()
+	p, perr := strconv.Atoi(q.Get("page"))
+	pp, pperr := strconv.Atoi(q.Get("perPage"))
+	if perr != nil || pperr != nil || p <= 0 || pp <= 0 {
+		return 0, 0, false
+	}
+	return p, pp, true
 }

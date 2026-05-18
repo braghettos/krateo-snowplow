@@ -231,14 +231,14 @@ var ctxKeyPrewarmIterSerial = ctxKeyPrewarmIterSerialType{}
 // resolver runs inner-call fan-out SERIALLY — iterParallelism returns 1
 // for a resolve under this context.
 //
-// Ship F2 (0.30.125): the SA content-population pass uncaps the
-// `dependsOn.iterator` (no WithPhase1Resolution), so a compositions-list
-// resolve does the full per-namespace inner-call fan-out — the #159 OOM
-// territory. The content pass is behind the 503 readiness gate with no
-// latency budget, so it trades wall-clock for peak RSS by forcing the
-// fan-out serial. This is CONTEXT-SCOPED — a process-wide
-// RESOLVER_ITER_PARALLELISM=1 would slow every real /call; the marker
-// only narrows the prewarm pass.
+// Ship F2 (0.30.125): the SA content-population pass does the full
+// per-namespace `dependsOn.iterator` fan-out — the #159 OOM territory.
+// (Ship 0.30.127 deleted phase1IteratorCap, so every resolve expands the
+// iterator fully; the content pass is no exception.) The content pass is
+// behind the 503 readiness gate with no latency budget, so it trades
+// wall-clock for peak RSS by forcing the fan-out serial. This is
+// CONTEXT-SCOPED — a process-wide RESOLVER_ITER_PARALLELISM=1 would slow
+// every real /call; the marker only narrows the prewarm pass.
 func WithPrewarmIterSerial(ctx context.Context) context.Context {
 	if ctx == nil {
 		return ctx

@@ -127,11 +127,12 @@ func TestFAL_Harvester_NilSafe(t *testing.T) {
 // proof. withContentPrewarmSAContext MUST set exactly:
 //   - cache.ApistagePrewarm ON  — so apistageContentServe populates the
 //     identity-free content L1 and skips the per-user gate;
-//   - cache.IsPhase1Resolution OFF — so the `dependsOn.iterator` runs
-//     UNCAPPED (the content pass warms the WHOLE data set, not the
-//     discovery sample);
 //   - cache.PrewarmIterSerial ON — so iterParallelism returns 1 (OOM
 //     mitigation 2 — the uncapped fan-out runs serially).
+//
+// (Ship 0.30.127 removed the cache.WithPhase1Resolution marker — the
+// iterator cap it gated is deleted, so a "Phase1Resolution OFF"
+// assertion is no longer meaningful and was dropped.)
 func TestFAL_ContentPrewarmSAContext_Markers(t *testing.T) {
 	saEP := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc"}
 	ctx := withContentPrewarmSAContext(context.Background(), saEP, nil)
@@ -139,11 +140,6 @@ func TestFAL_ContentPrewarmSAContext_Markers(t *testing.T) {
 	if !cache.ApistagePrewarmFromContext(ctx) {
 		t.Fatalf("FAL: content-prewarm ctx must set ApistagePrewarm — without it "+
 			"apistageContentServe would not populate the content L1")
-	}
-	if cache.IsPhase1Resolution(ctx) {
-		t.Fatalf("FAL: content-prewarm ctx must NOT set Phase1Resolution — with it "+
-			"the iterator stays CAPPED and the content pass warms only the "+
-			"discovery sample, not the full data set")
 	}
 	if !cache.PrewarmIterSerialFromContext(ctx) {
 		t.Fatalf("FAL: content-prewarm ctx must set PrewarmIterSerial — without it "+
@@ -153,21 +149,24 @@ func TestFAL_ContentPrewarmSAContext_Markers(t *testing.T) {
 }
 
 // TestFAL_ContrastPhase1SAContext confirms the DELIBERATE difference vs
-// the discovery walk's context: withPhase1SAContext sets Phase1Resolution
-// (capped iterator) and does NOT set the prewarm markers.
+// the discovery walk's context: withPhase1SAContext does NOT set the
+// content-prewarm markers. Fork B (0.30.127): the discovery walk runs at
+// the resolver's default bounded parallelism — it must NOT carry
+// PrewarmIterSerial, which is the content pass's serial marker.
+//
+// (Ship 0.30.127 removed cache.WithPhase1Resolution — the iterator cap
+// it gated is gone — so the former "discovery context sets
+// Phase1Resolution" assertion was dropped.)
 func TestFAL_ContrastPhase1SAContext(t *testing.T) {
 	saEP := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc"}
 	ctx := withPhase1SAContext(context.Background(), saEP, nil)
 
-	if !cache.IsPhase1Resolution(ctx) {
-		t.Fatalf("FAL: the discovery-walk context must set Phase1Resolution "+
-			"(capped iterator) — that is the contrast the content pass deliberately drops")
-	}
 	if cache.ApistagePrewarmFromContext(ctx) {
 		t.Fatalf("FAL: the discovery-walk context must NOT set ApistagePrewarm")
 	}
 	if cache.PrewarmIterSerialFromContext(ctx) {
-		t.Fatalf("FAL: the discovery-walk context must NOT set PrewarmIterSerial")
+		t.Fatalf("FAL: the discovery-walk context must NOT set PrewarmIterSerial "+
+			"(Fork B — discovery runs default-bounded-parallel, not serial)")
 	}
 }
 

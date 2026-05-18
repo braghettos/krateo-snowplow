@@ -9,33 +9,21 @@ import (
 	"github.com/krateoplatformops/plumbing/jqutil"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 )
 
-// phase1IteratorCap bounds how many elements a `dependsOn.iterator` api
-// stage expands to WHEN the resolve runs under a Phase-1
-// (startup-warmup) context — cache.IsPhase1Resolution(ctx)==true.
-//
-// WHY: the compositions-panels / blueprints-panels RESTActions fan a
-// stage-2 iterator over every namespace (~50 at production scale), one
-// per-namespace `panels` LIST each. During the Phase-1 warmup walk the
-// goal is only to DISCOVER + warm the `panels` informer — that informer
-// is GVR-scoped, so resolving the iterated path for ONE namespace warms
-// it exactly as well as resolving all 50. Expanding all 50 inside the
-// 900s startupProbe budget is what crashloops the pod. The cap lets the
-// warmup walk traverse the stage cheaply.
-//
-// >1 so a Phase-1 walk still exercises the iterator's templating with
-// more than a degenerate single element; small because additional
-// iterated elements discover no new informer. Mirrors the deliberate,
-// shape-validated constant rationale of phase1PerGVRSampleLimit
-// (dispatchers/phase1_walk.go).
-//
-// CRITICAL: the cap fires ONLY under a Phase-1 context. Every real
-// `/call` leaves cache.IsPhase1Resolution false, so the iterator expands
-// FULLY — behaviour byte-identical to pre-0.30.111.
-const phase1IteratorCap = 3
+// Ship 0.30.127: phase1IteratorCap (added 0.30.111) was DELETED. The cap
+// truncated a `dependsOn.iterator` stage to its first 3 elements under a
+// Phase-1 context — and that silently broke the Phase-1 navigation walk:
+// the sidebar-nav-menu's apiRef RESTAction iterates a per-namespace
+// navmenuitems LIST, and at bench scale the first 3 namespaces
+// (bench-ns-01/02/03) hold ZERO navmenuitems — the real nav-menu-item-*
+// CRs live in krateo-system, past the cap. The navmenu's
+// resourcesRefsTemplate then expanded to zero children and the walk
+// descended nothing past the roots (F2's warmed=2 defect, and a latent
+// regression of #83). Iterator stages now expand FULLY; the storm guard
+// for the expansion is the existing bounded errgroup
+// (g.SetLimit(iterParallelism(ctx)), resolve.go) — no new mechanism.
 
 func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.API, dict map[string]any) (all []httpcall.RequestOptions) {
 	it := ""
@@ -52,22 +40,7 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 
 	all = []httpcall.RequestOptions{}
 
-	// 0.30.111 Part 2 — Phase-1 iterator cap. Under a startup-warmup
-	// resolution (cache.IsPhase1Resolution(ctx)==true) the iterator
-	// fan-out is bounded to phase1IteratorCap elements: the warmup only
-	// needs to DISCOVER the downstream GVR's informer, and that informer
-	// is GVR-scoped, so one iterated element warms it as well as all N.
-	// For every real `/call` the marker is absent, capActive stays
-	// false, and the iterator expands FULLY — byte-identical to
-	// pre-0.30.111.
-	capActive := cache.IsPhase1Resolution(ctx)
-	capped := 0
-
 	action := func(sa any) error {
-		if capActive && len(all) >= phase1IteratorCap {
-			capped++
-			return nil // skip — cap reached; keep draining the stream
-		}
 		el := createRequestOption(in, sa)
 		all = append(all, el)
 		return nil
@@ -76,16 +49,6 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 	err := jqutil.ForEach(ctx, jqutil.EvalOptions{Query: it, Unquote: true, Data: dict}, action)
 	if err != nil {
 		log.Error("unable to execute iterator", slog.String("query", it), slog.Any("err", err))
-	}
-
-	if capActive && capped > 0 {
-		log.Info("phase1 iterator capped",
-			slog.String("query", it),
-			slog.Int("expanded", len(all)),
-			slog.Int("skipped", capped),
-			slog.Int("cap", phase1IteratorCap),
-			slog.String("reason", "startup-warmup resolution — informer discovery needs only a bounded sample"),
-		)
 	}
 
 	return all

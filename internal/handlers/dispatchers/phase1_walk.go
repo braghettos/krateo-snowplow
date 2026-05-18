@@ -527,13 +527,19 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	rctx := xcontext.BuildContext(ctx, opts...)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
-	// 0.30.111 Part 2 — mark this as a Phase-1 (startup-warmup)
-	// resolution. This is the SOLE production setter of the marker (a
-	// grep-able invariant): the RESTAction resolver's createRequestOptions
-	// caps `dependsOn.iterator` fan-out at phase1IteratorCap only when
-	// cache.IsPhase1Resolution(ctx) is true. Every real `/call` leaves
-	// the marker absent.
-	rctx = cache.WithPhase1Resolution(rctx)
+	// Ship 0.30.127 — FORK B (deliberate, Diego-confirmed). The
+	// discovery walk does NOT mark its context cache.WithPrewarmIterSerial,
+	// so the RESTAction resolver runs its inner-call iterator fan-out at
+	// the DEFAULT bounded parallelism — iterParallelism(ctx) = GOMAXPROCS,
+	// hard-capped at 32 (resolve.go). With phase1IteratorCap deleted this
+	// ship, that bounded errgroup (g.SetLimit(iterParallelism(ctx))) IS
+	// the storm guard for the now-uncapped iterator expansion — a real
+	// [1,32] bound, not unbounded. The F2 content pass is the opposite:
+	// it DOES set WithPrewarmIterSerial (iterParallelism = 1) because it
+	// materializes the 49K-row JSON and is the genuine OOM risk. Fork B:
+	// discovery = default-bounded-parallel, content pass = serial. The
+	// cache.WithPhase1Resolution marker was REMOVED this ship — its sole
+	// consumer (phase1IteratorCap) is gone, so the marker is dead.
 	return rctx
 }
 
@@ -543,59 +549,24 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	w := &phase1Walker{
 		authnNS:         authnNS,
 		visited:         map[string]struct{}{},
-		gvrSamples:      map[string]int{},
 		apiRefHarvester: harvester,
 	}
-	// The root has no parent — its per-(parent,GVR) sample budgets are
-	// scoped under the empty parent key (Ship 0.30.126).
-	return w.walk(rctx, root, 0, "")
+	// The root has no /call Path of its own, so it resolves under the
+	// bounded PREWARM_PAGE_LIMIT default; each descended child overrides
+	// with its own declared slice when present (Ship 0.30.127).
+	return w.walk(rctx, root, 0, prewarmPageLimit(), prewarmPageLimit())
 }
 
-// phase1PerGVRSampleLimit caps how many widget CRs of the same GVR, UNDER
-// ONE PARENT widget, the walk resolves+recurses into. It is the key
-// 0.30.105 data-fan-out bound, re-scoped per-parent at Ship 0.30.126.
-//
-// WHY (the on-cluster finding): a Compositions Page DataGrid yields one
-// resourcesRefs child PER COMPOSITION ROW — at production scale that is
-// ~49K children, every one a widget of the SAME GVR. Recursing into all
-// of them turns the startup walk into a 49K-deep per-composition
-// resolution storm that blows the PHASE1_TIMEOUT_SECONDS budget (the
-// first on-cluster 0.30.105 bench CrashLooped the pod). But for INFORMER
-// DISCOVERY every row-widget of a given GVR is identical — resolving one
-// fires the exact same lazyRegisterInnerCallPaths apiRef chain as
-// resolving the 49000th. So the walk samples a SMALL bounded number per
-// (parent, child-GVR): enough to traverse genuine navigation structure
-// while skipping the per-row data fan-out.
-//
-// The limit is >1 so a parent that legitimately has a couple of
-// different-purpose children sharing a GVR is not under-covered; it is
-// small because additional same-GVR widgets under that parent discover
-// no new informer.
-//
-// THE BUDGET KEY (Ship 0.30.126): gvrSamples is keyed on
-// (parentEndpoint, GVR), NOT the bare GVR. Pre-0.30.126 the bare-GVR key
-// let the Compositions DataGrid's per-composition-panel flood drain the
-// SHARED `panels` budget — so the Dashboard page's structural `panels`
-// widgets (same GVR, different parent) were skipped before the walk
-// reached `compositions-list`, and F2's apiRef harvester (which rides
-// this walk) never harvested it. Scoping the budget per parent makes
-// every parent's same-GVR children independent: the flood is still
-// capped at phase1PerGVRSampleLimit PER PARENT — the 49K-resolution
-// storm stays bounded — while a sibling parent's structural widgets are
-// never starved. 4 is a deliberate, navigation-shape-validated constant.
-const phase1PerGVRSampleLimit = 4
-
-// parentScopedGVRKey builds the gvrSamples budget key — Ship 0.30.126.
-// The key is (parentEndpoint, GVR): each parent widget's same-GVR
-// children draw on an independent phase1PerGVRSampleLimit budget, so a
-// DataGrid flooding one GVR cannot starve a sibling page's structural
-// widgets of the same GVR. parentEndpoint is the navWidgetEndpointKey of
-// the widget whose children are being iterated ("" for the root). The
-// '#' separator cannot appear in a navWidgetEndpointKey
-// (apiVersion|resource|namespace|name), so the key is unambiguous.
-func parentScopedGVRKey(parentEndpoint, apiVersion, resource string) string {
-	return parentEndpoint + "#" + apiVersion + "|" + resource
-}
+// Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,
+// parentScopedGVRKey, the phase1Walker.gvrSamples field, and the FAL-126
+// falsifier — were ALL DELETED. That count-cap heuristic (0.30.105,
+// re-keyed 0.30.126) was the wrong mechanism: it pruned distinct
+// navigation widgets by a sibling-count guess. The real data-fan-out
+// bound is now the DECLARED per-widget pagination — each widget resolves
+// under the `slice` it declares (carried on its `/call` Path) or the
+// bounded PREWARM_PAGE_LIMIT default — so the walk recurses EVERY
+// distinct navigation child and never the per-row data fan-out, with no
+// count heuristic. See walk()'s page/perPage threading.
 
 // phase1Walker carries the per-root recursive-walk state. A fresh walker
 // is created per navigation root so the dedupe state never crosses roots
@@ -606,13 +577,10 @@ type phase1Walker struct {
 	authnNS string
 	// visited dedupes by the child widget endpoint (resource+apiVersion+
 	// namespace+name) so a shared subtree is resolved once and a cyclic
-	// reference cannot loop forever.
+	// reference cannot loop forever. With the per-GVR sample cap removed
+	// (Ship 0.30.127) the visited-set + phase1MaxWalkDepth are the walk's
+	// only recursion bounds.
 	visited map[string]struct{}
-	// gvrSamples counts how many widget CRs of each GVR (resource+
-	// apiVersion) the walk has already resolved. Once a GVR hits
-	// phase1PerGVRSampleLimit, further siblings of that GVR are skipped —
-	// the data-fan-out bound (see phase1PerGVRSampleLimit).
-	gvrSamples map[string]int
 	// apiRefHarvester accumulates each resolved widget's spec.apiRef —
 	// Ship F2 (0.30.125) Step 7.5a. Harvesting rides the EXISTING walk
 	// (no second traversal). nil when PREWARM_CONTENT_ENABLED is off —
@@ -632,13 +600,14 @@ type phase1Walker struct {
 // of the navigation tree. The function returns an error ONLY for the
 // top-level root resolve failure, so the caller (phase1WarmupWith) can
 // log a root as failed.
-// parentEndpoint is the navWidgetEndpointKey of `in` itself — the parent
-// of every child this invocation iterates. The root call passes "".
-// Ship 0.30.126: it scopes the per-GVR data-fan-out budget per PARENT
-// widget (see phase1PerGVRSampleLimit), so a DataGrid flooding one GVR
-// cannot drain the budget of a sibling page's structural widgets of the
-// same GVR.
-func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, depth int, parentEndpoint string) error {
+//
+// page/perPage are the pagination declared for THIS widget — extracted
+// from the `/call` Path that led to it (Ship 0.30.127). They are passed
+// to widgets.Resolve so the walk honours each widget's own declared
+// `slice` instead of the old hardcoded -1/-1. The root call passes the
+// PREWARM_PAGE_LIMIT default; a child whose `/call` Path carries explicit
+// page/perPage overrides it.
+func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, depth int, page, perPage int) error {
 	log := slog.Default()
 	if in == nil {
 		return nil
@@ -666,13 +635,19 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any
 	// apiRef-bearing leaf such as the Compositions Page DataGrid) and
 	// returns status.resourcesRefs.items[] — the child widget endpoints.
-	// PerPage/Page = -1: Phase 1 wants the FULL navigation fan-out, not
-	// just the first visible page.
+	//
+	// Ship 0.30.127: page/perPage are the pagination DECLARED for this
+	// widget — its own `slice` carried on the `/call` Path that led here,
+	// or the PREWARM_PAGE_LIMIT bounded default. The old hardcoded -1/-1
+	// resolved every widget unbounded, which (with the iterator cap
+	// removed) is the 49K-row storm. Honouring the declared slice keeps
+	// the discovery walk's fan-out bounded by what the portal itself
+	// declared per widget.
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
 		In:      in,
 		AuthnNS: w.authnNS,
-		PerPage: -1,
-		Page:    -1,
+		PerPage: perPage,
+		Page:    page,
 	})
 	if err != nil {
 		// A resolution error at depth>0 is non-fatal — log and stop
@@ -718,35 +693,25 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		}
 		key := navWidgetEndpointKey(ref)
 		if _, seen := w.visited[key]; seen {
+			// Already walked (cycle-safety + shared-subtree dedup). The
+			// visited-set + phase1MaxWalkDepth are the ONLY recursion
+			// bounds — Ship 0.30.127 removed the per-(parent,GVR) sample
+			// cap; fan-out is bounded by the declared slice / the
+			// PREWARM_PAGE_LIMIT default each widget resolves under.
 			continue
 		}
-
-		// DATA-FAN-OUT BOUND: skip this child once this PARENT's children
-		// of this GVR have been sampled phase1PerGVRSampleLimit times. A
-		// Compositions Page DataGrid yields one child per composition row
-		// — ~49K children of the same GVR — and resolving every one would
-		// blow the PHASE1_TIMEOUT budget. Every same-GVR row-widget fires
-		// the identical lazyRegisterInnerCallPaths apiRef chain, so a small
-		// sample saturates informer discovery for that GVR under that
-		// parent.
-		//
-		// Ship 0.30.126: the budget key is (parentEndpoint, GVR), NOT the
-		// bare GVR. A bare-GVR key let the Compositions DataGrid's
-		// per-composition-panel flood drain the shared `panels` budget, so
-		// the Dashboard page's STRUCTURAL `panels` widgets — same GVR,
-		// different parent — were skipped and the walk never reached
-		// `compositions-list`. Scoping per parent gives every parent's
-		// same-GVR children an independent budget: the flood is still
-		// capped at phase1PerGVRSampleLimit PER PARENT (the 49K-resolution
-		// storm stays bounded), and a sibling parent's structural widgets
-		// are never starved.
-		gvrKey := parentScopedGVRKey(parentEndpoint, ref.APIVersion, ref.Resource)
-		if w.gvrSamples[gvrKey] >= phase1PerGVRSampleLimit {
-			continue
-		}
-
 		w.visited[key] = struct{}{}
-		w.gvrSamples[gvrKey]++
+
+		// Ship 0.30.127 — honour the child's DECLARED pagination. The
+		// child's `/call` Path carries page/perPage when the parent
+		// declared a `slice` (resourcesrefs writes them). Extract them;
+		// when absent, fall back to the bounded PREWARM_PAGE_LIMIT default
+		// — NEVER the unbounded -1 (which, with the iterator cap removed,
+		// is the 49K-row storm).
+		childPage, childPerPage := prewarmPageLimit(), prewarmPageLimit()
+		if p, pp, hasPg := util.ParseCallPathPagination(child.Path); hasPg {
+			childPage, childPerPage = p, pp
+		}
 
 		// Fetch the child widget CR under the SA-credentialed ctx. The
 		// resolver mutates the object in place, so a fresh fetch per
@@ -764,12 +729,11 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		if got.Unstructured == nil {
 			continue
 		}
-		// Recurse into the child widget subtree. The child's own endpoint
-		// key (`key` == navWidgetEndpointKey(ref)) becomes parentEndpoint
-		// for ITS children — so the per-(parent,GVR) sample budget is
-		// scoped under this child when the recursion iterates its
-		// descendants (Ship 0.30.126).
-		_ = w.walk(ctx, got.Unstructured, depth+1, key)
+		// Recurse into the child widget subtree. childPage/childPerPage
+		// are the pagination the child resolves under — its declared
+		// `slice` from the `/call` Path, or the PREWARM_PAGE_LIMIT default
+		// (Ship 0.30.127).
+		_ = w.walk(ctx, got.Unstructured, depth+1, childPage, childPerPage)
 	}
 	return nil
 }
