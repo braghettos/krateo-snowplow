@@ -149,7 +149,7 @@ func TestPhase1_CredentialReal_FixResolvesRoot(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := phase1WarmupWith(ctx, rw, lister, resolver); err != nil {
+	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil); err != nil {
 		t.Fatalf("phase1WarmupWith returned error with the 0.30.103 fix: %v", err)
 	}
 
@@ -209,7 +209,7 @@ func TestPhase1_CredentialReal_UnfixedPathFailsRoot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// phase1WarmupWith returns the first walk error — expected non-nil.
-	walkErr := phase1WarmupWith(ctx, rw, lister, resolver)
+	walkErr := phase1WarmupWith(ctx, rw, lister, resolver, nil)
 	if walkErr == nil {
 		t.Fatalf("negative control FAIL: the unfixed kubeconfig path did not error — "+
 			"the 0.30.102 bug is not reproduced at the walk level")

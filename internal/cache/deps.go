@@ -221,6 +221,42 @@ func WithApistagePrewarm(ctx context.Context) context.Context {
 	return context.WithValue(ctx, ctxKeyApistagePrewarm, true)
 }
 
+// ctxKeyPrewarmIterSerialType is the typed context key for the Ship F2
+// (0.30.125) serial-inner-call marker.
+type ctxKeyPrewarmIterSerialType struct{}
+
+var ctxKeyPrewarmIterSerial = ctxKeyPrewarmIterSerialType{}
+
+// WithPrewarmIterSerial returns a child context marked so the RESTAction
+// resolver runs inner-call fan-out SERIALLY — iterParallelism returns 1
+// for a resolve under this context.
+//
+// Ship F2 (0.30.125): the SA content-population pass uncaps the
+// `dependsOn.iterator` (no WithPhase1Resolution), so a compositions-list
+// resolve does the full per-namespace inner-call fan-out — the #159 OOM
+// territory. The content pass is behind the 503 readiness gate with no
+// latency budget, so it trades wall-clock for peak RSS by forcing the
+// fan-out serial. This is CONTEXT-SCOPED — a process-wide
+// RESOLVER_ITER_PARALLELISM=1 would slow every real /call; the marker
+// only narrows the prewarm pass.
+func WithPrewarmIterSerial(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyPrewarmIterSerial, true)
+}
+
+// PrewarmIterSerialFromContext reports whether ctx was marked by
+// WithPrewarmIterSerial — i.e. whether the resolver must run inner-call
+// fan-out serially (iterParallelism == 1).
+func PrewarmIterSerialFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyPrewarmIterSerial).(bool)
+	return v
+}
+
 // ApistagePrewarmFromContext reports whether ctx was marked by
 // WithApistagePrewarm — i.e. whether this is an SA prewarm resolve that
 // populates the content layer without a per-user gate.

@@ -248,11 +248,27 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		return listNavigationRootsFromConfigMap(
 			withPhase1SAContext(lctx, *saEP, rc), dynCli, cfgNamespace)
 	}
-	resolver := func(rctx context.Context, root *unstructured.Unstructured) error {
-		return resolveNavigationRoot(rctx, root, *saEP, rc, authnNS)
+
+	// Ship F2 (0.30.125): the content-prewarm harvester. When
+	// PREWARM_CONTENT_ENABLED is set, the discovery walk harvests every
+	// widget's spec.apiRef into this shared set (Step 7.5a) and the
+	// contentPrewarm callback below drains it (Step 7.5b). Flag-off the
+	// harvester stays nil — the walk's harvestApiRef calls are no-ops and
+	// the callback is nil, so startup is byte-identical to 0.30.124.
+	var harvester *contentPrewarmHarvester
+	var contentPrewarm func(context.Context)
+	if cache.PrewarmEnabled() && PrewarmContentEnabled() {
+		harvester = newContentPrewarmHarvester()
+		contentPrewarm = func(cctx context.Context) {
+			runContentPrewarmPass(cctx, harvester, *saEP, rc, authnNS)
+		}
 	}
 
-	return phase1WarmupWith(ctx, rw, lister, resolver)
+	resolver := func(rctx context.Context, root *unstructured.Unstructured) error {
+		return resolveNavigationRoot(rctx, root, *saEP, rc, authnNS, harvester)
+	}
+
+	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm)
 }
 
 // phase1WarmupWith is the testable core: it takes the watcher, the
@@ -269,7 +285,14 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 // /readyz should gate on. A walk error (one root failed to resolve) is
 // returned for logging but does not by itself withhold readiness — the
 // other roots' informers are warm.
-func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver) error {
+// contentPrewarm is the Ship F2 (0.30.125) Step-7.5 callback:
+// phase1WarmupWith invokes it AFTER WaitAllInformersSynced and BEFORE
+// MarkPhase1Done — behind the 503 readiness gate — so the SA content-
+// population pass completes before the pod goes Ready. nil disables the
+// step (flag-off / tests); production passes runContentPrewarmPass.
+type contentPrewarm func(ctx context.Context)
+
+func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -358,6 +381,17 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// informer (meta-query seeds + resolution-discovered + CRD-watch-
 	// spawned) reaches HasSynced, bounded by ctx.
 	syncErr := rw.WaitAllInformersSynced(ctx)
+
+	// Step 7.5 — Ship F2 (0.30.125): the SA content-population pass. Runs
+	// AFTER the sync barrier (the informers it resolves against are warm)
+	// and BEFORE MarkPhase1Done (still behind the 503 readiness gate — the
+	// pod goes Ready only once the content cache is warm). nil when
+	// PREWARM_CONTENT_ENABLED is off — flag-off this is byte-identical to
+	// 0.30.124. The pass is best-effort: any failure is logged inside
+	// runContentPrewarmPass and never blocks readiness.
+	if contentWarm != nil {
+		contentWarm(ctx)
+	}
 
 	// Step 8 — signal Phase1Done. /readyz flips to 200.
 	cache.MarkPhase1Done()
@@ -503,13 +537,14 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	return rctx
 }
 
-func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
+func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester) error {
 	rctx := withPhase1SAContext(ctx, saEP, saRC)
 
 	w := &phase1Walker{
-		authnNS:    authnNS,
-		visited:    map[string]struct{}{},
-		gvrSamples: map[string]int{},
+		authnNS:         authnNS,
+		visited:         map[string]struct{}{},
+		gvrSamples:      map[string]int{},
+		apiRefHarvester: harvester,
 	}
 	return w.walk(rctx, root, 0)
 }
@@ -566,6 +601,11 @@ type phase1Walker struct {
 	// phase1PerGVRSampleLimit, further siblings of that GVR are skipped —
 	// the data-fan-out bound (see phase1PerGVRSampleLimit).
 	gvrSamples map[string]int
+	// apiRefHarvester accumulates each resolved widget's spec.apiRef —
+	// Ship F2 (0.30.125) Step 7.5a. Harvesting rides the EXISTING walk
+	// (no second traversal). nil when PREWARM_CONTENT_ENABLED is off —
+	// harvestApiRef is nil-safe so flag-off is a clean no-op.
+	apiRefHarvester *contentPrewarmHarvester
 }
 
 // walk resolves widget `in` through the standard widget resolver under
@@ -597,6 +637,12 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		)
 		return nil
 	}
+
+	// Ship F2 (0.30.125) Step 7.5a — harvest this widget's spec.apiRef
+	// into the content-prewarm data-source set. This rides the EXISTING
+	// walk — no second traversal. nil-safe: when PREWARM_CONTENT_ENABLED
+	// is off the harvester is nil and this is a no-op.
+	w.apiRefHarvester.harvestApiRef(in)
 
 	// Resolve this widget. The resolver recursively reaches this widget's
 	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any

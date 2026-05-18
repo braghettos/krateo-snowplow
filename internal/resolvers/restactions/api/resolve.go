@@ -39,7 +39,18 @@ import (
 //
 // Per architect's design 0.30.95: bound is hard-capped at the resolver
 // boundary, NOT per-resource — no per-GVR carve-outs (feedback_no_special_cases.md).
-func iterParallelism() int {
+//
+// Ship F2 (0.30.125): a resolve under cache.WithPrewarmIterSerial — the
+// SA content-population pass — gets parallelism 1. The content pass
+// uncaps the iterator (full per-namespace fan-out, the #159 OOM
+// territory) but runs behind the 503 readiness gate with no latency
+// budget, so it forces the fan-out serial to hold peak RSS down. This
+// is CONTEXT-SCOPED: every real /call carries no marker and keeps the
+// GOMAXPROCS/env width.
+func iterParallelism(ctx context.Context) int {
+	if cache.PrewarmIterSerialFromContext(ctx) {
+		return 1
+	}
 	n := runtime.GOMAXPROCS(0)
 	if s := os.Getenv("RESOLVER_ITER_PARALLELISM"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil && v > 0 {
@@ -361,7 +372,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// writes too, so we take dictMu there as well.
 		var dictMu sync.Mutex
 		g, gctx := errgroup.WithContext(ctx)
-		g.SetLimit(iterParallelism())
+		g.SetLimit(iterParallelism(ctx))
 
 		// Ship 0.30.121 R1-b — the operator kill-switch. Compute once per
 		// stage: verbose is permitted ONLY when the RESTAction asked for it
