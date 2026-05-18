@@ -106,6 +106,18 @@ type refresher struct {
 	skippedNoEntryTotal atomic.Uint64
 	skippedNoHandler    atomic.Uint64
 
+	// Ship 0.30.120 — two-layer poison-fix counters.
+	//   refresherSkippedStageError: layer (b) — L1 Puts the error-aware
+	//     gate declined because a stage error was observed during the
+	//     refresh re-resolve (a continueOnError'd 401 from an exportJwt
+	//     loopback). The prior good entry is kept; TTL is the outer net.
+	//   refresherSkippedExportJwt: layer (a) — refreshes short-circuited
+	//     to TTL because the re-fetched RESTAction CR carries an
+	//     exportJwt:true stage (a background refresh has no per-user JWT
+	//     so that stage can never resolve correctly).
+	refresherSkippedStageError atomic.Uint64
+	refresherSkippedExportJwt  atomic.Uint64
+
 	startedOnce sync.Once
 	stopOnce    sync.Once
 	// workersWG lets test cleanup block until every worker goroutine
@@ -331,13 +343,15 @@ func (r *refresher) processOne(ctx context.Context, key string) error {
 
 // refresherStats is the read-only snapshot the summary log consumes.
 type refresherStats struct {
-	enqueued         uint64
-	completed        uint64
-	failed           uint64
-	retried          uint64
-	dropped          uint64
-	skippedNoEntry   uint64
-	skippedNoHandler uint64
+	enqueued          uint64
+	completed         uint64
+	failed            uint64
+	retried           uint64
+	dropped           uint64
+	skippedNoEntry    uint64
+	skippedNoHandler  uint64
+	skippedStageError uint64 // Ship 0.30.120 layer (b)
+	skippedExportJwt  uint64 // Ship 0.30.120 layer (a)
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -346,13 +360,15 @@ func refresherStatsSnapshot() refresherStats {
 		return refresherStats{}
 	}
 	return refresherStats{
-		enqueued:         r.enqueueTotal.Load(),
-		completed:        r.completedTotal.Load(),
-		failed:           r.failedTotal.Load(),
-		retried:          r.retriedTotal.Load(),
-		dropped:          r.droppedTotal.Load(),
-		skippedNoEntry:   r.skippedNoEntryTotal.Load(),
-		skippedNoHandler: r.skippedNoHandler.Load(),
+		enqueued:          r.enqueueTotal.Load(),
+		completed:         r.completedTotal.Load(),
+		failed:            r.failedTotal.Load(),
+		retried:           r.retriedTotal.Load(),
+		dropped:           r.droppedTotal.Load(),
+		skippedNoEntry:    r.skippedNoEntryTotal.Load(),
+		skippedNoHandler:  r.skippedNoHandler.Load(),
+		skippedStageError: r.refresherSkippedStageError.Load(),
+		skippedExportJwt:  r.refresherSkippedExportJwt.Load(),
 	}
 }
 
