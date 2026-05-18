@@ -185,6 +185,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 	}
 
+	// Ship 0.30.120 layer (b) — error-aware Put-gate sink. The background
+	// refresher installs an *atomic.Int64 on ctx via WithStageErrorSink;
+	// each dict[call.ErrorKey] write below bumps it so resolveAndPopulateL1
+	// can decline to overwrite a good L1 entry with a result produced
+	// under a swallowed (continueOnError'd) stage error. On the normal
+	// request path no sink is installed — stageErrSink is nil, the bump
+	// sites are no-ops, and this resolve is byte-identical to 0.30.119.
+	stageErrSink := cache.StageErrorSinkFromContext(ctx)
+
 	for _, id := range names {
 		// Get the api with this identifier
 		apiCall, ok := apiMap[id]
@@ -480,6 +489,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						dictMu.Lock()
 						dict[call.ErrorKey] = ierr.Error()
 						dictMu.Unlock()
+						// Ship 0.30.120 layer (b): record the stage error on
+						// the refresher's sink (nil on the request path).
+						if stageErrSink != nil {
+							stageErrSink.Add(1)
+						}
 						if !call.ContinueOnError {
 							// Cancel gctx so in-flight peers short-circuit —
 							// same contract as the httpcall.Do StatusFailure
@@ -534,6 +548,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						dict[call.ErrorKey] = res.Message
 					}
 					dictMu.Unlock()
+					// Ship 0.30.120 layer (b): record the stage error on the
+					// refresher's sink (nil on the request path) — covers both
+					// the asMap and res.Message ErrorKey-write branches above.
+					if stageErrSink != nil {
+						stageErrSink.Add(1)
+					}
 
 					if !call.ContinueOnError {
 						// Returning a non-nil error cancels gctx so

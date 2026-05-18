@@ -45,6 +45,7 @@ import (
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/jwtutil"
+	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/apis"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -133,6 +134,17 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// recording site re-records dep edges for this refresh.
 	rctx = cache.WithL1KeyContext(rctx, key)
 
+	// Ship 0.30.120 layer (b) — error-aware Put-gate. Install a
+	// stage-error sink on the re-resolve context. The api resolver bumps
+	// it whenever it writes dict[call.ErrorKey] (a swallowed,
+	// continueOnError'd stage failure — e.g. the 401 from an exportJwt
+	// loopback that has no per-user JWT in a background refresh). After
+	// the re-resolve we read stageErrSink.Load(): a non-zero value means
+	// the fresh bytes were produced under a stage error and MUST NOT
+	// overwrite the prior good entry. The sink is request-path-inert:
+	// only the refresher installs it, so a cold dispatch is unaffected.
+	rctx, stageErrSink := cache.WithStageErrorSink(rctx)
+
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
 		return fmt.Errorf("resolveAndPopulateL1 %s/%s: %w",
@@ -152,6 +164,31 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 		)
+		return nil
+	}
+
+	// Ship 0.30.120 layer (b) — error-aware Put-gate. If the re-resolve
+	// observed ANY stage error (a swallowed, continueOnError'd inner-call
+	// failure — e.g. the 401 from an exportJwt loopback that the SA-
+	// transport refresher cannot satisfy), the fresh bytes are an
+	// under-served result: they MUST NOT overwrite the user's prior good
+	// entry. Decline the Put and return nil — NOT an error. A deterministic
+	// stage failure must not drive AddRateLimited / burn the retry budget;
+	// the prior good entry stays and the outer TTL is the safety net.
+	//
+	// The gate keys on STAGE-ERROR PRESENCE, never on result emptiness — a
+	// user who legitimately has 0 compositions produces no stage error
+	// (sink == 0) and their empty result IS stored.
+	if stageErrSink.Load() > 0 {
+		log.Warn("resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.String("user", inputs.Username),
+			slog.Int64("stage_errors", stageErrSink.Load()),
+			slog.String("effect", "prior good entry kept; TTL is the outer net"),
+		)
+		cache.BumpRefresherSkippedStageError()
 		return nil
 	}
 
@@ -249,6 +286,37 @@ func resolveRestActionForRefresh(ctx context.Context, got objects.Result, inputs
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
 		return nil, fmt.Errorf("unstructured -> RESTAction: %w", err)
 	}
+
+	// Ship 0.30.120 layer (a) — exportJwt skip-to-TTL. A stage with
+	// exportJwt:true makes a nested snowplow /call loopback that needs
+	// the requesting user's bearer token. A background refresh has only
+	// the SA transport — no per-user JWT — so that loopback can never
+	// resolve correctly: it 401s, continueOnError swallows the 401 as a
+	// structurally-valid empty result, and the refresher would Put an
+	// under-served entry over the user's good one. When the re-fetched
+	// CR carries any exportJwt:true stage, decline to store: return
+	// (nil, nil) — the established "skip-to-TTL" sentinel
+	// (resolveAndPopulateL1 treats encoded==nil as a no-op). The prior
+	// good entry stays; TTL is the outer net.
+	//
+	// Keyed on the declarative ExportJWT CRD field ONLY — no resource /
+	// name / path literal (no_special_cases rule). This is layer (a):
+	// the short-circuit-before-resolve net; layer (b) (the error-aware
+	// Put-gate) is the general backstop for any other swallowed stage
+	// error.
+	for _, stage := range cr.Spec.API {
+		if stage != nil && ptr.Deref(stage.ExportJWT, false) {
+			cache.BumpRefresherSkippedExportJwt()
+			xcontext.Logger(ctx).Info("resolveRestActionForRefresh: RESTAction has exportJwt stage; skipping refresh to TTL",
+				slog.String("subsystem", "cache"),
+				slog.String("restaction", inputs.Name),
+				slog.String("namespace", inputs.Namespace),
+				slog.String("effect", "background refresh has no per-user JWT; prior good entry kept, TTL is the outer net"),
+			)
+			return nil, nil
+		}
+	}
+
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		AuthnNS: authnNS,
