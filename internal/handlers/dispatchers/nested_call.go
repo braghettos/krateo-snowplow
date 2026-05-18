@@ -11,10 +11,13 @@
 // ResolveNestedCall replicates restActionHandler.ServeHTTP MINUS the HTTP
 // edge: objects.Get the referenced RESTAction CR, gate it with
 // checkDispatchRBAC, FromUnstructured-decode it, restactions.Resolve it,
-// and return the resolved RESTAction's Status.Raw. The identity is
-// whatever WithUserInfo the inbound ctx already carries — so a JWT-less /
-// SA-credentialed resolve completes a /call-loopback stage that the HTTP
-// path could not (no Authorization header to forward).
+// and return the FULL RESTAction envelope via encodeResolvedJSON — the
+// exact bytes restActionHandler.ServeHTTP writes as the HTTP /call
+// response body (Ship 0.30.124 content-shape fix; 0.30.123 wrongly
+// returned the bare Status.Raw). The identity is whatever WithUserInfo
+// the inbound ctx already carries — so a JWT-less / SA-credentialed
+// resolve completes a /call-loopback stage that the HTTP path could not
+// (no Authorization header to forward).
 //
 // THE checkDispatchRBAC CALL IS THE SINGLE MOST IMPORTANT CORRECTNESS
 // LINE. The in-process path bypasses the HTTP edge and with it the
@@ -51,8 +54,9 @@ import (
 //  4. FromUnstructured-decode to a typed RESTAction;
 //  5. restactions.Resolve under a ctx whose nested-call depth is
 //     incremented by 1 (so an inner /call-loopback hop is bounded);
-//  6. return the resolved RESTAction's Status.Raw — byte-identical to
-//     what the HTTP /call would have produced as its response body.
+//  6. return encodeResolvedJSON(res) — the FULL RESTAction envelope,
+//     byte-identical to what restActionHandler.ServeHTTP writes as the
+//     HTTP /call response body (Ship 0.30.124 content-shape fix).
 func ResolveNestedCall(
 	ctx context.Context,
 	ref v1.ObjectReference,
@@ -133,18 +137,36 @@ func ResolveNestedCall(
 			ref.Resource, ref.Name, err)
 	}
 
-	// Step 6 — return the resolved RESTAction's Status.Raw. This is the
-	// content the HTTP /call would have delivered as its response body;
-	// the api resolver feeds these exact bytes into the stage's
-	// ResponseHandler (resolve.go's loopback branch).
-	if res == nil || res.Status == nil {
-		// A resolve that produced no status is an empty-but-valid result
-		// (the inner RESTAction has no api stages / an empty filter).
-		// Return an empty JSON object so the stage's ResponseHandler sees
-		// well-formed JSON rather than a nil reader.
+	// Step 6 — return the FULL RESTAction envelope, byte-shaped exactly as
+	// the HTTP /call endpoint delivers it.
+	//
+	// Ship 0.30.124 content-shape fix: 0.30.123 returned res.Status.Raw —
+	// the inner RESTAction's BARE status. That was wrong. The real HTTP
+	// GET /call?resource=restactions is intercepted by the handlers.Dispatcher
+	// middleware and routed to restActionHandler.ServeHTTP, whose response
+	// body is encodeResolvedJSON(res) — the WHOLE RESTAction envelope
+	// {kind, apiVersion, metadata, spec, status}. A consuming stage with
+	// `dependsOn.iterator: ".<id>.status"` does `.status` on the nested
+	// result, expecting that envelope. 0.30.123's bare-status array made
+	// `.status` on an array fail ("expected an object but got: array"),
+	// the iterator got no options, and the result was empty.
+	//
+	// encodeResolvedJSON is the SAME encoder restActionHandler.ServeHTTP
+	// uses (helpers.go) — calling it here guarantees the in-process bytes
+	// are byte-identical to the HTTP /call bytes; no hand-replicated
+	// marshal.
+	if res == nil {
+		// A resolve that produced no RESTAction at all — return an empty
+		// JSON object so the stage's ResponseHandler sees well-formed JSON
+		// rather than a nil reader.
 		return []byte("{}"), nil
 	}
-	return res.Status.Raw, nil
+	encoded, err := encodeResolvedJSON(res)
+	if err != nil {
+		return nil, fmt.Errorf("nested /call: encode RESTAction envelope %s/%s: %w",
+			ref.Resource, ref.Name, err)
+	}
+	return encoded, nil
 }
 
 // Compile-time assertion that ResolveNestedCall satisfies the

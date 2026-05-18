@@ -109,75 +109,101 @@ func nestedResolveJWTLess(t *testing.T, stage *templates.API) map[string]any {
 	})
 }
 
-// --- F1 — HEADLINE: JWT-less /call-loopback resolve is non-empty ---------
+// --- F1 — HEADLINE: in-process nested /call returns the FULL envelope ----
 
-// TestF1_NestedCall_JWTLessLoopbackNonEmpty is the headline falsifier and
-// the capturable pre-fix artifact.
+// TestF1_NestedCall_ReturnsFullEnvelope is the headline falsifier and the
+// Ship 0.30.124 capturable pre-fix→post-fix artifact.
 //
-//   * Flag OFF (RESOLVER_INPROCESS_NESTED_CALL=false) — the loopback
-//     branch is skipped; the /call stage takes the HTTP path; with no
-//     Authorization header / unreachable endpoint it fails, continueOnError
-//     swallows it, dict[id] is EMPTY. This is byte-identical to the
-//     0.30.121 / 0.30.120-poison behaviour — the PRE-FIX artifact.
-//   * Flag ON (default) — the loopback branch resolves the inner
-//     RESTAction IN-PROCESS via the registered resolver; dict[id] is
-//     NON-EMPTY.
-func TestF1_NestedCall_JWTLessLoopbackNonEmpty(t *testing.T) {
-	// The in-process result the stub nested resolver returns — a
-	// non-trivial inner RESTAction Status.Raw.
-	innerStatus := []byte(`{"list":[{"uid":"real-composition"}]}`)
+// It drives the REAL ResolveNestedCall (no stub) against a seeded inner
+// RESTAction whose resolved status is a top-level ARRAY — exactly the
+// shape of the real compositions-get-ns-and-crd RESTAction that broke
+// 0.30.123.
+//
+// THE CONTENT-SHAPE CONTRACT: the real HTTP GET /call?resource=restactions
+// is routed by the handlers.Dispatcher middleware to restActionHandler
+// .ServeHTTP, whose response body is encodeResolvedJSON(res) — the WHOLE
+// RESTAction envelope {kind, apiVersion, metadata, spec, status}. A
+// consuming stage's `dependsOn.iterator: ".<id>.status"` does `.status`
+// on the nested result, so the in-process path MUST deliver that
+// envelope, not the bare status.
+//
+//   * PRE-FIX (0.30.123, return res.Status.Raw): ResolveNestedCall
+//     returns the BARE array `[{"ns":"team-a"},...]`. The envelope keys
+//     kind/spec are absent, .status would fail on an array — the empty-
+//     result defect. This test FAILS on the pre-fix code.
+//   * POST-FIX (0.30.124, return encodeResolvedJSON(res)): ResolveNestedCall
+//     returns the full envelope; kind/spec/status are all present and the
+//     array sits under .status. This test PASSES.
+func TestF1_NestedCall_ReturnsFullEnvelope(t *testing.T) {
+	const ns, name = "krateo-system", "inner-restaction"
+	// Seed the watcher with the ARRAY-STATUS inner RESTAction — the
+	// compositions-get-ns-and-crd shape.
+	newNestedCallWatcherWithInner(t, ns, name,
+		nestedInnerRESTActionArrayStatus(ns, name),
+		nestedCallRoleBinding(ns, "sa-prewarmer"))
 
-	restore := setNestedCallResolverForTest(
-		func(_ context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
-			return innerStatus, nil
-		})
-	t.Cleanup(restore)
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "sa-prewarmer"}),
+	)
+	ref := templates.ObjectReference{
+		Reference:  templates.Reference{Name: name, Namespace: ns},
+		Resource:   nestedCallInnerGVR.Resource,
+		APIVersion: nestedCallInnerGVR.Group + "/" + nestedCallInnerGVR.Version,
+	}
+	raw, err := ResolveNestedCall(ctx, ref, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("F1: JWT-less nested /call must resolve cleanly, got error: %v", err)
+	}
+	if len(raw) == 0 {
+		t.Fatalf("F1: in-process nested /call produced EMPTY content")
+	}
 
-	// --- PRE-FIX arm: flag OFF ---
-	t.Run("prefix_flagOff_empty", func(t *testing.T) {
-		t.Setenv("RESOLVER_INPROCESS_NESTED_CALL", "false")
-		dict := nestedResolveJWTLess(t, loopbackStage("compositions", true))
-		// The /call stage took the HTTP path, failed JWT-less, and
-		// continueOnError swallowed it — dict["compositions"] is empty/nil.
-		if v, ok := dict["compositions"]; ok && v != nil {
-			if m, isMap := v.(map[string]any); !isMap || len(m) > 0 {
-				t.Fatalf("PRE-FIX expectation: flag-off /call loopback should yield "+
-					"EMPTY content (the 0.30.120 poison); got %#v", v)
-			}
+	// The returned bytes MUST be the full RESTAction envelope — the same
+	// shape the HTTP /call delivers. Decode and assert the envelope keys.
+	var envelope map[string]any
+	if uerr := json.Unmarshal(raw, &envelope); uerr != nil {
+		t.Fatalf("F1: nested /call result is not a JSON object — got %s "+
+			"(0.30.123 returned the bare status array; the fix must return the "+
+			"full envelope): %v", raw, uerr)
+	}
+	for _, key := range []string{"kind", "apiVersion", "spec", "status"} {
+		if _, ok := envelope[key]; !ok {
+			t.Fatalf("F1 CONTENT-SHAPE DEFECT: nested /call result is missing the "+
+				"envelope key %q — ResolveNestedCall returned the BARE status, not "+
+				"the full RESTAction envelope. A consuming stage's "+
+				"`dependsOn.iterator: \".<id>.status\"` would fail on this shape "+
+				"(the 0.30.123 empty-result defect).\n got: %s", key, raw)
 		}
-	})
-
-	// --- POST-FIX arm: flag ON (default) ---
-	t.Run("postfix_flagOn_nonEmpty", func(t *testing.T) {
-		t.Setenv("RESOLVER_INPROCESS_NESTED_CALL", "true")
-		dict := nestedResolveJWTLess(t, loopbackStage("compositions", true))
-		v, ok := dict["compositions"]
-		if !ok || v == nil {
-			t.Fatalf("F1: flag-on JWT-less /call loopback produced NO content — "+
-				"the in-process nested resolver did not run; dict=%#v", dict)
-		}
-		raw, _ := json.Marshal(v)
-		if !strings.Contains(string(raw), "real-composition") {
-			t.Fatalf("F1: in-process nested /call result missing the inner content; "+
-				"got %s", raw)
-		}
-	})
+	}
+	// The inner array content must sit UNDER .status — a stage doing
+	// `.status` on this envelope gets the array, exactly as the HTTP path.
+	statusBytes, _ := json.Marshal(envelope["status"])
+	if !strings.Contains(string(statusBytes), "team-a") {
+		t.Fatalf("F1: the inner resolved array must be reachable under .status; "+
+			"got status=%s", statusBytes)
+	}
 }
 
-// --- F2 — in-process result byte-identical to direct inner resolve -------
+// --- F2 — the loopback branch feeds the nested bytes through verbatim ----
 
-// TestF2_NestedCall_ByteIdenticalToInnerResolve asserts the bytes the
-// loopback branch feeds into the stage handler are EXACTLY the bytes the
-// nested resolver returned (which, in production, is the inner
-// RESTAction's Status.Raw — i.e. == a direct restactions.Resolve(inner)).
-// The stub returns a known payload; the test asserts dict[id] carries it
-// verbatim, proving the loopback branch does not mutate / re-wrap the
-// nested result.
-func TestF2_NestedCall_ByteIdenticalToInnerResolve(t *testing.T) {
-	innerStatus := []byte(`{"items":[{"k":"v"}],"meta":{"n":3}}`)
+// TestF2_NestedCall_LoopbackBranchPassesBytesVerbatim asserts the
+// resolve.go loopback branch feeds the bytes the nested resolver returned
+// into the stage's ResponseHandler EXACTLY — no mutation, no re-wrap.
+// This is a unit test of the loopback branch's pass-through; the nested
+// resolver itself is stubbed, so the stub returns what the REAL
+// ResolveNestedCall returns post-0.30.124 — the full RESTAction envelope
+// {kind,apiVersion,metadata,spec,status}. The test asserts dict[id]
+// carries that envelope verbatim.
+func TestF2_NestedCall_LoopbackBranchPassesBytesVerbatim(t *testing.T) {
+	// The corrected stub returns a full RESTAction ENVELOPE — the shape
+	// the fixed ResolveNestedCall produces (encodeResolvedJSON of the
+	// resolved *RESTAction), NOT a bare status.
+	innerEnvelope := []byte(`{"kind":"RESTAction","apiVersion":"templates.krateo.io/v1",` +
+		`"metadata":{"name":"inner-restaction"},"spec":{},` +
+		`"status":{"items":[{"k":"v"}],"meta":{"n":3}}}`)
 	restore := setNestedCallResolverForTest(
 		func(_ context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
-			return innerStatus, nil
+			return innerEnvelope, nil
 		})
 	t.Cleanup(restore)
 
@@ -188,21 +214,19 @@ func TestF2_NestedCall_ByteIdenticalToInnerResolve(t *testing.T) {
 	if !ok {
 		t.Fatalf("F2: dict missing the loopback stage output")
 	}
-	// dict["inner"] is the JSON-decoded innerStatus (the stage handler
+	// dict["inner"] is the JSON-decoded innerEnvelope (the stage handler
 	// json-decodes the nested bytes). Re-marshal and compare structurally
-	// to the inner resolver's output decoded the same way.
-	var want, have any
-	if err := json.Unmarshal(innerStatus, &want); err != nil {
-		t.Fatalf("F2: unmarshal inner status: %v", err)
+	// to the nested resolver's output decoded the same way — the loopback
+	// branch must not have mutated it.
+	var want any
+	if err := json.Unmarshal(innerEnvelope, &want); err != nil {
+		t.Fatalf("F2: unmarshal inner envelope: %v", err)
 	}
 	gotBytes, _ := json.Marshal(got)
-	if err := json.Unmarshal(gotBytes, &have); err != nil {
-		t.Fatalf("F2: re-unmarshal stage output: %v", err)
-	}
 	wantBytes, _ := json.Marshal(want)
 	if string(gotBytes) != string(wantBytes) {
-		t.Fatalf("F2: in-process nested result NOT byte-identical to the inner "+
-			"resolve.\n want: %s\n got:  %s", wantBytes, gotBytes)
+		t.Fatalf("F2: the loopback branch did NOT pass the nested bytes through "+
+			"verbatim.\n want: %s\n got:  %s", wantBytes, gotBytes)
 	}
 }
 
@@ -318,6 +342,32 @@ func nestedInnerRESTAction(ns, name string) *unstructured.Unstructured {
 	}}
 }
 
+// nestedInnerRESTActionArrayStatus builds an inner RESTAction whose
+// top-level filter yields a top-level JSON ARRAY — modelling the REAL
+// compositions-get-ns-and-crd RESTAction, whose resolved status is an
+// array. This is the Ship 0.30.124 content-shape fixture: it is exactly
+// the shape that broke 0.30.123 (a consuming stage's
+// `dependsOn.iterator: ".<id>.status"` does `.status` on the nested
+// result; if ResolveNestedCall returns the bare array instead of the
+// full envelope, `.status` on an array fails and the result is empty).
+func nestedInnerRESTActionArrayStatus(ns, name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "templates.krateo.io/v1",
+		"kind":       "RESTAction",
+		"metadata": map[string]any{
+			"namespace": ns,
+			"name":      name,
+		},
+		"spec": map[string]any{
+			// A filter that yields a top-level ARRAY — restactions.Resolve
+			// writes this verbatim into Status.Raw, so the inner resolve's
+			// BARE status is `[{"ns":"..."}]`.
+			"filter": `[{"ns":"team-a"},{"ns":"team-b"}]`,
+			"api":    []any{},
+		},
+	}}
+}
+
 // nestedCallClusterRole grants `get` on templates.krateo.io restactions.
 func nestedCallGetRole() *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
@@ -346,10 +396,21 @@ func nestedCallRoleBinding(ns, user string) *rbacv1.RoleBinding {
 	}
 }
 
-// newNestedCallWatcher builds a cache=on watcher seeded with one inner
-// RESTAction CR plus the RBAC grants passed in `bindings`. The inner
-// restactions informer is registered + synced so objects.Get serves it.
+// newNestedCallWatcher builds a cache=on watcher seeded with the DEFAULT
+// inner RESTAction CR (nestedInnerRESTAction) plus the RBAC grants. The
+// inner restactions informer is registered + synced so objects.Get
+// serves it.
 func newNestedCallWatcher(t *testing.T, ns, name string, bindings ...*rbacv1.RoleBinding) {
+	t.Helper()
+	newNestedCallWatcherWithInner(t, ns, name, nestedInnerRESTAction(ns, name), bindings...)
+}
+
+// newNestedCallWatcherWithInner is newNestedCallWatcher with the inner
+// RESTAction CR supplied explicitly — so a test can seed a specific
+// status shape (e.g. nestedInnerRESTActionArrayStatus for the Ship
+// 0.30.124 content-shape falsifier).
+func newNestedCallWatcherWithInner(t *testing.T, ns, name string,
+	inner *unstructured.Unstructured, bindings ...*rbacv1.RoleBinding) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
@@ -361,7 +422,7 @@ func newNestedCallWatcher(t *testing.T, ns, name string, bindings ...*rbacv1.Rol
 		cache.ResetDepsForTest()
 	})
 
-	seed := []k8sruntime.Object{nestedInnerRESTAction(ns, name), nestedCallGetRole()}
+	seed := []k8sruntime.Object{inner, nestedCallGetRole()}
 	for _, b := range bindings {
 		seed = append(seed, b)
 	}
@@ -512,8 +573,24 @@ func TestF3_NestedCall_AuthorizedResolveNonEmpty(t *testing.T) {
 		t.Fatalf("F3: authorized nested /call produced EMPTY content — the F2-unblock "+
 			"property requires real non-empty content, not a skip-to-TTL")
 	}
-	if !strings.Contains(string(raw), "resolved") {
-		t.Fatalf("F3: nested /call result missing the inner resolved content; got %s", raw)
+	// Ship 0.30.124 content-shape contract: the result MUST be the full
+	// RESTAction envelope, and the inner resolved content sits under
+	// .status — exactly as the HTTP /call delivers it.
+	var envelope map[string]any
+	if uerr := json.Unmarshal(raw, &envelope); uerr != nil {
+		t.Fatalf("F3: nested /call result is not a JSON object (full envelope): %v\n got %s",
+			uerr, raw)
+	}
+	for _, key := range []string{"kind", "apiVersion", "spec", "status"} {
+		if _, ok := envelope[key]; !ok {
+			t.Fatalf("F3: nested /call result missing envelope key %q — must return "+
+				"the full RESTAction envelope, not the bare status; got %s", key, raw)
+		}
+	}
+	statusBytes, _ := json.Marshal(envelope["status"])
+	if !strings.Contains(string(statusBytes), "resolved") {
+		t.Fatalf("F3: the inner resolved content must be reachable under .status; "+
+			"got status=%s", statusBytes)
 	}
 	// Layer (b): a clean resolve records NO stage error.
 	if got := sink.Load(); got != 0 {
