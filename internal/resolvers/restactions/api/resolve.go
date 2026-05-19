@@ -367,9 +367,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// 0.30.94 contract — sync.Map under the hood, safe to call from
 		// the parent goroutine, no need to record from inside the worker).
 		//
-		// The success-branch log calls mapDepth(dict) which walks dict —
-		// that read must be serialised against concurrent jsonHandler
-		// writes too, so we take dictMu there as well.
+		// The success-branch log's `depth` field is computed by
+		// depthForLog (support.go) — a mapDepth full-tree walk of dict.
+		// Ship #6 gates that walk behind the Debug level; when it DOES
+		// run (Debug on) it reads dict under dictMu, serialising against
+		// concurrent jsonHandler writes. On the common (Info) path
+		// neither the walk nor the lock runs.
 		var dictMu sync.Mutex
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(iterParallelism(ctx))
@@ -528,9 +531,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								return err
 							}
 						}
-						dictMu.Lock()
-						depth := mapDepth(dict)
-						dictMu.Unlock()
+						// Ship #6 — depthForLog runs mapDepth (under dictMu)
+						// ONLY when Debug is enabled; on the common path it
+						// returns the sentinel and does no work / takes no lock.
+						depth := depthForLog(ctx, log, &dictMu, dict)
 						dispatch := "in-process-nested-call"
 						if nerr != nil {
 							dispatch = "in-process-nested-call-error"
@@ -591,9 +595,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								if err := feedValue(gatedVal); err != nil {
 									return err
 								}
-								dictMu.Lock()
-								depth := mapDepth(dict)
-								dictMu.Unlock()
+								// Ship #6 — see depthForLog (support.go).
+								depth := depthForLog(ctx, log, &dictMu, dict)
 								log.Info("api successfully resolved",
 									slog.String("name", id),
 									slog.String("host", call.Endpoint.ServerURL),
@@ -616,9 +619,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						if err := feedBytes(raw); err != nil {
 							return err
 						}
-						dictMu.Lock()
-						depth := mapDepth(dict)
-						dictMu.Unlock()
+						// Ship #6 — see depthForLog (support.go).
+						depth := depthForLog(ctx, log, &dictMu, dict)
 						log.Info("api successfully resolved",
 							slog.String("name", id),
 							slog.String("host", call.Endpoint.ServerURL),
@@ -695,9 +697,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							return err
 						}
 					}
-					dictMu.Lock()
-					depth := mapDepth(dict)
-					dictMu.Unlock()
+					// Ship #6 — see depthForLog (support.go).
+					depth := depthForLog(ctx, log, &dictMu, dict)
 					dispatch := "internal-rest-config"
 					if ierr != nil {
 						dispatch = "internal-rest-config-error"
@@ -753,11 +754,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					// non-hard-error call).
 				}
 
-				// mapDepth walks dict — serialise against concurrent
-				// jsonHandler writes by reading under dictMu.
-				dictMu.Lock()
-				depth := mapDepth(dict)
-				dictMu.Unlock()
+				// Ship #6 — depthForLog runs mapDepth (the full-tree walk)
+				// under dictMu ONLY when Debug is enabled — serialising the
+				// read against concurrent jsonHandler writes. On the common
+				// (Info) path it does no work and takes no lock.
+				depth := depthForLog(ctx, log, &dictMu, dict)
 				log.Info("api successfully resolved",
 					slog.String("name", id),
 					slog.String("host", call.Endpoint.ServerURL),
