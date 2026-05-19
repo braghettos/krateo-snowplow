@@ -1410,7 +1410,13 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 		return nil, false
 	}
 
-	uns, ok := obj.(*unstructured.Unstructured)
+	// Ship H1 — decode-on-access (FINDING 1, cast site 1/5). The
+	// indexer value may be a *bytesObject (composition group, the
+	// GC-lean representation) or a plain *unstructured.Unstructured
+	// (every other GVR, and the CACHE_ENABLED=false path).
+	// decodeBytesObject handles both; a bytesObject is decoded to a
+	// fresh Unstructured, never silently dropped.
+	uns, ok := decodeBytesObject(obj)
 	if !ok {
 		return nil, false
 	}
@@ -1464,7 +1470,11 @@ func listFromIndexer(gi informers.GenericInformer, namespace string) []*unstruct
 
 	out := make([]*unstructured.Unstructured, 0, len(items))
 	for _, it := range items {
-		if uns, ok := it.(*unstructured.Unstructured); ok {
+		// Ship H1 — decode-on-access (FINDING 1, cast site 2/5).
+		// Shared by ListObjects + ListObjectsServable. A bytesObject
+		// is decoded to a fresh Unstructured; a missed conversion
+		// here would silently shrink every composition list.
+		if uns, ok := decodeBytesObject(it); ok {
 			out = append(out, uns)
 		}
 	}
@@ -1644,11 +1654,17 @@ func (rw *ResourceWatcher) listPassthrough(gvr schema.GroupVersionResource, name
 func filterByNamespace(items []interface{}, ns string) []interface{} {
 	out := make([]interface{}, 0, len(items))
 	for _, it := range items {
-		uns, ok := it.(*unstructured.Unstructured)
-		if !ok {
-			continue
-		}
-		if uns.GetNamespace() == ns {
+		// Ship H1 — decode-on-access (FINDING 1, cast site 3/5).
+		// This is a namespace FILTER, not a content read: a
+		// bytesObject embeds ObjectMeta and therefore satisfies
+		// the GetNamespace() accessor directly — no decode of `raw`
+		// is needed to filter. We keep the ORIGINAL item in the
+		// output slice (bytesObject or Unstructured) so the
+		// subsequent listFromIndexer pass decodes it. A plain type
+		// assert to *unstructured.Unstructured would silently drop
+		// every bytesObject here.
+		type nsAccessor interface{ GetNamespace() string }
+		if a, ok := it.(nsAccessor); ok && a.GetNamespace() == ns {
 			out = append(out, it)
 		}
 	}
@@ -1702,7 +1718,15 @@ func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, names
 		return nil, false
 	}
 
-	robj, ok := obj.(runtime.Object)
+	// Ship H1 — decode-on-access (FINDING 1, cast site 4/5).
+	// asRuntimeObject decodes a *bytesObject to an Unstructured
+	// (which IS a runtime.Object) and passes through anything
+	// already a runtime.Object (the typed-RBAC pointers). In
+	// production the composition group — the only bytes-routed GVR —
+	// is never read via GetTypedObject (that path serves the four
+	// RBAC GVRs); this conversion exists so AC-H1.2's all-five-sites
+	// guarantee holds even off the production path.
+	robj, ok := asRuntimeObject(obj)
 	if !ok {
 		return nil, false
 	}
@@ -1755,7 +1779,10 @@ func (rw *ResourceWatcher) ListTypedObjects(gvr schema.GroupVersionResource, nam
 
 	out := make([]runtime.Object, 0, len(items))
 	for _, it := range items {
-		if robj, ok := it.(runtime.Object); ok {
+		// Ship H1 — decode-on-access (FINDING 1, cast site 5/5).
+		// asRuntimeObject decodes a *bytesObject; a missed
+		// conversion would silently shrink the list.
+		if robj, ok := asRuntimeObject(it); ok {
 			out = append(out, robj)
 		}
 	}

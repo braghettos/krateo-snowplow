@@ -105,6 +105,37 @@ var rbacTypedGVRs = []schema.GroupVersionResource{
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"},
 }
 
+// bytesResourceOverrides is the Ship H1 declarative routing set: the
+// GVR *groups* whose informer-store objects are converted to the
+// GC-lean bytesObject representation at SetTransform time.
+//
+// Keyed by GROUP — NOT the full GVR — for the same reason
+// streamingListGVRs (streaming_list.go) is: the composition group
+// hosts one dynamically-named CRD per blueprint, so the resource
+// segment is not known at compile time. The group `composition.krateo.io`
+// is the only compile-time-stable discriminator. A resource-literal
+// key would be the exact special-case feedback_no_special_cases.md
+// forbids; a group key is an additive, declarative routing mechanism —
+// the same shape as resourceOverrides / typedResourceOverrides /
+// streamingListGVRs.
+//
+// H1 scopes the bytes representation to the composition group — the
+// measured ~4.9 GiB / ~152M-live-object offender on the 0.30.130 heap.
+// Widening to other groups is a data-gated follow-up, not an H1
+// decision.
+//
+// Reads are lock-free (write-once at init).
+var bytesResourceOverrides = map[string]struct{}{
+	"composition.krateo.io": {},
+}
+
+// matchesBytesOverrideGroup reports whether gvr's group is routed
+// through the H1 bytesObject representation.
+func matchesBytesOverrideGroup(gvr schema.GroupVersionResource) bool {
+	_, ok := bytesResourceOverrides[gvr.Group]
+	return ok
+}
+
 func init() {
 	// 0.30.6 — register typed-converting transforms for the four
 	// Role-Based Access Control GVRs. Population happens at package
@@ -223,6 +254,41 @@ func StripBulkyFieldsForResourceType(resourceType string, gvr schema.GroupVersio
 
 		pre, post := strip(uns)
 		logFirstStripOnce(resourceType, pre, post)
+
+		// Ship H1 — bytes-backed informer store. AFTER the default
+		// strip has run (SB-1: the pre-existing managedFields /
+		// last-applied policy is preserved exactly — H1 removes NO
+		// field), convert a bytes-override-routed object to the
+		// GC-lean bytesObject. The strip ran first so `raw` carries
+		// the stripped-but-otherwise-complete object JSON — identical
+		// content to what the plain-Unstructured path would have
+		// stored, only a different storage SHAPE.
+		//
+		// SB-2: this block sits INSIDE `if !Disabled()` — a sibling of
+		// the typedResourceOverrides lookup above — so CACHE_ENABLED=
+		// false cleanly reverts to the plain-Unstructured path (the
+		// `return uns, nil` below). SB-3: routing is the declarative
+		// group-keyed bytesResourceOverrides set; no resource literal.
+		//
+		// On marshal failure newBytesObject returns an error and we
+		// fall through to storing the plain Unstructured — a malformed
+		// object never stalls the informer (same fail-open contract as
+		// the typed-RBAC override).
+		if !Disabled() && matchesBytesOverrideGroup(gvr) {
+			if bo, err := newBytesObject(uns); err == nil {
+				logFirstBytesOnce(resourceType, len(bo.raw))
+				return bo, nil
+			} else {
+				slog.Warn("cache.strip.bytes_conversion_failed",
+					slog.String("subsystem", "cache"),
+					slog.String("resource_type", resourceType),
+					slog.String("name", uns.GetName()),
+					slog.String("namespace", uns.GetNamespace()),
+					slog.String("error", err.Error()),
+				)
+			}
+		}
+
 		return uns, nil
 	}
 }
@@ -393,6 +459,37 @@ func logFirstStripOnceTyped(resourceType string, pre, post int, typedKind string
 	)
 }
 
+// logFirstBytesOnce emits the Ship H1 falsifier INFO line on the first
+// bytes-conversion for a given resource type. Subsequent invocations
+// are silent (same once-per-type gate as logFirstStripOnce). The
+// ship row reads this line to confirm the bytes representation is
+// active for the composition group:
+//
+//	strip.bytes_applied resource_type=composition.krateo.io/v1/<crd> raw_bytes=12345
+func logFirstBytesOnce(resourceType string, rawBytes int) {
+	firstBytesLoggedMu.Lock()
+	if _, done := firstBytesLogged[resourceType]; done {
+		firstBytesLoggedMu.Unlock()
+		return
+	}
+	firstBytesLogged[resourceType] = struct{}{}
+	firstBytesLoggedMu.Unlock()
+
+	slog.Info("strip.bytes_applied",
+		slog.String("subsystem", "cache"),
+		slog.String("resource_type", resourceType),
+		slog.Int("raw_bytes", rawBytes),
+		slog.String("hint", "H1 — object stored as GC-lean bytesObject"),
+	)
+}
+
+// firstBytesLogged tracks (per resource type) whether the H1
+// bytes-conversion falsifier line has already been emitted.
+var (
+	firstBytesLoggedMu sync.Mutex
+	firstBytesLogged   = map[string]struct{}{}
+)
+
 // resetStripLoggingForTest is a test-only helper that clears the
 // once-per-resource-type log gate so successive subtests can each
 // observe the first-invocation log.
@@ -400,6 +497,10 @@ func resetStripLoggingForTest() {
 	firstLoggedMu.Lock()
 	firstLogged = map[string]struct{}{}
 	firstLoggedMu.Unlock()
+
+	firstBytesLoggedMu.Lock()
+	firstBytesLogged = map[string]struct{}{}
+	firstBytesLoggedMu.Unlock()
 }
 
 // DisableTypedOverrideForTest removes the typed-converting override

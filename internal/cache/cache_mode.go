@@ -132,9 +132,11 @@ var annotatedGVRs sync.Map // map[schema.GroupVersionResource]struct{}
 // Decision rule:
 //
 //   1. RBAC GVRs are NEVER metadata-only (typed-RBAC needs spec/rules).
-//   2. If the annotated set contains this exact GVR, return true.
-//   3. If any seed pattern matches (Group + Resource-prefix), return true.
-//   4. Otherwise, return false (default: full Unstructured informer).
+//   2. bytes-override groups are NEVER metadata-only (Ship H1 — see
+//      below): the bytes representation needs the FULL object.
+//   3. If the annotated set contains this exact GVR, return true.
+//   4. If any seed pattern matches (Group + Resource-prefix), return true.
+//   5. Otherwise, return false (default: full Unstructured informer).
 //
 // Per the binding constraint in `feedback_no_special_cases.md`: this
 // function is the only place per-GVR routing logic lives. `EnsureResourceType`
@@ -155,19 +157,45 @@ func shouldUseMetadataOnly(gvr schema.GroupVersionResource) bool {
 		return false
 	}
 
-	// Rule 2: annotation-driven (runtime-discovered).
+	// Rule 2 (Ship H1 — B1): a bytes-override group is NEVER
+	// metadata-only. The two routings are MUTUALLY EXCLUSIVE BY DESIGN
+	// and this is the single point that encodes it:
+	//
+	//   - metadata-only stores *metav1.PartialObjectMetadata — it
+	//     DROPS spec/status. It also SKIPS SetTransform
+	//     (addResourceTypeMetadataOnlyLocked, watcher.go) — so the H1
+	//     bytes-override, which lives inside the TransformFunc, would
+	//     never run.
+	//   - the bytes representation IS the memory fix for this group and
+	//     it KEEPS every field (the resolver needs the full
+	//     spec/status; metadata-only would break the resolver, not
+	//     just H1).
+	//
+	// Without this guard a `krateo.io/cache-mode: metadata` annotation
+	// (or a future seed pattern) on a composition CRD could silently
+	// route the composition GVR to the metadata-only path, where H1 is
+	// a no-op: no error, no log, scanobject unchanged — an on-cluster
+	// falsifier would then misread "H1 failed" when H1 never ran. The
+	// guard makes the H1 mechanism robust regardless of cluster
+	// annotation state. It is checked BEFORE the annotation/seed rules
+	// so it strictly wins.
+	if matchesBytesOverrideGroup(gvr) {
+		return false
+	}
+
+	// Rule 3: annotation-driven (runtime-discovered).
 	if _, ok := annotatedGVRs.Load(gvr); ok {
 		return true
 	}
 
-	// Rule 3: static-seed (GVR-pattern).
+	// Rule 4: static-seed (GVR-pattern).
 	for _, pat := range metadataOnlyGVRSeed {
 		if matchesSeed(gvr, pat) {
 			return true
 		}
 	}
 
-	// Rule 4: default — full informer.
+	// Rule 5: default — full informer.
 	return false
 }
 

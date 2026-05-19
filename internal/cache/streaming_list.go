@@ -114,7 +114,38 @@ func (d *streamingDynamicInformer) Informer() clientcache.SharedIndexInformer {
 	return d.informer
 }
 
+// Lister returns a GenericLister over this informer's indexer.
+//
+// Ship H1 — B2 SILENT-DROP GUARD: dynamiclister.New produces a lister
+// whose List/Get type-assert every indexer value to
+// *unstructured.Unstructured. The composition group is routed through
+// BOTH the streaming informer (this type) AND the H1 bytes-override
+// (the SetTransform installed in addResourceTypeLocked stores
+// *bytesObject for this group). A dynamiclister would therefore
+// SILENTLY DROP every bytesObject — an empty/short list, no crash, no
+// log: exactly the FINDING 1 silent-drop defect class, but on a path
+// the five watcher.go cast sites do not cover.
+//
+// Verified at H1 ship time: there are ZERO production callers of
+// Lister() — every cache read goes through GetObject / ListObjects /
+// GetTypedObject / ListTypedObjects (which read GetIndexer() directly
+// and decode-on-access). So this panic is unreachable today.
+//
+// It is retained as a LOUD trap: if a future caller invokes Lister()
+// on a bytes-routed GVR, it fails immediately with a diagnostic
+// message pointing at the fix — rather than silently returning a
+// truncated list that would be misdiagnosed for ships. A future caller
+// that genuinely needs a lister here must add a bytesObject-aware
+// lister (decode-on-access), the same way the five cast sites were
+// converted. Per feedback_no_park_broken_behind_flag: a known
+// silent-drop trap is made loud, not left latent.
 func (d *streamingDynamicInformer) Lister() clientcache.GenericLister {
+	if matchesBytesOverrideGroup(d.gvr) {
+		panic("cache: streamingDynamicInformer.Lister() called for bytes-override GVR " +
+			d.gvr.String() + " — dynamiclister would silently drop *bytesObject values " +
+			"(H1 bytes-backed store). Read via ResourceWatcher.ListObjects / GetObject " +
+			"(decode-on-access) or add a bytesObject-aware lister; do NOT use dynamiclister here.")
+	}
 	return dynamiclister.NewRuntimeObjectShim(dynamiclister.New(d.informer.GetIndexer(), d.gvr))
 }
 
