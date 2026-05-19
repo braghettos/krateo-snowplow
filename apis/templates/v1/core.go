@@ -94,8 +94,27 @@ type UserAccessFilterSpec struct {
 	// = core group. Required (use "" explicitly for core).
 	Group string `json:"group"`
 	// Resource is the plural resource name (e.g. "namespaces").
-	// Required.
-	Resource string `json:"resource"`
+	// The STATIC resource. Required UNLESS ResourcesFrom is set — when
+	// ResourcesFrom is set the resource plural set is derived at
+	// dispatch time and Resource may be left empty.
+	Resource string `json:"resource,omitempty"`
+	// ResourcesFrom is a JQ expression evaluated ONCE against the full
+	// resolve dict, yielding a []string of resource plurals — Ship
+	// 0.30.129. Symmetric with NamespaceFrom (which is jq-evaluated
+	// per object): ResourcesFrom lets the checked resource set itself
+	// be RUNTIME-DISCOVERED rather than a static literal.
+	//
+	// When set, the refilter keeps a namespace iff the user can perform
+	// Verb on ANY plural in the set (OR semantics) in that namespace.
+	// Group stays static (a single API group). When unset, behaviour is
+	// byte-identical to pre-0.30.129 — the static Resource is checked.
+	//
+	// Use case: compositions-get-ns-and-crd discovers the composition
+	// CRD plurals at runtime in dict["crds"]; resourcesFrom evaluates
+	// "[ (.crds // [])[] | .plural ]" so the per-namespace RBAC prune
+	// covers exactly the discovered composition CRDs — no hardcoded
+	// plural literal.
+	ResourcesFrom string `json:"resourcesFrom,omitempty"`
 	// NamespaceFrom is a JQ path expression evaluated against each
 	// returned object to derive the per-object namespace for the
 	// EvaluateRBAC call. Typical values:

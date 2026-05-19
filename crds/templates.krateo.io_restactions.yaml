@@ -141,7 +141,19 @@ spec:
                         resource:
                           description: |-
                             Resource is the plural resource name (e.g. "namespaces").
-                            Required.
+                            The STATIC resource. Required UNLESS ResourcesFrom is set —
+                            when ResourcesFrom is set the resource plural set is derived
+                            at dispatch time and Resource may be left empty.
+                          type: string
+                        resourcesFrom:
+                          description: |-
+                            ResourcesFrom is a JQ expression evaluated ONCE against the
+                            full resolve dict, yielding a []string of resource plurals
+                            (Ship 0.30.129). Symmetric with NamespaceFrom. When set, the
+                            refilter keeps a namespace iff the user can perform Verb on
+                            ANY plural in the set (OR semantics) in that namespace; Group
+                            stays static. When unset, behaviour is byte-identical to
+                            pre-0.30.129 — the static Resource is checked.
                           type: string
                         verb:
                           description: |-
@@ -150,7 +162,6 @@ spec:
                           type: string
                       required:
                       - group
-                      - resource
                       - verb
                       type: object
                     verb:

@@ -105,7 +105,7 @@ func TestFalsifierF3_RefilterScalarItems(t *testing.T) {
 	ctx := ctxWithUser("cyberjoker", "devs")
 
 	kept, dropped, calls := refilterSlice(ctx, scalarFalsifierLogger(),
-		"cyberjoker", []string{"devs"}, scalarTestUAF(), items)
+		"cyberjoker", []string{"devs"}, scalarTestUAF(), []string{"namespaces"}, items)
 
 	if calls != 3 {
 		t.Fatalf("F3-scalar: EvaluateRBAC calls = %d; want 3 (one per scalar item) "+
@@ -150,7 +150,7 @@ func TestFalsifierF3_RefilterObjectItems(t *testing.T) {
 	ctx := ctxWithUser("cyberjoker", "devs")
 
 	kept, dropped, calls := refilterSlice(ctx, scalarFalsifierLogger(),
-		"cyberjoker", []string{"devs"}, uaf, items)
+		"cyberjoker", []string{"devs"}, uaf, []string{"namespaces"}, items)
 
 	if calls != 3 {
 		t.Fatalf("F3-object: calls = %d; want 3", calls)
@@ -177,7 +177,7 @@ func TestFalsifierF3_RefilterDenyPaths(t *testing.T) {
 		Verb: "list", Group: "", Resource: "namespaces", NamespaceFrom: ".metadata.name",
 	}
 	kept, dropped, _ := refilterSlice(ctx, log, "cyberjoker", []string{"devs"},
-		badUAF, []any{"ns-a"})
+		badUAF, []string{"namespaces"}, []any{"ns-a"})
 	if len(kept) != 0 || dropped != 1 {
 		t.Fatalf("F3-deny: a namespaceFrom error on a scalar must deny; got kept=%d dropped=%d",
 			len(kept), dropped)
@@ -185,7 +185,7 @@ func TestFalsifierF3_RefilterDenyPaths(t *testing.T) {
 
 	// Leg 2 — an unhandleable item type (int, nil) → conservative-deny.
 	kept2, dropped2, _ := refilterSlice(ctx, log, "cyberjoker", []string{"devs"},
-		scalarTestUAF(), []any{42, nil})
+		scalarTestUAF(), []string{"namespaces"}, []any{42, nil})
 	if len(kept2) != 0 || dropped2 != 2 {
 		t.Fatalf("F3-deny: unhandleable item types must be conservative-denied; got kept=%d dropped=%d",
 			len(kept2), dropped2)

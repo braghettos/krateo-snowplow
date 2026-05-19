@@ -17,6 +17,8 @@ package api
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -300,4 +302,131 @@ func TestTrimJSONString(t *testing.T) {
 			t.Errorf("trimJSONString(%q) = %q; want %q", c.in, got, c.want)
 		}
 	}
+}
+
+// --- Ship 0.30.129 — ResourcesFrom (RBAC-aware fan-out) -------------------
+
+// TestResourcesFrom_MultiCRD_ORSemantics is AC-129.3: a UAF with
+// resourcesFrom jq-deriving TWO synthetic composition CRD plurals from
+// dict["crds"]. cyberjoker is permitted to `list` ONLY the first plural
+// (compaaa) in bench-ns-01. OR semantics: a namespace is kept iff the
+// user can list ANY plural there — so bench-ns-01 is KEPT (granted on
+// compaaa), bench-ns-02/03 dropped (granted on neither).
+func TestResourcesFrom_MultiCRD_ORSemantics(t *testing.T) {
+	// RBAC: "devs" may list compaaa (only) in bench-ns-01. No grant for
+	// compbbb anywhere — proves the keep came from the OR over compaaa.
+	role := &rbacv1.Role{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ns01-compaaa-lister", Namespace: "bench-ns-01"},
+		Rules: []rbacv1.PolicyRule{
+			{
+				Verbs:     []string{"list"},
+				APIGroups: []string{"composition.krateo.io"},
+				Resources: []string{"compaaa"},
+			},
+		},
+	}
+	binding := &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ns01-compaaa-lister-binding", Namespace: "bench-ns-01"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "Group", APIGroup: "rbac.authorization.k8s.io", Name: "devs"},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "ns01-compaaa-lister",
+		},
+	}
+	newRefilterTestWatcher(t, role, binding)
+
+	apiCall := &templates.API{
+		Name: "namespaces",
+		UserAccessFilter: &templates.UserAccessFilterSpec{
+			Verb:  "list",
+			Group: "composition.krateo.io",
+			// No static Resource — resourcesFrom supplies the set.
+			ResourcesFrom: "[ (.crds // [])[] | .plural ]",
+			NamespaceFrom: ".",
+		},
+	}
+	// dict carries the runtime-discovered CRD plurals + the namespaces
+	// stage output (a name-string array, the post-filter shape).
+	dict := map[string]any{
+		"crds": []any{
+			map[string]any{"plural": "compaaa"},
+			map[string]any{"plural": "compbbb"},
+		},
+		"namespaces": []any{"bench-ns-01", "bench-ns-02", "bench-ns-03"},
+	}
+
+	ctx := ctxWithUser("cyberjoker", "devs")
+	res := applyUserAccessFilter(ctx, dict, apiCall)
+
+	if res.Kept != 1 {
+		t.Errorf("AC-129.3: kept = %d; want 1 (bench-ns-01 — granted on compaaa via OR)", res.Kept)
+	}
+	if res.Dropped != 2 {
+		t.Errorf("AC-129.3: dropped = %d; want 2", res.Dropped)
+	}
+	kept, _ := dict["namespaces"].([]any)
+	if len(kept) != 1 || kept[0] != "bench-ns-01" {
+		t.Fatalf("AC-129.3: kept namespaces = %v; want [bench-ns-01]", kept)
+	}
+}
+
+// TestResourcesFrom_Unset_ByteIdentical is AC-129.7: with ResourcesFrom
+// unset, resolveUAFResources returns exactly [uaf.Resource] and the
+// refilter behaves byte-identically to pre-0.30.129 — the static
+// Resource is checked, existing UAFs unaffected.
+func TestResourcesFrom_Unset_ByteIdentical(t *testing.T) {
+	uaf := &templates.UserAccessFilterSpec{
+		Verb: "get", Group: "composition.krateo.io", Resource: "compositions",
+	}
+	got, ok := resolveUAFResources(context.Background(), discardLogger(), uaf, map[string]any{})
+	if !ok {
+		t.Fatalf("AC-129.7: resolveUAFResources(unset) must succeed")
+	}
+	if len(got) != 1 || got[0] != "compositions" {
+		t.Fatalf("AC-129.7: ResourcesFrom unset must yield exactly [uaf.Resource]; got %v", got)
+	}
+}
+
+// TestResourcesFrom_FailClosed covers the AC-129.9 / fail-closed paths:
+// a ResourcesFrom that errors, yields a non-array, or a non-string
+// element returns ok=false (caller drops all); an empty array yields
+// ([], true) and evalSingle then denies every item.
+func TestResourcesFrom_FailClosed(t *testing.T) {
+	log := discardLogger()
+	dict := map[string]any{"crds": []any{map[string]any{"plural": "compaaa"}}}
+
+	// JQ error → fail-closed.
+	if _, ok := resolveUAFResources(context.Background(), log,
+		&templates.UserAccessFilterSpec{ResourcesFrom: ".this | broken("}, dict); ok {
+		t.Errorf("fail-closed: a ResourcesFrom JQ error must return ok=false")
+	}
+	// Non-array result → fail-closed.
+	if _, ok := resolveUAFResources(context.Background(), log,
+		&templates.UserAccessFilterSpec{ResourcesFrom: ".crds | length"}, dict); ok {
+		t.Errorf("fail-closed: a non-array ResourcesFrom result must return ok=false")
+	}
+	// Non-string element → fail-closed.
+	if _, ok := resolveUAFResources(context.Background(), log,
+		&templates.UserAccessFilterSpec{ResourcesFrom: "[ (.crds // [])[] ]"}, dict); ok {
+		t.Errorf("fail-closed: a non-string element must return ok=false")
+	}
+	// Empty array → ([], true): valid, but evalSingle then denies all.
+	got, ok := resolveUAFResources(context.Background(), log,
+		&templates.UserAccessFilterSpec{ResourcesFrom: "[]"}, dict)
+	if !ok || len(got) != 0 {
+		t.Fatalf("an empty ResourcesFrom array must yield ([], true); got %v ok=%v", got, ok)
+	}
+	if evalSingle(context.Background(), log, "u", []string{"g"},
+		&templates.UserAccessFilterSpec{Verb: "list"}, nil, "ns-a") {
+		t.Errorf("fail-closed: evalSingle with an empty resource set must DENY")
+	}
+}
+
+// discardLogger is a no-op slog.Logger for the resolveUAFResources unit
+// tests (they assert return values, not log output).
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

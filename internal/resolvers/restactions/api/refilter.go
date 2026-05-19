@@ -33,6 +33,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -89,6 +90,22 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		return res
 	}
 
+	// Ship 0.30.129 — resolve the RBAC resource-plural set ONCE per
+	// dispatch. With ResourcesFrom set, the set is jq-evaluated against
+	// the full dict (runtime-discovered plurals); unset, it is the
+	// single static uaf.Resource. resolveUAFResources fails closed: a
+	// ResourcesFrom that errors or yields an empty set returns an empty
+	// slice — and evalSingle with an empty resource set DENIES every
+	// item (no resource to grant against), never allow-all.
+	resources, resOK := resolveUAFResources(ctx, log, uaf, dict)
+	if !resOK {
+		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
+			slog.String("api", apiCall.Name),
+		)
+		_ = setRefilteredEmpty(dict, apiCall.Name)
+		return res
+	}
+
 	raw, ok := dict[apiCall.Name]
 	if !ok || raw == nil {
 		return res
@@ -102,7 +119,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 			// Some endpoints return a single object without an "items"
 			// wrapper (cluster-scoped GET-by-name). Treat the whole
 			// map as the single object.
-			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, v)
+			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v)
 			res.EvaluateRBACCalls++
 			if permitted {
 				res.Kept++
@@ -120,14 +137,14 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 			)
 			return res
 		}
-		kept, dropped, calls := refilterSlice(ctx, log, user.Username, user.Groups, uaf, items)
+		kept, dropped, calls := refilterSlice(ctx, log, user.Username, user.Groups, uaf, resources, items)
 		v["items"] = kept
 		res.Kept = len(kept)
 		res.Dropped = dropped
 		res.EvaluateRBACCalls = calls
 
 	case []any:
-		kept, dropped, calls := refilterSlice(ctx, log, user.Username, user.Groups, uaf, v)
+		kept, dropped, calls := refilterSlice(ctx, log, user.Username, user.Groups, uaf, resources, v)
 		dict[apiCall.Name] = kept
 		res.Kept = len(kept)
 		res.Dropped = dropped
@@ -163,7 +180,7 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 // RBAC fail-closed is preserved on every branch: a NamespaceFrom JQ
 // error denies the item; an EvaluateRBAC error denies the item; a
 // scalar the user has no grant for is dropped by EvaluateRBAC.
-func refilterSlice(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, items []any) ([]any, int, int) {
+func refilterSlice(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, items []any) ([]any, int, int) {
 	kept := make([]any, 0, len(items))
 	dropped := 0
 	calls := 0
@@ -173,7 +190,7 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 			// Object OR bare scalar — both reach the evaluator. evalSingle
 			// resolves NamespaceFrom against the item (jq handles a string
 			// receiver fine) and calls EvaluateRBAC.
-			permitted := evalSingle(ctx, log, username, groups, uaf, item)
+			permitted := evalSingle(ctx, log, username, groups, uaf, resources, item)
 			calls++
 			if permitted {
 				kept = append(kept, item)
@@ -191,18 +208,23 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 }
 
 // evalSingle resolves NamespaceFrom against item and calls EvaluateRBAC.
-// Returns true iff RBAC permits the (verb, group, resource, ns) tuple
-// for (username, groups).
+// Returns true iff RBAC permits (verb, group, <resource>, ns) for
+// (username, groups) for AT LEAST ONE resource in `resources` — the
+// Ship 0.30.129 OR semantics: a namespace is kept iff the user can
+// perform Verb on ANY of the resolved resource plurals there.
+//
+// `resources` is the resolved plural set (resolveUAFResources): a single
+// element [uaf.Resource] when ResourcesFrom is unset (pre-0.30.129
+// behaviour, byte-identical), or the jq-derived set when it is set.
 //
 // item is any (0.30.111 Part 1): a K8s object (map[string]any) OR a
 // bare scalar (string — the namespaces-stage name-array shape). jq
 // evaluates a string receiver fine, so namespaceFrom:"." on "ns-01"
-// yields "ns-01". The single-object caller (applyUserAccessFilter's
-// no-"items"-wrapper branch) still passes a map — the widened any
-// parameter accepts it with no behaviour change.
+// yields "ns-01".
 //
-// JQ-eval errors and RBAC errors both fail closed.
-func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, item any) bool {
+// JQ-eval errors and RBAC errors both fail closed. An EMPTY `resources`
+// set denies (no resource to grant against) — never allow-all.
+func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any) bool {
 	namespace := ""
 	if uaf.NamespaceFrom != "" {
 		ns, err := evalJQString(ctx, uaf.NamespaceFrom, item)
@@ -216,26 +238,97 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 		namespace = ns
 	}
 
-	allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  username,
-		Groups:    groups,
-		Verb:      uaf.Verb,
-		Group:     uaf.Group,
-		Resource:  uaf.Resource,
-		Namespace: namespace,
+	// OR semantics: keep the item iff the user is permitted on ANY
+	// resource in the set. An empty set yields no iterations -> false
+	// (fail-closed — an unresolvable / empty resource set never permits).
+	for _, resource := range resources {
+		allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+			Username:  username,
+			Groups:    groups,
+			Verb:      uaf.Verb,
+			Group:     uaf.Group,
+			Resource:  resource,
+			Namespace: namespace,
+		})
+		if err != nil {
+			log.Warn("userAccessFilter: EvaluateRBAC error; treating resource as denied",
+				slog.String("user", username),
+				slog.String("verb", uaf.Verb),
+				slog.String("group", uaf.Group),
+				slog.String("resource", resource),
+				slog.String("namespace", namespace),
+				slog.Any("err", err),
+			)
+			continue // a transient evaluator error on one resource must
+			// not mask a genuine grant on another — but it also must not
+			// permit: try the rest, default-deny if none grant.
+		}
+		if allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveUAFResources resolves the RBAC resource-plural set for a UAF
+// dispatch — Ship 0.30.129.
+//
+//   - ResourcesFrom unset: the set is the single static uaf.Resource.
+//     Returns ([uaf.Resource], true) — pre-0.30.129 behaviour,
+//     byte-identical. (An empty static Resource yields [""] — and an old
+//     resolver path; evalSingle then checks resource "" which RBAC never
+//     grants, i.e. fail-closed. That is the AC-129.9 cross-repo
+//     deploy-order safety.)
+//   - ResourcesFrom set: the expression is jq-evaluated ONCE against the
+//     full dict, expected to yield a JSON array of strings. A jq error,
+//     a non-array result, or a non-string element FAILS CLOSED — returns
+//     (nil, false); the caller drops all items. An empty array is a
+//     valid "no resources" answer: returns ([], true), and evalSingle
+//     then denies every item (no resource to grant against).
+func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.UserAccessFilterSpec, dict map[string]any) ([]string, bool) {
+	if uaf.ResourcesFrom == "" {
+		return []string{uaf.Resource}, true
+	}
+	v, err := jqutil.Eval(ctx, jqutil.EvalOptions{
+		Query:        uaf.ResourcesFrom,
+		Data:         dict,
+		ModuleLoader: jqsupport.ModuleLoader(),
 	})
 	if err != nil {
-		log.Warn("userAccessFilter: EvaluateRBAC error; treating item as denied",
-			slog.String("user", username),
-			slog.String("verb", uaf.Verb),
-			slog.String("group", uaf.Group),
-			slog.String("resource", uaf.Resource),
-			slog.String("namespace", namespace),
+		log.Warn("userAccessFilter: ResourcesFrom JQ eval failed; fail-closed",
+			slog.String("expr", uaf.ResourcesFrom),
 			slog.Any("err", err),
 		)
-		return false
+		return nil, false
 	}
-	return allowed
+	var arr []any
+	if uerr := json.Unmarshal([]byte(v), &arr); uerr != nil {
+		log.Warn("userAccessFilter: ResourcesFrom result is not a JSON array; fail-closed",
+			slog.String("expr", uaf.ResourcesFrom),
+			slog.Any("err", uerr),
+		)
+		return nil, false
+	}
+	out := make([]string, 0, len(arr))
+	seen := map[string]struct{}{}
+	for _, e := range arr {
+		s, ok := e.(string)
+		if !ok {
+			log.Warn("userAccessFilter: ResourcesFrom yielded a non-string element; fail-closed",
+				slog.String("expr", uaf.ResourcesFrom),
+			)
+			return nil, false
+		}
+		if s == "" {
+			continue // skip empty plurals — they grant nothing
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out, true
 }
 
 // evalJQString evaluates expr against data and returns a Go string. The
