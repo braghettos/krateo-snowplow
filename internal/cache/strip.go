@@ -115,26 +115,37 @@ var rbacTypedGVRs = []schema.GroupVersionResource{
 //   - the H2a streaming-list routing (matchesStreamingListGroup in
 //     streaming_list.go DERIVES from this set — it is not a separate
 //     map).
+//
 // Post-H2a the streaming LIST decodes items directly into bytesObject,
 // so streaming a GVR and storing it as bytes are inseparable — one set
 // expresses both. A second group map would let the two drift and
 // silently half-disable H2a.
 //
-// Keyed by GROUP — NOT the full GVR — because the composition group
-// hosts one dynamically-named CRD per blueprint, so the resource
-// segment is not known at compile time. The group `composition.krateo.io`
-// is the only compile-time-stable discriminator. A resource-literal key
-// would be the exact special-case feedback_no_special_cases.md forbids;
-// a group key is an additive, declarative routing mechanism — the same
-// shape as resourceOverrides / typedResourceOverrides.
+// Keyed by GROUP — NOT the full GVR — because these groups host
+// dynamically-named CRDs (the composition group one per blueprint; the
+// widgets group nine widget kinds), so the resource segment is not
+// known at compile time. The group is the only compile-time-stable
+// discriminator. A resource-literal key would be the exact
+// special-case feedback_no_special_cases.md forbids; a group key is an
+// additive, declarative routing mechanism — the same shape as
+// resourceOverrides / typedResourceOverrides.
 //
-// Scoped to the composition group — the measured LIST-decode offender
-// (5.28 GiB UnstructuredList.UnmarshalJSON on the 0.30.131 heap).
-// Widening to other groups is a data-gated follow-up.
+// Membership — each entry is a data-gated heap-attribution finding:
+//   - composition.krateo.io — the 0.30.131 LIST-decode offender
+//     (5.28 GiB UnstructuredList.UnmarshalJSON).
+//   - widgets.templates.krateo.io (Ship H4) — the team-lead-verified
+//     0.30.133 heap attribution: NewFilteredDynamicInformer.func3 =
+//     4,440 MB / ~74% of heap = the STOCK informers for the entire
+//     widgets group (~720K objects across 9 populated GVRs). Adding
+//     the group key routes every widget GVR through the SAME
+//     streaming-list + bytesObject machinery compositions already use
+//     — no code-logic change, the 0.30.133 hoist makes it
+//     timing-independent.
 //
 // Reads are lock-free (write-once at init).
 var bytesResourceOverrides = map[string]struct{}{
-	"composition.krateo.io": {},
+	"composition.krateo.io":       {},
+	"widgets.templates.krateo.io": {},
 }
 
 // matchesBytesOverrideGroup reports whether gvr's group is routed
