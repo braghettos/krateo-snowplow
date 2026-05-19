@@ -398,15 +398,37 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				call.Endpoint = &ep
 			}
 			// Wrap jsonHandler so every dict[id] mutation goes through
-			// dictMu. The inner closure is the per-call ResponseHandler
-			// that httpcall.Do invokes from inside its goroutine.
-			inner := jsonHandler(gctx, jsonHandlerOptions{
-				key: id, out: dict, filter: apiCall.Filter,
-			})
+			// dictMu. Three forms — Ship 0.30.128 P-CORE-1/2:
+			//   * inner (io.ReadCloser) — the genuine httpcall.Do HTTP-body
+			//     path; set as call.ResponseHandler.
+			//   * innerBytes ([]byte) — an in-memory dispatch result whose
+			//     bytes are already materialised (informer-served, nested
+			//     /call, internal-rest-config); skips the redundant
+			//     io.ReadAll copy.
+			//   * innerValue (any) — an apistage content-cache hit whose
+			//     gated envelope is already a decoded structured value;
+			//     skips both the marshal and the unmarshal.
+			hOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
+			inner := jsonHandler(gctx, hOpts)
+			innerBytesFn := jsonHandlerBytes(gctx, hOpts)
+			innerValueFn := jsonHandlerValue(gctx, hOpts)
 			call.ResponseHandler = func(r io.ReadCloser) error {
 				dictMu.Lock()
 				defer dictMu.Unlock()
 				return inner(r)
+			}
+			// feedBytes / feedValue are the dictMu-protected in-memory
+			// equivalents the readerFromBytes call sites below use instead
+			// of call.ResponseHandler(readerFromBytes(...)).
+			feedBytes := func(b []byte) error {
+				dictMu.Lock()
+				defer dictMu.Unlock()
+				return innerBytesFn(b)
+			}
+			feedValue := func(v any) error {
+				dictMu.Lock()
+				defer dictMu.Unlock()
+				return innerValueFn(v)
 			}
 
 			// Edge type 3 dep recording — see 0.30.94 ship for full
@@ -499,9 +521,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						} else {
 							// The in-process result IS the referenced
 							// RESTAction's Status.Raw — byte-identical to the
-							// HTTP /call response body. Feed it to the stage's
-							// ResponseHandler exactly as the HTTP return is fed.
-							if err := call.ResponseHandler(readerFromBytes(statusRaw)); err != nil {
+							// HTTP /call response body. Feed the in-memory
+							// bytes directly (Ship 0.30.128 P-CORE-1 — no
+							// io.ReadAll copy).
+							if err := feedBytes(statusRaw); err != nil {
 								return err
 							}
 						}
@@ -560,9 +583,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// to the 0.30.118 pivot path.
 				if resolverUseInformer() == "true" {
 					if apistageEnabled {
-						if raw, served, ok := apistageContentServe(gctx, apistageStore, call); ok {
+						if gatedVal, served, ok := apistageContentServe(gctx, apistageStore, call); ok {
 							if served {
-								if err := call.ResponseHandler(readerFromBytes(raw)); err != nil {
+								// Ship 0.30.128 P-CORE-2: the gated envelope
+								// is already a decoded structured value —
+								// feed it direct (no marshal, no unmarshal).
+								if err := feedValue(gatedVal); err != nil {
 									return err
 								}
 								dictMu.Lock()
@@ -585,7 +611,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						// call (not pivot-servable: write verb, external URL,
 						// metadata-only GVR, pre-sync). Fall through.
 					} else if raw, served := dispatchViaInformer(gctx, call); served {
-						if err := call.ResponseHandler(readerFromBytes(raw)); err != nil {
+						// Informer-served bytes are in memory — feed direct
+						// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy).
+						if err := feedBytes(raw); err != nil {
 							return err
 						}
 						dictMu.Lock()
@@ -661,7 +689,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						// success-log line and return, mirroring the
 						// httpcall.Do ContinueOnError fall-through.
 					} else {
-						if err := call.ResponseHandler(readerFromBytes(raw)); err != nil {
+						// internal-rest-config dispatch result is in memory
+						// — feed direct (Ship 0.30.128 P-CORE-1).
+						if err := feedBytes(raw); err != nil {
 							return err
 						}
 					}

@@ -20,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestResolvedCacheEnabled_CacheDisabledMeansL1Off(t *testing.T) {
@@ -368,5 +370,58 @@ func TestApistageL1Enabled_DefaultOffAndGates(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
 	if !ApistageL1Enabled() {
 		t.Fatalf("AC-E6: apistage L1 must be on when all three gates are open")
+	}
+}
+
+// TestEntryBytes_DecodedFormWeighsMoreThanRaw is the Ship 0.30.128
+// P-CORE-2 PM-binding LRU-accounting test. An apistage content entry
+// carries the decoded structured form (the R3 Items tree) so a cache hit
+// hands back the already-decoded value. The LRU maxBytes accounting MUST
+// count that decoded resident size, not just the RawJSON length —
+// otherwise every content entry silently under-counts and the cache size
+// bound (curBytes vs maxBytes) is broken.
+//
+// This asserts entryBytes for an entry CARRYING the decoded form weighs
+// STRICTLY MORE than the same entry's raw byte length — i.e. the decoded
+// tree is genuinely accounted, not dropped.
+func TestEntryBytes_DecodedFormWeighsMoreThanRaw(t *testing.T) {
+	raw := []byte(`{"apiVersion":"composition.krateo.io/v1","kind":"GithubScaffoldingsList",` +
+		`"items":[{"metadata":{"name":"c1","namespace":"ns-a"}},` +
+		`{"metadata":{"name":"c2","namespace":"ns-b"}}]}`)
+
+	// Entry with ONLY RawJSON — no decoded form.
+	rawOnly := &ResolvedEntry{
+		RawJSON: raw,
+		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage},
+	}
+	// Same entry, additionally carrying the decoded Items tree (what an
+	// apistage LIST content entry holds post-R3 / P-CORE-2).
+	withDecoded := &ResolvedEntry{
+		RawJSON: raw,
+		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage},
+		Items: []*unstructured.Unstructured{
+			{Object: map[string]any{"metadata": map[string]any{"name": "c1", "namespace": "ns-a"}}},
+			{Object: map[string]any{"metadata": map[string]any{"name": "c2", "namespace": "ns-b"}}},
+		},
+		ItemsAPIVersion: "composition.krateo.io/v1",
+		ItemsKind:       "GithubScaffoldingsList",
+	}
+
+	rawWeight := entryBytes(rawOnly)
+	decodedWeight := entryBytes(withDecoded)
+
+	// The raw-only weight is exactly the byte length.
+	if rawWeight != int64(len(raw)) {
+		t.Fatalf("entryBytes(raw-only) = %d, want exactly len(RawJSON) = %d",
+			rawWeight, len(raw))
+	}
+	// The decoded-form entry MUST weigh strictly more — the decoded tree
+	// is counted, not dropped. A miss here means the LRU cap under-counts
+	// every apistage content entry (the PM-binding failure mode).
+	if decodedWeight <= rawWeight {
+		t.Fatalf("LRU under-count: entryBytes for an entry carrying the decoded form "+
+			"= %d, NOT strictly greater than the raw byte length %d — the decoded "+
+			"resident tree is not being accounted; the maxBytes bound is broken",
+			decodedWeight, rawWeight)
 	}
 }

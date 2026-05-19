@@ -97,13 +97,19 @@ func gateContentEnvelope(
 		GetVerb() string
 	},
 	raw []byte,
-) ([]byte, bool) {
+) (any, bool) {
 	gvr, _, name, parseOK := cache.ParseAPIServerPathToDep(call.GetPath())
 	if !parseOK {
 		// Not an apiserver GVR path — the content layer never produced
 		// this; pass the bytes through un-gated (defensive — the caller
-		// only invokes the gate for content-served calls).
-		return raw, true
+		// only invokes the gate for content-served calls). Decode to a
+		// value so the return type matches the gated paths (Ship 0.30.128
+		// P-CORE-2).
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, false
+		}
+		return v, true
 	}
 	if name == "" {
 		// LIST envelope: {apiVersion, kind, items:[...]}.
@@ -155,22 +161,44 @@ func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListE
 }
 
 // gateListItems runs filterListByRBAC over an ALREADY-PARSED item slice
-// and re-marshals the narrowed set into the apiserver-shaped envelope —
-// Ship 0.30.121 R3. This is the unmarshal-free gate path: identical
-// parse->filter->marshalAsList pipeline to gateListEnvelope, only the
-// json.Unmarshal has been hoisted out to the Put site (parseListEnvelope).
-func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed parsedListEnvelope) ([]byte, bool) {
+// and assembles the narrowed set into the apiserver-shaped envelope as a
+// DECODED structured value (map[string]any) — Ship 0.30.128 P-CORE-2.
+//
+// Pre-0.30.128 this re-marshalled the narrowed set to []byte
+// (marshalAsList) so the stage jsonHandler could io.ReadAll +
+// json.Unmarshal it straight back — a redundant marshal+unmarshal on
+// EVERY content-cache hit. It now returns the envelope value directly;
+// jsonHandlerValue consumes it with no marshal and no unmarshal. The
+// envelope map is built exactly as marshalAsList builds it
+// (apiVersion/kind/items), so the eventual served body is byte-identical
+// (AC-128.4) — only the decode timing moves.
+func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed parsedListEnvelope) (any, bool) {
 	kept, identityOK := filterListByRBAC(ctx, gvr, parsed.items)
 	if !identityOK {
 		// FAIL-CLOSED: no identity — same contract as the inline gate's
 		// served=false (caller falls through to the apiserver).
 		return nil, false
 	}
-	gated, err := marshalAsList(parsed.apiVersion, parsed.kind, kept)
-	if err != nil {
-		return nil, false
+	return listEnvelopeValue(parsed.apiVersion, parsed.kind, kept), true
+}
+
+// listEnvelopeValue assembles the apiserver-shaped LIST envelope as a
+// decoded map[string]any — the structured equivalent of marshalAsList's
+// input, returned WITHOUT the json.Marshal. Field set + ordering of the
+// map are irrelevant to the served body: the stage filter / jsonHandler
+// operate on the decoded value and re-encode canonically downstream.
+func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstructured) map[string]any {
+	itemList := make([]any, 0, len(items))
+	for _, it := range items {
+		if it != nil {
+			itemList = append(itemList, it.Object)
+		}
 	}
-	return gated, true
+	return map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       listKind,
+		"items":      itemList,
+	}
 }
 
 // gateListEnvelope unmarshals a LIST envelope, runs filterListByRBAC over
@@ -183,7 +211,7 @@ func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed 
 // envelope, or a refresh path that stored RawJSON only). The hot path
 // (a content-Get-hit on an entry with Items) goes through gateListItems
 // and never reaches here. Output is byte-identical between the two.
-func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) ([]byte, bool) {
+func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (any, bool) {
 	parsed, ok := parseListEnvelope(gvr, raw)
 	if !ok {
 		// A malformed stored envelope cannot be vouched for — fail closed.
@@ -195,7 +223,7 @@ func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw 
 // gateGetEnvelope runs filterGetByRBAC on a single-object envelope.
 // A denied / no-identity object is fail-closed (served=false) — the
 // caller falls through to the apiserver, whose per-user token 403s.
-func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) ([]byte, bool) {
+func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (any, bool) {
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, false
@@ -204,7 +232,9 @@ func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw [
 	if !filterGetByRBAC(ctx, gvr, u) {
 		return nil, false
 	}
-	return raw, true
+	// Ship 0.30.128 P-CORE-2: return the decoded object value, not the
+	// raw bytes — jsonHandlerValue consumes it with no re-unmarshal.
+	return obj, true
 }
 
 // apiVersionForGVR renders a GVR's apiVersion: "v1" for the core group,
@@ -237,7 +267,7 @@ func (c callPathVerb) GetVerb() string {
 // one K8s call. It is invoked from resolve.go's g.Go worker when the
 // resolver pivot is on AND the content-keyed api-stage L1 is enabled.
 //
-// Returns (raw, served, ok):
+// Returns (value, served, ok):
 //   - ok==false  — the content layer cannot serve this call (it is not
 //     pivot-servable: a write verb, an external URL, a metadata-only
 //     GVR, a pre-sync informer, a non-apiserver path). The caller falls
@@ -246,15 +276,16 @@ func (c callPathVerb) GetVerb() string {
 //   - ok==true, served==false — fail-closed: no identity on ctx, or a
 //     GET the requester is denied. The caller falls through to the
 //     apiserver branch, whose per-user token narrows correctly.
-//   - ok==true, served==true — `raw` is the RBAC-GATED envelope to feed
-//     the stage's ResponseHandler.
+//   - ok==true, served==true — `value` is the RBAC-GATED envelope as an
+//     already-DECODED structured value (Ship 0.30.128 P-CORE-2). The
+//     caller feeds it to jsonHandlerValue — no marshal, no unmarshal.
 //
 // Pipeline (per the F1 spec):
 //  1. content key from call.Path via ParseAPIServerPathToDep.
-//  2. content Get — HIT: stored raw envelope. MISS: dispatch UN-GATED
-//     (WithApistageContentResolve) + Put the raw envelope.
-//  3. gate the raw envelope with the request identity (the single F1
-//     gate site — runs on hit AND miss).
+//  2. content Get — HIT: stored entry (R3 pre-parsed Items reused).
+//     MISS: dispatch UN-GATED (WithApistageContentResolve) + Put.
+//  3. gate with the request identity, returning the DECODED envelope
+//     value (the single F1 gate site — runs on hit AND miss).
 //
 // On the prewarm path (cache.ApistagePrewarmFromContext, wired by F2)
 // step 3 is skipped — the prewarm resolve has no requester; it only
@@ -264,7 +295,7 @@ func apistageContentServe(
 	ctx context.Context,
 	store *cache.ResolvedCacheStore,
 	call httpcall.RequestOptions,
-) (raw []byte, served bool, ok bool) {
+) (value any, served bool, ok bool) {
 	log := xcontext.Logger(ctx)
 
 	// Content-keyed entries describe apiserver GET/LIST calls only — the
@@ -358,8 +389,10 @@ func apistageContentServe(
 	}
 	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
 	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
-	// takes gateContentEnvelope's RawJSON path. Output is byte-identical.
-	var gated []byte
+	// takes gateContentEnvelope's RawJSON path. Ship 0.30.128 P-CORE-2:
+	// the gate now returns the DECODED envelope value, so the caller
+	// feeds it via jsonHandlerValue with no marshal + no unmarshal.
+	var gated any
 	var gateOK bool
 	if haveParsed {
 		gated, gateOK = gateListItems(ctx, gvr, parsed)

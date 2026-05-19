@@ -21,6 +21,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -63,7 +64,9 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: f1NarrowUser}),
 	)
 
-	// Path A — the unmarshal-inside-gate fallback path.
+	// Path A — the unmarshal-inside-gate fallback path. Ship 0.30.128
+	// P-CORE-2: the gate now returns the DECODED envelope value, not
+	// []byte.
 	gatedA, okA := gateListEnvelope(ctx, f1WidgetsGVR, raw)
 	if !okA {
 		t.Fatalf("path A (gateListEnvelope) returned served=false; want a gated envelope")
@@ -80,19 +83,28 @@ func TestR3_PreParsedGateByteIdentical(t *testing.T) {
 		t.Fatalf("path B (gateListItems) returned served=false; want a gated envelope")
 	}
 
-	// THE INVARIANT — byte-identical.
-	if string(gatedA) != string(gatedB) {
-		t.Fatalf("R3 byte-identity FAILED: the pre-parsed-Items gate path produced "+
-			"different bytes from the unmarshal-inside-gate path.\n"+
-			" gateListEnvelope: %s\n gateListItems:    %s", gatedA, gatedB)
+	// THE INVARIANT — the two gate paths produce the SAME content. Both
+	// now return decoded values (Ship 0.30.128 P-CORE-2); canonical-JSON
+	// marshalling both proves equivalence regardless of map-key ordering.
+	jA, errA := json.Marshal(gatedA)
+	jB, errB := json.Marshal(gatedB)
+	if errA != nil || errB != nil {
+		t.Fatalf("R3: marshalling gated values failed: A=%v B=%v", errA, errB)
+	}
+	if string(jA) != string(jB) {
+		t.Fatalf("R3 content-equivalence FAILED: the pre-parsed-Items gate path "+
+			"produced different content from the unmarshal-inside-gate path.\n"+
+			" gateListEnvelope: %s\n gateListItems:    %s", jA, jB)
 	}
 
 	// And both must be non-empty narrowed content (the narrow user IS
-	// authorized for 2 namespaces — a 200-with-empty-body would be a
-	// serving failure, AC-2 in spirit).
-	if len(gatedA) == 0 {
-		t.Fatalf("R3: gated output is empty — the narrow user is authorized for "+
-			"%d namespaces and must see their widgets", len(f1NarrowNamespaces))
+	// authorized for 2 namespaces — an empty body would be a serving
+	// failure). The gated value is the {apiVersion,kind,items} envelope;
+	// its items array must be non-empty.
+	envA, _ := gatedA.(map[string]any)
+	if items, _ := envA["items"].([]any); len(items) == 0 {
+		t.Fatalf("R3: gated envelope has empty items — the narrow user is authorized "+
+			"for %d namespaces and must see their widgets", len(f1NarrowNamespaces))
 	}
 }
 
