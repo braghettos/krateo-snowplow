@@ -105,24 +105,32 @@ var rbacTypedGVRs = []schema.GroupVersionResource{
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"},
 }
 
-// bytesResourceOverrides is the Ship H1 declarative routing set: the
-// GVR *groups* whose informer-store objects are converted to the
-// GC-lean bytesObject representation at SetTransform time.
+// bytesResourceOverrides is the declarative routing set: the GVR
+// *groups* whose informer-store objects use the GC-lean bytesObject
+// representation.
 //
-// Keyed by GROUP — NOT the full GVR — for the same reason
-// streamingListGVRs (streaming_list.go) is: the composition group
+// SINGLE SOURCE OF TRUTH (Ship H2a — SB-3): this one set drives BOTH
+//   - the H1 SetTransform bytes-override (WATCH-event ingestion path,
+//     StripBulkyFieldsForResourceType below), AND
+//   - the H2a streaming-list routing (matchesStreamingListGroup in
+//     streaming_list.go DERIVES from this set — it is not a separate
+//     map).
+// Post-H2a the streaming LIST decodes items directly into bytesObject,
+// so streaming a GVR and storing it as bytes are inseparable — one set
+// expresses both. A second group map would let the two drift and
+// silently half-disable H2a.
+//
+// Keyed by GROUP — NOT the full GVR — because the composition group
 // hosts one dynamically-named CRD per blueprint, so the resource
 // segment is not known at compile time. The group `composition.krateo.io`
-// is the only compile-time-stable discriminator. A resource-literal
-// key would be the exact special-case feedback_no_special_cases.md
-// forbids; a group key is an additive, declarative routing mechanism —
-// the same shape as resourceOverrides / typedResourceOverrides /
-// streamingListGVRs.
+// is the only compile-time-stable discriminator. A resource-literal key
+// would be the exact special-case feedback_no_special_cases.md forbids;
+// a group key is an additive, declarative routing mechanism — the same
+// shape as resourceOverrides / typedResourceOverrides.
 //
-// H1 scopes the bytes representation to the composition group — the
-// measured ~4.9 GiB / ~152M-live-object offender on the 0.30.130 heap.
-// Widening to other groups is a data-gated follow-up, not an H1
-// decision.
+// Scoped to the composition group — the measured LIST-decode offender
+// (5.28 GiB UnstructuredList.UnmarshalJSON on the 0.30.131 heap).
+// Widening to other groups is a data-gated follow-up.
 //
 // Reads are lock-free (write-once at init).
 var bytesResourceOverrides = map[string]struct{}{
@@ -130,7 +138,8 @@ var bytesResourceOverrides = map[string]struct{}{
 }
 
 // matchesBytesOverrideGroup reports whether gvr's group is routed
-// through the H1 bytesObject representation.
+// through the bytesObject representation (and, since H2a, the streaming
+// LIST). The single per-group routing predicate.
 func matchesBytesOverrideGroup(gvr schema.GroupVersionResource) bool {
 	_, ok := bytesResourceOverrides[gvr.Group]
 	return ok

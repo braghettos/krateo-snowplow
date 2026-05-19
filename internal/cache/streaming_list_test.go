@@ -1,11 +1,14 @@
-// streaming_list_test.go — Ship 0.30.122 R4 Lever 1 hermetic falsifier.
+// streaming_list_test.go — Ship 0.30.122 R4 Lever 1 hermetic falsifier,
+// updated for Ship H2a (the LIST-decode re-design).
 //
-// The streaming ListFunc MUST produce a *UnstructuredList equivalent to
+// The streaming ListFunc MUST produce a *bytesObjectList equivalent to
 // the standard dynamic-client path for the same apiserver input — same
 // items, same identity, same post-strip content (Diego's hard
-// constraint: spec + status intact). These tests drive streamingList
-// against an httptest apiserver stub serving a paged LIST fixture; no
-// live cluster.
+// constraint: spec + status intact). Since H2a, the list's Items are
+// *bytesObject values; the equivalence assertions decode each
+// bytesObject (the field-fidelity path) and compare. These tests drive
+// streamingList against an httptest apiserver stub serving a paged LIST
+// fixture; no live cluster.
 
 package cache
 
@@ -130,23 +133,35 @@ func TestR4_StreamingListEquivalentToStandard(t *testing.T) {
 		t.Fatalf("streamingList returned %d items, want %d (paged continue-walk "+
 			"must traverse every page)", len(got.Items), totalItems)
 	}
-	// Envelope identity carried onto the result list.
-	if got.GetAPIVersion() != "composition.krateo.io/v1" {
-		t.Fatalf("result apiVersion=%q, want composition.krateo.io/v1", got.GetAPIVersion())
+	// Envelope identity carried onto the result list. bytesObjectList
+	// embeds TypeMeta (APIVersion plain field) + ListMeta (RV accessor).
+	if got.APIVersion != "composition.krateo.io/v1" {
+		t.Fatalf("result apiVersion=%q, want composition.krateo.io/v1", got.APIVersion)
 	}
 	if got.GetResourceVersion() != "12345" {
 		t.Fatalf("result resourceVersion=%q, want 12345", got.GetResourceVersion())
 	}
 
 	for i := range got.Items {
-		item := &got.Items[i]
 		wantName := fmt.Sprintf("comp-%04d", i)
-		if item.GetName() != wantName {
+
+		// H2a — each item is a *bytesObject. The embedded ObjectMeta is
+		// the indexer-key surface; Decode() is the field-fidelity path.
+		bo, ok := got.Items[i].(*bytesObject)
+		if !ok {
+			t.Fatalf("item %d is %T, want *bytesObject (H2a streaming path)", i, got.Items[i])
+		}
+		if bo.GetName() != wantName {
 			t.Fatalf("item %d name=%q, want %q (streaming decode must preserve order)",
-				i, item.GetName(), wantName)
+				i, bo.GetName(), wantName)
 		}
 
-		// STRIP: the two bookkeeping fields must be gone.
+		// STRIP (AC-H2a.2) — verified on the DECODED object: the two
+		// bookkeeping fields must be gone from `raw`.
+		item, derr := bo.Decode()
+		if derr != nil {
+			t.Fatalf("item %d Decode: %v", i, derr)
+		}
 		if mf := item.GetManagedFields(); len(mf) != 0 {
 			t.Fatalf("item %d still carries %d managedFields entries — strip not applied",
 				i, len(mf))
@@ -160,7 +175,7 @@ func TestR4_StreamingListEquivalentToStandard(t *testing.T) {
 			t.Fatalf("item %d: strip dropped a non-bookkeeping annotation", i)
 		}
 
-		// HARD CONSTRAINT — spec + status intact.
+		// HARD CONSTRAINT — spec + status intact (decoded from `raw`).
 		spec, specOK := item.Object["spec"].(map[string]any)
 		if !specOK || spec["repoName"] != wantName+"-repo" || spec["org"] != "krateo" {
 			t.Fatalf("item %d: spec corrupted/missing after strip — want repoName=%q org=krateo, got %v",

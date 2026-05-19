@@ -20,19 +20,42 @@
 //   1. issues the paged LIST itself — a `continue`-token walk, identical
 //      LIST semantics to client-go's ListPager;
 //   2. streams each page's HTTP response body through a json.Decoder —
-//      Token() down to the `items` array, then Decode(&obj) ONE element
-//      at a time (never io.ReadAll of the whole body, never a full
-//      []map[string]any, no RawMessage intermediate);
-//   3. applies the strip transform to each item inline as it is decoded;
-//   4. drops the reference to the full pre-transform object before
-//      decoding the next element — so only already-stripped objects
-//      accumulate;
-//   5. accumulates only transformed objects into the returned
-//      *UnstructuredList.
-// The reflector still re-applies SetTransform on the returned items —
-// defaultStripUnstructured is idempotent (re-stripping an already-stripped
-// object is a no-op), so the store contents are byte-identical to the
-// standard path. The WatchFunc is the standard dynamic watch, unchanged.
+//      Token() down to the `items` array, then captures each element's
+//      RAW JSON BYTES one at a time (never io.ReadAll of the whole
+//      body);
+//   3. (H2a) builds a *bytesObject directly from each item's raw bytes
+//      — decoding ONLY the small `metadata` sub-object, never the
+//      spec/status map tree;
+//   4. drops the per-element raw slice's decoder buffer before decoding
+//      the next element;
+//   5. accumulates only *bytesObject values into the returned
+//      *bytesObjectList.
+//
+// Ship H2a (the LIST-decode re-design). H1 (0.30.131) converted the
+// resident store to bytesObject but FAILED its scanobject HARD STOP
+// (62%->77%): the re-diagnosis traces proved the scanobject driver is
+// the LIST-decode map[string]interface{} tree — UnstructuredList.
+// UnmarshalJSON, 5.28 GiB / 56% of heap — NOT the resident store H1
+// fixed. H1 also ADDED an 845 MB ingestion json.Marshal (newBytesObject
+// re-marshalling an already-built Unstructured).
+//
+// H2a eliminates BOTH: the streaming ListFunc no longer builds a
+// per-item map[string]interface{} (step 2-3 above) — it captures the
+// item's raw JSON frame and constructs the bytesObject directly via
+// newBytesObjectFromRaw (metadata-only sub-decode). The
+// UnstructuredList.UnmarshalJSON driver and H1's ingestion marshal are
+// both gone from the LIST path.
+//
+// The reflector still re-applies SetTransform (StripBulkyFieldsFor-
+// ResourceType) on the returned items — a *bytesObject fails that
+// transform's `obj.(*unstructured.Unstructured)` cast and is returned
+// UNCHANGED (a clean idempotent passthrough — AC-H2a.4): no re-marshal,
+// no drop. The strip policy itself is applied at the JSON-bytes level
+// inside the streaming decoder (stripItemJSON), so the stored `raw`
+// matches the H1-stored shape exactly (managedFields + last-applied
+// removed). The WatchFunc is the standard dynamic watch, unchanged —
+// the re-diagnosis proved the watch decoder is 0.091% of allocations,
+// not a driver; WATCH events still flow through H1's newBytesObject.
 //
 // Gated by RESOLVER_COMPOSITION_STREAMING_LIST (default ON). Flag off, or
 // no *rest.Config wired, reverts the composition GVR to the standard
@@ -81,24 +104,27 @@ func compositionStreamingListEnabled() bool {
 // separate page-limit constant/config would buy zero memory and only
 // multiply round-trips, so none is added.
 
-// streamingListGVRs is the declarative set of GVR *groups* whose
-// standalone informer is routed through the R4 streaming ListWatch. Same
-// shape as resourceOverrides: a write-once init map, lock-free reads.
+// matchesStreamingListGroup reports whether gvr's group is routed
+// through the streaming ListWatch.
+//
+// SINGLE SOURCE OF TRUTH (Ship H2a — SB-3): the streaming-list routing
+// is NOT a separate group set — it is DERIVED FROM bytesResourceOverrides
+// (strip.go). Since H2a, the streaming ListFunc decodes items directly
+// into *bytesObject; a GVR can therefore only be streamed if it is also
+// a bytes-override group (the streaming path produces the bytes
+// representation). Keeping a separate `streamingListGVRs` map would let
+// the two sets drift — one updated, the other not — silently
+// half-disabling H2a (streaming on, bytes off, or vice versa). Deriving
+// from the one set makes the streaming path and the bytes representation
+// inseparable by construction.
+//
 // Keyed by GROUP (not the full GVR) — the composition group hosts one
 // dynamically-named CRD per blueprint, so the resource segment is not
-// known at compile time; the group `composition.krateo.io` is the
-// stable, declarative discriminator (mirrors matchesAutoDiscoverGroup).
-// No per-resource literal — this is an additive routing mechanism, not a
+// known at compile time; the group is the stable, declarative
+// discriminator. No per-resource literal — additive routing, not a
 // special case (feedback_no_special_cases.md).
-var streamingListGVRs = map[string]struct{}{
-	"composition.krateo.io": {},
-}
-
-// matchesStreamingListGroup reports whether gvr's group is in the
-// streamingListGVRs set.
 func matchesStreamingListGroup(gvr schema.GroupVersionResource) bool {
-	_, ok := streamingListGVRs[gvr.Group]
-	return ok
+	return matchesBytesOverrideGroup(gvr)
 }
 
 // streamingDynamicInformer is the R4 GenericInformer wrapper — the exact
@@ -186,7 +212,15 @@ func newStreamingDynamicInformer(
 			if tweak != nil {
 				tweak(&options)
 			}
-			return streamingList(context.TODO(), restClient, gvr, options)
+			list, err := streamingList(context.TODO(), restClient, gvr, options)
+			if err != nil {
+				// Return an untyped nil on the error path — never a
+				// typed-nil *bytesObjectList wrapped in a non-nil
+				// runtime.Object interface (the reflector checks err
+				// first, but an explicit untyped nil is unambiguous).
+				return nil, err
+			}
+			return list, nil
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 			// Standard dynamic watch — unchanged from
@@ -228,9 +262,11 @@ func streamingRESTClient(rc *rest.Config) (*rest.RESTClient, error) {
 }
 
 // streamingList issues the paged LIST for gvr and streams every page's
-// response body through a json.Decoder, decoding + stripping one item at
-// a time. The returned *UnstructuredList holds only post-strip objects;
-// no full pre-transform copy of the 48,999-object set is ever alive.
+// response body through a json.Decoder, building one *bytesObject per
+// item directly from its raw JSON frame (H2a). The returned
+// *bytesObjectList holds only bytes-backed objects; no full
+// pre-transform map[string]interface{} copy of the 48,999-object set is
+// ever alive, and no per-item map tree is built at all.
 //
 // Paging: a `continue`-token walk, identical semantics to client-go's
 // ListPager — each page carries opts.Limit (listPageLimit) and the
@@ -241,8 +277,8 @@ func streamingList(
 	rc *rest.RESTClient,
 	gvr schema.GroupVersionResource,
 	opts metav1.ListOptions,
-) (*unstructured.UnstructuredList, error) {
-	out := &unstructured.UnstructuredList{}
+) (*bytesObjectList, error) {
+	out := &bytesObjectList{}
 	pages := 0
 	totalItems := 0
 
@@ -281,11 +317,14 @@ func streamingList(
 
 		// Carry envelope identity onto the result list ONCE, from the
 		// FIRST page only (the same one-shot pattern for all three).
-		if out.GetAPIVersion() == "" && apiVersion != "" {
-			out.SetAPIVersion(apiVersion)
+		// bytesObjectList embeds metav1.TypeMeta (APIVersion/Kind are
+		// plain exported fields) + metav1.ListMeta (ResourceVersion via
+		// Get/SetResourceVersion).
+		if out.APIVersion == "" && apiVersion != "" {
+			out.APIVersion = apiVersion
 		}
-		if out.GetKind() == "" && kind != "" {
-			out.SetKind(kind)
+		if out.Kind == "" && kind != "" {
+			out.Kind = kind
 		}
 		// BLOCKER 1 (re-review) — the list's resourceVersion MUST be the
 		// FIRST page's, not last-write-wins. For a paged collection LIST
@@ -347,16 +386,17 @@ func streamingListAbsPath(gvr schema.GroupVersionResource) []string {
 
 // decodeListPageStreaming consumes one LIST page's response body with a
 // streaming json.Decoder. It walks the top-level object, and when it
-// reaches the `items` array it Decode()s ONE element at a time into a
-// fresh unstructured.Unstructured, applies the strip transform, appends
-// the stripped object to out.Items, and drops the per-element reference
-// before decoding the next — so the page's full pre-transform set is
-// never simultaneously alive.
+// reaches the `items` array it captures ONE element's raw JSON bytes at
+// a time, strips them at the JSON-bytes level, builds a *bytesObject
+// directly (H2a — no map[string]interface{} tree), appends it to
+// out.Items, and drops the per-element raw slice before decoding the
+// next — so the page's full pre-transform set is never simultaneously
+// alive AND no per-item map tree is ever built.
 //
 // Returns (continueToken, resourceVersion, apiVersion, kind, err).
 func decodeListPageStreaming(
 	body io.Reader,
-	out *unstructured.UnstructuredList,
+	out *bytesObjectList,
 	totalItems *int,
 ) (continueToken, resourceVersion, apiVersion, kind string, err error) {
 	dec := json.NewDecoder(body)
@@ -422,15 +462,36 @@ func decodeListPageStreaming(
 	return continueToken, resourceVersion, apiVersion, kind, nil
 }
 
-// decodeItemsArrayStreaming consumes the `items` array. The decoder is
-// positioned just before the array. It reads the '[', then Decode()s one
-// element per iteration into a FRESH unstructured.Unstructured, strips
-// it, appends the stripped object, and lets the pre-transform map go out
-// of scope before the next Decode — bounding the live set to one item
-// plus the accumulated stripped slice.
+// decodeItemsArrayStreaming consumes the `items` array — Ship H2a, the
+// LIST-decode fix. The decoder is positioned just before the array. It
+// reads the '[', then per iteration:
+//
+//  1. captures ONE element as raw JSON bytes (json.RawMessage) — the
+//     decoder copies the element's bytes WITHOUT building a
+//     map[string]interface{} tree;
+//  2. strips that raw frame at the JSON-bytes level (stripItemJSON —
+//     drops managedFields + last-applied-config, everything else
+//     verbatim) so the stored `raw` matches the H1-stored shape;
+//  3. builds a *bytesObject directly from the stripped raw bytes
+//     (newBytesObjectFromRaw — decodes ONLY the small `metadata`
+//     sub-object for the embedded ObjectMeta; spec/status are never
+//     decoded);
+//  4. appends the *bytesObject to out.Items and drops the per-element
+//     raw slices on the next iteration.
+//
+// This is the H2a core: the per-item map[string]interface{} the old
+// code built via `dec.Decode(&obj)` — the UnstructuredList.UnmarshalJSON
+// 5.28 GiB scanobject driver — is NEVER constructed. H1's added
+// ingestion json.Marshal (newBytesObject) is also bypassed: the
+// bytesObject's `raw` IS the captured LIST frame bytes, not a re-marshal.
+//
+// A single malformed item is skipped (logged once) rather than failing
+// the whole LIST — the streaming relist of 48,999 items must not abort
+// on one bad object. (A page-level Status envelope IS still a whole-list
+// failure — that check lives in streamingList, unchanged.)
 func decodeItemsArrayStreaming(
 	dec *json.Decoder,
-	out *unstructured.UnstructuredList,
+	out *bytesObjectList,
 	totalItems *int,
 ) error {
 	tok, err := dec.Token()
@@ -442,25 +503,52 @@ func decodeItemsArrayStreaming(
 	}
 
 	for dec.More() {
-		// Decode ONE element into a fresh object map. The map is the
-		// only pre-transform copy alive; after the strip + append it is
-		// dropped on the next loop iteration.
-		obj := map[string]any{}
-		if derr := dec.Decode(&obj); derr != nil {
-			return fmt.Errorf("decode list item %d: %w", *totalItems, derr)
+		// Step 1 — capture ONE element as raw bytes. dec.Decode into a
+		// json.RawMessage copies the element's literal bytes; it does
+		// NOT build a map tree. This is the allocation H2a replaces the
+		// `map[string]any` decode with — bytes, not a pointer-dense map.
+		var itemRaw json.RawMessage
+		if derr := dec.Decode(&itemRaw); derr != nil {
+			return fmt.Errorf("capture list item %d raw: %w", *totalItems, derr)
 		}
-		item := unstructured.Unstructured{Object: obj}
-		// R4 step 3 — strip inline. defaultStripUnstructured drops
-		// managedFields + the last-applied annotation; spec + status are
-		// untouched (Diego's hard constraint). The reflector re-applies
-		// SetTransform on the returned list — idempotent on an already-
-		// stripped object, so store contents are byte-identical to the
-		// standard path.
-		_, _ = defaultStripUnstructured(&item)
-		out.Items = append(out.Items, item)
+
+		// Step 2 — strip at the JSON-bytes level. stripItemJSON decodes
+		// ONLY metadata (small) and carries spec/status as raw bytes —
+		// the spec/status map tree is never built. The result matches
+		// the H1-stored shape (managedFields + last-applied removed).
+		stripped, serr := stripItemJSON(itemRaw)
+		if serr != nil {
+			slog.Warn("cache.streaming_list.item_strip_failed",
+				slog.String("subsystem", "cache"),
+				slog.Int("item_index", *totalItems),
+				slog.String("error", serr.Error()),
+				slog.String("effect", "item skipped — streaming relist continues"),
+			)
+			*totalItems++
+			continue
+		}
+
+		// Step 3 — build the bytesObject directly. newBytesObjectFromRaw
+		// decodes ONLY the metadata sub-object; `raw` is the stripped
+		// frame, carried by reference (stripItemJSON already returned a
+		// fresh, non-aliased slice — SB-4).
+		bo, berr := newBytesObjectFromRaw(stripped)
+		if berr != nil {
+			slog.Warn("cache.streaming_list.item_decode_failed",
+				slog.String("subsystem", "cache"),
+				slog.Int("item_index", *totalItems),
+				slog.String("error", berr.Error()),
+				slog.String("effect", "item skipped — streaming relist continues"),
+			)
+			*totalItems++
+			continue
+		}
+
+		// Step 4 — append. `itemRaw` and `stripped`'s intermediate maps
+		// go out of scope on the next iteration; only out.Items (the
+		// bytes-backed objects) accumulates.
+		out.Items = append(out.Items, bo)
 		*totalItems++
-		// `obj` / `item` go out of scope here — the next Decode allocates
-		// a fresh map; only out.Items (stripped objects) accumulates.
 	}
 
 	// Consume the closing ']'.

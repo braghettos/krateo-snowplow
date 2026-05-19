@@ -161,6 +161,187 @@ func newBytesObject(uns *unstructured.Unstructured) (*bytesObject, error) {
 	return bo, nil
 }
 
+// newBytesObjectFromRaw builds a bytesObject DIRECTLY from an item's
+// raw JSON bytes — Ship H2a, the LIST-decode fix.
+//
+// Unlike newBytesObject (which takes an already-built *Unstructured map
+// tree and re-marshals it — H1's ingestion path, 845 MB of
+// encoding/json.Marshal), this constructor NEVER builds the full
+// map[string]interface{} tree for spec/status. The streaming LIST
+// decoder hands it the item's raw JSON frame as a json.RawMessage;
+// newBytesObjectFromRaw decodes ONLY the `metadata` sub-object (and the
+// top-level apiVersion/kind scalars) to populate the embedded
+// ObjectMeta/TypeMeta — the indexer-relevant fields. The spec/status
+// body is carried verbatim inside `raw` and is never decoded at
+// ingestion. This eliminates the UnstructuredList.UnmarshalJSON 5.28
+// GiB driver AND H1's added ingestion marshal.
+//
+// CONTRACT — `raw` MUST already be stripped (SB-1 / AC-H2a.2): the
+// caller (decodeItemsArrayStreaming) strips managedFields +
+// last-applied-config at the JSON-bytes level BEFORE calling this, so
+// `raw` matches the H1-stored shape exactly (stripped of those two
+// keys, everything else retained). newBytesObjectFromRaw does not strip
+// — it takes `raw` as the authoritative, already-policy-applied frame.
+// `raw` is retained by reference and never mutated (SB-4) — the caller
+// MUST pass a slice the streaming decoder will not reuse.
+//
+// NUMERIC FIDELITY: the metadata sub-decode uses
+// k8s.io/apimachinery/pkg/util/json (integral numbers -> int64),
+// matching the dynamic informer's UnstructuredJSONScheme convention —
+// the same discipline Decode() applies (see its doc). metadata fields
+// like `generation` are integers; a plain encoding/json would make
+// them float64 and break the embedded ObjectMeta's typed accessors.
+//
+// Returns (nil, error) when `raw` is not a decodable JSON object — the
+// caller falls through (logs + skips the item) so a single malformed
+// item never stalls the streaming LIST.
+func newBytesObjectFromRaw(raw []byte) (*bytesObject, error) {
+	// Decode ONLY the indexer-relevant envelope: apiVersion, kind, and
+	// the metadata sub-object. spec/status are deliberately captured by
+	// json.RawMessage and NEVER decoded into a map tree — that is the
+	// whole point of H2a.
+	var envelope struct {
+		APIVersion string          `json:"apiVersion"`
+		Kind       string          `json:"kind"`
+		Metadata   json.RawMessage `json:"metadata"`
+	}
+	if err := utiljson.Unmarshal(raw, &envelope); err != nil {
+		return nil, err
+	}
+
+	bo := &bytesObject{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       envelope.Kind,
+			APIVersion: envelope.APIVersion,
+		},
+		raw: raw,
+	}
+
+	// Decode the metadata sub-object directly into the embedded
+	// ObjectMeta. metav1.ObjectMeta has json tags for every field, so a
+	// single util/json.Unmarshal populates name/namespace/
+	// resourceVersion/uid/generation/labels/annotations/
+	// creationTimestamp/ownerReferences/finalizers/deletionTimestamp in
+	// one pass — no per-field SetX calls. This is the only map-shaped
+	// decode H2a does per item, and it is bounded to metadata (small),
+	// NOT the full spec/status tree.
+	//
+	// An item with no metadata (malformed) leaves ObjectMeta zero —
+	// MetaNamespaceKeyFunc would then key it as "" and the indexer Add
+	// would surface a KeyError upstream rather than silently dropping
+	// it; that is the correct loud failure for a malformed item.
+	if len(envelope.Metadata) > 0 {
+		if err := utiljson.Unmarshal(envelope.Metadata, &bo.ObjectMeta); err != nil {
+			return nil, err
+		}
+	}
+
+	return bo, nil
+}
+
+// stripItemJSON applies the defaultStripUnstructured policy to a LIST
+// item's raw JSON bytes — Ship H2a, AC-H2a.2.
+//
+// It removes exactly the two fields the existing strip policy removes:
+//
+//   - metadata.managedFields
+//   - metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]
+//
+// CRITICAL — it does this WITHOUT building the spec/status map tree.
+// The item is decoded into an ordered-key-agnostic shape where ONLY
+// `metadata` is a map (metadata is small — decoding it is the same
+// bounded cost newBytesObjectFromRaw already pays) and EVERY OTHER
+// top-level key (spec, status, and any others) is a json.RawMessage
+// carried verbatim. The two strip keys are deleted from the metadata
+// map; the item is re-marshalled. spec/status are spliced back as raw
+// bytes — never decoded into a map[string]interface{}.
+//
+// The result `raw` matches the H1-stored shape exactly: stripped of the
+// two policy fields, every other field (spec, status, all metadata
+// except the two) retained verbatim.
+//
+// If the input has no managedFields and no last-applied annotation the
+// re-marshal still runs (cheap — metadata is small) and produces an
+// equivalent object; correctness does not depend on detecting the
+// no-op case.
+//
+// Returns (nil, error) on undecodable input — the caller skips the item.
+func stripItemJSON(itemRaw []byte) ([]byte, error) {
+	// Decode the item: metadata as a map (small, bounded), every other
+	// key as raw bytes carried verbatim. util/json keeps integral
+	// numbers as int64 for the metadata map (numeric fidelity).
+	var fields map[string]json.RawMessage
+	if err := utiljson.Unmarshal(itemRaw, &fields); err != nil {
+		return nil, err
+	}
+
+	metaRaw, hasMeta := fields["metadata"]
+	if !hasMeta || len(metaRaw) == 0 {
+		// No metadata sub-object — nothing to strip. Return the input
+		// unchanged (a defensive copy so the caller's decoder buffer
+		// is not aliased).
+		out := make([]byte, len(itemRaw))
+		copy(out, itemRaw)
+		return out, nil
+	}
+
+	var metaMap map[string]json.RawMessage
+	if err := utiljson.Unmarshal(metaRaw, &metaMap); err != nil {
+		return nil, err
+	}
+
+	changed := false
+
+	// Drop metadata.managedFields.
+	if _, ok := metaMap["managedFields"]; ok {
+		delete(metaMap, "managedFields")
+		changed = true
+	}
+
+	// Drop the last-applied annotation from metadata.annotations.
+	if annoRaw, ok := metaMap["annotations"]; ok && len(annoRaw) > 0 {
+		var annos map[string]json.RawMessage
+		if err := utiljson.Unmarshal(annoRaw, &annos); err != nil {
+			return nil, err
+		}
+		if _, present := annos[lastAppliedAnnotation]; present {
+			delete(annos, lastAppliedAnnotation)
+			changed = true
+			if len(annos) == 0 {
+				// Mirror defaultStripUnstructured: an emptied
+				// annotations map is dropped entirely (SetAnnotations(nil)).
+				delete(metaMap, "annotations")
+			} else {
+				reAnno, err := json.Marshal(annos)
+				if err != nil {
+					return nil, err
+				}
+				metaMap["annotations"] = reAnno
+			}
+		}
+	}
+
+	if !changed {
+		// Nothing stripped — return a defensive copy of the original
+		// (avoids aliasing the streaming decoder's buffer; SB-4).
+		out := make([]byte, len(itemRaw))
+		copy(out, itemRaw)
+		return out, nil
+	}
+
+	// Re-marshal metadata, splice it back into the item. spec/status
+	// (and any other top-level keys) are still json.RawMessage —
+	// re-marshalling fields just re-emits those bytes verbatim; the
+	// spec/status map tree is NEVER built.
+	reMeta, err := json.Marshal(metaMap)
+	if err != nil {
+		return nil, err
+	}
+	fields["metadata"] = reMeta
+
+	return json.Marshal(fields)
+}
+
 // Decode reconstructs a fresh *unstructured.Unstructured from `raw`.
 //
 // SB-4 — concurrency: a brand-new map[string]any is allocated on EVERY
@@ -280,4 +461,65 @@ func (b *bytesObject) DeepCopyObject() runtime.Object {
 // construction into the embedded TypeMeta.
 func (b *bytesObject) GroupVersionKind() schema.GroupVersionKind {
 	return b.TypeMeta.GroupVersionKind()
+}
+
+// --- bytesObjectList — the LIST return type for the H2a streaming path ---
+//
+// The streaming ListFunc must return a runtime.Object that client-go's
+// reflector can treat as a list: meta.ListAccessor reads its
+// resourceVersion, meta.ExtractListWithAlloc reads its Items. H1's
+// bytesObject cannot live in *unstructured.UnstructuredList (whose
+// Items is []unstructured.Unstructured — a concrete struct type), so
+// H2a introduces bytesObjectList: a list whose Items is
+// []runtime.Object, each element a *bytesObject.
+//
+// reflector compatibility:
+//   - meta.ListAccessor: bytesObjectList embeds metav1.ListMeta, which
+//     provides GetListMeta() -> metav1.ListInterface — so it satisfies
+//     the metav1.ListMetaAccessor branch of meta.ListAccessor.
+//   - meta.ExtractListWithAlloc: it reflects over the `Items` field; a
+//     []runtime.Object slice whose element type implements
+//     runtime.Object is handled by the `implementsObject` branch — each
+//     *bytesObject IS a runtime.Object (asserted above).
+//   - runtime.Object: GetObjectKind() comes from the embedded TypeMeta;
+//     DeepCopyObject() is implemented below.
+//
+// After ExtractListWithAlloc the reflector calls store.Replace, which
+// re-applies the SetTransform (StripBulkyFieldsForResourceType) to each
+// item. A *bytesObject fails that transform's
+// `obj.(*unstructured.Unstructured)` cast and is returned UNCHANGED — a
+// clean idempotent passthrough (AC-H2a.4): no re-marshal, no drop.
+type bytesObjectList struct {
+	metav1.TypeMeta
+	metav1.ListMeta
+
+	// Items holds *bytesObject values typed as runtime.Object so the
+	// reflector's reflection-based ExtractList accepts the slice.
+	Items []runtime.Object
+}
+
+var _ runtime.Object = (*bytesObjectList)(nil)
+
+// GetObjectKind is provided by the embedded TypeMeta; declared here
+// only for documentation symmetry with bytesObject. (No explicit method
+// needed — TypeMeta.GetObjectKind is promoted.)
+
+// DeepCopyObject satisfies runtime.Object for the list. The reflector
+// does not deep-copy the list itself on the hot path, but the contract
+// requires the method. Items are shallow-copied (each *bytesObject is
+// immutable — SB-4 — so sharing the element pointers is safe; only the
+// slice header is fresh).
+func (l *bytesObjectList) DeepCopyObject() runtime.Object {
+	if l == nil {
+		return nil
+	}
+	cp := &bytesObjectList{
+		TypeMeta: l.TypeMeta,
+		ListMeta: *l.ListMeta.DeepCopy(),
+	}
+	if l.Items != nil {
+		cp.Items = make([]runtime.Object, len(l.Items))
+		copy(cp.Items, l.Items)
+	}
+	return cp
 }
