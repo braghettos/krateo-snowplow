@@ -173,6 +173,17 @@ func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListE
 // (apiVersion/kind/items), so the eventual served body is byte-identical
 // (AC-128.4) — only the decode timing moves.
 func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed parsedListEnvelope) (any, bool) {
+	// [panel500-instr] site=8 — apistage gate-list-items entry
+	// (control). Architect §2.8: empirical question "does the
+	// burst's failing path cross gateListItems? If yes (and
+	// items_len shows the composition LIST content), it's relevant;
+	// if no, control-confirmed that D.4 was at the wrong layer."
+	// Logs GVR + items_len — operators can correlate against the
+	// failing iterator path's expected resource set.
+	slog.Info("[panel500-instr] site=8 tag=apistage_gate_list_items",
+		slog.String("gvr", gvr.String()),
+		slog.Int("items_len", len(parsed.items)),
+	)
 	kept, identityOK := filterListByRBAC(ctx, gvr, parsed.items)
 	if !identityOK {
 		// FAIL-CLOSED: no identity — same contract as the inline gate's

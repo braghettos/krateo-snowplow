@@ -1,10 +1,13 @@
 package dispatchers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -16,6 +19,28 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
+
+// [panel500-instr] site=10 helper — see writeResolvedJSON call site
+// below. Strips the per-request traceId from the response bytes
+// before hashing so the hash captures CONTENT EQUIVALENCE
+// (decoupled from per-request identity). The regex is conservative
+// — matches "traceId":"<anything>" — and replaces with a fixed
+// placeholder before sha256.
+//
+// Architect §6 design rationale: tester's D.4.1 validation showed
+// "all 4 named canaries + 6 other corpus items diffed" even though
+// resolver-nil-merge counter never fired. Site 10's diagnostic
+// question: was the diff content-meaningful, or was it just
+// methodology (traceId/timestamps in the body)? A matching
+// hash_no_traceid across pre-D.4.1 and D.4.1 captures confirms
+// methodology; a mismatching hash confirms content change.
+var traceIdRegex = regexp.MustCompile(`"traceId":"[^"]*"`)
+
+func hashWithoutTraceId(b []byte) string {
+	s := traceIdRegex.ReplaceAllString(string(b), `"traceId":"<stripped>"`)
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
 
 func Widgets() http.Handler {
 	return &widgetsHandler{
@@ -154,6 +179,24 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	log.Info("Widget successfully resolved",
 		slog.String("duration", util.ETA(start)),
 		slog.String("l1", "miss"),
+	)
+
+	// [panel500-instr] site=10 — widget-response-byte capture
+	// (D.4.1 universal-corpus-diff discriminator). Architect §6:
+	// "during the D.4.1-style universal-corpus-diff run, do
+	// encoded_hash_no_traceid values match the same widget's hash
+	// on a pre-D.4.1 capture? If YES, (a) confirmed — the diff is
+	// methodology (traceId/timestamps); D.4.1's resolver-merge code
+	// change was behaviour-equivalent. If NO, (b) or (c) — the
+	// change ACTUALLY produced different bytes, and we re-diagnose."
+	// Fires per widget /call response, BEFORE writeResolvedJSON so
+	// the bytes captured match exactly what the wire sees.
+	slog.Info("[panel500-instr] site=10 tag=widget_response_bytes",
+		slog.String("widget_name", widgets.GetName(res.Object)),
+		slog.String("widget_namespace", widgets.GetNamespace(res.Object)),
+		slog.String("traceId", xcontext.TraceId(ctx, false)),
+		slog.Int("encoded_len", len(encoded)),
+		slog.String("encoded_hash_no_traceid", hashWithoutTraceId(encoded)),
 	)
 
 	writeResolvedJSON(wri, encoded)

@@ -117,17 +117,68 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 			// Single value. Current: json.Unmarshal(s) -> tmp. Ship A:
 			// tmp = v directly (the §3.1-3.3 equivalence proof).
 			tmp = v
+			// [panel500-instr] site=4 — Ship A EvalValue default-arm
+			// assignment. Architect §2.4: empirical question "does
+			// the per-iteration stage filter ever produce v == nil?
+			// If yes, Ship A's EvalValue returning (nil, true, nil)
+			// is the proximate nil source for tmp." Fires AFTER tmp
+			// is set so the value-side check matches the assigned
+			// nil precisely.
+			slog.Info("[panel500-instr] site=4 tag=evalvalue_default",
+				slog.String("stage_key", opts.key),
+				slog.String("filter", q),
+				slog.Bool("v_is_nil", v == nil),
+				slog.String("v_type", fmt.Sprintf("%T", v)),
+			)
 		}
 	}
 
 	got, ok := opts.out[opts.key]
 	if !ok {
+		// [panel500-instr] site=1 — first-iteration write to dict.
+		// Architect's design §2.1: empirical question "does a
+		// first-iteration write of tmp == nil ever happen for stage
+		// {allCompositionResources, getComposition}?" A tmp_is_nil=true
+		// first write means D.4.1's case []any: guard cannot catch
+		// this defect — the literal nil lands directly in dict before
+		// any later iteration enters either type-switch arm.
+		slog.Info("[panel500-instr] site=1 tag=first_iteration_write",
+			slog.String("stage_key", opts.key),
+			slog.Bool("tmp_is_nil", tmp == nil),
+			slog.String("tmp_type", fmt.Sprintf("%T", tmp)),
+		)
+		// [panel500-instr] site=11 — PM-added (dict-state-after-write
+		// canary, distinct from site 1's source-side capture). Same
+		// code location, complementary field shape: includes the
+		// explicit is_first_iteration flag so the burst-log
+		// cross-product can identify the (stage, first-iter) tuple
+		// without inferring it from absence of `got`.
+		slog.Info("[panel500-instr] site=11 tag=first-iteration-dict-write",
+			slog.String("stage", opts.key),
+			slog.String("tmp_type", fmt.Sprintf("%T", tmp)),
+			slog.Bool("tmp_is_nil", tmp == nil),
+			slog.Bool("is_first_iteration", true),
+		)
 		opts.out[opts.key] = tmp
 		return nil
 	}
 
 	switch existingSlice := got.(type) {
 	case []any:
+		// [panel500-instr] site=3 — D.4.1 case []any: arm entry
+		// (control). Architect §2.3: tester report says the
+		// resolver-nil-merge counter never fired on the burst →
+		// expect this log to NOT fire either. Confirms D.4.1 was on
+		// the wrong arm. If site 3 DOES fire during burst, D.4.1's
+		// site was reached but the counter wiring failed; if it
+		// does NOT fire, the defect path stayed in the default: arm
+		// (site 2).
+		slog.Info("[panel500-instr] site=3 tag=case_anyslice_arm",
+			slog.String("stage_key", opts.key),
+			slog.Int("existing_len", len(existingSlice)),
+			slog.String("tmp_type", fmt.Sprintf("%T", tmp)),
+			slog.Bool("tmp_is_nil", tmp == nil),
+		)
 		// Ship D.4.1 (0.30.145) — iterator-merge nil-skip.
 		//
 		// The defect: an iterator over a RESTAction stage's
@@ -182,6 +233,22 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 			}
 		}
 	default:
+		// [panel500-instr] site=2 — type-switch default: arm
+		// reassignment. Architect §2.2: empirical question "does the
+		// burst land in this arm? got_is_nil=true means a prior
+		// site=1 nil-write happened and we're now constructing
+		// []any{nil, tmp} — the literal-nil-embedded slice the
+		// downstream filter trips on." D.4.1 NEVER touched this arm
+		// — its guard sat only in the case []any: arm above. Log
+		// fires per-iteration on the failing path with both got and
+		// tmp types + nil flags.
+		slog.Info("[panel500-instr] site=2 tag=default_arm_merge",
+			slog.String("stage_key", opts.key),
+			slog.String("got_type", fmt.Sprintf("%T", got)),
+			slog.Bool("got_is_nil", got == nil),
+			slog.String("tmp_type", fmt.Sprintf("%T", tmp)),
+			slog.Bool("tmp_is_nil", tmp == nil),
+		)
 		opts.out[opts.key] = []any{got, tmp}
 
 		switch v := tmp.(type) {
@@ -202,6 +269,15 @@ func wrapAsSlice(value any) []any {
 	case []any:
 		return v
 	default:
+		// [panel500-instr] site=9 — wrapAsSlice nil case. Architect
+		// §2.9: empirical question "is wrapAsSlice(nil) ever called?
+		// If yes and site 3 doesn't fire, then wrapAsSlice(nil) is
+		// being called from a different caller chain than the D.4.1
+		// case []any: arm." Confirms the structural mechanism — the
+		// helper that turns a literal nil into []any{nil}.
+		if v == nil {
+			slog.Info("[panel500-instr] site=9 tag=wrap_as_slice_nil")
+		}
 		return []any{v}
 	}
 }

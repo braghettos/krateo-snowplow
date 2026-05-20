@@ -500,6 +500,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						statusRaw, nerr := nestedCallResolver(gctx, ref,
 							opts.PerPage, opts.Page, opts.Extras)
 						if nerr != nil {
+							// [panel500-instr] site=6 — nested-call ERROR
+							// branch. Architect §2.6: empirical question
+							// "does the burst's failures come from the
+							// nested-call error branch (and the
+							// dict[ErrorKey] synthetic-error stanza in the
+							// filter handles it correctly) or from the
+							// success branch with a nil/{} body?" Fires
+							// only when nerr != nil; the dict[ErrorKey]
+							// write that follows puts the error under
+							// ...ResourcesError for the filter's
+							// synthetic-error stanza.
+							slog.Info("[panel500-instr] site=6 tag=nested_call_error",
+								slog.String("stage_name", id),
+								slog.String("path", call.Path),
+								slog.String("nerr", nerr.Error()),
+							)
 							log.Error("nested /call resolution failed",
 								slog.String("name", id),
 								slog.String("path", call.Path),
@@ -522,6 +538,29 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							// line, mirroring the httpcall.Do ContinueOnError
 							// contract.
 						} else {
+							// [panel500-instr] site=5 — nested-call SUCCESS
+							// branch (feedBytes). Architect §2.5: empirical
+							// question "what bytes does the nested call
+							// return for the burst's failing stage? An {}
+							// (empty envelope, len=2) signals
+							// ResolveNestedCall:158-162's res == nil branch
+							// fired. A larger envelope with .status content
+							// shows the chain reaches a deeper nesting
+							// layer." Logs len + first ~200 bytes so the
+							// tester's grep can see the envelope shape
+							// directly.
+							headLen := len(statusRaw)
+							if headLen > 200 {
+								headLen = 200
+							}
+							slog.Info("[panel500-instr] site=5 tag=nested_call_success",
+								slog.String("stage_name", id),
+								slog.String("ref_resource", ref.Resource),
+								slog.String("ref_name", ref.Name),
+								slog.String("ref_namespace", ref.Namespace),
+								slog.Int("status_raw_len", len(statusRaw)),
+								slog.String("status_raw_head", string(statusRaw[:headLen])),
+							)
 							// The in-process result IS the referenced
 							// RESTAction's Status.Raw — byte-identical to the
 							// HTTP /call response body. Feed the in-memory
