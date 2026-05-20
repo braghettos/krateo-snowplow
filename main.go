@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"expvar"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -590,6 +591,19 @@ func main() {
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+
+	// Ship D.1 (0.30.142) — mount expvar.Handler on the snowplow mux so
+	// Ship D's counters (snowplow_apiserver_fallthrough_total,
+	// snowplow_apiserver_fallthrough_cells,
+	// snowplow_assertion_violations_total) are reachable over HTTP.
+	// Without this mount the counters published in
+	// internal/cache/fallthrough_meter_expvar.go are visible only via
+	// the process expvar registry — not on the production pod's HTTP
+	// surface — which is why Ship D's tester gate appeared to fail
+	// observability (the architect's audit confirmed the wrappers WERE
+	// firing; the counter simply wasn't reachable). One-liner alongside
+	// the existing pprof registrations.
+	mux.Handle("GET /debug/vars", expvar.Handler())
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
 		os.Interrupt,

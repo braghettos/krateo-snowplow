@@ -26,6 +26,9 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
+	"expvar"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -33,7 +36,9 @@ import (
 	"sync"
 	"testing"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateoplatformops/plumbing/server/use"
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -338,3 +343,230 @@ func TestNoBehaviorChange_RecordIsTelemetryOnly(t *testing.T) {
 		t.Errorf("FallthroughTotal = %d; want %d", got, want)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Ship D.1 (0.30.142) — E2E HTTP-chain integration test
+// ─────────────────────────────────────────────────────────────────────
+
+// TestFallthroughScope_E2E_HTTPChain is the integration coverage Ship
+// D's unit-level tests didn't have: it builds a production-shape
+// middleware chain (use.NewChain + cache.FallthroughScopeMiddleware +
+// terminal handler), spins an httptest.Server, fires a real GET /call
+// request through it, and asserts that the Layer B wrapper invoked
+// from inside the handler observes the Layer A scope AND increments
+// the counter.
+//
+// Why this test exists. Ship D's existing unit tests verify each
+// layer in isolation:
+//   - TestFallthroughScopeMiddleware_Sets_Context — middleware stamps
+//     the ctx (in-process probe);
+//   - TestRecordApiserverFallthrough_Counter_Increments — recorder
+//     increments the cell when given a scoped ctx.
+//
+// The PM-gate coverage gap was the *composition*: does the chain
+// produce a ctx whose scope survives the middleware → handler →
+// wrapper boundary? The unit tests can't catch a future regression
+// where (e.g.) a handler re-creates the request via
+// `httpcall.Do(context.Background(), ...)` — the recorder would still
+// look up the scope and find none, the counter would stay at 0, and
+// nothing in the unit suite would notice. This E2E test wires the
+// exact composition main.go uses (chain.Append → middleware →
+// dispatcher-shaped handler → terminal call) and asserts the counter
+// post-request.
+//
+// Architect's prescription, codified: if the scope-marker drop ever
+// IS introduced (e.g. a future ship swaps a real handler for a
+// context.Background() re-entrant), this test fails immediately.
+//
+// Optional probe — interleave xcontext.BuildContext inside the
+// terminal handler to close the "BuildContext-strips-scope" hypothesis
+// (the architect's audit refuted this on live evidence, but the test
+// pins the contract). The probe re-derives a new context layered on
+// top of the request ctx and asserts the scope STILL survives — i.e.
+// BuildContext composes additively, it does not replace the value
+// chain.
+func TestFallthroughScope_E2E_HTTPChain(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	ResetFallthroughCountersForTest()
+
+	// Terminal handler — models a Dispatcher-routed inner handler
+	// (e.g. restactions.ServeHTTP). It does the work the production
+	// wrapper sites do: read the scope, then call
+	// RecordApiserverFallthrough exactly as endpoints.go:59 would.
+	// Mirrors api/endpoints.go F-3 (secret-get) — the highest-volume
+	// /call-read fall-through reason in the design.
+	var observedScope *FallthroughScopeData
+	var observedTotalAfterRecord uint64
+	terminal := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Architect's optional probe: BuildContext-as-suspect.
+		// xcontext.BuildContext layers user-info / access-token onto
+		// the parent context — it must NOT strip the FallthroughScope
+		// value. A regression that re-creates the ctx via
+		// context.Background() would lose the scope and the recorder
+		// would observe nil → counter stays 0.
+		buildCtx := xcontext.BuildContext(r.Context())
+		observedScope = FallthroughScope(buildCtx)
+
+		// Layer B wrapper-call shape — exactly the pattern at
+		// api/endpoints.go:59 (F-3 secret-get).
+		RecordApiserverFallthrough(buildCtx, ReasonSecretGet, "")
+		observedTotalAfterRecord = FallthroughTotal()
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	})
+
+	// Production-shape middleware chain. We omit use.UserConfig
+	// (which would require a real signingKey + authn namespace + JWT
+	// stamped on the request; a hermetic test can't easily fabricate
+	// those) and substitute a trivial pass-through so the chain shape
+	// matches main.go's mux.Handle("GET /call", ...) registration:
+	//
+	//   chain.Append(use.UserConfig(...),
+	//                cache.FallthroughScopeMiddleware(...),
+	//                handlers.Dispatcher(...)).Then(handlers.Call())
+	//
+	// The architectural-consistency property under test — does the
+	// scope marker survive the chain through to the terminal handler
+	// — is unaffected by which user-auth middleware sits before
+	// FallthroughScopeMiddleware. Use of use.NewChain (the real
+	// snowplow chain primitive) keeps the test honest about the
+	// middleware-composition mechanism.
+	chain := use.NewChain(
+		FallthroughScopeMiddleware(ScopeCallRestactions),
+	)
+	wrapped := chain.Then(terminal)
+
+	srv := httptest.NewServer(wrapped)
+	defer srv.Close()
+
+	// One real GET /call?... request through the test server.
+	req, err := http.NewRequest(http.MethodGet,
+		srv.URL+"/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=test&namespace=default", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.StatusCode, string(body))
+	}
+
+	// --- Assertions ---------------------------------------------------
+
+	// (1) The scope MUST be observable inside the terminal handler.
+	// A nil scope is the canonical scope-marker-drop regression the
+	// architect's audit refuted but Ship D had no test for.
+	if observedScope == nil {
+		t.Fatalf("scope marker DROPPED across the middleware chain — observedScope==nil. "+
+			"This is the regression the test exists to catch (Ship D.1). "+
+			"BuildContext probe ran AFTER FallthroughScopeMiddleware; the scope must survive.")
+	}
+	if !observedScope.Active {
+		t.Errorf("scope.Active = false; want true (FallthroughScopeMiddleware stamps Active=true)")
+	}
+	if observedScope.Path != ScopeCallRestactions {
+		t.Errorf("scope.Path = %q; want %q", observedScope.Path, ScopeCallRestactions)
+	}
+
+	// (2) The counter MUST have incremented exactly once — the
+	// terminal handler's RecordApiserverFallthrough call landed in
+	// the (call-restactions, "", secret-get) cell.
+	if got, want := FallthroughTotal(), uint64(1); got != want {
+		t.Errorf("FallthroughTotal = %d; want %d", got, want)
+	}
+	if got := observedTotalAfterRecord; got != 1 {
+		t.Errorf("FallthroughTotal observed inside handler after Record = %d; want 1", got)
+	}
+	if got, want := FallthroughCount(ScopeCallRestactions, "", ReasonSecretGet), uint64(1); got != want {
+		t.Errorf("(call-restactions, secret-get) cell = %d; want %d (counter wired E2E)", got, want)
+	}
+}
+
+// TestFallthroughScope_E2E_ExpvarHandler — Ship D.1 (0.30.142).
+// Validates the second half of Change 1: the counters exposed via
+// fallthrough_meter_expvar.go's expvar.Publish are actually visible
+// through expvar.Handler() (the handler main.go mounts at
+// /debug/vars). Without this test a future expvar registration
+// regression in init() would silently break the operator surface.
+//
+// Per the published shape (fallthrough_meter_expvar.go):
+//
+//   - "snowplow_apiserver_fallthrough_total" → uint64 grand total
+//   - "snowplow_apiserver_fallthrough_cells" → map[string]uint64
+//     keyed "path|gvr|reason"
+//   - "snowplow_assertion_violations_total" → map[string]uint64
+//     keyed "check"
+func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	ResetFallthroughCountersForTest()
+
+	// Drive the counter once so the cells are populated — otherwise
+	// the per-cell map is empty (sync.Map only stores on first Inc).
+	ctx := WithFallthroughScope(context.Background(), ScopeCallWidgets)
+	RecordApiserverFallthrough(ctx, ReasonCRDGet, "apiextensions.k8s.io/v1/customresourcedefinitions")
+	RecordApiserverFallthrough(ctx, ReasonRestmapperKindFor, "v1/pods")
+
+	// Mount expvar.Handler on a test server (the same one-line mount
+	// main.go now does at /debug/vars).
+	mux := http.NewServeMux()
+	mux.Handle("/debug/vars", expvar.Handler())
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/debug/vars")
+	if err != nil {
+		t.Fatalf("HTTP GET /debug/vars: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/debug/vars status = %d", resp.StatusCode)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("unmarshal /debug/vars JSON: %v\nbody: %s", err, string(body))
+	}
+
+	// (1) grand total — JSON numbers unmarshal as float64.
+	total, ok := doc["snowplow_apiserver_fallthrough_total"].(float64)
+	if !ok {
+		t.Fatalf("snowplow_apiserver_fallthrough_total missing or wrong type: %#v", doc["snowplow_apiserver_fallthrough_total"])
+	}
+	if uint64(total) != 2 {
+		t.Errorf("expvar total = %d; want 2", uint64(total))
+	}
+
+	// (2) per-cell breakdown — map[string]float64 (JSON-decoded).
+	cellsRaw, ok := doc["snowplow_apiserver_fallthrough_cells"].(map[string]any)
+	if !ok {
+		t.Fatalf("snowplow_apiserver_fallthrough_cells missing or wrong type: %#v", doc["snowplow_apiserver_fallthrough_cells"])
+	}
+	const crdKey = "call-widgets|apiextensions.k8s.io/v1/customresourcedefinitions|crd-get"
+	const kindKey = "call-widgets|v1/pods|restmapper-kindfor"
+	if v, ok := cellsRaw[crdKey].(float64); !ok || uint64(v) != 1 {
+		t.Errorf("expvar cell %q = %#v; want 1", crdKey, cellsRaw[crdKey])
+	}
+	if v, ok := cellsRaw[kindKey].(float64); !ok || uint64(v) != 1 {
+		t.Errorf("expvar cell %q = %#v; want 1", kindKey, cellsRaw[kindKey])
+	}
+
+	// (3) assertion-violations map — must exist (zero is the
+	// expected steady-state value with no missing routes).
+	violations, ok := doc["snowplow_assertion_violations_total"].(map[string]any)
+	if !ok {
+		t.Fatalf("snowplow_assertion_violations_total missing or wrong type: %#v", doc["snowplow_assertion_violations_total"])
+	}
+	if _, has := violations["read_paths_scoped"]; !has {
+		t.Errorf("snowplow_assertion_violations_total[read_paths_scoped] missing — expvar map shape regression")
+	}
+}
+
