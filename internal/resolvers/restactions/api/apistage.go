@@ -32,7 +32,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -174,17 +173,6 @@ func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListE
 // (apiVersion/kind/items), so the eventual served body is byte-identical
 // (AC-128.4) — only the decode timing moves.
 func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed parsedListEnvelope) (any, bool) {
-	// [panel500-instr] site=8 — apistage gate-list-items entry
-	// (control). Architect §2.8: empirical question "does the
-	// burst's failing path cross gateListItems? If yes (and
-	// items_len shows the composition LIST content), it's relevant;
-	// if no, control-confirmed that D.4 was at the wrong layer."
-	// Logs GVR + items_len — operators can correlate against the
-	// failing iterator path's expected resource set.
-	slog.Info("[panel500-instr] site=8 tag=apistage_gate_list_items",
-		slog.String("gvr", gvr.String()),
-		slog.Int("items_len", len(parsed.items)),
-	)
 	kept, identityOK := filterListByRBAC(ctx, gvr, parsed.items)
 	if !identityOK {
 		// FAIL-CLOSED: no identity — same contract as the inline gate's
@@ -267,23 +255,6 @@ func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw 
 // A denied / no-identity object is fail-closed (served=false) — the
 // caller falls through to the apiserver, whose per-user token 403s.
 func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (any, bool) {
-	// [panel500-instr] site=12 — gateGetEnvelope ENTRY. v2 design §2:
-	// closes the v2 diagnosis's chain-of-inference gap by binding the
-	// claim "gateGetEnvelope is on the failing nested-call's path" to
-	// a runtime artifact. raw_head shows the first 200 bytes of the
-	// cached envelope — operators can see whether apiVersion is
-	// literally present in the bytes vs absent vs JSON-null. If
-	// site=12 fires zero times during the burst, the v2 diagnosis's
-	// chosen fix site is OFF the defect path (decision-tree branch C).
-	rawHeadLen := len(raw)
-	if rawHeadLen > 200 {
-		rawHeadLen = 200
-	}
-	slog.Info("[panel500-instr] site=12 tag=gate_get_envelope_entry",
-		slog.String("gvr", gvr.String()),
-		slog.Int("raw_len", len(raw)),
-		slog.String("raw_head", string(raw[:rawHeadLen])),
-	)
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, false
@@ -292,41 +263,9 @@ func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw [
 	if !filterGetByRBAC(ctx, gvr, u) {
 		return nil, false
 	}
-	// [panel500-instr] site=13 — gateGetEnvelope SUCCESS-PATH EXIT
-	// (post-RBAC, just before serving obj). v2 design §2: the
-	// PM-§5-binding gate for the v2 diagnosis. 8 fields split across
-	// BOTH apiVersion AND kind, each carrying 3 booleans
-	// (_present, _is_string, _is_empty_string) + a _type. The
-	// three-boolean split distinguishes:
-	//   - present=false → apiVersion key entirely absent from the
-	//     cached JSON map (controller mid-write at apistage Put).
-	//   - is_empty_string=true → present and string but the literal
-	//     "" — cached partial-shape with empty TypeMeta.
-	//   - is_string=false → present but JSON-null / bool / etc. —
-	//     the _type field disambiguates (<nil> for JSON null).
-	// If ANY served object during the burst shows any of these on
-	// either field, the v2 diagnosis is CONFIRMED (decision-tree
-	// branch A).
-	avRaw := obj["apiVersion"]
-	kRaw := obj["kind"]
-	avStr, avIsStr := avRaw.(string)
-	kStr, kIsStr := kRaw.(string)
-	slog.Info("[panel500-instr] site=13 tag=gate_get_envelope_serve",
-		slog.String("gvr", gvr.String()),
-		slog.Bool("obj_apiVersion_present", avRaw != nil),
-		slog.Bool("obj_apiVersion_is_string", avIsStr),
-		slog.Bool("obj_apiVersion_is_empty_string", avIsStr && avStr == ""),
-		slog.String("obj_apiVersion_type", fmt.Sprintf("%T", avRaw)),
-		slog.Bool("obj_kind_present", kRaw != nil),
-		slog.Bool("obj_kind_is_string", kIsStr),
-		slog.Bool("obj_kind_is_empty_string", kIsStr && kStr == ""),
-		slog.String("obj_kind_type", fmt.Sprintf("%T", kRaw)),
-	)
 	// Ship D.4.2 (0.30.149) — apistage GET-by-name partial-shape
-	// guard. EMPIRICALLY GROUNDED at the 0.30.148 burst's site=13
-	// evidence (the slog.Info immediately above this comment in 0.30.148
-	// captured the burst artifact at /tmp/snowplow-runs/0.30.148/
-	// panel500-instr-v2.log): 10/250 served objects for
+	// guard. EMPIRICALLY GROUNDED at the 0.30.148 burst evidence
+	// (site=13 success-path exit): 10/250 served objects for
 	// `/v1, Resource=configmaps` had `obj_apiVersion_present=false`
 	// AND `obj_apiVersion_is_empty_string=false` AND
 	// `obj_apiVersion_type=<nil>`. The map literally LACKS the key

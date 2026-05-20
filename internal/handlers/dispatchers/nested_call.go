@@ -156,18 +156,6 @@ func ResolveNestedCall(
 	// are byte-identical to the HTTP /call bytes; no hand-replicated
 	// marshal.
 	if res == nil {
-		// [panel500-instr] site=7 — empty-envelope return. Architect
-		// §2.7: empirical question "does ResolveNestedCall ever return
-		// the empty-envelope {} during the burst? If yes, that's the
-		// structural nil-source — downstream's .status on {} produces
-		// nil." Fires only when res == nil; the {} envelope flows up
-		// to resolve.go site 5 as a 2-byte status_raw_head.
-		slog.Info("[panel500-instr] site=7 tag=nested_call_empty_envelope",
-			slog.String("ref_resource", ref.Resource),
-			slog.String("ref_name", ref.Name),
-			slog.String("ref_namespace", ref.Namespace),
-			slog.Int("depth", depth),
-		)
 		// A resolve that produced no RESTAction at all — return an empty
 		// JSON object so the stage's ResponseHandler sees well-formed JSON
 		// rather than a nil reader.

@@ -183,7 +183,7 @@ func runGateGetEnvelopeTest(t *testing.T, raw []byte) (any, bool, uint64) {
 // ─────────────────────────────────────────────────────────────────────
 
 // TestGateGetEnvelope_PartialShape_AbsentApiVersion exercises the
-// EMPIRICAL anchor from /tmp/snowplow-runs/0.30.148/panel500-instr-v2.log:
+// EMPIRICAL anchor from the 0.30.148 burst (site=13 success-path exit):
 //
 //   site=13 ... gvr="/v1, Resource=configmaps"
 //     obj_apiVersion_present=false
@@ -451,9 +451,9 @@ func TestGateGetEnvelope_PartialShape_CounterWiring(t *testing.T) {
 
 	// Confirm the cell-key shape (path + gvr + reason). A future
 	// regression that wires the counter with an empty `gvr` argument
-	// (or with `gvr` as a stage-name like ReasonResolverNilMerge)
-	// would put the increments in the wrong cell; this assert
-	// catches it.
+	// (or with `gvr` as something other than gvr.String() — e.g. a
+	// stage name) would put the increments in the wrong cell; this
+	// assert catches it.
 	cellTotal := d42PartialShapeCounterFor(cache.ScopeCallRestactions, configmapGVR.String())
 	if cellTotal < 2 {
 		t.Errorf("(call-restactions, %s, apistage-get-partial-shape) cell = %d; want ≥2 (per-GVR breakdown wired)",

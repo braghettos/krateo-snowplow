@@ -64,12 +64,6 @@ import (
 //     ReasonInformerSubresource, ReasonInformerExternalURL,
 //     ReasonInformerUnparseable, ReasonInformerPassthrough,
 //     ReasonInformerMetadataOnly.
-//   - Resolver iterator-merge nil-skip (Ship D.4.1 / 0.30.145 —
-//     handler.go's `case []any:` iterator-merge drops literal Go-nil
-//     elements before they reach downstream gojq filters that would
-//     trip "cannot iterate over: null"). See ReasonResolverNilMerge
-//     below for the per-stage `gvr`-label semantic.
-//     ReasonResolverNilMerge.
 //   - Apistage GET-by-name partial-shape guard (Ship D.4.2 / 0.30.149 —
 //     gateGetEnvelope:281 Go-nil-check on apiVersion/kind; empirically
 //     grounded at the 0.30.148 burst's site=13 evidence — 10/250
@@ -98,36 +92,21 @@ const (
 // reasons MUST be non-zero in the tester's tester-side multi-context
 // validation (any zero count means the wiring missed a branch).
 //
-// Ship D.4.1 / 0.30.145 — ReasonResolverNilMerge ("resolver-nil-
-// merge"). Fired by `handler.go`'s iterator-merge `case []any:`
-// branch when a per-iteration `tmp` value is a literal Go `nil`
-// (Ship A's EvalValue returns (nil, true, nil) on a gojq `null`
-// result; an apistage `served=false` empty-response arm also yields
-// `tmp == nil`). `wrapAsSlice(nil)` returns `[]any{nil}`, and the
-// resolver's append-into-merged-slice would otherwise put a literal
-// nil into the downstream gojq input — tripping "cannot iterate
-// over: null" on any filter that probes the merged slice's items.
-// The merge drops the nil element before append; the counter
-// records each drop.
-//
-// LABEL SEMANTIC FOR ReasonResolverNilMerge (AC-D4.1.11, PM-explicit):
-// the `gvr` label position carries the STAGE NAME (i.e. `opts.key`
-// from `jsonHandlerCore`), NOT a GroupVersionResource string. The
-// resolver-side merge layer has no GVR in scope — the failing nil
-// originates from an iteration over a stage's RESTAction.spec.api[]
-// entries, indexed by stage name. Per-stage breakdown is the
-// diagnostic value-add (operators see exactly which RESTAction stage
-// is yielding nil per-iteration responses). Cardinality budget
-// remains comfortable: stage names are bounded by the RESTAction
-// CRD set (~500 distinct stage names at production scale).
-//
 // Ship D.4 / 0.30.144 (HARD-REVERTED) introduced
 // ReasonApistagePartialShape and a TypeMeta-based predicate at the
 // apistage cache gates. The predicate fired on every core-group
 // LIST item (apiserver elides per-item TypeMeta by k8s convention)
 // → false positives across `namespaces`, `configmaps`, etc.
-// The constant and both gates are removed in Ship D.4.1; the
-// closed-enum count stays at 17 (one out, one in).
+// The constant and both gates were removed in Ship D.4.1.
+//
+// Ship D.4.1 / 0.30.145 (HARD-REVERTED) introduced a per-stage
+// "resolver-nil-merge" reason and a `case []any:` iterator-merge
+// predicate in `handler.go`. The 0.30.146-debug and 0.30.148-debug
+// burst evidence showed `tmp_is_nil=false` on every fire — the
+// predicate was empirically inert (never matched). The constant +
+// predicate were REMOVED in Ship D.4.3 / 0.30.150 alongside the
+// associated diagnostic scaffold. Closed-enum count: 18 (D.4.2) − 1
+// (D.4.3 removes the resolver-nil-merge constant) = 17.
 //
 // Ship D.4.2 / 0.30.149 — ReasonApistageGetPartialShape
 // ("apistage-get-partial-shape"). EMPIRICALLY GROUNDED at the
@@ -149,8 +128,9 @@ const (
 // the narrower scope (GET-by-name only, NOT LIST), avoids bisect
 // confusion across the campaign.
 //
-// Closed-enum count: 17 (D.4.1) + 1 (D.4.2) = 18. Within budget
-// (cardinality: 10 paths × 50 GVRs × 18 reasons = 9,000 cells).
+// Closed-enum count: 18 (D.4.2) − 1 (D.4.3 removes the
+// resolver-nil-merge constant) = 17. Within budget
+// (cardinality: 10 paths × 50 GVRs × 17 reasons = 8,500 cells).
 const (
 	ReasonInformerNotSynced       FallthroughReason = "informer-fallthrough-not-synced"
 	ReasonInformerNotServable     FallthroughReason = "informer-fallthrough-not-servable"
@@ -161,7 +141,6 @@ const (
 	ReasonInformerUnparseable     FallthroughReason = "informer-fallthrough-unparseable"
 	ReasonInformerPassthrough     FallthroughReason = "informer-fallthrough-passthrough"
 	ReasonInformerMetadataOnly    FallthroughReason = "informer-fallthrough-metadata-only"
-	ReasonResolverNilMerge        FallthroughReason = "resolver-nil-merge"
 	ReasonApistageGetPartialShape FallthroughReason = "apistage-get-partial-shape"
 	ReasonGetMissLetApiserver404  FallthroughReason = "get-miss-let-apiserver-404"
 )
