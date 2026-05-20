@@ -61,6 +61,11 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 	}
 	gvr := gv.WithResource(in.Resource)
 
+	// Ship D (0.30.141) — F-5: dynamic.KindFor builds a fresh discovery
+	// client + cold restmapper per ResourceRef per widget /call. Record
+	// BEFORE the upstream call so the counter is honest about
+	// reachability (AC-D.3).
+	cache.RecordApiserverFallthrough(ctx, cache.ReasonRestmapperKindFor, gvr.String())
 	gvk, err := dynamic.KindFor(rc, gvr)
 	if err != nil {
 		return all, err

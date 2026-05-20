@@ -18,6 +18,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -105,6 +106,12 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		callOpts.Payload = ptr.To(string(opts.dat))
 	}
 
+	// Ship D (0.30.141) — F-1: handlers.Call() is the dispatcher's
+	// fallthrough lane for GVR groups not in the
+	// dispatchers.All() map (every "raw apiserver passthrough" /call).
+	// Record BEFORE request.Do so a panicking plumbing call still
+	// counts (AC-D.3 ordering).
+	cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
 	rt := request.Do(req.Context(), callOpts)
 	if rt.Status == response.StatusFailure {
 		log.Error("unable to call endpoint",

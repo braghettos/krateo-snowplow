@@ -185,6 +185,11 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		return
 	}
 
+	// Ship D (0.30.141) — F-6: objects.getFromAPIServer is the routed
+	// pivot's apiserver fall-through arm. Record BEFORE the upstream
+	// client build so a panicking construction still increments the
+	// counter (AC-D.3 ordering).
+	cache.RecordApiserverFallthrough(ctx, cache.ReasonClientBuild, res.GVR.String())
 	cli, err := dynamic.NewClient(rc)
 	if err != nil {
 		log.Error("unable to create kubernetes dynamic client", slog.Any("err", err))

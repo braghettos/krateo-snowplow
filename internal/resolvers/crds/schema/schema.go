@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/crds"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,7 +20,12 @@ const (
 
 func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]any) error {
 	gv := dynamic.GroupVersion(obj)
-	gvr, err := dynamic.ResourceFor(rc, gv.WithKind(dynamic.GetKind(obj)))
+	gvk := gv.WithKind(dynamic.GetKind(obj))
+	// Ship D (0.30.141) — F-4: dynamic.ResourceFor builds a fresh
+	// discovery client + cold restmapper per widget /call. Record
+	// BEFORE the upstream construction (AC-D.3).
+	cache.RecordApiserverFallthrough(ctx, cache.ReasonRestmapperResourceFor, gvk.String())
+	gvr, err := dynamic.ResourceFor(rc, gvk)
 	if err != nil {
 		return err
 	}

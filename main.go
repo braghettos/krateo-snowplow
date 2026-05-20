@@ -524,17 +524,62 @@ func main() {
 
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /readyz", handlers.ReadyCheck())
-	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
-	mux.Handle("GET /list", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.List()))
+	// Ship D (0.30.141, architectural-consistency invariant) —
+	// /api-info/names is `/call`-class read; scope as `plurals` so the
+	// invariant counter classifies any apiserver fall-through from this
+	// route. cache.FallthroughScopeMiddleware is a no-op when
+	// CACHE_ENABLED=false (project_caching_is_provisional).
+	mux.Handle("GET /api-info/names", chain.Append(
+		cache.FallthroughScopeMiddleware(cache.ScopePlurals)).
+		Then(handlers.Plurals()))
+	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
 
+	mux.Handle("GET /list", chain.Append(
+		use.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeList)).
+		Then(handlers.List()))
+	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
+
+	// Ship D — GET /call is the canonical `/call` read path. Dispatcher
+	// routes into the per-group restactions / widgets handlers; for the
+	// scope label we use call-generic (the dispatcher's fallthrough lane
+	// is the F-1 site). The restactions / widgets dispatcher entries
+	// inherit the scope via the same ctx.
 	mux.Handle("GET /call", chain.Append(
 		use.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		handlers.Dispatcher(dispatchers.All())).
 		Then(handlers.Call()))
-	mux.Handle("POST /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
-	mux.Handle("PUT /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
-	mux.Handle("PATCH /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
-	mux.Handle("DELETE /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
+	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
+
+	// Ship D — write-verb `/call` routes also get the middleware (PM
+	// explicit). Write verbs are out of the read-path invariant (F-11
+	// in the design), but centralizing classification prevents silent
+	// escapes: a future GET-class route mistakenly registered under
+	// `call-write-*` would still trip the counter on the wrong cell.
+	mux.Handle("POST /call", chain.Append(
+		use.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePost)).
+		Then(handlers.Call()))
+	cache.RegisterScopedRoute("POST /call", cache.ScopeCallWritePost)
+
+	mux.Handle("PUT /call", chain.Append(
+		use.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePut)).
+		Then(handlers.Call()))
+	cache.RegisterScopedRoute("PUT /call", cache.ScopeCallWritePut)
+
+	mux.Handle("PATCH /call", chain.Append(
+		use.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePatch)).
+		Then(handlers.Call()))
+	cache.RegisterScopedRoute("PATCH /call", cache.ScopeCallWritePatch)
+
+	mux.Handle("DELETE /call", chain.Append(
+		use.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallWriteDelete)).
+		Then(handlers.Call()))
+	cache.RegisterScopedRoute("DELETE /call", cache.ScopeCallWriteDelete)
 
 	mux.Handle("POST /jq", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.JQ()))
 
@@ -576,6 +621,14 @@ func main() {
 		WriteTimeout: 50 * time.Second,
 		IdleTimeout:  30 * time.Second,
 	}
+
+	// Ship D (0.30.141) — architectural-consistency invariant boot
+	// assert. Verifies every /call-class route is wrapped with
+	// FallthroughScopeMiddleware. Test mode panics on missing routes;
+	// prod logs ERROR + bumps snowplow_assertion_violations_total. The
+	// invariant has no kill-switch in prod — a missing route degrades
+	// invariant visibility, not service correctness.
+	cache.AssertReadPathsScoped()
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

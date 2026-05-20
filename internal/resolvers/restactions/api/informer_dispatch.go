@@ -287,6 +287,8 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// call.Verb is nil (httpcall convention).
 	if v := ptr.Deref(call.Verb, http.MethodGet); v != http.MethodGet {
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-2 sub-reason: write verb on the inner-call path.
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerWriteVerb, "")
 		return nil, false
 	}
 
@@ -294,6 +296,8 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// reads have no informer-cache shape and must hit the apiserver.
 	if hasSubresourceSuffix(call.Path) {
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-2 sub-reason: subresource (permanent allowance).
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerSubresource, "")
 		return nil, false
 	}
 
@@ -303,6 +307,12 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	gvr, namespace, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)
 	if !parseOK {
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-2 sub-reason: external URL / unparseable. Both
+		// the "external URL" and the "unparseable" cases reach here;
+		// using ReasonInformerUnparseable as the umbrella keeps the
+		// closed enum tight (the design's §F-2 lists both as
+		// permanent allowances — they cannot be cache-served).
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerUnparseable, "")
 		return nil, false
 	}
 
@@ -311,6 +321,10 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	rw := cache.Global()
 	if rw == nil || rw.IsPassthrough() || cache.Disabled() {
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-2 sub-reason: passthrough watcher (cache=off /
+		// degraded mode). RecordApiserverFallthrough short-circuits on
+		// Disabled() upstream — the call is no-op in cache=off.
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerPassthrough, gvr.String())
 		return nil, false
 	}
 
@@ -320,6 +334,9 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// MUST fall through to the apiserver for these GVRs.
 	if rw.IsMetadataOnly(gvr) {
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-2 sub-reason: metadata-only GVR (permanent
+		// allowance — the informer carries no full-object shape).
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerMetadataOnly, gvr.String())
 		return nil, false
 	}
 
@@ -387,6 +404,9 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				slog.String("path", call.Path),
 			)
 			dispatchInformerFallthrough.Add(1)
+			// Ship D — F-2 sub-reason: GVR not yet synced (Gate 6 —
+			// the RESOLVER_SYNC_WAIT_MS budget expired without sync).
+			cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotSynced, gvr.String())
 			return nil, false
 		}
 	}
@@ -419,6 +439,10 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				slog.String("path", call.Path),
 			)
 			dispatchInformerFallthrough.Add(1)
+			// Ship D — F-2 sub-reason: LIST informer unservable (the
+			// post-Gate-6 re-check; servable means registered AND
+			// HasSynced).
+			cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
 			return nil, false
 		}
 
@@ -448,6 +472,9 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			items, identityOK = filterListByRBAC(ctx, gvr, items)
 			if !identityOK {
 				dispatchInformerFallthrough.Add(1)
+				// Ship D — F-2 sub-reason: RBAC denied at LIST gate
+				// (missing identity or evaluator error → fail-closed).
+				cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerRBACDeny, gvr.String())
 				return nil, false
 			}
 		}
@@ -460,6 +487,11 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 				slog.Any("err", err),
 			)
 			dispatchInformerFallthrough.Add(1)
+			// Ship D — F-2 sub-reason: marshal failure is a defensive
+			// fall-through (should never fire in practice; the WARN log
+			// is the operator signal). Classify under "not-servable"
+			// since we can't serve usable bytes.
+			cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
 			return nil, false
 		}
 		log.Debug("informer_dispatch.list_served",
@@ -487,6 +519,8 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			slog.String("name", name),
 		)
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-2 sub-reason: GET informer unservable.
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
 		return nil, false
 	}
 	// The indexer returns (obj, true) on hit and (nil, false) on
@@ -503,6 +537,12 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			slog.String("name", name),
 		)
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-6 allowed-fallthrough: GET-miss → let apiserver
+		// answer 404. Documented contract: the apiserver returns the
+		// canonical Status envelope (Status kind, code:404) that the
+		// JQ pipeline expects; synthesizing it here would either lose
+		// the shape or duplicate it.
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonGetMissLetApiserver404, gvr.String())
 		return nil, false
 	}
 
@@ -523,6 +563,10 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	if !cache.ApistageContentResolveFromContext(ctx) {
 		if !filterGetByRBAC(ctx, gvr, obj) {
 			dispatchInformerFallthrough.Add(1)
+			// Ship D — F-2 sub-reason: GET-verb RBAC denied (or
+			// missing identity / evaluator error → fail-closed). The
+			// apiserver's per-user token will correctly 403.
+			cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerRBACDeny, gvr.String())
 			return nil, false
 		}
 	}
@@ -536,6 +580,9 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			slog.Any("err", err),
 		)
 		dispatchInformerFallthrough.Add(1)
+		// Ship D — F-2 sub-reason: GET marshal failure (defensive;
+		// same posture as the LIST-marshal branch).
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonInformerNotServable, gvr.String())
 		return nil, false
 	}
 	log.Debug("informer_dispatch.get_served",

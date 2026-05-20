@@ -11,6 +11,7 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/kubeconfig"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -59,6 +60,11 @@ func List() http.HandlerFunc {
 			return
 		}
 
+		// Ship D (0.30.141) — F-9: /list issues a per-user dynamic
+		// client + Discover + per-GVR ListObjects; the cache-gate
+		// stub at dynamic/list.go:19-33 today falls through to
+		// apiserver. Record BEFORE client build (AC-D.3 ordering).
+		cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
 		cli, err := dynamic.NewClient(rc)
 		if err != nil {
 			log.Error("cannot create dynamic client", slog.Any("err", err))

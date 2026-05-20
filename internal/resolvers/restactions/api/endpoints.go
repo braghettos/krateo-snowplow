@@ -56,6 +56,15 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		isInternal = true
 	}
 
+	// Ship D (0.30.141) — F-3: endpoints.FromSecret issues a per-user
+	// clientconfig-Secret GET (apiserver) per non-UAF stage per /call —
+	// architect's largest snowplow-attributable apiserver traffic
+	// source on the request path. Record BEFORE the plumbing call so a
+	// panicking secret-GET still increments the counter (AC-D.3). The
+	// gvr label is left empty: the Secret being read is fixed per user,
+	// not per resolver target, and synthesizing a placeholder would
+	// inflate cardinality without diagnostic value.
+	cache.RecordApiserverFallthrough(ctx, cache.ReasonSecretGet, "")
 	ep, err := endpoints.FromSecret(ctx, m.rc, ref.Name, ref.Namespace)
 	if err != nil {
 		return ep, err
