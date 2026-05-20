@@ -23,6 +23,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
 	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -559,7 +560,7 @@ func main() {
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
 
 	mux.Handle("GET /list", chain.Append(
-		use.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(*signKey, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeList)).
 		Then(handlers.List()))
 	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
@@ -570,7 +571,7 @@ func main() {
 	// is the F-1 site). The restactions / widgets dispatcher entries
 	// inherit the scope via the same ctx.
 	mux.Handle("GET /call", chain.Append(
-		use.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(*signKey, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		handlers.Dispatcher(dispatchers.All())).
 		Then(handlers.Call()))
@@ -582,30 +583,30 @@ func main() {
 	// escapes: a future GET-class route mistakenly registered under
 	// `call-write-*` would still trip the counter on the wrong cell.
 	mux.Handle("POST /call", chain.Append(
-		use.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(*signKey, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePost)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("POST /call", cache.ScopeCallWritePost)
 
 	mux.Handle("PUT /call", chain.Append(
-		use.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(*signKey, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePut)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("PUT /call", cache.ScopeCallWritePut)
 
 	mux.Handle("PATCH /call", chain.Append(
-		use.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(*signKey, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePatch)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("PATCH /call", cache.ScopeCallWritePatch)
 
 	mux.Handle("DELETE /call", chain.Append(
-		use.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(*signKey, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWriteDelete)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("DELETE /call", cache.ScopeCallWriteDelete)
 
-	mux.Handle("POST /jq", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.JQ()))
+	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(*signKey, *authnNS)).Then(handlers.JQ()))
 
 	// /debug/pprof/* — registered on the custom mux (server does NOT use http.DefaultServeMux).
 	// Exposes goroutine, heap, profile, allocs, mutex, block, cmdline, symbol, threadcreate, trace.

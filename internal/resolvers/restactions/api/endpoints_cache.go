@@ -83,6 +83,16 @@ const (
 //     missing). Returns the exact upstream error message verbatim
 //     ("missed required attribute for endpoint: server-url") so a
 //     caller checking err.Error() doesn't behave differently.
+//     Reached by the Ship D.3 middleware site
+//     (`internal/handlers/middleware/userconfig.go`) on cache
+//     hard-error — the middleware treats this branch as upstream's
+//     non-NotFound error arm (→ 500 InternalError with the verbatim
+//     string). The resolver-internal site
+//     (`endpoints.go:67-88`) reaches it only when the upstream
+//     re-call subsequently produces the same error; on a plain cache
+//     hard-error the resolver re-call ALSO returns the same string
+//     (apiserver state is authoritative — if the Secret on the wire
+//     is malformed, both call sites surface the same verbatim text).
 //
 // AC-D2.6 byte-equivalence: TestFromInformerSecret_UpstreamFieldParity
 // asserts this returns a reflect.DeepEqual Endpoint to plumbing's
