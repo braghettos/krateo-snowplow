@@ -322,6 +322,69 @@ func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw [
 		slog.Bool("obj_kind_is_empty_string", kIsStr && kStr == ""),
 		slog.String("obj_kind_type", fmt.Sprintf("%T", kRaw)),
 	)
+	// Ship D.4.2 (0.30.149) — apistage GET-by-name partial-shape
+	// guard. EMPIRICALLY GROUNDED at the 0.30.148 burst's site=13
+	// evidence (the slog.Info immediately above this comment in 0.30.148
+	// captured the burst artifact at /tmp/snowplow-runs/0.30.148/
+	// panel500-instr-v2.log): 10/250 served objects for
+	// `/v1, Resource=configmaps` had `obj_apiVersion_present=false`
+	// AND `obj_apiVersion_is_empty_string=false` AND
+	// `obj_apiVersion_type=<nil>`. The map literally LACKS the key
+	// (not present-but-empty, not present-but-null).
+	//
+	// Defect flow (TRACED at design §1.5):
+	//   apiserver elides per-item TypeMeta on core-group LIST
+	//   responses (k8s wire convention)
+	//   → streaming_list.go:507 captures item bytes verbatim
+	//   → bytesObject's b.raw lacks apiVersion
+	//   → bytesObject.Decode produces map[string]any without
+	//     apiVersion key
+	//   → dispatchViaInformer's json.Marshal(obj.Object) emits bytes
+	//     without apiVersion
+	//   → apistage Put stores them
+	//   → apistage Get + gateGetEnvelope decodes back
+	//   → obj["apiVersion"] is Go nil (untyped nil from absent
+	//     map key).
+	//
+	// PREDICATE: Go nil-check (`obj["apiVersion"] == nil`), NOT D.4's
+	// `obj["apiVersion"].(string) == ""`. The narrower predicate fires
+	// ONLY on the empirically-observed defect class (present=false).
+	// D.4's predicate would have ALSO fired on a present-but-empty-
+	// string case that DOES NOT empirically exist (0/250 site=13
+	// fires had is_empty_string=true). `feedback_empirical_apiserver
+	// _probe_for_predicate_design` requires the predicate's blast
+	// radius bounded by empirically observed cases.
+	//
+	// Truth table:
+	//   - key absent → obj["apiVersion"]==any(nil) → predicate fires
+	//     ✓ (the empirical defect class).
+	//   - key present, JSON null → obj["apiVersion"]==nil → predicate
+	//     fires ✓ (defensive; hypothetical, not empirically observed
+	//     but caught by the same code).
+	//   - key present, string "v1" → obj["apiVersion"]=="v1" → does
+	//     NOT fire ✓.
+	//   - key present, empty string "" → obj["apiVersion"]=="" →
+	//     does NOT fire ✓ (D.4 false-positive class; empirically
+	//     never observed; D.4.2 explicitly avoids).
+	//
+	// Returns (nil, false) — same shape as the filterGetByRBAC deny
+	// branch above. apistageContentServe sees served=false; resolve.go
+	// falls through to dispatchViaInternalRESTConfig / httpcall.Do; the
+	// fresh apiserver GET-by-name response (verified §1.5: kubectl
+	// get --raw returns apiVersion + kind populated) feeds the
+	// downstream filter with a fully-populated map. ZERO new caller-
+	// side code path.
+	//
+	// CACHE ENTRY PRESERVED: no eviction per
+	// feedback_l1_invalidation_delete_only — the partial-shape entry
+	// stays in the apistage cache; the next informer UPDATE event
+	// dirty-marks the entry; the refresher re-Puts the entry, which
+	// will pick up the apiserver's now-fresh GET-by-name shape; the
+	// guard ceases firing for that (gvr, ns, name) tuple.
+	if obj["apiVersion"] == nil || obj["kind"] == nil {
+		cache.RecordApiserverFallthrough(ctx, cache.ReasonApistageGetPartialShape, gvr.String())
+		return nil, false
+	}
 	// Ship 0.30.128 P-CORE-2: return the decoded object value, not the
 	// raw bytes — jsonHandlerValue consumes it with no re-unmarshal.
 	return obj, true

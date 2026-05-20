@@ -70,6 +70,12 @@ import (
 //     trip "cannot iterate over: null"). See ReasonResolverNilMerge
 //     below for the per-stage `gvr`-label semantic.
 //     ReasonResolverNilMerge.
+//   - Apistage GET-by-name partial-shape guard (Ship D.4.2 / 0.30.149 —
+//     gateGetEnvelope:281 Go-nil-check on apiVersion/kind; empirically
+//     grounded at the 0.30.148 burst's site=13 evidence — 10/250
+//     /v1,configmaps GET-by-name fires had key-absent shape. Returns
+//     (nil, false) → fall-through to fresh apiserver GET-by-name).
+//     ReasonApistageGetPartialShape.
 //   - Allowed-fall-through bucket (mainly for visibility):
 //     ReasonGetMissLetApiserver404.
 type FallthroughReason string
@@ -122,18 +128,42 @@ const (
 // → false positives across `namespaces`, `configmaps`, etc.
 // The constant and both gates are removed in Ship D.4.1; the
 // closed-enum count stays at 17 (one out, one in).
+//
+// Ship D.4.2 / 0.30.149 — ReasonApistageGetPartialShape
+// ("apistage-get-partial-shape"). EMPIRICALLY GROUNDED at the
+// 0.30.148 burst's site=13 evidence: 10/250 served objects for
+// `/v1, Resource=configmaps` had `obj["apiVersion"] == nil` (key
+// ABSENT from the map). Fired by gateGetEnvelope:281's narrower
+// Go-nil-check predicate (NOT D.4's TypeMeta string-zero-value
+// check) on per-name GET-by-name cached envelopes whose decoded
+// map lacks `apiVersion` or `kind`. The defect flows: apiserver
+// elides per-item TypeMeta on core-group LIST responses (k8s
+// convention) → streaming_list.go captures item bytes verbatim →
+// bytesObject's b.raw lacks apiVersion → dispatchViaInformer's
+// json.Marshal produces bytes without apiVersion → apistage Put
+// stores them → apistage Get + gateGetEnvelope decodes back →
+// obj["apiVersion"] is Go nil (untyped nil from absent map key).
+// Returns (nil, false) → fall-through to fresh apiserver GET-by-
+// name (the existing served=false arm). Distinct name from D.4's
+// reverted ReasonApistagePartialShape — `-get-` suffix signals
+// the narrower scope (GET-by-name only, NOT LIST), avoids bisect
+// confusion across the campaign.
+//
+// Closed-enum count: 17 (D.4.1) + 1 (D.4.2) = 18. Within budget
+// (cardinality: 10 paths × 50 GVRs × 18 reasons = 9,000 cells).
 const (
-	ReasonInformerNotSynced      FallthroughReason = "informer-fallthrough-not-synced"
-	ReasonInformerNotServable    FallthroughReason = "informer-fallthrough-not-servable"
-	ReasonInformerRBACDeny       FallthroughReason = "informer-fallthrough-rbac-deny"
-	ReasonInformerWriteVerb      FallthroughReason = "informer-fallthrough-write-verb"
-	ReasonInformerSubresource    FallthroughReason = "informer-fallthrough-subresource"
-	ReasonInformerExternalURL    FallthroughReason = "informer-fallthrough-external-url"
-	ReasonInformerUnparseable    FallthroughReason = "informer-fallthrough-unparseable"
-	ReasonInformerPassthrough    FallthroughReason = "informer-fallthrough-passthrough"
-	ReasonInformerMetadataOnly   FallthroughReason = "informer-fallthrough-metadata-only"
-	ReasonResolverNilMerge       FallthroughReason = "resolver-nil-merge"
-	ReasonGetMissLetApiserver404 FallthroughReason = "get-miss-let-apiserver-404"
+	ReasonInformerNotSynced       FallthroughReason = "informer-fallthrough-not-synced"
+	ReasonInformerNotServable     FallthroughReason = "informer-fallthrough-not-servable"
+	ReasonInformerRBACDeny        FallthroughReason = "informer-fallthrough-rbac-deny"
+	ReasonInformerWriteVerb       FallthroughReason = "informer-fallthrough-write-verb"
+	ReasonInformerSubresource     FallthroughReason = "informer-fallthrough-subresource"
+	ReasonInformerExternalURL     FallthroughReason = "informer-fallthrough-external-url"
+	ReasonInformerUnparseable     FallthroughReason = "informer-fallthrough-unparseable"
+	ReasonInformerPassthrough     FallthroughReason = "informer-fallthrough-passthrough"
+	ReasonInformerMetadataOnly    FallthroughReason = "informer-fallthrough-metadata-only"
+	ReasonResolverNilMerge        FallthroughReason = "resolver-nil-merge"
+	ReasonApistageGetPartialShape FallthroughReason = "apistage-get-partial-shape"
+	ReasonGetMissLetApiserver404  FallthroughReason = "get-miss-let-apiserver-404"
 )
 
 // fallthroughKey is the composite label tuple for one counter cell.
