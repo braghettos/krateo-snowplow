@@ -64,6 +64,9 @@ import (
 //     ReasonInformerSubresource, ReasonInformerExternalURL,
 //     ReasonInformerUnparseable, ReasonInformerPassthrough,
 //     ReasonInformerMetadataOnly.
+//   - Apistage cache partial-shape guard (Ship D.4 — gateListItems
+//     filter-in-place; secondary gateGetEnvelope fail-closed):
+//     ReasonApistagePartialShape.
 //   - Allowed-fall-through bucket (mainly for visibility):
 //     ReasonGetMissLetApiserver404.
 type FallthroughReason string
@@ -85,16 +88,30 @@ const (
 // sub-classified by gate-miss cause. PM tightening — these sub-
 // reasons MUST be non-zero in the tester's tester-side multi-context
 // validation (any zero count means the wiring missed a branch).
+//
+// Ship D.4 adds ReasonApistagePartialShape (apistage-partial-shape) —
+// fired by the per-item LIST guard in gateListItems and the
+// single-object guard in gateGetEnvelope when an apistage cache
+// entry's decoded object lacks apiVersion or kind (controller
+// mid-write OR malformed cache entry). The LIST-path guard
+// filters items in-place (no apiserver fall-through — the served
+// envelope simply omits the partial item; partial-shape entry
+// preserved in cache per feedback_l1_invalidation_delete_only); the
+// GET-path guard returns (nil, false) and reuses the existing
+// served=false fall-through arm in apistageContentServe. See
+// docs/ship-d4-apistage-partial-shape-guard-design.md §12 for the
+// site-level rationale.
 const (
-	ReasonInformerNotSynced     FallthroughReason = "informer-fallthrough-not-synced"
-	ReasonInformerNotServable   FallthroughReason = "informer-fallthrough-not-servable"
-	ReasonInformerRBACDeny      FallthroughReason = "informer-fallthrough-rbac-deny"
-	ReasonInformerWriteVerb     FallthroughReason = "informer-fallthrough-write-verb"
-	ReasonInformerSubresource   FallthroughReason = "informer-fallthrough-subresource"
-	ReasonInformerExternalURL   FallthroughReason = "informer-fallthrough-external-url"
-	ReasonInformerUnparseable   FallthroughReason = "informer-fallthrough-unparseable"
-	ReasonInformerPassthrough   FallthroughReason = "informer-fallthrough-passthrough"
-	ReasonInformerMetadataOnly  FallthroughReason = "informer-fallthrough-metadata-only"
+	ReasonInformerNotSynced      FallthroughReason = "informer-fallthrough-not-synced"
+	ReasonInformerNotServable    FallthroughReason = "informer-fallthrough-not-servable"
+	ReasonInformerRBACDeny       FallthroughReason = "informer-fallthrough-rbac-deny"
+	ReasonInformerWriteVerb      FallthroughReason = "informer-fallthrough-write-verb"
+	ReasonInformerSubresource    FallthroughReason = "informer-fallthrough-subresource"
+	ReasonInformerExternalURL    FallthroughReason = "informer-fallthrough-external-url"
+	ReasonInformerUnparseable    FallthroughReason = "informer-fallthrough-unparseable"
+	ReasonInformerPassthrough    FallthroughReason = "informer-fallthrough-passthrough"
+	ReasonInformerMetadataOnly   FallthroughReason = "informer-fallthrough-metadata-only"
+	ReasonApistagePartialShape   FallthroughReason = "apistage-partial-shape"
 	ReasonGetMissLetApiserver404 FallthroughReason = "get-miss-let-apiserver-404"
 )
 
