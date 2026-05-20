@@ -64,9 +64,12 @@ import (
 //     ReasonInformerSubresource, ReasonInformerExternalURL,
 //     ReasonInformerUnparseable, ReasonInformerPassthrough,
 //     ReasonInformerMetadataOnly.
-//   - Apistage cache partial-shape guard (Ship D.4 — gateListItems
-//     filter-in-place; secondary gateGetEnvelope fail-closed):
-//     ReasonApistagePartialShape.
+//   - Resolver iterator-merge nil-skip (Ship D.4.1 / 0.30.145 —
+//     handler.go's `case []any:` iterator-merge drops literal Go-nil
+//     elements before they reach downstream gojq filters that would
+//     trip "cannot iterate over: null"). See ReasonResolverNilMerge
+//     below for the per-stage `gvr`-label semantic.
+//     ReasonResolverNilMerge.
 //   - Allowed-fall-through bucket (mainly for visibility):
 //     ReasonGetMissLetApiserver404.
 type FallthroughReason string
@@ -89,18 +92,36 @@ const (
 // reasons MUST be non-zero in the tester's tester-side multi-context
 // validation (any zero count means the wiring missed a branch).
 //
-// Ship D.4 adds ReasonApistagePartialShape (apistage-partial-shape) —
-// fired by the per-item LIST guard in gateListItems and the
-// single-object guard in gateGetEnvelope when an apistage cache
-// entry's decoded object lacks apiVersion or kind (controller
-// mid-write OR malformed cache entry). The LIST-path guard
-// filters items in-place (no apiserver fall-through — the served
-// envelope simply omits the partial item; partial-shape entry
-// preserved in cache per feedback_l1_invalidation_delete_only); the
-// GET-path guard returns (nil, false) and reuses the existing
-// served=false fall-through arm in apistageContentServe. See
-// docs/ship-d4-apistage-partial-shape-guard-design.md §12 for the
-// site-level rationale.
+// Ship D.4.1 / 0.30.145 — ReasonResolverNilMerge ("resolver-nil-
+// merge"). Fired by `handler.go`'s iterator-merge `case []any:`
+// branch when a per-iteration `tmp` value is a literal Go `nil`
+// (Ship A's EvalValue returns (nil, true, nil) on a gojq `null`
+// result; an apistage `served=false` empty-response arm also yields
+// `tmp == nil`). `wrapAsSlice(nil)` returns `[]any{nil}`, and the
+// resolver's append-into-merged-slice would otherwise put a literal
+// nil into the downstream gojq input — tripping "cannot iterate
+// over: null" on any filter that probes the merged slice's items.
+// The merge drops the nil element before append; the counter
+// records each drop.
+//
+// LABEL SEMANTIC FOR ReasonResolverNilMerge (AC-D4.1.11, PM-explicit):
+// the `gvr` label position carries the STAGE NAME (i.e. `opts.key`
+// from `jsonHandlerCore`), NOT a GroupVersionResource string. The
+// resolver-side merge layer has no GVR in scope — the failing nil
+// originates from an iteration over a stage's RESTAction.spec.api[]
+// entries, indexed by stage name. Per-stage breakdown is the
+// diagnostic value-add (operators see exactly which RESTAction stage
+// is yielding nil per-iteration responses). Cardinality budget
+// remains comfortable: stage names are bounded by the RESTAction
+// CRD set (~500 distinct stage names at production scale).
+//
+// Ship D.4 / 0.30.144 (HARD-REVERTED) introduced
+// ReasonApistagePartialShape and a TypeMeta-based predicate at the
+// apistage cache gates. The predicate fired on every core-group
+// LIST item (apiserver elides per-item TypeMeta by k8s convention)
+// → false positives across `namespaces`, `configmaps`, etc.
+// The constant and both gates are removed in Ship D.4.1; the
+// closed-enum count stays at 17 (one out, one in).
 const (
 	ReasonInformerNotSynced      FallthroughReason = "informer-fallthrough-not-synced"
 	ReasonInformerNotServable    FallthroughReason = "informer-fallthrough-not-servable"
@@ -111,7 +132,7 @@ const (
 	ReasonInformerUnparseable    FallthroughReason = "informer-fallthrough-unparseable"
 	ReasonInformerPassthrough    FallthroughReason = "informer-fallthrough-passthrough"
 	ReasonInformerMetadataOnly   FallthroughReason = "informer-fallthrough-metadata-only"
-	ReasonApistagePartialShape   FallthroughReason = "apistage-partial-shape"
+	ReasonResolverNilMerge       FallthroughReason = "resolver-nil-merge"
 	ReasonGetMissLetApiserver404 FallthroughReason = "get-miss-let-apiserver-404"
 )
 

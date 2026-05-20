@@ -179,56 +179,7 @@ func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed 
 		// served=false (caller falls through to the apiserver).
 		return nil, false
 	}
-
-	// Ship D.4 (0.30.144) — per-item partial-shape guard. A cached LIST
-	// item missing apiVersion or kind (controller mid-write — e.g.
-	// core-provider crash-loop produces incomplete CompositionResources
-	// observations — OR a malformed cache entry) crashes downstream
-	// RESTAction filters that assume apiVersion is non-null (the
-	// `cannot iterate over: null` / `startswith(...) cannot be applied
-	// to: null` symptom — see docs/panels-500-diagnosis-2026-05-20.md
-	// and docs/ship-d4-apistage-partial-shape-guard-design.md §12).
-	//
-	// FILTER-IN-PLACE — NOT apiserver fall-through. The served
-	// envelope simply omits partial items; healthy items in the same
-	// LIST are served unchanged. No apiserver round-trip (the LIST
-	// path's filter-in-place semantics keep §9's apiserver delta near
-	// zero per §12.6).
-	//
-	// CACHE ENTRY PRESERVED — NO eviction (per
-	// feedback_l1_invalidation_delete_only: DELETE is the only verb
-	// that self-evicts). The partial-shape entry stays in the cache;
-	// the next informer UPDATE event from the controller's eventual
-	// settle dirty-marks the entry, the refresher re-Puts the
-	// now-complete shape, and subsequent Gets serve the full set.
-	// Self-healing once the controller stabilizes.
-	//
-	// RBAC ORDERING — guard runs AFTER filterListByRBAC so it can only
-	// REMOVE items the user is already authorized to see; never widens
-	// the RBAC view (§12.2).
-	//
-	// Predicate via Unstructured accessors: GetAPIVersion()/GetKind()
-	// return "" when the field is absent OR JSON-null OR non-string —
-	// the three documented partial-shape variants. Nil-safe via the
-	// explicit `it == nil` check (defensive; parseListEnvelope:149-151
-	// constructs the slice from un-validated json.Unmarshal output).
-	//
-	// AC-D4.6 falsifier — investigation trigger at >1.3× counter/
-	// apiserver-delta ratio (PM tightening, sub-2× canary, NOT hard
-	// revert). The LIST-path guard contributes counter increments WITHOUT
-	// a matching apiserver fetch by construction (filter-in-place), so
-	// the ratio gate semantics hold only for the secondary
-	// gateGetEnvelope guard's GET-by-name fall-through path.
-	healthy := make([]*unstructured.Unstructured, 0, len(kept))
-	for _, it := range kept {
-		if it == nil || it.GetAPIVersion() == "" || it.GetKind() == "" {
-			cache.RecordApiserverFallthrough(ctx, cache.ReasonApistagePartialShape, gvr.String())
-			continue
-		}
-		healthy = append(healthy, it)
-	}
-
-	return listEnvelopeValue(parsed.apiVersion, parsed.kind, healthy), true
+	return listEnvelopeValue(parsed.apiVersion, parsed.kind, kept), true
 }
 
 // listEnvelopeValue assembles the apiserver-shaped LIST envelope as a
@@ -303,19 +254,6 @@ func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw 
 // gateGetEnvelope runs filterGetByRBAC on a single-object envelope.
 // A denied / no-identity object is fail-closed (served=false) — the
 // caller falls through to the apiserver, whose per-user token 403s.
-//
-// Ship D.4 (0.30.144) — defense-in-depth partial-shape guard for the
-// GET-by-name path. The primary site (gateListItems) handles the
-// LIST-item partial-shape symptom that produced the panels-500
-// regression; this secondary guard catches the rare case where a
-// per-name iterator hits a single-object content entry directly with
-// a partial shape (e.g. a future iterator pattern, or a cache entry
-// Put while a single-object GET hit a mid-write controller). Same
-// predicate + same counter as the primary guard; uses the existing
-// (nil, false) fail-closed return — caller falls through to apiserver
-// via apistageContentServe → resolve.go's dispatchViaInternalRESTConfig
-// / httpcall.Do arms (the same fall-through arm "no identity / GET
-// denied" already uses; ZERO new code paths in the caller).
 func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) (any, bool) {
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
@@ -323,20 +261,6 @@ func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw [
 	}
 	u := &unstructured.Unstructured{Object: obj}
 	if !filterGetByRBAC(ctx, gvr, u) {
-		return nil, false
-	}
-	// Ship D.4 partial-shape guard (secondary site). Same predicate
-	// as gateListItems: a single-object content entry lacking
-	// apiVersion OR kind is a controller-mid-write artifact; serving
-	// it would crash downstream RESTAction filters. Fail closed; the
-	// caller's existing served=false arm refetches from the apiserver,
-	// whose response by definition carries apiVersion + kind. Cache
-	// entry preserved (no DELETE-time eviction —
-	// feedback_l1_invalidation_delete_only); the next informer UPDATE
-	// event dirty-marks it and the refresher re-Puts the complete
-	// shape.
-	if u.GetAPIVersion() == "" || u.GetKind() == "" {
-		cache.RecordApiserverFallthrough(ctx, cache.ReasonApistagePartialShape, gvr.String())
 		return nil, false
 	}
 	// Ship 0.30.128 P-CORE-2: return the decoded object value, not the

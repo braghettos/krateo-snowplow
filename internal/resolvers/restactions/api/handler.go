@@ -10,6 +10,7 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 )
 
@@ -127,8 +128,58 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 
 	switch existingSlice := got.(type) {
 	case []any:
+		// Ship D.4.1 (0.30.145) — iterator-merge nil-skip.
+		//
+		// The defect: an iterator over a RESTAction stage's
+		// `apiCall.path` template can yield a per-iteration `tmp`
+		// that is a literal Go `nil` — either because Ship A's
+		// `EvalValue` returned `(nil, true, nil)` for a gojq `null`
+		// result, or because the apistage cache hit a `served=false`
+		// empty-response arm. `wrapAsSlice(nil)` returns
+		// `[]any{nil}` — a single-element slice containing a
+		// literal Go nil. The append-into-merged-slice would
+		// otherwise put that nil into the merged downstream slice
+		// under `opts.out[opts.key]`, and any subsequent gojq filter
+		// probing `.apiVersion` (or any field) on that nil element
+		// trips "cannot iterate over: null" — the original panels-500
+		// symptom (re-diagnosed at design doc §2.4).
+		//
+		// The predicate runs INSIDE the wrapAsSlice loop — NOT
+		// before it. A "shortcut `if tmp == nil`" before
+		// wrapAsSlice would miss the case where `tmp` is itself a
+		// `[]any` whose elements include a nil (multi-yield filter
+		// returning nils interleaved with healthy values). The
+		// actual failure mode is at the slice-element level after
+		// wrapAsSlice, so the predicate operates there.
+		//
+		// FILTER-IN-PLACE — no apiserver fall-through. The merge
+		// just doesn't append the nil; healthy elements in the same
+		// iteration are merged unchanged. The per-iteration source
+		// (apistage cache entry / nested-call result) is the
+		// resolver's transient state, NOT a cache layer — there is
+		// nothing to evict (per
+		// feedback_l1_invalidation_delete_only: DELETE is the only
+		// verb that self-evicts; nothing here mutates a cache).
+		//
+		// Counter (AC-D4.1.11 — PM-explicit per-stage label): the
+		// `gvr` argument carries `opts.key` (the STAGE NAME from
+		// jsonHandlerCore at :122-123), NOT a GroupVersionResource
+		// string. Operators get a per-RESTAction-stage breakdown
+		// at `/debug/vars`'s
+		// `snowplow_apiserver_fallthrough_cells["call-*|<stageName>|resolver-nil-merge"]`
+		// — the diagnostic value-add per the design's §3.4 note 5.
 		if v := wrapAsSlice(tmp); len(v) > 0 {
-			opts.out[opts.key] = append(existingSlice, v...)
+			kept := make([]any, 0, len(v))
+			for _, x := range v {
+				if x == nil {
+					cache.RecordApiserverFallthrough(ctx, cache.ReasonResolverNilMerge, opts.key)
+					continue
+				}
+				kept = append(kept, x)
+			}
+			if len(kept) > 0 {
+				opts.out[opts.key] = append(existingSlice, kept...)
+			}
 		}
 	default:
 		opts.out[opts.key] = []any{got, tmp}
