@@ -56,6 +56,36 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		isInternal = true
 	}
 
+	// Ship D.2 (0.30.143) — F-3 cache lookup FIRST. The Secrets
+	// snapshot covers AUTHN_NAMESPACE `<user>-clientconfig` Secrets
+	// in-process; on a hit we skip the apiserver round-trip
+	// entirely. On any soft miss (cache=off, namespace mismatch,
+	// pre-sync, Secret absent, snapshot nil pre-readiness) the
+	// function returns served=false and we fall through to the
+	// upstream plumbing call below — the pre-D.2 behavior preserved
+	// exactly (AC-D2.4). The Ship D RecordApiserverFallthrough call
+	// is BELOW the cache-hit return so the F-3 counter measures
+	// only the fallback path; the F-3 falsifier (134/60s → ≤5/60s)
+	// reads that drop.
+	if ep, served, ferr := FromInformerSecret(ctx, ref.Namespace, ref.Name); served {
+		// Hard error path: Secret present but malformed
+		// (server-url missing). Upstream FromSecret would have
+		// returned the same error verbatim — we propagate it.
+		if ferr != nil {
+			return ep, ferr
+		}
+		// AC-D2.7 — the isInternal+!env.TestMode ServerURL override
+		// applies UNIFORMLY on both the cache-hit and the upstream-
+		// fallback path. Kept here (not factored into
+		// FromInformerSecret) per PM-explicit `feedback_no_special_cases`:
+		// the override is the resolver's contextual decision (the
+		// stage is internal-driven), not a Secret-cache concern.
+		if isInternal && !env.TestMode() {
+			ep.ServerURL = "https://kubernetes.default.svc"
+		}
+		return ep, nil
+	}
+
 	// Ship D (0.30.141) — F-3: endpoints.FromSecret issues a per-user
 	// clientconfig-Secret GET (apiserver) per non-UAF stage per /call —
 	// architect's largest snowplow-attributable apiserver traffic

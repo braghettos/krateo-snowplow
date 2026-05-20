@@ -258,6 +258,29 @@ func main() {
 					}
 					syncCancel()
 
+					// Ship D.2 (0.30.143) — F-3 cache. Start the
+					// AUTHN_NAMESPACE-scoped Secrets informer so the
+					// per-user `<user>-clientconfig` lookup the
+					// resolver mapper runs (endpoints.go:67) is
+					// served from in-process instead of the
+					// apiserver. Soft-fail by design — a wiring error
+					// leaves the cache inert and the resolver mapper
+					// falls back to plumbing's endpoints.FromSecret
+					// (the pre-D.2 path).
+					//
+					// AUTHN_NAMESPACE empty → no-op (production sets
+					// it via the chart values; dev/test may leave
+					// blank). AssertSecretsInformerWired runs after
+					// to surface the misconfiguration.
+					if *authnNS != "" {
+						if err := cache.StartSecretsInformer(cacheCtx, rc, *authnNS); err != nil {
+							log.Warn("cache: StartSecretsInformer failed; F-3 cache offline (upstream fallback)",
+								slog.String("authn_ns", *authnNS),
+								slog.Any("err", err))
+						}
+					}
+					cache.AssertSecretsInformerWired()
+
 					// Tag 0.30.6 binding: walk every RestAction in the
 					// cluster, derive the GVR set referenced by
 					// spec.api[*].path, and eager-register the lot.
