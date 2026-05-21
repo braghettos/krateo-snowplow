@@ -44,6 +44,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		return opts.In, err
 	}
 
+	// Ship H7 (0.30.161): re-inject the pagination triple into the
+	// widget data source. The api-resolver constructed `dict["slice"]`
+	// at internal/resolvers/restactions/api/resolve.go:211-215, but the
+	// RESTAction's spec.Filter projection (e.g. compositions-list emits
+	// `{list: (.allCompositions // [])}`) strips `.slice` from the dict
+	// before it arrives here as `ds`. The widget jq expects `.slice`
+	// (see e.g. table.dashboard-compositions-panel-row-table.yaml:32 —
+	// `if .slice then $sorted[0 : (.slice.page * .slice.perPage)] else …`)
+	// and silently falls through to "return all rows" when absent —
+	// materialising the unbounded list at the resolver layer.
+	injectSlice(ds, opts.PerPage, opts.Page)
+
 	widgetData, err := resolveWidgetData(ctx, opts.In, ds)
 	if err != nil {
 		log.Error("unable to resolve widget data", slog.Any("err", err))
@@ -200,4 +212,34 @@ func resolveResourceRefs(ctx context.Context, obj *Widget, ds map[string]any) ([
 	}
 
 	return resourcesrefs.Resolve(ctx, all)
+}
+
+// injectSlice writes `ds["slice"] = {page, perPage, offset}` IFF
+// the request carried pagination (`perPage > 0 && page > 0`) AND
+// `ds` does not already contain a `slice` entry.
+//
+// Mechanism-uniform per feedback_no_special_cases: no widget-name
+// table, no GVR allowlist. The shape mirrors the triple computed at
+// internal/resolvers/restactions/api/resolve.go:211-215; this hop
+// merely propagates that triple through the RA-filter projection
+// (which would otherwise strip it — see the function's call site
+// for the TRACED defect chain).
+//
+// Branch A per design §3: pre-existing `slice` is preserved so an
+// RA author who deliberately emits `.slice` via spec.Filter wins.
+func injectSlice(ds map[string]any, perPage, page int) {
+	if ds == nil {
+		return
+	}
+	if perPage <= 0 || page <= 0 {
+		return
+	}
+	if _, present := ds["slice"]; present {
+		return
+	}
+	ds["slice"] = map[string]any{
+		"page":    page,
+		"perPage": perPage,
+		"offset":  (page - 1) * perPage,
+	}
 }
