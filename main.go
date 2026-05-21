@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,6 +58,19 @@ func main() {
 	signKey := flag.String("jwt-sign-key", env.String("JWT_SIGN_KEY", ""), "secret key used to sign JWT tokens")
 	jqModPath := flag.String("jq-modules-path", env.String(jqsupport.EnvModulesPath, ""),
 		"loads JQ custom modules from the filesystem")
+	// Ship Resilience-1 (0.30.162) — comma-separated list of
+	// namespaces whose Deployment + Endpoints are watched for the
+	// snowplow_upstream_controller_health gauge. Default
+	// "krateo-system". Empty string → per-namespace Deployment +
+	// Endpoints watches inert; cluster-scoped webhook-config
+	// watches still run (so webhook gauge is populated). Discovery
+	// of WHICH Deployments to watch is automatic via
+	// MutatingWebhookConfiguration / ValidatingWebhookConfiguration
+	// introspection — no hardcoded controller-name list
+	// (feedback_no_special_cases).
+	controllerHealthNS := flag.String("controller-health-namespaces",
+		env.String("CONTROLLER_HEALTH_NAMESPACES", "krateo-system"),
+		"comma-separated list of namespaces whose controllers are watched for Resilience-1 expvar gauges")
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -281,6 +295,22 @@ func main() {
 						}
 					}
 					cache.AssertSecretsInformerWired()
+
+					// Ship Resilience-1 (0.30.162) — upstream-controller
+					// health watch surface. Default scope is
+					// krateo-system; multi-namespace via comma-
+					// separated chart override. Soft-fail by design —
+					// wiring errors leave the gauges publishing empty
+					// maps and the rest of snowplow runs byte-
+					// identical to pre-Resilience-1. CACHE_ENABLED=false
+					// has already short-circuited inside Start (no
+					// goroutine, no client built) — this whole block
+					// only runs when cache is on.
+					controllerHealthNamespaces := splitCommaList(*controllerHealthNS)
+					if err := cache.StartControllerHealthInformer(cacheCtx, rc, controllerHealthNamespaces); err != nil {
+						log.Warn("cache: StartControllerHealthInformer failed; Resilience-1 gauges offline",
+							slog.Any("err", err))
+					}
 
 					// Tag 0.30.6 binding: walk every RestAction in the
 					// cluster, derive the GVR set referenced by
@@ -703,4 +733,27 @@ func main() {
 	}
 
 	log.Info("server gracefully stopped")
+}
+
+// splitCommaList parses a comma-separated env var into a string
+// slice, dropping empty entries and trimming whitespace. Used by
+// the Ship Resilience-1 wiring (0.30.162) to parse
+// CONTROLLER_HEALTH_NAMESPACES into the watch-scope slice. Empty
+// input → empty slice (subsystem-defined behavior: the per-
+// namespace Deployment + Endpoints watches stay inert; cluster-
+// scoped webhook watches still run).
+func splitCommaList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
