@@ -58,6 +58,15 @@ const (
 	// resolved-output store + the refresher).
 	envResolvedCacheApistageEnabled = "RESOLVED_CACHE_APISTAGE_ENABLED"
 
+	// envWidgetContentL1Enabled is the Ship G (0.30.16x) opt-in gate for
+	// the identity-free widget content L1 layer. Default ON — the layer
+	// is the actual zero-cold ship per Diego's 2026-05-21 framing; flag-
+	// off it bypasses the upper layer and the dispatcher takes the
+	// pre-Ship-G per-user widget L1 path. It is gated UNDER
+	// ResolvedCacheEnabled() (the widget content L1 reuses the resolved
+	// store + refresher).
+	envWidgetContentL1Enabled = "WIDGET_CONTENT_L1_ENABLED"
+
 	defaultResolvedCacheMaxEntries          = 100_000
 	defaultResolvedCacheMaxBytes            = int64(2) * 1024 * 1024 * 1024 // 2 GiB
 	defaultResolvedCacheTTLSeconds          = 3600
@@ -77,6 +86,28 @@ const (
 // would invalidate every in-flight entry. The 0.30.118 rename touches the
 // Go const IDENTIFIER only.
 const CacheEntryClassApistage = "apistage"
+
+// CacheEntryClassWidgetContent is the ResolvedKeyInputs.CacheEntryClass
+// discriminant for Ship G (0.30.16x) — the identity-free widget content
+// L1 layer. Sibling to CacheEntryClassApistage, one tier UP: caches the
+// resolved widget envelope (not the per-K8s-call envelope) keyed on
+// (gvr, ns, name, perPage, page, extras) — Username + Groups OMITTED.
+//
+// The resolved widget envelope is identity-invariant EXCEPT for the
+// per-item `status.resourcesRefs.items[].allowed` boolean — set by
+// rbac.UserCan under whichever identity resolved it. The walker
+// populates this layer under the SA identity (so the stored flags are
+// SA-evaluated, typically all-true for navigation widgets); the
+// serve-time gate (gateWidgetEnvelope, dispatchers/widgets.go) OVERWRITES
+// every `allowed` flag per-request via rbac.UserCan under the request
+// identity before serialisation. The cached body is the SHELL; the body
+// that leaves the pod is per-user — same architectural property F1's
+// apistage class introduced, applied one tier up.
+//
+// The string VALUE "widgetContent" is load-bearing: it is hashed into
+// the cache key (ComputeKey) AND used as the refresher registry key.
+// Rotating it would invalidate every in-flight entry.
+const CacheEntryClassWidgetContent = "widgetContent"
 
 // ResolvedEntry is the L1 cache value. The pre-encoded JSON bytes are
 // what we hand back on a hit; storing the encoded form (rather than the
@@ -202,6 +233,16 @@ type ResolvedCacheStore struct {
 	// per-kind tag.
 	apistageStoreTotal atomic.Uint64
 	apistageEvictTotal atomic.Uint64
+
+	// Ship G (0.30.16x) widget-content counters. widgetContentStoreTotal
+	// counts Put()s of a "widgetContent"-kind entry (the identity-free
+	// widget envelope cached by Phase 1's F2 walker as a free side-effect
+	// of widgets.Resolve); widgetContentEvictTotal counts evictions
+	// (LRU/TTL/DELETE) of one. widget_content_evict_pressure in the
+	// summary line is the evict/store ratio — same shape as the apistage
+	// counters. Classified off entry.Inputs.CacheEntryClass.
+	widgetContentStoreTotal atomic.Uint64
+	widgetContentEvictTotal atomic.Uint64
 }
 
 type lruItem struct {
@@ -252,6 +293,33 @@ func ApistageL1Enabled() bool {
 		return false
 	}
 	return os.Getenv(envResolvedCacheApistageEnabled) == "true"
+}
+
+// WidgetContentL1Enabled reports whether the Ship G (0.30.16x) identity-
+// free widget content L1 layer is opted in. TWO gates, all must hold:
+//  1. CACHE_ENABLED=true            — the whole cache subsystem
+//     (Disabled()).
+//  2. RESOLVED_CACHE_ENABLED!=false — the resolved-output L1 store +
+//     refresher, which the widget content entry reuses verbatim.
+//  3. WIDGET_CONTENT_L1_ENABLED!="false" — the per-feature toggle.
+//     Defaults to true; explicit "false"/"0"/"no" disables.
+//
+// Default ON when the cache subsystem itself is on, mirroring
+// ResolvedCacheEnabled. When CACHE_ENABLED=false the entire path is
+// skipped (cleanly removable per project_caching_is_provisional).
+// WIDGET_CONTENT_L1_ENABLED=false bypasses ONLY this upper layer; the
+// per-user widget L1 + apistage L1 (if enabled) keep serving — same
+// "AC-G.6" fine-grained toggle pattern as ApistageL1Enabled.
+func WidgetContentL1Enabled() bool {
+	if !ResolvedCacheEnabled() {
+		return false
+	}
+	switch os.Getenv(envWidgetContentL1Enabled) {
+	case "false", "0", "no":
+		return false
+	default:
+		return true
+	}
 }
 
 // ResolvedCache returns the singleton resolved-output cache, lazily
@@ -337,7 +405,16 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	// identical, no key-space rotation. apistage is flag-off in prod
 	// (RESOLVED_CACHE_APISTAGE_ENABLED default off), so this key change
 	// rotates nothing live.
-	if in.CacheEntryClass != CacheEntryClassApistage {
+	//
+	// Ship G (0.30.16x): CacheEntryClassWidgetContent is ALSO identity-
+	// free — the widget envelope is identity-invariant except for the
+	// embedded `status.resourcesRefs.items[].allowed` flag, which the
+	// serve-time gateWidgetEnvelope overwrites per-request. Same shape
+	// as the F1 apistage carve-out: skip identity for the widgetContent
+	// class, leave every other class (restactions / widgets) byte-
+	// identical to the pre-Ship-G hash.
+	if in.CacheEntryClass != CacheEntryClassApistage &&
+		in.CacheEntryClass != CacheEntryClassWidgetContent {
 		h.Write([]byte(in.Username))
 		h.Write([]byte{0})
 
@@ -474,6 +551,7 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	defer c.mu.Unlock()
 
 	apistage := isApistageEntry(entry)
+	widgetContent := isWidgetContentEntry(entry)
 
 	// Replace-in-place semantics if key already present.
 	if el, ok := c.index[key]; ok {
@@ -487,6 +565,9 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		if apistage {
 			c.apistageStoreTotal.Add(1)
 		}
+		if widgetContent {
+			c.widgetContentStoreTotal.Add(1)
+		}
 		c.evictUntilUnderCapsLocked()
 		return
 	}
@@ -499,6 +580,9 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	if apistage {
 		c.apistageStoreTotal.Add(1)
 	}
+	if widgetContent {
+		c.widgetContentStoreTotal.Add(1)
+	}
 
 	c.evictUntilUnderCapsLocked()
 }
@@ -508,6 +592,13 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 func isApistageEntry(entry *ResolvedEntry) bool {
 	return entry != nil && entry.Inputs != nil &&
 		entry.Inputs.CacheEntryClass == CacheEntryClassApistage
+}
+
+// isWidgetContentEntry reports whether entry is a Ship G widget-content
+// L1 entry — classified by its Inputs.CacheEntryClass. Nil-safe.
+func isWidgetContentEntry(entry *ResolvedEntry) bool {
+	return entry != nil && entry.Inputs != nil &&
+		entry.Inputs.CacheEntryClass == CacheEntryClassWidgetContent
 }
 
 // itemsTreeOverheadFactor estimates the in-memory footprint of a parsed
@@ -579,6 +670,10 @@ type ResolvedCacheStats struct {
 	// Ship E (0.30.116) api-stage counters.
 	ApistageStoreTotal uint64
 	ApistageEvictTotal uint64
+
+	// Ship G (0.30.16x) widget-content counters.
+	WidgetContentStoreTotal uint64
+	WidgetContentEvictTotal uint64
 }
 
 func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
@@ -590,18 +685,20 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 	bytes := c.curBytes
 	c.mu.Unlock()
 	return ResolvedCacheStats{
-		Entries:            entries,
-		Bytes:              bytes,
-		MaxEntries:         c.maxEntries,
-		MaxBytes:           c.maxBytes,
-		HitTotal:           c.hitTotal.Load(),
-		MissTotal:          c.missTotal.Load(),
-		StoreTotal:         c.storeTotal.Load(),
-		EvictLRUTotal:      c.evictLRUTotal.Load(),
-		EvictTTLTotal:      c.evictTTLTotal.Load(),
-		EvictDeleteTotal:   c.evictDeleteTotal.Load(),
-		ApistageStoreTotal: c.apistageStoreTotal.Load(),
-		ApistageEvictTotal: c.apistageEvictTotal.Load(),
+		Entries:                 entries,
+		Bytes:                   bytes,
+		MaxEntries:              c.maxEntries,
+		MaxBytes:                c.maxBytes,
+		HitTotal:                c.hitTotal.Load(),
+		MissTotal:               c.missTotal.Load(),
+		StoreTotal:              c.storeTotal.Load(),
+		EvictLRUTotal:           c.evictLRUTotal.Load(),
+		EvictTTLTotal:           c.evictTTLTotal.Load(),
+		EvictDeleteTotal:        c.evictDeleteTotal.Load(),
+		ApistageStoreTotal:      c.apistageStoreTotal.Load(),
+		ApistageEvictTotal:      c.apistageEvictTotal.Load(),
+		WidgetContentStoreTotal: c.widgetContentStoreTotal.Load(),
+		WidgetContentEvictTotal: c.widgetContentEvictTotal.Load(),
 	}
 }
 
@@ -618,6 +715,17 @@ func (s ResolvedCacheStats) ApistageEvictPressure() float64 {
 		return 0
 	}
 	return float64(s.ApistageEvictTotal) / float64(s.ApistageStoreTotal)
+}
+
+// WidgetContentEvictPressure is the Ship G (0.30.16x) per-class budget
+// signal — same shape as ApistageEvictPressure but for the widget
+// content layer. A ratio approaching 1 means the LRU budget is too
+// small for the navigation-tree-width entries the F2 walker populates.
+func (s ResolvedCacheStats) WidgetContentEvictPressure() float64 {
+	if s.WidgetContentStoreTotal == 0 {
+		return 0
+	}
+	return float64(s.WidgetContentEvictTotal) / float64(s.WidgetContentStoreTotal)
 }
 
 // HitRate computes a simple cumulative hit rate. Returns 0 when there
@@ -665,6 +773,11 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	if isApistageEntry(item.entry) {
 		c.apistageEvictTotal.Add(1)
 	}
+	// Ship G (0.30.16x): count a widget-content eviction for the same
+	// per-class pressure signal.
+	if isWidgetContentEntry(item.entry) {
+		c.widgetContentEvictTotal.Add(1)
+	}
 	// Dep-tracker cleanup. Safe even when L1 is the only consumer
 	// (Deps() is always non-nil); a no-op when no edges were ever
 	// recorded for this key.
@@ -708,10 +821,16 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	// Ship E (0.30.116): count an api-stage DELETE-eviction for the O6
 	// pressure metric — same classification as removeElementLocked.
 	apistage := isApistageEntry(item.entry)
+	// Ship G (0.30.16x): same per-class DELETE classification for the
+	// widget-content layer.
+	widgetContent := isWidgetContentEntry(item.entry)
 	c.mu.Unlock()
 	c.evictDeleteTotal.Add(1)
 	if apistage {
 		c.apistageEvictTotal.Add(1)
+	}
+	if widgetContent {
+		c.widgetContentEvictTotal.Add(1)
 	}
 	return true
 }
@@ -775,6 +894,11 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Uint64("apistage_evict_total", s.ApistageEvictTotal),
 				slog.Float64("apistage_evict_pressure", s.ApistageEvictPressure()),
 				slog.Bool("apistage_enabled", ApistageL1Enabled()),
+				// Ship G (0.30.16x) — AC-G.1 / AC-G.12 / AC-G.14 surface.
+				slog.Uint64("widget_content_store_total", s.WidgetContentStoreTotal),
+				slog.Uint64("widget_content_evict_total", s.WidgetContentEvictTotal),
+				slog.Float64("widget_content_evict_pressure", s.WidgetContentEvictPressure()),
+				slog.Bool("widget_content_enabled", WidgetContentL1Enabled()),
 			)
 		}
 	}()

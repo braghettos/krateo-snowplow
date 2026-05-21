@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // TestPhase1Walk_MaxDepthTruncation asserts the recursion-depth cap. The
@@ -52,8 +53,8 @@ func TestPhase1Walk_MaxDepthTruncation(t *testing.T) {
 	// At depth == phase1MaxWalkDepth+1 the depth gate fires: walk returns
 	// nil immediately, never touching widgets.Resolve. If the cap were
 	// removed walk would call the resolver and fail (no apiserver).
-	// Signature (Ship 0.30.127): walk(ctx, in, depth, page, perPage).
-	if err := w.walk(context.Background(), widget, phase1MaxWalkDepth+1, 5, 5); err != nil {
+	// Signature (Ship G, 0.30.16x): walk(ctx, in, gvr, depth, page, perPage).
+	if err := w.walk(context.Background(), widget, schema.GroupVersionResource{}, phase1MaxWalkDepth+1, 5, 5); err != nil {
 		t.Fatalf("walk past the depth cap must return nil (truncate), got err: %v", err)
 	}
 
@@ -63,7 +64,7 @@ func TestPhase1Walk_MaxDepthTruncation(t *testing.T) {
 	}
 
 	// A deep nil widget must also be safe (defensive).
-	if err := w.walk(context.Background(), nil, phase1MaxWalkDepth+5, 5, 5); err != nil {
+	if err := w.walk(context.Background(), nil, schema.GroupVersionResource{}, phase1MaxWalkDepth+5, 5, 5); err != nil {
 		t.Errorf("walk(nil widget, deep) must return nil, got: %v", err)
 	}
 

@@ -113,13 +113,18 @@ func frontendConfigConfigMapName() string {
 // each named root widget CR via the SA dynamic client, and returns them
 // for the recursive walker.
 //
+// Ship G (0.30.16x): widened to return navigationRoot pairs (the
+// resolved root CR + the GVR parsed from its ObjectReference) — the
+// widget content L1 Put site needs the root's GVR to compose the
+// identity-free cache key in a shape that MATCHES the serve-time key.
+//
 // Errors are NON-FATAL: a missing/unparseable ConfigMap or a missing
 // root CR yields a warning + a (possibly empty) partial result — the
 // walk degrades gracefully, lazy register-on-navigation still covers
 // every GVR on first request. It returns an error only when NOTHING
 // could be produced AND a hard read error occurred, so phase1WarmupWith
 // can log a roots_list_failed.
-func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Interface, cfgNamespace string) ([]*unstructured.Unstructured, error) {
+func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Interface, cfgNamespace string) ([]navigationRoot, error) {
 	log := slog.Default()
 
 	cmName := frontendConfigConfigMapName()
@@ -196,7 +201,13 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 	// internal-dispatch context (cache.WithInternalRESTConfig) the caller
 	// installs, so the SA credentials are used. A missing root CR is
 	// non-fatal — log + skip; the other root still warms its subtree.
-	out := make([]*unstructured.Unstructured, 0, len(refs))
+	//
+	// Ship G (0.30.16x): the GVR each root resolves under is read from
+	// objects.Get's return (got.GVR) — the EXACT same parse the
+	// dispatcher's fetchObject uses (util.ParseGVR), so the F2 walker
+	// and the serve-time dispatcher compose the same identity-free
+	// cache key.
+	out := make([]navigationRoot, 0, len(refs))
 	for _, ref := range refs {
 		got := objects.Get(ctx, ref)
 		if got.Err != nil {
@@ -212,7 +223,7 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 		if got.Unstructured == nil {
 			continue
 		}
-		out = append(out, got.Unstructured)
+		out = append(out, navigationRoot{Root: got.Unstructured, GVR: got.GVR})
 	}
 
 	if len(out) == 0 {

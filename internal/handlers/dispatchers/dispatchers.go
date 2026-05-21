@@ -90,4 +90,14 @@ func RegisterRefreshHandlers(saRC *rest.Config) {
 	// CacheEntryClassApistage (resolve_populate.go re-resolves the owning
 	// RESTAction, whose in-loop key-swap re-Puts the stage entry).
 	cache.RegisterRefreshFunc(cache.CacheEntryClassApistage, refreshFunc)
+	// Ship G (0.30.16x) — AC-G.5: the same refresher serves the identity-
+	// free widget content layer. resolveOnceFn dispatches by
+	// inputs.CacheEntryClass; resolveOnceProd routes
+	// CacheEntryClassWidgetContent to resolveWidgetForRefresh (the same
+	// path the per-user "widgets" entries take, since BOTH classes re-
+	// resolve via widgets.Resolve and the F2 walker's Put site uses the
+	// EXACT same Resolve call). The class-aware identity-free key
+	// composition lives in ComputeKey, so the re-Put lands under the
+	// content key correctly.
+	cache.RegisterRefreshFunc(cache.CacheEntryClassWidgetContent, refreshFunc)
 }

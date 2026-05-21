@@ -115,6 +115,45 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 	return allowed
 }
 
+// dispatchWidgetContentKey builds the identity-free widget content L1
+// key and returns the live cache handle (Ship G, 0.30.16x). Returns
+// (key, nil, nil) when the layer is disabled — callers MUST treat
+// handle==nil as "skip the content lookup, take the existing per-user
+// L1 path".
+//
+// IDENTITY-FREE BY CONSTRUCTION: Username/Groups are left ZERO; the
+// ComputeKey branch skips identity for CacheEntryClassWidgetContent
+// (resolved.go). The serve-time gateWidgetEnvelope re-derives every
+// embedded status.resourcesRefs.items[].allowed flag under the request
+// identity before the body is written to the response — see widgets.go.
+// A request that lacks UserInfo would not be able to run the gate, but
+// keying itself is identity-independent so we do NOT bail on missing
+// identity here; the gate's served=false branch handles the no-identity
+// case symmetrically with the existing per-user lookup (which DOES
+// nil-check UserInfo at dispatchCacheLookupKey).
+func dispatchWidgetContentKey(ctx context.Context, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
+	c := cache.ResolvedCache()
+	if c == nil {
+		return "", nil, nil
+	}
+	if !cache.WidgetContentL1Enabled() {
+		return "", nil, nil
+	}
+	inputs := cache.ResolvedKeyInputs{
+		CacheEntryClass: cache.CacheEntryClassWidgetContent,
+		Group:           group,
+		Version:         version,
+		Resource:        resource,
+		Namespace:       namespace,
+		Name:            name,
+		// Username/Groups intentionally zero — see header.
+		PerPage: perPage,
+		Page:    page,
+		Extras:  extras,
+	}
+	return cache.ComputeKey(inputs), c, &inputs
+}
+
 // dispatchCacheLookupKey builds the L1 resolved-output cache key and
 // returns the live cache handle, if the L1 layer is enabled. Returns
 // (key, nil, nil) when L1 is disabled — callers MUST treat handle==nil

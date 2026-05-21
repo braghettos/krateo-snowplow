@@ -121,8 +121,8 @@ func TestPhase1_NoHardcode_OrphanExcluded(t *testing.T) {
 	t.Cleanup(cache.ResetAutoDiscoverGroupsForTest)
 
 	// One routesloaders root — the only navigation seed.
-	lister := func(ctx context.Context) ([]*unstructured.Unstructured, error) {
-		return []*unstructured.Unstructured{routesLoaderCR("ns-a", "main")}, nil
+	lister := func(ctx context.Context) ([]navigationRoot, error) {
+		return []navigationRoot{{Root: routesLoaderCR("ns-a", "main"), GVR: gvrReached}}, nil
 	}
 
 	// The resolver stub models the production contract: resolving a root
@@ -132,7 +132,7 @@ func TestPhase1_NoHardcode_OrphanExcluded(t *testing.T) {
 	// behaves identically at runtime: it fires only for paths the
 	// resolver actually walked.)
 	resolveCalls := 0
-	resolver := func(ctx context.Context, root *unstructured.Unstructured) error {
+	resolver := func(ctx context.Context, root navigationRoot) error {
 		resolveCalls++
 		rw.EnsureResourceType(gvrReached)
 		return nil
@@ -179,10 +179,10 @@ func TestPhase1_NoRoots_StillSignalsDone(t *testing.T) {
 	cache.ResetPhase1DoneForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)
 
-	lister := func(ctx context.Context) ([]*unstructured.Unstructured, error) {
+	lister := func(ctx context.Context) ([]navigationRoot, error) {
 		return nil, nil
 	}
-	resolver := func(ctx context.Context, root *unstructured.Unstructured) error {
+	resolver := func(ctx context.Context, root navigationRoot) error {
 		t.Fatalf("resolver must not be called when there are no roots")
 		return nil
 	}
@@ -213,10 +213,10 @@ func TestPhase1_PrematureReady(t *testing.T) {
 	release := make(chan struct{})
 	resolverEntered := make(chan struct{})
 
-	lister := func(ctx context.Context) ([]*unstructured.Unstructured, error) {
-		return []*unstructured.Unstructured{routesLoaderCR("ns-a", "main")}, nil
+	lister := func(ctx context.Context) ([]navigationRoot, error) {
+		return []navigationRoot{{Root: routesLoaderCR("ns-a", "main"), GVR: gvrReached}}, nil
 	}
-	resolver := func(ctx context.Context, root *unstructured.Unstructured) error {
+	resolver := func(ctx context.Context, root navigationRoot) error {
 		close(resolverEntered)
 		<-release // block until the test releases the walk
 		rw.EnsureResourceType(gvrReached)

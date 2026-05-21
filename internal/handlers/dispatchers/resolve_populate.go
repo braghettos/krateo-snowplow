@@ -247,6 +247,21 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		return resolveRestActionForRefresh(ctx, got, inputs, authnNS)
 	case "widgets":
 		return resolveWidgetForRefresh(ctx, got, inputs, authnNS)
+	case cache.CacheEntryClassWidgetContent:
+		// Ship G (0.30.16x) — refresh path for the identity-free widget
+		// content layer. The entry's Inputs identify the SAME widget CR
+		// the per-user "widgets" entries identify, just under a
+		// different key shape (identity-free vs per-user-keyed). The
+		// resolver call is identical — widgets.Resolve on the re-fetched
+		// CR — so we delegate to the same helper. The fresh bytes are
+		// Put back under the identity-free key (ComputeKey reads
+		// inputs.CacheEntryClass and skips identity for this class).
+		//
+		// Stage-error sink semantics + post-resolve liveness check are
+		// inherited from resolveAndPopulateL1 (the caller). The Put
+		// declines symmetrically when stage errors fire, preserving
+		// the AC-G.5 contract.
+		return resolveWidgetForRefresh(ctx, got, inputs, authnNS)
 	default:
 		// Unknown handler kind — skip-to-TTL.
 		return nil, nil

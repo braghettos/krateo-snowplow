@@ -98,6 +98,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -164,17 +165,30 @@ func splitCanonicalSAUsername(u string) (string, string, bool) {
 	return rest[:i], rest[i+1:], true
 }
 
+// navigationRoot is a navigation-root widget plus the GVR the lister
+// parsed it under — Ship G (0.30.16x). The dispatcher path composes
+// widget keys from got.GVR (objects.Get's return), so the lister widens
+// its return shape from a bare []*unstructured to []navigationRoot
+// so the GVR threads through to the F2 walker's content-L1 Put site
+// (populateWidgetContentL1) and the resulting key MATCHES the serve-
+// time key. The GVR is parsed from the templatesv1.ObjectReference
+// each /call URL decoded into — identical parse to util.ParseGVR.
+type navigationRoot struct {
+	Root *unstructured.Unstructured
+	GVR  schema.GroupVersionResource
+}
+
 // rootsLister abstracts the cluster-wide LIST of the navigation-root CRs
 // so the no-hardcode falsifier test can substitute an in-memory inventory
 // without a cluster. Production lists BOTH routesloaders and navmenus.
-type rootsLister func(ctx context.Context) ([]*unstructured.Unstructured, error)
+type rootsLister func(ctx context.Context) ([]navigationRoot, error)
 
 // rootResolver abstracts resolving a single navigation-root CR (and, in
 // production, recursively walking its widget subtree). Production passes
 // resolveNavigationRoot (the standard widget resolver + recursive
 // walker); the falsifier tests substitute a stub that drives the same
 // informer-registration side effects deterministically.
-type rootResolver func(ctx context.Context, root *unstructured.Unstructured) error
+type rootResolver func(ctx context.Context, root navigationRoot) error
 
 // Phase1Warmup runs the Tag B Part 1 SA-credentialed recursive resolution
 // walk, then blocks on the Phase 1 sync barrier and signals
@@ -244,7 +258,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	// internal-dispatch context. So the lister runs under the same
 	// SA-credentialed context the per-root resolver uses — built here
 	// once via withPhase1SAContext.
-	lister := func(lctx context.Context) ([]*unstructured.Unstructured, error) {
+	lister := func(lctx context.Context) ([]navigationRoot, error) {
 		return listNavigationRootsFromConfigMap(
 			withPhase1SAContext(lctx, *saEP, rc), dynCli, cfgNamespace)
 	}
@@ -264,8 +278,8 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		}
 	}
 
-	resolver := func(rctx context.Context, root *unstructured.Unstructured) error {
-		return resolveNavigationRoot(rctx, root, *saEP, rc, authnNS, harvester)
+	resolver := func(rctx context.Context, root navigationRoot) error {
+		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester)
 	}
 
 	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm)
@@ -343,7 +357,7 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		if err := resolve(ctx, root); err != nil {
 			log.Warn("phase1.warmup.root_resolve_failed",
 				slog.String("subsystem", "cache"),
-				slog.String("root", rootKey(root)),
+				slog.String("root", rootKey(root.Root)),
 				slog.Any("err", err),
 			)
 			if walkErr == nil {
@@ -543,7 +557,7 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	return rctx
 }
 
-func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester) error {
+func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester) error {
 	rctx := withPhase1SAContext(ctx, saEP, saRC)
 
 	w := &phase1Walker{
@@ -551,10 +565,19 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 		visited:         map[string]struct{}{},
 		apiRefHarvester: harvester,
 	}
+	// Ship G (0.30.16x): gvr is threaded from the lister
+	// (listNavigationRootsFromConfigMap, phase1_roots.go) which parses
+	// it from the templatesv1.ObjectReference each /call URL decoded
+	// into. This is the EXACT same parse objects.Get + the dispatcher
+	// use (util.ParseGVR), so the content-key shape MATCHES the
+	// serve-time key composed by widgets.go from got.GVR — admin and
+	// cyberjoker requesting the same root via dispatcher will hit the
+	// SAME cell.
+	//
 	// The root has no /call Path of its own, so it resolves under the
 	// bounded PREWARM_PAGE_LIMIT default; each descended child overrides
 	// with its own declared slice when present (Ship 0.30.127).
-	return w.walk(rctx, root, 0, prewarmPageLimit(), prewarmPageLimit())
+	return w.walk(rctx, root, gvr, 0, prewarmPageLimit(), prewarmPageLimit())
 }
 
 // Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,
@@ -607,7 +630,13 @@ type phase1Walker struct {
 // `slice` instead of the old hardcoded -1/-1. The root call passes the
 // PREWARM_PAGE_LIMIT default; a child whose `/call` Path carries explicit
 // page/perPage overrides it.
-func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, depth int, page, perPage int) error {
+//
+// gvr is THIS widget's GroupVersionResource (Ship G, 0.30.16x) — threaded
+// from the root site (passed by resolveNavigationRoot) and from the
+// recursive site (got.GVR from objects.Get at the child fetch). It feeds
+// populateWidgetContentL1's identity-free cache key so the F2 walker's
+// Put MATCHES the serve-time dispatcher's key composition.
+func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, gvr schema.GroupVersionResource, depth int, page, perPage int) error {
 	log := slog.Default()
 	if in == nil {
 		return nil
@@ -631,6 +660,24 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// is off the harvester is nil and this is a no-op.
 	w.apiRefHarvester.harvestApiRef(in)
 
+	// Ship G defect-fix (AC-G.5): install the widgetContent L1 key on the
+	// ctx BEFORE widgets.Resolve. The resolver's inner-call dep recording
+	// site (resolvers/restactions/api/resolve.go:467-485) reads
+	// L1KeyFromContext and records each inner K8s call's dep edge against
+	// THIS L1 key. Without this install the resolver sees "" and records
+	// nothing — the content entry would be TTL-only stale-forever even
+	// though populateWidgetContentL1 Puts it (AC-G.5 defect caught at
+	// architect diff-review). Mirrors widgets.go:148-150 per-user path
+	// exactly: cacheKey computed BEFORE Resolve, ctx decorated with
+	// WithL1KeyContext, then Resolve called. The key MUST match the key
+	// populateWidgetContentL1 Puts under — both call widgetContentL1Key
+	// with the SAME (gvr, ns, name, perPage, page) tuple.
+	wcKey, _ := widgetContentL1Key(gvr, in.GetNamespace(), in.GetName(), perPage, page)
+	resolveCtx := ctx
+	if wcKey != "" {
+		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
+	}
+
 	// Resolve this widget. The resolver recursively reaches this widget's
 	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any
 	// apiRef-bearing leaf such as the Compositions Page DataGrid) and
@@ -643,7 +690,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// removed) is the 49K-row storm. Honouring the declared slice keeps
 	// the discovery walk's fan-out bounded by what the portal itself
 	// declared per widget.
-	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
+	res, err := widgets.Resolve(resolveCtx, widgets.ResolveOptions{
 		In:      in,
 		AuthnNS: w.authnNS,
 		PerPage: perPage,
@@ -667,6 +714,23 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	if res == nil {
 		return nil
 	}
+
+	// Ship G (0.30.16x) — populate the identity-free widget content L1
+	// layer as a free side-effect of widgets.Resolve. The walker resolves
+	// under the SA identity (withPhase1SAContext); the stored body carries
+	// SA-evaluated allowed=true flags on its resourcesRefs.items[] (the
+	// snowplow SA's */* get/list/watch grant). They are NEVER served
+	// verbatim — gateWidgetEnvelope at widgets.go re-derives every
+	// `allowed` flag per-request under the request identity before the
+	// body leaves the pod. Gated on cache.WidgetContentL1Enabled() —
+	// flag-off this is a clean no-op and startup is byte-identical to
+	// pre-Ship-G.
+	//
+	// extras=nil at prewarm — the walker does not receive user-supplied
+	// extras; extras-bearing serve-time requests will MISS the prewarmed
+	// entry and fall through to the existing per-user L1, the correct
+	// degraded posture.
+	populateWidgetContentL1(ctx, gvr, in, perPage, page, res)
 
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
 	children := extractResourcesRefsItems(res.Object)
@@ -733,7 +797,12 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// are the pagination the child resolves under — its declared
 		// `slice` from the `/call` Path, or the PREWARM_PAGE_LIMIT default
 		// (Ship 0.30.127).
-		_ = w.walk(ctx, got.Unstructured, depth+1, childPage, childPerPage)
+		//
+		// Ship G (0.30.16x): got.GVR is the child widget's GVR — threaded
+		// from objects.Get's return shape (internal/objects/get.go:22-26)
+		// so populateWidgetContentL1 down the recursion has the GVR the
+		// serve-time dispatcher will compose its key under.
+		_ = w.walk(ctx, got.Unstructured, got.GVR, depth+1, childPage, childPerPage)
 	}
 	return nil
 }

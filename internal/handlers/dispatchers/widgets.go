@@ -73,6 +73,50 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	perPage, page := paginationInfo(log, req)
 
+	// Ship G (0.30.16x) — identity-free widget content L1 lookup runs
+	// FIRST. Same gating semantics as the per-user lookup below
+	// (strictly after EvaluateRBAC at :62-72). The content key is
+	// (gvr, ns, name, perPage, page, extras) — Username/Groups
+	// OMITTED — so admin and cyberjoker hit the SAME cell. The
+	// cached body carries SA-evaluated `allowed=true` flags
+	// (the F2 walker resolved under the snowplow SA); gateWidgetEnvelope
+	// OVERWRITES every status.resourcesRefs.items[].allowed per-request
+	// via rbac.UserCan under THIS request's identity, so the body that
+	// leaves the pod is per-user-narrowed. The body in the cache is
+	// the SHELL — never served verbatim.
+	//
+	// On MISS we fall through to the existing per-user widget L1 lookup
+	// below — the expected path when F2 has not warmed this
+	// (gvr, ns, name, perPage, page) tuple.
+	contentKey, contentHandle, _ := dispatchWidgetContentKey(req.Context(),
+		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		perPage, page, extras)
+	if contentHandle != nil {
+		if entry, ok := contentHandle.Get(contentKey); ok {
+			if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
+				cache.RecordApiserverFallthrough(req.Context(),
+					cache.ReasonWidgetContentHit, got.GVR.String())
+				emitResolvedCacheLookup(log, "widgetContent",
+					contentKey, true, len(gated))
+				writeResolvedJSON(wri, gated)
+				log.Info("Widget successfully resolved",
+					slog.String("duration", util.ETA(start)),
+					slog.String("l1", "content-hit"),
+				)
+				return
+			}
+			// served==false — fail-closed (no identity / malformed
+			// stored envelope). Fall through to the existing per-user
+			// L1 lookup, which symmetrically nil-checks UserInfo at
+			// dispatchCacheLookupKey.
+		}
+		// Content-layer MISS — fall through to the per-user L1 lookup
+		// below. Record the diagnostic counter.
+		cache.RecordApiserverFallthrough(req.Context(),
+			cache.ReasonWidgetContentMissPerUserFallback, got.GVR.String())
+	}
+
 	// Tag 0.30.7: L1 resolved-output cache lookup. Same gating
 	// semantics as restactions.go — strictly after EvaluateRBAC.
 	// 0.30.8: cacheInputs is returned so we can stash it on the L1

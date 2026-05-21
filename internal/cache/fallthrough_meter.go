@@ -168,6 +168,20 @@ const (
 	// iterator path verbatim.
 	ReasonClusterListDispatch      FallthroughReason = "cluster-list-dispatch"
 	ReasonClusterListShapeFallback FallthroughReason = "cluster-list-shape-fallback"
+
+	// Ship G / 0.30.16x — identity-free widget content L1 layer.
+	// ReasonWidgetContentHit is a DIAGNOSTIC (NOT a fall-through) counter
+	// recording that the Ship G content layer was consulted and Get-hit
+	// — gateWidgetEnvelope runs over the cached envelope and overwrites
+	// every status.resourcesRefs.items[].allowed flag per-request before
+	// the body leaves the pod. ReasonWidgetContentMissPerUserFallback
+	// fires when the content layer Gets a miss and the dispatcher falls
+	// through to the existing per-user widget L1 — the expected path
+	// when F2 has not warmed this (gvr, ns, name, perPage, page) tuple.
+	// Closed-enum count: 19 (D.5) + 2 = 21. Within budget (cardinality:
+	// 10 paths × 50 GVRs × 21 reasons = 10,500 cells).
+	ReasonWidgetContentHit                 FallthroughReason = "widget-content-hit"
+	ReasonWidgetContentMissPerUserFallback FallthroughReason = "widget-content-miss-per-user-fallback"
 )
 
 // fallthroughKey is the composite label tuple for one counter cell.

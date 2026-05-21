@@ -45,7 +45,6 @@ import (
 	"github.com/krateoplatformops/plumbing/kubeconfig"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/rest"
 )
 
@@ -117,12 +116,12 @@ func TestPhase1_CredentialReal_FixResolvesRoot(t *testing.T) {
 
 	saEP, saRC := phase1RealSACreds(t)
 
-	lister := func(ctx context.Context) ([]*unstructured.Unstructured, error) {
-		return []*unstructured.Unstructured{routesLoaderCR("ns-a", "main")}, nil
+	lister := func(ctx context.Context) ([]navigationRoot, error) {
+		return []navigationRoot{{Root: routesLoaderCR("ns-a", "main"), GVR: gvrReached}}, nil
 	}
 
 	resolved := 0
-	resolver := func(ctx context.Context, root *unstructured.Unstructured) error {
+	resolver := func(ctx context.Context, root navigationRoot) error {
 		// The REAL 0.30.103 credential wiring resolveRoutesLoaderRoot does.
 		rctx := cache.WithInternalRESTConfig(ctx, saRC)
 		// The REAL call objects.Get / resourcesrefs.Resolve now make to
@@ -187,13 +186,13 @@ func TestPhase1_CredentialReal_UnfixedPathFailsRoot(t *testing.T) {
 
 	saEP, _ := phase1RealSACreds(t)
 
-	lister := func(ctx context.Context) ([]*unstructured.Unstructured, error) {
-		return []*unstructured.Unstructured{routesLoaderCR("ns-a", "main")}, nil
+	lister := func(ctx context.Context) ([]navigationRoot, error) {
+		return []navigationRoot{{Root: routesLoaderCR("ns-a", "main"), GVR: gvrReached}}, nil
 	}
 
 	resolved := 0
 	var lastErr error
-	resolver := func(ctx context.Context, root *unstructured.Unstructured) error {
+	resolver := func(ctx context.Context, root navigationRoot) error {
 		// THE 0.30.102 PATH: build the SA kube client straight through
 		// kubeconfig.NewClientConfig — no WithInternalRESTConfig.
 		_, err := kubeconfig.NewClientConfig(ctx, saEP)
