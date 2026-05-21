@@ -57,6 +57,53 @@ type API struct {
 	// whether the outer dispatch is RBAC-gated. The refilter step
 	// also calls EvaluateRBAC per object returned by the SA call.
 	UserAccessFilter *UserAccessFilterSpec `json:"userAccessFilter,omitempty"`
+
+	// ClusterListWhenAllowed declares that this API call is eligible
+	// to dispatch as a SINGLE cluster-scoped LIST against
+	// /apis/<g>/<v>/<resource> (instead of a per-namespace iterator
+	// fan-out) when the requesting identity holds cluster-scope
+	// `list` permission on the target GVR. Added at Tag 0.30.152
+	// Ship D.5.
+	//
+	// Permission is checked against the Ship B typed RBAC snapshot
+	// (cache.RBACSnapshot) via rbac.EvaluateRBAC(ctx, opts) with
+	// opts.Namespace=="" — the existing cluster-list semantics at
+	// internal/rbac/evaluate.go:198-211. On a deny verdict the call
+	// falls through to the existing iterator path verbatim (no
+	// behavioral change for non-cluster-list users e.g. cyberjoker).
+	//
+	// Additionally gated on !cache.Disabled() at the resolver entry
+	// (AC-D5.13) and on Ship B snapshot readiness — the
+	// `useClusterList` decision must NOT execute against a nil
+	// snapshot. When the cache is "removed" (CACHE_ENABLED=false),
+	// the cluster-list collapse is disabled entirely; dispatch falls
+	// through to the existing per-NS iterator UNCHANGED. This
+	// preserves the removable-cache invariant
+	// (project_caching_is_provisional).
+	//
+	// Default false (nil): existing RestActions are byte-identical
+	// to pre-D.5. Setting true is an OPT-IN by the RA author who
+	// has verified that:
+	//
+	//   1. The target GVR is namespace-scoped (cluster-scoped GVRs
+	//      have no iterator pattern to collapse).
+	//   2. A cluster-list dispatch returns the SAME object set the
+	//      iterator fan-out would have aggregated. For
+	//      namespace-scoped resources, the apiserver cluster-scoped
+	//      LIST endpoint /apis/<g>/<v>/<resource> returns objects
+	//      across all namespaces; the iterator's per-NS LIST returns
+	//      the same objects partitioned by namespace.
+	//   3. The widget consuming the RA's output applies any
+	//      per-object narrowing through the existing serve-time
+	//      RBAC gate (gateContentEnvelope at
+	//      internal/resolvers/restactions/api/apistage.go:94-145),
+	//      NOT through the RA's iterator shape.
+	//
+	// When this field is true but DependsOn.Iterator is empty, the
+	// field is a no-op (there is nothing to collapse). When both
+	// are set, the resolver runs §2.3's permission check and
+	// selects the dispatch path.
+	ClusterListWhenAllowed *bool `json:"clusterListWhenAllowed,omitempty"`
 }
 
 // UserAccessFilterSpec declares the per-object refilter contract.

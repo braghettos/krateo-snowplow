@@ -327,6 +327,25 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			continue
 		}
 
+		// Ship D.5 (0.30.152) — cluster-list-when-allowed iterator
+		// collapse. When the RA opts in AND the requester holds
+		// cluster-scope `list` on the target GVR AND
+		// cache + Ship B snapshot are ready, attemptClusterListCollapse
+		// pre-dispatches a SINGLE cluster-scope LIST, validates its
+		// shape (AC-D5.14), Puts the envelope under the identity-free
+		// apistage key, and returns a 1-element tmp slice. The existing
+		// worker loop then runs apistageContentServe which Get-hits the
+		// cache + applies the per-user gateContentEnvelope narrowing —
+		// no double-dispatch, no special-case in the worker.
+		//
+		// Default-off + RBAC-deny + shape-fail all yield
+		// useClusterList=false; tmp keeps its iterator fan-out and the
+		// path is byte-identical to pre-D.5 (AC-D5.6).
+		if newTmp, useClusterList := attemptClusterListCollapse(
+			ctx, log, apiCall, dict, ep, apistageStore, apistageEnabled); useClusterList {
+			tmp = newTmp
+		}
+
 		// 0.30.92 widening: lazy-register the informer for every
 		// downstream apiserver GVR enumerated by this stage's request
 		// options. Without this, the 0.30.91 hook only fired for the

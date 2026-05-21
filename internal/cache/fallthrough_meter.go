@@ -131,6 +131,21 @@ const (
 // Closed-enum count: 18 (D.4.2) − 1 (D.4.3 removes the
 // resolver-nil-merge constant) = 17. Within budget
 // (cardinality: 10 paths × 50 GVRs × 17 reasons = 8,500 cells).
+//
+// Ship D.5 / 0.30.152 — adds TWO new constants:
+//   - ReasonClusterListDispatch — diagnostic counter that fires when
+//     the new cluster-list-when-allowed iterator collapse selects the
+//     single cluster-scope LIST path. NOT a fallthrough (the dispatch
+//     SUCCEEDED); recorded through the same fall-through-meter cell
+//     model so per-RA / per-GVR activation can be observed via the
+//     existing FallthroughCount + /debug/vars surfaces. Closed-enum
+//     count: 17 + 1 = 18.
+//   - ReasonClusterListShapeFallback — fires when AC-D5.14's defensive
+//     multi-element shape check rejects the cluster-scope response
+//     envelope (missing list kind, empty/missing items, items lacking
+//     apiVersion/kind). The dispatcher then falls back to the per-NS
+//     iterator path. Closed-enum count: 18 + 1 = 19. Within budget
+//     (cardinality: 10 paths × 50 GVRs × 19 reasons = 9,500 cells).
 const (
 	ReasonInformerNotSynced       FallthroughReason = "informer-fallthrough-not-synced"
 	ReasonInformerNotServable     FallthroughReason = "informer-fallthrough-not-servable"
@@ -143,6 +158,16 @@ const (
 	ReasonInformerMetadataOnly    FallthroughReason = "informer-fallthrough-metadata-only"
 	ReasonApistageGetPartialShape FallthroughReason = "apistage-get-partial-shape"
 	ReasonGetMissLetApiserver404  FallthroughReason = "get-miss-let-apiserver-404"
+
+	// Ship D.5 / 0.30.152 — cluster-list-when-allowed iterator collapse.
+	// ReasonClusterListDispatch is a diagnostic (NOT a fall-through) counter
+	// recording that a stage's iterator fan-out was successfully collapsed
+	// to a single cluster-scope LIST. ReasonClusterListShapeFallback fires
+	// when the defensive shape check (AC-D5.14) rejects the cluster-scope
+	// response envelope; the dispatcher then falls back to the per-NS
+	// iterator path verbatim.
+	ReasonClusterListDispatch      FallthroughReason = "cluster-list-dispatch"
+	ReasonClusterListShapeFallback FallthroughReason = "cluster-list-shape-fallback"
 )
 
 // fallthroughKey is the composite label tuple for one counter cell.
