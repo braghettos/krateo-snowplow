@@ -395,3 +395,129 @@ func TestWaitAllInformersSynced_CtxBound(t *testing.T) {
 		t.Fatalf("WaitAllInformersSynced must return a non-nil error on a cancelled ctx")
 	}
 }
+
+// --- Readiness-gate startup-flip helper (Ship 0.30.153) -------------------
+
+// TestShouldFlipPhase1DoneOnStartup is the AC-3 truth table for the
+// startup safety-net. The bug fixed at 0.30.153: the inline conditional
+// at main.go missed (cache=off, prewarm=on, watcher-non-nil) — the pod
+// was stuck `{"status":"warming","phase1Done":false}` forever because
+// neither disjunct of the old 2-term condition fired. The helper here
+// is the four-disjunct invariant the conditional was supposed to encode.
+//
+// The healthy serving path (cache=on, prewarm=on, watcher-non-nil) is
+// the ONLY case where the helper returns false — Phase1Warmup owns the
+// flip there. Every other tuple has nothing to warm and must flip.
+func TestShouldFlipPhase1DoneOnStartup(t *testing.T) {
+	tests := []struct {
+		name           string
+		cacheEnabled   bool
+		prewarmEnabled bool
+		watcherIsNil   bool
+		want           bool
+		why            string
+	}{
+		{
+			name:           "incident_repro_cache_off_prewarm_on_watcher_non_nil",
+			cacheEnabled:   false,
+			prewarmEnabled: true,
+			watcherIsNil:   false,
+			want:           true,
+			why:            "the 0.30.153 incident: passthrough watcher built, nothing to warm, must flip",
+		},
+		{
+			name:           "healthy_serving_path_cache_on_prewarm_on_watcher_non_nil",
+			cacheEnabled:   true,
+			prewarmEnabled: true,
+			watcherIsNil:   false,
+			want:           false,
+			why:            "Phase1Warmup goroutine owns the flip — do NOT pre-flip or the premature-Ready invariant breaks",
+		},
+		{
+			name:           "cache_off_prewarm_off_watcher_non_nil",
+			cacheEnabled:   false,
+			prewarmEnabled: false,
+			watcherIsNil:   false,
+			want:           true,
+			why:            "cache off AND prewarm off: clearly nothing to warm",
+		},
+		{
+			name:           "cache_off_prewarm_off_watcher_nil",
+			cacheEnabled:   false,
+			prewarmEnabled: false,
+			watcherIsNil:   true,
+			want:           true,
+			why:            "all three reasons fire — must flip",
+		},
+		{
+			name:           "cache_off_prewarm_on_watcher_nil",
+			cacheEnabled:   false,
+			prewarmEnabled: true,
+			watcherIsNil:   true,
+			want:           true,
+			why:            "cache off + watcher missing — nothing to warm",
+		},
+		{
+			name:           "cache_on_prewarm_off_watcher_non_nil",
+			cacheEnabled:   true,
+			prewarmEnabled: false,
+			watcherIsNil:   false,
+			want:           true,
+			why:            "prewarm disabled (the original main.go condition) — must flip",
+		},
+		{
+			name:           "cache_on_prewarm_off_watcher_nil",
+			cacheEnabled:   true,
+			prewarmEnabled: false,
+			watcherIsNil:   true,
+			want:           true,
+			why:            "both fallback disjuncts of the original condition true — must flip",
+		},
+		{
+			name:           "cache_on_prewarm_on_watcher_nil",
+			cacheEnabled:   true,
+			prewarmEnabled: true,
+			watcherIsNil:   true,
+			want:           true,
+			why:            "watcher construction failed (the original main.go condition) — nothing to warm",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cache.ShouldFlipPhase1DoneOnStartup(
+				tc.cacheEnabled, tc.prewarmEnabled, tc.watcherIsNil,
+			)
+			if got != tc.want {
+				t.Fatalf("ShouldFlipPhase1DoneOnStartup(cache=%v, prewarm=%v, watcherNil=%v) = %v, want %v\n  why: %s",
+					tc.cacheEnabled, tc.prewarmEnabled, tc.watcherIsNil, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// TestShouldFlipPhase1DoneOnStartup_HealthyPathIsTheOnlyFalse is a
+// targeted falsifier: the ONLY tuple of the 8-case truth table that
+// must return false is (cache=on, prewarm=on, watcher-non-nil). Any
+// future regression that adds a new false case (e.g. accidentally
+// removing the !cacheEnabled disjunct, re-introducing the 0.30.153
+// incident) trips here in addition to the broader truth table above.
+func TestShouldFlipPhase1DoneOnStartup_HealthyPathIsTheOnlyFalse(t *testing.T) {
+	falseCount := 0
+	for _, cacheEnabled := range []bool{false, true} {
+		for _, prewarmEnabled := range []bool{false, true} {
+			for _, watcherIsNil := range []bool{false, true} {
+				if !cache.ShouldFlipPhase1DoneOnStartup(cacheEnabled, prewarmEnabled, watcherIsNil) {
+					falseCount++
+					if !(cacheEnabled && prewarmEnabled && !watcherIsNil) {
+						t.Fatalf("unexpected false case: cache=%v prewarm=%v watcherNil=%v — only the healthy serving path may return false",
+							cacheEnabled, prewarmEnabled, watcherIsNil)
+					}
+				}
+			}
+		}
+	}
+	if falseCount != 1 {
+		t.Fatalf("exactly one of 8 tuples must return false (the healthy serving path); got %d", falseCount)
+	}
+}

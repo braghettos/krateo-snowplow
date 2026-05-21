@@ -86,6 +86,36 @@ func IsPhase1Done() bool {
 	return phase1Done.Load()
 }
 
+// ShouldFlipPhase1DoneOnStartup reports whether the startup safety-net
+// at main.go's readiness-gate block should flip Phase1Done immediately
+// (because there is nothing to warm), rather than wait for the
+// Phase1Warmup goroutine to signal completion.
+//
+// The invariant: /readyz must return 200 once the pod is ready to serve
+// traffic. When the cache subsystem is OFF, prewarm is OFF, or the
+// watcher failed to construct, NO informer-warming work exists — the
+// gate must flip at boot or the pod is stuck "warming" forever, the
+// Service drops it from Endpoints, and the LB has 0 backends. The
+// healthy CACHE_ENABLED=true + PREWARM_ENABLED=true path returns false
+// here so Phase1Warmup retains ownership of the flip.
+//
+// 0.30.153 — Ship: introduced as a named helper to make the four-disjunct
+// invariant testable and to retire the inline conditional at main.go that
+// missed the CACHE_ENABLED=false + PREWARM_ENABLED=true + watcher-non-nil
+// case (incident: pod stuck `{"status":"warming","phase1Done":false}`,
+// Service endpoints empty, snowplow LB unroutable).
+//
+// Three reasons to flip (any one suffices):
+//   - cacheEnabled == false — cache subsystem off, no informers exist
+//   - prewarmEnabled == false — prewarm disabled, no warmup goroutine runs
+//   - watcherIsNil == true — watcher construction failed, no informers exist
+//
+// MarkPhase1Done is idempotent (atomic store) so a caller may invoke it
+// unconditionally when this returns true.
+func ShouldFlipPhase1DoneOnStartup(cacheEnabled, prewarmEnabled, watcherIsNil bool) bool {
+	return !cacheEnabled || !prewarmEnabled || watcherIsNil
+}
+
 // ResetPhase1DoneForTest clears the Phase1Done signal. TEST-ONLY — the
 // production lifecycle is set-once. Exported so the readyz handler test
 // in another package can drive the gate deterministically.

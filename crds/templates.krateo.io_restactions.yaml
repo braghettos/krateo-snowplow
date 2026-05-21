@@ -54,6 +54,54 @@ spec:
                 items:
                   description: API represents a request to an HTTP service
                   properties:
+                    clusterListWhenAllowed:
+                      description: |-
+                        ClusterListWhenAllowed declares that this API call is eligible
+                        to dispatch as a SINGLE cluster-scoped LIST against
+                        /apis/<g>/<v>/<resource> (instead of a per-namespace iterator
+                        fan-out) when the requesting identity holds cluster-scope
+                        `list` permission on the target GVR. Added at Tag 0.30.152
+                        Ship D.5.
+
+                        Permission is checked against the Ship B typed RBAC snapshot
+                        (cache.RBACSnapshot) via rbac.EvaluateRBAC(ctx, opts) with
+                        opts.Namespace=="" — the existing cluster-list semantics at
+                        internal/rbac/evaluate.go:198-211. On a deny verdict the call
+                        falls through to the existing iterator path verbatim (no
+                        behavioral change for non-cluster-list users e.g. cyberjoker).
+
+                        Additionally gated on !cache.Disabled() at the resolver entry
+                        (AC-D5.13) and on Ship B snapshot readiness — the
+                        `useClusterList` decision must NOT execute against a nil
+                        snapshot. When the cache is "removed" (CACHE_ENABLED=false),
+                        the cluster-list collapse is disabled entirely; dispatch falls
+                        through to the existing per-NS iterator UNCHANGED. This
+                        preserves the removable-cache invariant
+                        (project_caching_is_provisional).
+
+                        Default false (nil): existing RestActions are byte-identical
+                        to pre-D.5. Setting true is an OPT-IN by the RA author who
+                        has verified that:
+
+                          1. The target GVR is namespace-scoped (cluster-scoped GVRs
+                             have no iterator pattern to collapse).
+                          2. A cluster-list dispatch returns the SAME object set the
+                             iterator fan-out would have aggregated. For
+                             namespace-scoped resources, the apiserver cluster-scoped
+                             LIST endpoint /apis/<g>/<v>/<resource> returns objects
+                             across all namespaces; the iterator's per-NS LIST returns
+                             the same objects partitioned by namespace.
+                          3. The widget consuming the RA's output applies any
+                             per-object narrowing through the existing serve-time
+                             RBAC gate (gateContentEnvelope at
+                             internal/resolvers/restactions/api/apistage.go:94-145),
+                             NOT through the RA's iterator shape.
+
+                        When this field is true but DependsOn.Iterator is empty, the
+                        field is a no-op (there is nothing to collapse). When both
+                        are set, the resolver runs §2.3's permission check and
+                        selects the dispatch path.
+                      type: boolean
                     continueOnError:
                       type: boolean
                     dependsOn:
@@ -141,19 +189,28 @@ spec:
                         resource:
                           description: |-
                             Resource is the plural resource name (e.g. "namespaces").
-                            The STATIC resource. Required UNLESS ResourcesFrom is set —
-                            when ResourcesFrom is set the resource plural set is derived
-                            at dispatch time and Resource may be left empty.
+                            The STATIC resource. Required UNLESS ResourcesFrom is set — when
+                            ResourcesFrom is set the resource plural set is derived at
+                            dispatch time and Resource may be left empty.
                           type: string
                         resourcesFrom:
                           description: |-
-                            ResourcesFrom is a JQ expression evaluated ONCE against the
-                            full resolve dict, yielding a []string of resource plurals
-                            (Ship 0.30.129). Symmetric with NamespaceFrom. When set, the
-                            refilter keeps a namespace iff the user can perform Verb on
-                            ANY plural in the set (OR semantics) in that namespace; Group
-                            stays static. When unset, behaviour is byte-identical to
-                            pre-0.30.129 — the static Resource is checked.
+                            ResourcesFrom is a JQ expression evaluated ONCE against the full
+                            resolve dict, yielding a []string of resource plurals — Ship
+                            0.30.129. Symmetric with NamespaceFrom (which is jq-evaluated
+                            per object): ResourcesFrom lets the checked resource set itself
+                            be RUNTIME-DISCOVERED rather than a static literal.
+
+                            When set, the refilter keeps a namespace iff the user can perform
+                            Verb on ANY plural in the set (OR semantics) in that namespace.
+                            Group stays static (a single API group). When unset, behaviour is
+                            byte-identical to pre-0.30.129 — the static Resource is checked.
+
+                            Use case: compositions-get-ns-and-crd discovers the composition
+                            CRD plurals at runtime in dict["crds"]; resourcesFrom evaluates
+                            "[ (.crds // [])[] | .plural ]" so the per-namespace RBAC prune
+                            covers exactly the discovered composition CRDs — no hardcoded
+                            plural literal.
                           type: string
                         verb:
                           description: |-

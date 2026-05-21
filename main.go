@@ -531,14 +531,24 @@ func main() {
 	// flips the Phase1Done gate (immediately when PREWARM_ENABLED is OFF,
 	// or asynchronously at the tail of Phase1Warmup when ON). But several
 	// startup paths bypass that block entirely: CACHE_ENABLED=false
-	// (diagnostic passthrough), or a cache-setup failure (nil watcher).
-	// On any such path there is nothing to warm, so /readyz must still
-	// return 200. When PREWARM_ENABLED is ON AND a watcher exists, the
-	// Phase1Warmup goroutine owns the flip — do NOT pre-flip here, or the
-	// premature-Ready invariant breaks. cacheWatcher==nil with
-	// PREWARM_ENABLED ON also has nothing to warm (no informer factory),
-	// so flip it.
-	if !cache.PrewarmEnabled() || cacheWatcher == nil {
+	// (diagnostic passthrough), PREWARM_ENABLED=false, or a cache-setup
+	// failure (nil watcher). On any such path there is nothing to warm,
+	// so /readyz must still return 200. When CACHE_ENABLED is ON AND
+	// PREWARM_ENABLED is ON AND a watcher exists, the Phase1Warmup
+	// goroutine owns the flip — do NOT pre-flip here, or the
+	// premature-Ready invariant breaks.
+	//
+	// 0.30.153 — the four-disjunct invariant is encoded in
+	// cache.ShouldFlipPhase1DoneOnStartup so the cache-off case
+	// (CACHE_ENABLED=false + PREWARM_ENABLED=true + non-nil passthrough
+	// watcher) is covered. The prior 2-disjunct condition missed that
+	// case; pod was stuck `{"status":"warming","phase1Done":false}`
+	// forever, Service endpoints empty, snowplow LB unroutable.
+	if cache.ShouldFlipPhase1DoneOnStartup(
+		!cache.Disabled(),
+		cache.PrewarmEnabled(),
+		cacheWatcher == nil,
+	) {
 		cache.MarkPhase1Done()
 	}
 
