@@ -9,10 +9,17 @@
 // immutable snapshot via atomic.Pointer and returns map(s) suitable
 // for JSON marshalling.
 //
-// HG-5 discharge: when Disabled() (CACHE_ENABLED=false) every closure
-// returns the EMPTY map — the gauges are present in /debug/vars but
-// carry zero entries. The absence of any controllerHealthStarted log
-// + the empty maps together signal inert.
+// HG-5 discharge (legacy, pre-CFG-1): when Disabled() the closures
+// returned an empty map. This was "gauges present but empty".
+//
+// CFG-1 (Ship 0.30.163) — cache-off compliance per project memory
+// `project_cache_off_is_transparent_fallback`. Diego's 2026-05-22
+// contract supersedes HG-5: "there is no cache with cache_enabled=false".
+// Under CACHE_ENABLED=false the cache subsystem does not exist and
+// these gauges MUST NOT be registered (so they don't appear at
+// /debug/vars at all). The closure-level Disabled() guards are kept
+// as defense-in-depth in case of runtime flip (rare); the boot-time
+// guard is the primary mechanism.
 //
 // HG-6 discharge: the values published are NAME + COUNT only — no
 // raw object bodies, no .clientConfig.caBundle, no auth tokens. The
@@ -20,11 +27,37 @@
 // the snapshot.
 package cache
 
-import "expvar"
+import (
+	"expvar"
+	"sync"
+)
+
+// controllerHealthExpvarOnce guards registerControllerHealthExpvar so
+// the registration body runs at most once per process. See the
+// matching sync.Once in fallthrough_meter_expvar.go for rationale.
+var controllerHealthExpvarOnce sync.Once
 
 func init() {
-	expvar.Publish("snowplow_upstream_controller_health", expvar.Func(controllerHealthExpvarValue))
-	expvar.Publish("snowplow_upstream_webhook_failurepolicy", expvar.Func(webhookFailurePolicyExpvarValue))
+	// CFG-1: under CACHE_ENABLED=false, no cache subsystem exists →
+	// gauges must not be registered. init() runs once per process so
+	// this branch cannot be unit-tested in-process; falsifier is
+	// HG-321 (4-env-value matrix process spawn, see
+	// e2e/bench/cfg1_falsifier.sh).
+	if Disabled() {
+		return
+	}
+	registerControllerHealthExpvar()
+}
+
+// registerControllerHealthExpvar performs the two expvar.Publish
+// calls for the controller-health gauges. Guarded by
+// controllerHealthExpvarOnce so it is safe to call from both init()
+// and the test helper.
+func registerControllerHealthExpvar() {
+	controllerHealthExpvarOnce.Do(func() {
+		expvar.Publish("snowplow_upstream_controller_health", expvar.Func(controllerHealthExpvarValue))
+		expvar.Publish("snowplow_upstream_webhook_failurepolicy", expvar.Func(webhookFailurePolicyExpvarValue))
+	})
 }
 
 // controllerHealthExpvarValue is the closure body for the

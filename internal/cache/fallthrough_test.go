@@ -503,6 +503,12 @@ func TestFallthroughScope_E2E_HTTPChain(t *testing.T) {
 //     keyed "check"
 func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
+	// CFG-1 (Ship 0.30.163): expvar gauges are registered only when
+	// CACHE_ENABLED is truthy at package init() time. The `go test`
+	// process boots with the env unset, so init() returned early.
+	// RegisterExpvarForTest is the explicit, sync.Once-guarded
+	// re-registration hook. See expvar_test_helpers.go.
+	RegisterExpvarForTest()
 	ResetFallthroughCountersForTest()
 
 	// Drive the counter once so the cells are populated — otherwise
