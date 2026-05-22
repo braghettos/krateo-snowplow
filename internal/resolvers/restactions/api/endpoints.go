@@ -99,6 +99,12 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 	if err != nil {
 		return ep, err
 	}
+	// Ship 0.30.165 — normalize CA bytes to the single-base64-encoded
+	// PEM shape that plumbing's transport expects (see endpoints_ca.go).
+	// Live `<user>-clientconfig` Secrets store double-base64 PEM; without
+	// this normalization plumbing silently fails to populate RootCAs and
+	// requests die with `x509: certificate signed by unknown authority`.
+	ep.CertificateAuthorityData = string(normalizeCAData([]byte(ep.CertificateAuthorityData)))
 	if isInternal && !env.TestMode() {
 		ep.ServerURL = "https://kubernetes.default.svc"
 	}

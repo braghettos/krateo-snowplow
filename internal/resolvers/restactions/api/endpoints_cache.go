@@ -190,7 +190,12 @@ func extractEndpointFromSecret(sec *corev1.Secret) (endpoints.Endpoint, error) {
 		res.Password = string(v)
 	}
 	if v, ok := sec.Data[caLabel]; ok {
-		res.CertificateAuthorityData = string(v)
+		// Ship 0.30.165 — cache-on mirror of endpoints.go normalization
+		// (HG-165-4 cache-on parity). For correctly-shaped single-base64
+		// PEM bytes the call is a no-op passthrough; for double-base64
+		// `<user>-clientconfig` Secrets it returns the inner single-base64
+		// form that plumbing's transport can decode in one pass.
+		res.CertificateAuthorityData = string(normalizeCAData(v))
 	}
 	if v, ok := sec.Data[clientKeyLabel]; ok {
 		res.ClientKeyData = string(v)
