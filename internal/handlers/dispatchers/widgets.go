@@ -50,6 +50,12 @@ var _ http.Handler = (*widgetsHandler)(nil)
 func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 
+	// Ship 0.30.171-debug — per-/call structured timing log; see
+	// restactions.go for the rationale. Emits dispatcher.call.complete
+	// into the existing stdout->otel-daemonset->ClickHouse pipeline.
+	pcs, pcEmit := beginPerCall(req, "widgets")
+	defer pcEmit()
+
 	extras, err := util.ParseExtras(req)
 	if err != nil {
 		response.BadRequest(wri, err)
@@ -61,6 +67,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		response.Encode(wri, got.Err)
 		return
 	}
+	pcs.gvr = got.GVR.String()
 
 	log := xcontext.Logger(req.Context()).
 		With(
@@ -115,6 +122,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					cache.ReasonWidgetContentHit, got.GVR.String())
 				emitResolvedCacheLookup(log, "widgetContent",
 					contentKey, true, len(gated))
+				pcs.l1Hit = "content-hit"
 				writeResolvedJSON(wri, gated)
 				log.Info("Widget successfully resolved",
 					slog.String("duration", util.ETA(start)),
@@ -144,6 +152,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", cacheKey, true, len(entry.RawJSON))
+			pcs.l1Hit = "hit"
 			writeResolvedJSON(wri, entry.RawJSON)
 			log.Info("Widget successfully resolved",
 				slog.String("duration", util.ETA(start)),
@@ -152,6 +161,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			return
 		}
 		emitResolvedCacheLookup(log, "widgets", cacheKey, false, 0)
+		pcs.l1Hit = "miss"
 	}
 
 	ctx := xcontext.BuildContext(req.Context())

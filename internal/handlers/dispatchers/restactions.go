@@ -62,6 +62,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 
 	start := time.Now()
 
+	// Ship 0.30.171-debug — per-/call structured timing log. Emits
+	// dispatcher.call.complete into the snowplow stdout -> otel-
+	// daemonset filelog -> ClickHouse otel_logs pipeline at every
+	// ServeHTTP exit (success, RBAC-deny, error). Used to identify
+	// the slow /call class in the 8-cycle parallelism diagnostic.
+	pcs, pcEmit := beginPerCall(req, "restactions")
+	defer pcEmit()
+
 	extras, err := util.ParseExtras(req)
 	if err != nil {
 		response.BadRequest(wri, err)
@@ -73,6 +81,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		response.Encode(wri, got.Err)
 		return
 	}
+	pcs.gvr = got.GVR.String()
 
 	// Revision 2 binding (0.30.4): in cache=on mode every RestAction
 	// dispatch is gated by EvaluateRBAC against the CR being dispatched.
@@ -112,6 +121,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", cacheKey, true, len(entry.RawJSON))
+			pcs.l1Hit = "hit"
 			writeResolvedJSON(wri, entry.RawJSON)
 			log.Info("RESTAction successfully resolved",
 				slog.String("name", got.Unstructured.GetName()),
@@ -122,6 +132,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			return
 		}
 		emitResolvedCacheLookup(log, "restactions", cacheKey, false, 0)
+		pcs.l1Hit = "miss"
 	}
 
 	scheme := runtime.NewScheme()
