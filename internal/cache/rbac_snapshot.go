@@ -97,6 +97,56 @@ type RBACSnapshot struct {
 
 	// Roles indexed by `ns + "/" + name` — read at evaluate.go:270.
 	RolesByNSName map[string]*rbacv1.Role
+
+	// ─────────────────────────────────────────────────────────────
+	// Ship 0.30.169 — subject→bindings indexes.
+	//
+	// Built ONCE per `rebuildRBACSnapshot` via `rebuildSubjectIndexes`
+	// (called as the final step of `rebuildRBACSnapshot`, before the
+	// atomic Store). IMMUTABLE post-publish — same concurrency model
+	// as ClusterRoleBindings / RoleBindingsByNS (AC-B.5 invariant 1).
+	//
+	// The values are pointer slices into the SAME typed objects already
+	// stored in ClusterRoleBindings / RoleBindingsByNS — NO duplication
+	// of the typed structs. RSS overhead is the pointer-slice headers
+	// plus map-bucket allocations only.
+	//
+	// Routing rules — mirror the architect's §3 case-walk:
+	//
+	//   Subject.Kind == "User"           → CRBsByUser[s.Name]
+	//   Subject.Kind == "Group"          → CRBsByGroup[s.Name]
+	//   Subject.Kind == "ServiceAccount" → CRBsByServiceAccount[s.Namespace+"/"+s.Name]
+	//   Subject.Kind == <anything else>  → CRBsCatchAll  (safety net for
+	//                                       unrecognised / future Kinds;
+	//                                       under-inclusion would be a
+	//                                       permit-loss bug)
+	//
+	// A CRB with multiple subjects appears under multiple index entries;
+	// the union at lookup time dedups by pointer. A CRB with EMPTY
+	// Subjects appears in NO index (matches nothing in linear scan;
+	// must match nothing in index lookup).
+	//
+	// Correctness barrier: these indexes are a PRE-FILTER for
+	// `anySubjectMatches` (evaluate.go:402-431). Any superset of the
+	// linear-scan match set is correct; the post-lookup matcher enforces
+	// exact equality. Under-inclusion is a correctness defect.
+	//
+	// Reader-side contract: callers MUST NOT mutate the returned slices
+	// (they are owned by the snapshot, just like ClusterRoleBindings).
+	// Concurrent read is lock-free post-publish.
+	CRBsByUser           map[string][]*rbacv1.ClusterRoleBinding
+	CRBsByGroup          map[string][]*rbacv1.ClusterRoleBinding
+	CRBsByServiceAccount map[string][]*rbacv1.ClusterRoleBinding // key = "<ns>/<name>"
+	CRBsCatchAll         []*rbacv1.ClusterRoleBinding            // unrecognised Subject.Kind
+
+	// Per-namespace RoleBinding indexes. Same shape as the CRB indexes
+	// but keyed first by RoleBinding.Namespace. The outer map is missing
+	// for namespaces with no RoleBindings; inner map lookups on a
+	// missing namespace return nil (zero-iteration range).
+	RBsByUserByNS           map[string]map[string][]*rbacv1.RoleBinding
+	RBsByGroupByNS          map[string]map[string][]*rbacv1.RoleBinding
+	RBsByServiceAccountByNS map[string]map[string][]*rbacv1.RoleBinding // inner key = "<ns>/<name>"
+	RBsCatchAllByNS         map[string][]*rbacv1.RoleBinding
 }
 
 // rbacSnap is the sole publish container — a single-writer / many-reader
@@ -355,6 +405,12 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		}
 	}
 
+	// Ship 0.30.169 — populate the subject→bindings indexes BEFORE
+	// publishing. Indexes are immutable post-publish; building them
+	// after the slice/map fields are stable means a reader that observes
+	// snap via Snapshot() sees a fully-formed snapshot, indexes and all.
+	rebuildSubjectIndexes(snap)
+
 	rbacSnap.Store(snap)
 	rbacSnapshotPublishSeq.Add(1)
 
@@ -364,7 +420,128 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		slog.Int("rb_namespaces", len(snap.RoleBindingsByNS)),
 		slog.Int("crs", len(snap.ClusterRolesByName)),
 		slog.Int("rs", len(snap.RolesByNSName)),
+		slog.Int("crbs_by_user", len(snap.CRBsByUser)),
+		slog.Int("crbs_by_group", len(snap.CRBsByGroup)),
+		slog.Int("crbs_by_sa", len(snap.CRBsByServiceAccount)),
+		slog.Int("crbs_catch_all", len(snap.CRBsCatchAll)),
 	)
+}
+
+// rebuildSubjectIndexes populates the snapshot's CRBs*/RBs* subject
+// indexes from the already-populated ClusterRoleBindings slice and
+// RoleBindingsByNS map. Called as the final step of rebuildRBACSnapshot,
+// BEFORE the atomic Store, so a reader that observes snap via Snapshot()
+// always sees a fully-built snapshot.
+//
+// Routing — mirrors the architect's §3 case-walk one-to-one:
+//
+//   - rbacv1.UserKind:           binding → CRBsByUser[s.Name]
+//   - rbacv1.GroupKind:          binding → CRBsByGroup[s.Name]
+//   - rbacv1.ServiceAccountKind: binding → CRBsByServiceAccount[s.Namespace+"/"+s.Name]
+//   - anything else:             binding → CRBsCatchAll  (safety net)
+//
+// Correctness invariants (HG-169-2):
+//   - For any (snap, opts): {crb | crb ∈ ClusterRoleBindings ∧ anySubjectMatches}
+//     ⊆ {crb | crb appears in at least one index landing reachable from opts}.
+//     Equivalently: the index is a SUPERSET pre-filter. Anything narrower
+//     is a permit-loss bug.
+//   - A binding with EMPTY Subjects appears in NO index (matches nothing
+//     in linear scan; must match nothing in lookup).
+//   - A binding with multiple subjects is appended to MULTIPLE indexes;
+//     the union+pointer-dedup at lookup time collapses to a single
+//     candidate.
+//
+// Cost: O(Σᵢ |CRBᵢ.Subjects| + Σⱼ |RBⱼ.Subjects|). At 8533 CRBs × ~2
+// subjects/binding ≈ 17K pointer-appends + ~3 map-insert/append per
+// route. Empirical target: ≤ 100 ms per rebuild (AC-169.7).
+//
+// Exported indirectly via the snapshot getter; rebuildSubjectIndexes
+// itself is package-private — production callers use rebuildRBACSnapshot.
+// Tests reach it directly to seed synthetic snapshots without driving
+// the full informer-backed rebuild path.
+func rebuildSubjectIndexes(snap *RBACSnapshot) {
+	if snap == nil {
+		return
+	}
+
+	// Initial capacities are heuristic — index maps mirror the
+	// subject-name cardinality, NOT the binding count. Production
+	// observation: ~tens of distinct usernames, ~tens of groups,
+	// ~hundreds of SA keys (one per namespace×name).
+	snap.CRBsByUser = make(map[string][]*rbacv1.ClusterRoleBinding, 64)
+	snap.CRBsByGroup = make(map[string][]*rbacv1.ClusterRoleBinding, 64)
+	snap.CRBsByServiceAccount = make(map[string][]*rbacv1.ClusterRoleBinding, 256)
+	// CRBsCatchAll left as nil slice until we encounter an
+	// unrecognised-Kind subject — most production CRBs route to the
+	// per-Kind maps, so the catch-all is typically empty.
+
+	for _, crb := range snap.ClusterRoleBindings {
+		if crb == nil {
+			continue
+		}
+		for i := range crb.Subjects {
+			s := &crb.Subjects[i] // pointer to avoid copying Subject (8-field struct)
+			switch s.Kind {
+			case rbacv1.UserKind:
+				snap.CRBsByUser[s.Name] = append(snap.CRBsByUser[s.Name], crb)
+			case rbacv1.GroupKind:
+				snap.CRBsByGroup[s.Name] = append(snap.CRBsByGroup[s.Name], crb)
+			case rbacv1.ServiceAccountKind:
+				key := s.Namespace + "/" + s.Name
+				snap.CRBsByServiceAccount[key] = append(snap.CRBsByServiceAccount[key], crb)
+			default:
+				// Unrecognised Kind — route to catch-all so the
+				// post-lookup anySubjectMatches still sees this CRB.
+				// Under-inclusion here = correctness defect (HG-169-2).
+				snap.CRBsCatchAll = append(snap.CRBsCatchAll, crb)
+			}
+		}
+	}
+
+	// Per-namespace RoleBinding indexes. Same routing as CRBs, scoped
+	// by RoleBinding.Namespace. Outer maps are allocated lazily as
+	// namespaces appear.
+	snap.RBsByUserByNS = make(map[string]map[string][]*rbacv1.RoleBinding, len(snap.RoleBindingsByNS))
+	snap.RBsByGroupByNS = make(map[string]map[string][]*rbacv1.RoleBinding, len(snap.RoleBindingsByNS))
+	snap.RBsByServiceAccountByNS = make(map[string]map[string][]*rbacv1.RoleBinding, len(snap.RoleBindingsByNS))
+	snap.RBsCatchAllByNS = make(map[string][]*rbacv1.RoleBinding)
+
+	for ns, rbs := range snap.RoleBindingsByNS {
+		for _, rb := range rbs {
+			if rb == nil {
+				continue
+			}
+			for i := range rb.Subjects {
+				s := &rb.Subjects[i]
+				switch s.Kind {
+				case rbacv1.UserKind:
+					inner := snap.RBsByUserByNS[ns]
+					if inner == nil {
+						inner = make(map[string][]*rbacv1.RoleBinding, 16)
+						snap.RBsByUserByNS[ns] = inner
+					}
+					inner[s.Name] = append(inner[s.Name], rb)
+				case rbacv1.GroupKind:
+					inner := snap.RBsByGroupByNS[ns]
+					if inner == nil {
+						inner = make(map[string][]*rbacv1.RoleBinding, 16)
+						snap.RBsByGroupByNS[ns] = inner
+					}
+					inner[s.Name] = append(inner[s.Name], rb)
+				case rbacv1.ServiceAccountKind:
+					inner := snap.RBsByServiceAccountByNS[ns]
+					if inner == nil {
+						inner = make(map[string][]*rbacv1.RoleBinding, 16)
+						snap.RBsByServiceAccountByNS[ns] = inner
+					}
+					key := s.Namespace + "/" + s.Name
+					inner[key] = append(inner[key], rb)
+				default:
+					snap.RBsCatchAllByNS[ns] = append(snap.RBsCatchAllByNS[ns], rb)
+				}
+			}
+		}
+	}
 }
 
 // indexerList returns the typed-RBAC indexer's List() for gvr, or nil

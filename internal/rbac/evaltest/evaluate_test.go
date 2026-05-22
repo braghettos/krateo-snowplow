@@ -597,3 +597,173 @@ func TestEvaluateRBAC_UnstructuredFallbackEquivalence(t *testing.T) {
 // silence the unstructured import even when the test that uses it is
 // the only consumer.
 var _ = unstructured.Unstructured{}
+
+// ──────────────────────────────────────────────────────────────────────
+// Ship 0.30.169 — end-to-end equivalence for the subject-index path
+// (exercises the real selectCRBCandidates / selectRBCandidates in
+// internal/rbac/evaluate.go via EvaluateRBAC).
+// ──────────────────────────────────────────────────────────────────────
+
+// TestEvaluateRBAC_SubjectIndex_AllKinds asserts that EvaluateRBAC
+// reaches every supported Subject.Kind category through the new
+// index-pre-filter path. Each sub-test seeds a single binding of the
+// specified Kind and asserts a positive match by EvaluateRBAC.
+//
+// The architectural claim: post-Ship-169 the CRB path is the indexed
+// candidate set, not the linear scan. anySubjectMatches (evaluate.go:402-431)
+// is unchanged — semantics are identical for these positive cases.
+func TestEvaluateRBAC_SubjectIndex_AllKinds(t *testing.T) {
+	t.Run("User_CRB", func(t *testing.T) {
+		newTestWatcher(t,
+			clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+			clusterRoleBinding("admin-bind", "admin", userSubject("alice-169")),
+		)
+		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "alice-169", Verb: "get", Resource: "secrets", Namespace: "default",
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC: %v", err)
+		}
+		if !ok {
+			t.Fatalf("Subject-index path failed for User subject — alice-169 should match")
+		}
+	})
+
+	t.Run("Group_CRB", func(t *testing.T) {
+		newTestWatcher(t,
+			clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+			clusterRoleBinding("admin-bind", "admin", groupSubject("devs-169")),
+		)
+		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "bob-169", Groups: []string{"devs-169"},
+			Verb: "get", Resource: "secrets", Namespace: "default",
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC: %v", err)
+		}
+		if !ok {
+			t.Fatalf("Subject-index path failed for Group subject — devs-169 group should match")
+		}
+	})
+
+	t.Run("ServiceAccount_CRB", func(t *testing.T) {
+		newTestWatcher(t,
+			clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+			clusterRoleBinding("admin-bind", "admin", saSubject("krateo-system", "snowplow-169")),
+		)
+		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "system:serviceaccount:krateo-system:snowplow-169",
+			Groups:   []string{"system:authenticated"},
+			Verb:     "get", Resource: "secrets", Namespace: "default",
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC: %v", err)
+		}
+		if !ok {
+			t.Fatalf("Subject-index path failed for ServiceAccount subject — snowplow-169 SA should match")
+		}
+	})
+
+	t.Run("SystemAuthenticated_implicit", func(t *testing.T) {
+		// A CRB granting system:authenticated MUST be reached via the
+		// implicit CRBsByGroup["system:authenticated"] index landing
+		// for any non-empty Username.
+		newTestWatcher(t,
+			clusterRole("any-auth", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+			clusterRoleBinding("any-auth-bind", "any-auth",
+				groupSubject("system:authenticated"),
+			),
+		)
+		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "anyone-169",
+			Verb:     "get", Resource: "secrets", Namespace: "default",
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC: %v", err)
+		}
+		if !ok {
+			t.Fatalf("Subject-index path failed for system:authenticated implicit group")
+		}
+	})
+
+	t.Run("SA_synthetic_groups", func(t *testing.T) {
+		// A CRB granting system:serviceaccounts:<ns> MUST be reached
+		// via the index landing CRBsByGroup["system:serviceaccounts:<ns>"]
+		// for an SA in that namespace.
+		newTestWatcher(t,
+			clusterRole("ns-sas", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+			clusterRoleBinding("ns-sas-bind", "ns-sas",
+				groupSubject("system:serviceaccounts:krateo-system"),
+			),
+		)
+		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "system:serviceaccount:krateo-system:any-sa",
+			Groups:   []string{"system:authenticated"},
+			Verb:     "get", Resource: "secrets", Namespace: "default",
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC: %v", err)
+		}
+		if !ok {
+			t.Fatalf("Subject-index path failed for SA synthetic group")
+		}
+	})
+
+	t.Run("User_RB", func(t *testing.T) {
+		// Per-NS RoleBinding via the user index.
+		newTestWatcher(t,
+			role("ns-169", "reader",
+				rule([]string{""}, []string{"configmaps"}, []string{"get"})),
+			roleBinding("ns-169", "reader-bind", "Role", "reader",
+				userSubject("carol-169"),
+			),
+		)
+		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: "carol-169", Verb: "get", Resource: "configmaps", Namespace: "ns-169",
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC: %v", err)
+		}
+		if !ok {
+			t.Fatalf("Subject-index path failed for User RB in ns-169")
+		}
+	})
+}
+
+// TestEvaluateRBAC_SubjectIndex_NegativesUnaffected asserts that the
+// candidate-set pre-filter does NOT over-grant: deny cases remain deny.
+// The post-lookup anySubjectMatches is unchanged, so over-inclusion in
+// the candidate set never produces a wrong allow.
+func TestEvaluateRBAC_SubjectIndex_NegativesUnaffected(t *testing.T) {
+	newTestWatcher(t,
+		clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+		clusterRoleBinding("admin-bind", "admin", userSubject("alice-169")),
+		clusterRoleBinding("group-bind", "admin", groupSubject("devs-169")),
+		clusterRoleBinding("sa-bind", "admin", saSubject("krateo-system", "snowplow-169")),
+	)
+
+	deniedCases := []rbac.EvaluateOptions{
+		// Unknown user, no matching group, not an SA.
+		{Username: "stranger-169", Verb: "get", Resource: "secrets"},
+		// User in a non-matching group.
+		{Username: "stranger-169", Groups: []string{"other-group"}, Verb: "get", Resource: "secrets"},
+		// SA in a non-matching namespace.
+		{
+			Username: "system:serviceaccount:other-ns:other-sa",
+			Groups:   []string{"system:authenticated"},
+			Verb:     "get", Resource: "secrets",
+		},
+	}
+	for _, opts := range deniedCases {
+		opts := opts
+		t.Run(opts.Username, func(t *testing.T) {
+			ok, err := rbac.EvaluateRBAC(context.Background(), opts)
+			if err != nil {
+				t.Fatalf("EvaluateRBAC: %v", err)
+			}
+			if ok {
+				t.Errorf("Subject-index path OVER-GRANTED: %+v should be denied", opts)
+			}
+		})
+	}
+}

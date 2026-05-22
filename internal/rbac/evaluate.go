@@ -211,12 +211,26 @@ func evaluateAgainstInformer(ctx context.Context, snap *cache.RBACSnapshot, opts
 	log := xcontext.Logger(ctx)
 
 	// 1) ClusterRoleBindings — apply cluster-wide. Cluster-wide
-	//    permits override namespace scope. (Pre-Ship-B: evaluate.go:198
-	//    ListTypedObjects(clusterRoleBindingsGVR, ""). Ship B: snapshot
-	//    field read — no slice allocation per call.)
-	for _, crb := range snap.ClusterRoleBindings {
+	//    permits override namespace scope.
+	//
+	// Ship 0.30.169 — the unconditional linear scan over ALL CRBs
+	// (~8533 on the production cluster) is replaced by an indexed
+	// pre-filter:
+	//
+	//   candidates := selectCRBCandidates(snap, opts)   // O(1+|groups|)
+	//   for _, crb := range candidates { ... }
+	//
+	// The post-lookup `anySubjectMatches` is UNCHANGED — it remains the
+	// canonical correctness barrier (HG-169-2). The index is a strict
+	// pre-filter; over-inclusion is fine (the matcher rejects), but
+	// under-inclusion is a permit-loss bug. Catch-all path (CRBsCatchAll)
+	// handles unrecognised Subject.Kind so future-Kind bindings stay
+	// reachable.
+	for _, crb := range selectCRBCandidates(snap, opts) {
 		// Subject prefilter FIRST — skip the entire roleRefPermits
 		// walk when no subject matches. Cheaper than the rule-walk.
+		// The index already narrowed the candidate set; this matcher
+		// is the post-lookup correctness gate.
 		if !anySubjectMatches(crb.Subjects, opts) {
 			continue
 		}
@@ -233,10 +247,10 @@ func evaluateAgainstInformer(ctx context.Context, snap *cache.RBACSnapshot, opts
 	//    A RoleBinding's permit is scoped to its own namespace; the
 	//    RoleRef can point at a Role (same namespace) or a ClusterRole
 	//    (cluster-wide) but the binding's effect is the namespace.
-	//    (Pre-Ship-B: evaluate.go:223 ListTypedObjects(roleBindingsGVR,
-	//    opts.Namespace). Ship B: snapshot map lookup.)
+	//
+	// Ship 0.30.169 — same indexed pre-filter, scoped per-namespace.
 	if opts.Namespace != "" {
-		for _, rb := range snap.RoleBindingsByNS[opts.Namespace] {
+		for _, rb := range selectRBCandidates(snap, opts.Namespace, opts) {
 			if !anySubjectMatches(rb.Subjects, opts) {
 				continue
 			}
@@ -251,6 +265,133 @@ func evaluateAgainstInformer(ctx context.Context, snap *cache.RBACSnapshot, opts
 	}
 
 	return false, nil
+}
+
+// selectCRBCandidates returns the candidate set of ClusterRoleBindings
+// reachable by opts — a strict SUPERSET of the linear-scan match set.
+// The caller (evaluateAgainstInformer) then post-filters each candidate
+// with anySubjectMatches (the canonical correctness barrier, evaluate.go:402-431).
+//
+// Routing — mirrors the index population in cache.rebuildSubjectIndexes
+// and the architect's §3 case-walk one-to-one:
+//
+//  1. CRBsByUser[opts.Username]                          (User subjects)
+//  2. CRBsByGroup[g] for every g in effectiveGroups(opts) (Group subjects;
+//     effectiveGroups adds the synthetic system:serviceaccounts groups
+//     for SA identities, evaluate.go:451-462 — REUSED here so the index
+//     and the matcher agree on group expansion)
+//  3. CRBsByGroup["system:authenticated"]                (implicit group;
+//     mirrors anySubjectMatches' s.Name == "system:authenticated" branch.
+//     The matcher requires opts.Username != "", so we only include this
+//     index landing when the request is authenticated.)
+//  4. CRBsByServiceAccount["<ns>/<name>"]                (SA subjects;
+//     only when opts.Username is a canonical SA)
+//  5. CRBsCatchAll                                        (unrecognised
+//     Subject.Kind safety net — under-inclusion would silently drop a
+//     future-Kind binding, which the matcher would otherwise still match)
+//
+// Pointer-dedup — a CRB whose Subjects match multiple routes (e.g. a
+// User + Group subject set, or a multi-subject CRB hitting both the
+// per-user and the per-group index) appears in the union slice once.
+// Dedup wastes a few extra anySubjectMatches calls but never produces
+// a wrong answer.
+//
+// Returns nil-or-empty when no route hits — the caller iterates over
+// zero elements, identical to the pre-Ship-169 linear scan's behaviour
+// when no CRB matches.
+func selectCRBCandidates(snap *cache.RBACSnapshot, opts EvaluateOptions) []*rbacv1.ClusterRoleBinding {
+	if snap == nil {
+		return nil
+	}
+
+	// effectiveGroups handles the SA-synthetic-groups expansion. We
+	// derive isSA + saNS here so both selectCRBCandidates and
+	// effectiveGroups agree on the SA identity.
+	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
+	groups := effectiveGroups(opts, isSA, saNS)
+
+	// Pointer-keyed dedup. A binding appearing under multiple index
+	// landings is added once.
+	seen := make(map[*rbacv1.ClusterRoleBinding]struct{})
+	var out []*rbacv1.ClusterRoleBinding
+	add := func(crbs []*rbacv1.ClusterRoleBinding) {
+		for _, c := range crbs {
+			if _, ok := seen[c]; ok {
+				continue
+			}
+			seen[c] = struct{}{}
+			out = append(out, c)
+		}
+	}
+
+	if opts.Username != "" {
+		add(snap.CRBsByUser[opts.Username])
+	}
+	for _, g := range groups {
+		add(snap.CRBsByGroup[g])
+	}
+	// system:authenticated is implicit for every authenticated request.
+	// anySubjectMatches gates this on opts.Username != "" — mirror that
+	// here so we don't include the implicit-group landing for an empty
+	// (unauthenticated) identity.
+	if opts.Username != "" {
+		add(snap.CRBsByGroup["system:authenticated"])
+	}
+	if isSA {
+		add(snap.CRBsByServiceAccount[saNS+"/"+saName])
+	}
+	// CRBsCatchAll — unrecognised Kind safety net. Always included;
+	// post-lookup anySubjectMatches rejects unrecognised kinds via its
+	// default switch arm (no case → no match).
+	add(snap.CRBsCatchAll)
+
+	return out
+}
+
+// selectRBCandidates is the RoleBinding analogue of selectCRBCandidates,
+// scoped to a single namespace. Same routing rules; inner-map lookup on a
+// missing namespace returns nil and the function falls through to
+// RBsCatchAllByNS[ns] (also nil for an absent namespace), so the empty
+// case yields an empty candidate set with no allocations.
+func selectRBCandidates(snap *cache.RBACSnapshot, ns string, opts EvaluateOptions) []*rbacv1.RoleBinding {
+	if snap == nil || ns == "" {
+		return nil
+	}
+
+	saNS, saName, isSA := parseServiceAccountUsername(opts.Username)
+	groups := effectiveGroups(opts, isSA, saNS)
+
+	seen := make(map[*rbacv1.RoleBinding]struct{})
+	var out []*rbacv1.RoleBinding
+	add := func(rbs []*rbacv1.RoleBinding) {
+		for _, r := range rbs {
+			if _, ok := seen[r]; ok {
+				continue
+			}
+			seen[r] = struct{}{}
+			out = append(out, r)
+		}
+	}
+
+	if userInner := snap.RBsByUserByNS[ns]; userInner != nil && opts.Username != "" {
+		add(userInner[opts.Username])
+	}
+	if groupInner := snap.RBsByGroupByNS[ns]; groupInner != nil {
+		for _, g := range groups {
+			add(groupInner[g])
+		}
+		if opts.Username != "" {
+			add(groupInner["system:authenticated"])
+		}
+	}
+	if isSA {
+		if saInner := snap.RBsByServiceAccountByNS[ns]; saInner != nil {
+			add(saInner[saNS+"/"+saName])
+		}
+	}
+	add(snap.RBsCatchAllByNS[ns])
+
+	return out
 }
 
 // roleRefPermits resolves ref (Role or ClusterRole) against the
