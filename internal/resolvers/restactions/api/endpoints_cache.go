@@ -195,6 +195,14 @@ func extractEndpointFromSecret(sec *corev1.Secret) (endpoints.Endpoint, error) {
 		// PEM bytes the call is a no-op passthrough; for double-base64
 		// `<user>-clientconfig` Secrets it returns the inner single-base64
 		// form that plumbing's transport can decode in one pass.
+		//
+		// 0.30.166: dormant — wire shape is single-base64 in-process; helper
+		// kept as inert passthrough. The 0.30.165 pre-deploy proof was
+		// captured via kubectl-jsonpath (auto-decodes wire-base64) which
+		// silently double-decoded vs the in-process client-go shape; the
+		// helper defends a wire shape that never occurs at this call site.
+		// Retained per design §5 (zero-cost forward defence; deletion adds
+		// churn) and `feedback_no_kubectl_jsonpath_for_in_process_reasoning`.
 		res.CertificateAuthorityData = string(normalizeCAData(v))
 	}
 	if v, ok := sec.Data[clientKeyLabel]; ok {

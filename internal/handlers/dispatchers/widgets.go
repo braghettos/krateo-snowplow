@@ -139,6 +139,23 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	ctx := xcontext.BuildContext(req.Context())
+	// 0.30.166 / #307 AMEND — attach the snowplow SA endpoint + *rest.Config
+	// to the request context. SYMMETRIC with restactions.go — the widget
+	// dispatcher transitively resolves apiRef RESTActions whose inner
+	// api[] stages dispatch /api/v1/... GETs/LISTs; without the attach
+	// they take plumbing's httpcall.Do path and the snowplow SA endpoint
+	// hits tlsConfigFor's !HasCertAuth() early-return, dropping the CA
+	// (the 0.30.103 / 0.30.165 x509 defect). See snowplowSACtx() in
+	// helpers.go and design §2 of
+	// docs/ship-307-tls-x509-cache-off-design-amend-2026-05-22.md.
+	//
+	// AC-307.7 OUT-OF-CLUSTER INVARIANT: snowplowSACtx returns (nil, nil)
+	// when the projected SA volume is absent. The nil-guard below SKIPS
+	// the attach and the request ctx is byte-identical to pre-0.30.166.
+	if saEP, saRC := snowplowSACtx(); saEP != nil && saRC != nil {
+		ctx = cache.WithInternalEndpoint(ctx, saEP)
+		ctx = cache.WithInternalRESTConfig(ctx, saRC)
+	}
 	// 0.30.94 Edge type 3: attach the L1 key being populated so the
 	// underlying restactions resolver (called transitively via apiRef)
 	// records dep edges against each inner K8s call. Widget L1 key

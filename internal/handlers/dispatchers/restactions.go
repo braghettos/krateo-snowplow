@@ -118,6 +118,26 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	}
 
 	ctx := xcontext.BuildContext(req.Context())
+	// 0.30.166 / #307 AMEND — attach the snowplow SA endpoint + *rest.Config
+	// to the request context so the api-stage K8s GET/LIST dispatch can
+	// engage dispatchViaInternalRESTConfig (client-go transport, installs
+	// cluster CA correctly) instead of falling through to plumbing's
+	// httpcall.Do (whose tlsConfigFor drops the CA for token-auth endpoints
+	// — the 0.30.103 / 0.30.165 x509 defect). IDENTICAL mechanism to the
+	// Phase 1 walker (phase1_walk.go:231) and the L1 refresher
+	// (resolve_populate.go:117-131) — the previously-unpatched per-request
+	// surface that is the actual cache-off /call request path. See
+	// snowplowSACtx() in helpers.go and design §2 of
+	// docs/ship-307-tls-x509-cache-off-design-amend-2026-05-22.md.
+	//
+	// AC-307.7 OUT-OF-CLUSTER INVARIANT: snowplowSACtx returns (nil, nil)
+	// when the projected SA volume is absent (every unit test, every
+	// out-of-cluster developer run). The nil-guard below then SKIPS the
+	// attach and the request ctx is byte-identical to pre-0.30.166.
+	if saEP, saRC := snowplowSACtx(); saEP != nil && saRC != nil {
+		ctx = cache.WithInternalEndpoint(ctx, saEP)
+		ctx = cache.WithInternalRESTConfig(ctx, saRC)
+	}
 	// 0.30.94 Edge type 3: attach the L1 key being populated so the
 	// resolver can record dep edges for each inner K8s call it makes.
 	// Empty cacheKey (L1 disabled, RBAC-skipped) is a no-op inside

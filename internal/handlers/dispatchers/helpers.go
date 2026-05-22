@@ -9,13 +9,16 @@ import (
 	"strconv"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/http/response"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
 )
 
 func fetchObject(req *http.Request) (got objects.Result) {
@@ -246,4 +249,55 @@ func writeResolvedJSON(wri http.ResponseWriter, payload []byte) {
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)
 	_, _ = wri.Write(payload)
+}
+
+// snowplowSACtx — Ship 0.30.166 / #307 AMEND. Returns the snowplow
+// ServiceAccount endpoint + *rest.Config the dispatcher attaches to every
+// per-request context so the api-stage K8s GET/LIST dispatch can engage
+// dispatchViaInternalRESTConfig (client-go transport that correctly
+// installs the cluster CA) instead of falling through to plumbing's
+// httpcall.Do (whose tlsConfigFor drops the CA for token-auth endpoints
+// — the 0.30.103 / 0.30.165 x509 defect).
+//
+// IDENTICAL MECHANISM to the prior-art sites that already use it:
+//   - Phase 1 walker: phase1_walk.go:231 attaches the same SA pair to the
+//     SA-credentialed startup walk context (the 0.30.104 fix surface).
+//   - L1 refresher: resolve_populate.go:117-131 attaches the same SA pair
+//     to the background re-resolve context (the 0.30.113 Part B fix
+//     surface, where the SA is transport-only and per-user identity comes
+//     from the cached Inputs).
+// 0.30.166 extends the SAME attach to the per-request restactions.go +
+// widgets.go dispatcher entries — the previously-unpatched surface that
+// is the actual cache-off /call request path. See ship-307-tls-x509-cache-
+// off-design-amend-2026-05-22.md §2.
+//
+// GRACEFUL DEGRADATION (AC-307.7): out-of-cluster unit tests have no
+// projected SA volume and no KUBERNETES_SERVICE_HOST env — both
+// idynamic.ServiceAccountEndpoint() and idynamic.ServiceAccountRESTConfig()
+// error. The helper swallows the error and returns (nil, nil). The
+// dispatcher caller's nil-guarded attach (`if saEP != nil && saRC != nil`)
+// then SKIPS the WithInternalEndpoint / WithInternalRESTConfig calls, so
+// the request ctx is byte-identical to pre-0.30.166 and the request flows
+// through the unchanged httpcall.Do path. Every unit test in the tree is
+// preserved verbatim.
+//
+// CONCURRENCY: idynamic.ServiceAccountEndpoint memoises a process-wide
+// singleton under its own mutex; the helper itself is stateless and safe
+// for concurrent callers (every per-request dispatch is a fresh goroutine).
+//
+// LOG VISIBILITY: by design the helper is silent on the per-request
+// happy path — repeated nil-warns would flood the log. The startup-time
+// warn already exists at dispatchers.go:58-66 (RegisterRefreshHandlers)
+// where the SAME SA pair is fetched once for the refresher; a missing
+// SA there is surfaced once and is sufficient for diagnosis.
+func snowplowSACtx() (*endpoints.Endpoint, *rest.Config) {
+	saEP, err := idynamic.ServiceAccountEndpoint()
+	if err != nil {
+		return nil, nil
+	}
+	saRC, err := idynamic.ServiceAccountRESTConfig()
+	if err != nil {
+		return nil, nil
+	}
+	return saEP, saRC
 }
