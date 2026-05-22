@@ -276,8 +276,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		if !uafActive {
 			if accessToken, _ := xcontext.AccessToken(ctx); accessToken != "" {
 				if apiCall.EndpointRef == nil || ptr.Deref(apiCall.ExportJWT, false) {
-					apiCall.Headers = append(apiCall.Headers,
+					// 0.30.164: stage-local Headers — never write the user
+					// bearer back into the shared CR slice (the CR is marshaled
+					// into the /call response body at restactions.go:149; an
+					// in-place append leaked the JWT to the wire — see
+					// /tmp/snowplow-runs/ship-307/before/.../call-namespaces.json).
+					stageHeaders := make([]string, len(apiCall.Headers), len(apiCall.Headers)+1)
+					copy(stageHeaders, apiCall.Headers)
+					stageHeaders = append(stageHeaders,
 						fmt.Sprintf("Authorization: Bearer %s", accessToken))
+					local := *apiCall
+					local.Headers = stageHeaders
+					apiCall = &local
 				}
 			}
 		}
