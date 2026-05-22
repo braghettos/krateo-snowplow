@@ -163,13 +163,25 @@ func ServiceAccountRESTConfig() (*rest.Config, error) {
 		return saRestConfigInstance, nil
 	}
 
-	rc, err := rest.InClusterConfig()
+	rc, err := inClusterConfigFn()
 	if err != nil {
 		return nil, fmt.Errorf("dynamic.sa: rest.InClusterConfig: %w", err)
 	}
+	rc.QPS = -1 // disable client-side rate limiter (server-side P&F is authoritative); see client-go rest/config.go:117-122
+	rc.Burst = 0
 	saRestConfigInstance = rc
 	return rc, nil
 }
+
+// inClusterConfigFn is the package-private indirection that lets unit
+// tests swap rest.InClusterConfig for a synthetic builder. The real
+// rest.InClusterConfig reads hardcoded paths
+// /var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt}
+// (client-go rest/config.go:544-547) and is not pointable from tests
+// without this seam. Production code path is unchanged; the variable
+// is initialized once to the real function and is only reassigned by
+// test code wrapped in the resetSARestConfigForTest contract.
+var inClusterConfigFn = rest.InClusterConfig
 
 // resetSAEndpointForTest clears the singleton so each test sees a
 // fresh state. Exported via the _test.go shim only; production code
