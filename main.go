@@ -10,6 +10,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -78,6 +79,17 @@ func main() {
 	}
 
 	flag.Parse()
+
+	// Ship 0.30.170-debug — enable Go runtime off-CPU profilers at boot
+	// so /debug/pprof/mutex + /debug/pprof/block return non-empty data
+	// under Chrome MCP cold-nav load. Required for the parallelism
+	// regression investigation after Ship 0.30.169 RBAC index proved the
+	// 2× ceiling is OFF-CPU (pod CPU utilization 13.43% during burst).
+	// fraction=1 / rate=1 = sample every event; overhead is noise at
+	// today's utilization. DEBUG BUILD — roll back to 0.30.169 once
+	// profiles are captured.
+	runtime.SetMutexProfileFraction(1)
+	runtime.SetBlockProfileRate(1)
 
 	os.Setenv("DEBUG", strconv.FormatBool(*debugOn))
 	os.Setenv("TRACE", strconv.FormatBool(*blizzardOn))
