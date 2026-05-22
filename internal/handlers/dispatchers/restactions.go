@@ -7,6 +7,7 @@ import (
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/snowplow/apis"
@@ -15,18 +16,43 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 )
 
 func RESTAction() http.Handler {
+	// Ship 0.30.167 — Option 2 parallelism regression fix.
+	// Resolve the snowplow SA endpoint + *rest.Config ONCE at handler
+	// construction (the same cadence the refresher uses at
+	// dispatchers.go:56-66 RegisterRefreshHandlers — the load-bearing
+	// prior art for this shape). The resolved pair is then captured as
+	// struct fields and attached to the per-request ctx in ServeHTTP
+	// via a cheap nil-check + field read, eliminating the per-request
+	// snowplowSACtx() helper call (which transitively re-acquired the
+	// SA singletons' mutexes on every dispatch).
+	//
+	// Out-of-cluster (unit tests, developer runs): snowplowSACtx
+	// returns (nil, nil); both fields stay nil; the ServeHTTP attach
+	// block then skips the WithInternalEndpoint / WithInternalRESTConfig
+	// calls, preserving AC-307.7 byte-identically.
+	saEP, saRC := snowplowSACtx()
 	return &restActionHandler{
 		authnNS: env.String("AUTHN_NAMESPACE", ""),
 		verbose: env.True("DEBUG"),
+		saEP:    saEP,
+		saRC:    saRC,
 	}
 }
 
 type restActionHandler struct {
 	authnNS string
 	verbose bool
+	// saEP + saRC are the snowplow ServiceAccount transport pair
+	// captured at handler construction (Ship 0.30.167 Option 2). Both
+	// may be nil in out-of-cluster runs; ServeHTTP nil-checks before
+	// attaching to the request ctx. Mirrors RegisterRefreshHandlers'
+	// closure-captured saEP/saRC at dispatchers.go:56-66.
+	saEP *endpoints.Endpoint
+	saRC *rest.Config
 }
 
 var _ http.Handler = (*restActionHandler)(nil)
@@ -118,25 +144,22 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	}
 
 	ctx := xcontext.BuildContext(req.Context())
-	// 0.30.166 / #307 AMEND — attach the snowplow SA endpoint + *rest.Config
-	// to the request context so the api-stage K8s GET/LIST dispatch can
-	// engage dispatchViaInternalRESTConfig (client-go transport, installs
-	// cluster CA correctly) instead of falling through to plumbing's
-	// httpcall.Do (whose tlsConfigFor drops the CA for token-auth endpoints
-	// — the 0.30.103 / 0.30.165 x509 defect). IDENTICAL mechanism to the
-	// Phase 1 walker (phase1_walk.go:231) and the L1 refresher
-	// (resolve_populate.go:117-131) — the previously-unpatched per-request
-	// surface that is the actual cache-off /call request path. See
-	// snowplowSACtx() in helpers.go and design §2 of
-	// docs/ship-307-tls-x509-cache-off-design-amend-2026-05-22.md.
+	// Ship 0.30.167 — Option 2 parallelism regression fix.
+	// Read the SA transport pair from struct fields populated once at
+	// RESTAction() construction (Ship 0.30.166 attached the pair to ctx
+	// PER REQUEST via snowplowSACtx() — under concurrent /call load that
+	// serialised every dispatch through the SA singletons' mutexes).
+	// The construction-time capture mirrors RegisterRefreshHandlers'
+	// closure-captured saEP/saRC at dispatchers.go:56-66.
 	//
 	// AC-307.7 OUT-OF-CLUSTER INVARIANT: snowplowSACtx returns (nil, nil)
 	// when the projected SA volume is absent (every unit test, every
-	// out-of-cluster developer run). The nil-guard below then SKIPS the
-	// attach and the request ctx is byte-identical to pre-0.30.166.
-	if saEP, saRC := snowplowSACtx(); saEP != nil && saRC != nil {
-		ctx = cache.WithInternalEndpoint(ctx, saEP)
-		ctx = cache.WithInternalRESTConfig(ctx, saRC)
+	// out-of-cluster developer run); both fields stay nil; the nil-guard
+	// below then SKIPS the attach and the request ctx is byte-identical
+	// to pre-0.30.166.
+	if r.saEP != nil && r.saRC != nil {
+		ctx = cache.WithInternalEndpoint(ctx, r.saEP)
+		ctx = cache.WithInternalRESTConfig(ctx, r.saRC)
 	}
 	// 0.30.94 Edge type 3: attach the L1 key being populated so the
 	// resolver can record dep edges for each inner K8s call it makes.

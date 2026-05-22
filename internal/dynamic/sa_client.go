@@ -57,6 +57,32 @@ var (
 	saEndpointInstance *endpoints.Endpoint
 )
 
+// saRestConfigSingleton is the process-wide cached SA *rest.Config.
+// Built lazily on first successful call to ServiceAccountRESTConfig();
+// error path re-tries on every call (same contract as
+// saEndpointInstance — a transient boot-time failure must not poison
+// the lifetime of the process).
+//
+// Ship 0.30.167: the 0.30.166 dispatcher attach invokes
+// ServiceAccountRESTConfig per request. rest.InClusterConfig() reads
+// /var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt} +
+// parses the CA PEM on every call — under concurrent /call load
+// this serialises the cache-off request path through the disk + parse
+// cost, defeating the per-request parallelism the cache-off mode is
+// supposed to deliver. The singleton is structurally identical to
+// saEndpointInstance and is the architect-recommended Option 1 fix
+// (mirror the same prior-art pattern at sa_client.go:55-58).
+//
+// Concurrency: after construction the *rest.Config is immutable from
+// the consumer's perspective; callers MUST NOT mutate the returned
+// pointer's fields. rest.Config carries internal sync.Once state for
+// its transport cache, so transport construction remains race-free
+// regardless of how many goroutines share the pointer.
+var (
+	saRestConfigMu       sync.Mutex
+	saRestConfigInstance *rest.Config
+)
+
 // ServiceAccountEndpoint returns the snowplow ServiceAccount-backed
 // Endpoint used by the userAccessFilter dispatch path. The endpoint
 // targets the in-cluster apiserver ("https://kubernetes.default.svc")
@@ -112,13 +138,36 @@ func ServiceAccountEndpoint() (*endpoints.Endpoint, error) {
 // kubernetes.Clientset (e.g., the typed dynamic client) rather than
 // the Endpoint shape that the httpcall resolver consumes.
 //
-// Returns whatever rest.InClusterConfig errors when running outside
-// a cluster — the production caller path always lives inside a pod.
+// Caches the result on first success — subsequent calls return the
+// SAME pointer. On failure (e.g., running outside a cluster, missing
+// SA env / file), returns an error and does NOT cache, so a later
+// call can retry. Identical shape + contract to ServiceAccountEndpoint
+// above (the lines 79-108 prior art).
+//
+// Ship 0.30.167 memoisation rationale: prior to memoisation, the
+// 0.30.166 dispatcher attach invoked rest.InClusterConfig() per
+// /call request — re-reading the SA token/CA from disk and re-parsing
+// the CA PEM on every dispatch, serialising the cache-off request
+// path through the disk + parse cost under concurrent load (the
+// parallelism regression). The singleton lifts that cost to once
+// per process.
+//
+// The function is goroutine-safe. After construction the *rest.Config
+// is immutable from the consumer's perspective; callers MUST NOT
+// mutate the returned pointer's fields.
 func ServiceAccountRESTConfig() (*rest.Config, error) {
+	saRestConfigMu.Lock()
+	defer saRestConfigMu.Unlock()
+
+	if saRestConfigInstance != nil {
+		return saRestConfigInstance, nil
+	}
+
 	rc, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("dynamic.sa: rest.InClusterConfig: %w", err)
 	}
+	saRestConfigInstance = rc
 	return rc, nil
 }
 
@@ -129,4 +178,13 @@ func resetSAEndpointForTest() {
 	saEndpointMu.Lock()
 	defer saEndpointMu.Unlock()
 	saEndpointInstance = nil
+}
+
+// resetSARestConfigForTest clears the *rest.Config singleton so each
+// test sees a fresh state. Same shape as resetSAEndpointForTest above;
+// production code MUST NOT call this.
+func resetSARestConfigForTest() {
+	saRestConfigMu.Lock()
+	defer saRestConfigMu.Unlock()
+	saRestConfigInstance = nil
 }
