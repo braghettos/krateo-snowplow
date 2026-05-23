@@ -119,6 +119,14 @@ func main() {
 	}
 
 	log := slog.New(lh)
+	// 0.30.172: route package-level slog calls (slog.InfoContext / .Info /
+	// .DebugContext etc.) through the configured handler. Without this, any
+	// emission via slog.* package-level functions goes to Go's uninitialised
+	// default handler (text format to stderr) and is silently filtered out
+	// by the JSON-only stdout log pipeline. Specifically caught the
+	// dispatcher.call.complete log from per_call_log.go (0.30.171-debug)
+	// that uses slog.InfoContext(ctx, ...) and never appeared in pod logs.
+	slog.SetDefault(log)
 	if *debugOn {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
