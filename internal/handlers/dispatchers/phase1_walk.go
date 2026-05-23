@@ -278,11 +278,33 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		}
 	}
 
-	resolver := func(rctx context.Context, root navigationRoot) error {
-		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester)
+	// Ship PIP (0.30.173): the per-identity prewarm seed harvester.
+	// Sibling of the content-prewarm harvester. When PIP is on the
+	// discovery walk harvests every resolved navigation widget CR + its
+	// (GVR, perPage, page) tuple into this set (Step 7.6a); the pipSeed
+	// callback below drains it together with the apiRef set to seed the
+	// top-level per-user resolved-output L1 for every enumerated RBAC
+	// cohort BEFORE phase1Done flips. Flag-off (PIP_ENABLED=false or
+	// PREWARM_CONTENT_ENABLED=false) the harvester stays nil — startup
+	// is byte-identical to 0.30.172.
+	//
+	// PIP rides the content-prewarm gate (it depends on the same
+	// apiRefHarvester for the restactions seed loop). A future ship may
+	// split the gates if the OOM profile justifies it.
+	var navHarvester *navWidgetHarvester
+	var pipSeed pipSeedFn
+	if cache.PrewarmEnabled() && PrewarmContentEnabled() && PrewarmPIPEnabled() {
+		navHarvester = newNavWidgetHarvester()
+		pipSeed = func(pctx context.Context) error {
+			return runPIPSeed(pctx, harvester, navHarvester, *saEP, rc, authnNS)
+		}
 	}
 
-	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm)
+	resolver := func(rctx context.Context, root navigationRoot) error {
+		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester, navHarvester)
+	}
+
+	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm, pipSeed)
 }
 
 // phase1WarmupWith is the testable core: it takes the watcher, the
@@ -306,7 +328,17 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 // step (flag-off / tests); production passes runContentPrewarmPass.
 type contentPrewarm func(ctx context.Context)
 
-func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm) error {
+// pipSeedFn is the Ship PIP (0.30.173) Step-7.6 callback:
+// phase1WarmupWith invokes it AFTER contentWarm (7.5) and BEFORE
+// MarkPhase1Done (8) — behind the 503 readiness gate — so the per-
+// identity prewarm seed of restactions + widgets top-level L1
+// completes before the pod goes Ready. Returning a non-nil error
+// causes phase1WarmupWith to FAIL-CLOSED: cache.MarkPhase1Done is NOT
+// called, /readyz stays 503, the pod stays not-ready. nil disables
+// the step (flag-off / tests); production passes runPIPSeed.
+type pipSeedFn func(ctx context.Context) error
+
+func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm, pipSeed pipSeedFn) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -405,6 +437,38 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// runContentPrewarmPass and never blocks readiness.
 	if contentWarm != nil {
 		contentWarm(ctx)
+	}
+
+	// Step 7.6 — Ship PIP (0.30.173): the per-identity prewarm seed.
+	// Runs AFTER the content-prewarm pass (the apiRef harvester is full)
+	// and BEFORE MarkPhase1Done (still behind the 503 readiness gate).
+	// Seeds the per-user resolved-output L1 (top-level restactions +
+	// widgets cache classes) for EVERY enumerated RBAC cohort. nil when
+	// PIP_ENABLED is off — flag-off this is byte-identical to 0.30.172.
+	//
+	// FOREGROUND + FAIL-CLOSED (Diego OQ-1 + OQ-2 — PM acceptance):
+	// phase1Done flips ONLY after the seed completes successfully. A
+	// non-nil error returned by pipSeed causes phase1WarmupWith to
+	// return WITHOUT calling cache.MarkPhase1Done — /readyz stays 503,
+	// the pod stays not-ready. The chart's startupProbe failureThreshold
+	// determines the operator's window to recover; the operator sees a
+	// loud `phase1.seed.cohort.error` log line.
+	if pipSeed != nil {
+		if err := pipSeed(ctx); err != nil {
+			log.Warn("phase1.seed.failed",
+				slog.String("subsystem", "cache"),
+				slog.Any("err", err),
+				slog.String("effect", "phase1Done stays false; /readyz returns 503; "+
+					"operator must inspect phase1.seed.cohort.error log lines"),
+				slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			)
+			// FAIL-CLOSED — do NOT mark Phase1Done. The pod stays
+			// not-ready until restart/redeploy.
+			if walkErr != nil {
+				return walkErr
+			}
+			return err
+		}
 	}
 
 	// Step 8 — signal Phase1Done. /readyz flips to 200.
@@ -557,13 +621,14 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	return rctx
 }
 
-func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester) error {
+func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester) error {
 	rctx := withPhase1SAContext(ctx, saEP, saRC)
 
 	w := &phase1Walker{
-		authnNS:         authnNS,
-		visited:         map[string]struct{}{},
-		apiRefHarvester: harvester,
+		authnNS:            authnNS,
+		visited:            map[string]struct{}{},
+		apiRefHarvester:    harvester,
+		navWidgetHarvester: navHarvester,
 	}
 	// Ship G (0.30.16x): gvr is threaded from the lister
 	// (listNavigationRootsFromConfigMap, phase1_roots.go) which parses
@@ -609,6 +674,14 @@ type phase1Walker struct {
 	// (no second traversal). nil when PREWARM_CONTENT_ENABLED is off —
 	// harvestApiRef is nil-safe so flag-off is a clean no-op.
 	apiRefHarvester *contentPrewarmHarvester
+	// navWidgetHarvester accumulates each resolved navigation widget CR
+	// together with the GVR/pagination it was resolved under — Ship PIP
+	// (0.30.173) Step 7.6a. Sibling of apiRefHarvester: harvested
+	// alongside in walk() (no second traversal). Drained by runPIPSeed
+	// for the per-cohort widgets top-level L1 seed loop. nil when PIP is
+	// off — harvestNavWidget is nil-safe so the flag-off path is a clean
+	// no-op.
+	navWidgetHarvester *navWidgetHarvester
 }
 
 // walk resolves widget `in` through the standard widget resolver under
@@ -659,6 +732,14 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// walk — no second traversal. nil-safe: when PREWARM_CONTENT_ENABLED
 	// is off the harvester is nil and this is a no-op.
 	w.apiRefHarvester.harvestApiRef(in)
+
+	// Ship PIP (0.30.173) Step 7.6a — harvest this navigation widget CR
+	// together with the GVR + pagination tuple it resolved under so the
+	// per-cohort seed loop (runPIPSeed) can Put a widgets top-level L1
+	// entry per cohort × widget. Sibling of apiRefHarvester; rides the
+	// EXISTING walk, no second traversal. nil-safe — flag-off is a
+	// clean no-op.
+	w.navWidgetHarvester.harvestNavWidget(in, gvr, perPage, page)
 
 	// Ship G defect-fix (AC-G.5): install the widgetContent L1 key on the
 	// ctx BEFORE widgets.Resolve. The resolver's inner-call dep recording
