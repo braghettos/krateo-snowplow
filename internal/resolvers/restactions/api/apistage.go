@@ -410,11 +410,17 @@ func apistageContentServe(
 	// per-hit gate skips json.Unmarshal. `parsed`/`haveParsed` carry the
 	// pre-parsed form when available; `envelope` carries the raw bytes
 	// for the GET path and the unmarshal fallback.
+	// Ship GMC / 0.30.174 — `entryRef` carries the *cache.ResolvedEntry
+	// pointer (HIT: from store.Get; MISS: the just-Put entry) so the
+	// per-cohort gate memo (CohortGates) can attach to the entry's own
+	// lifetime.
 	var envelope []byte
 	var parsed parsedListEnvelope
 	var haveParsed bool
+	var entryRef *cache.ResolvedEntry
 	if entry, hit := store.Get(contentKey); hit && entry != nil {
 		envelope = entry.RawJSON
+		entryRef = entry
 		// R3: a LIST entry stored with pre-parsed Items — gate directly
 		// over them, no re-unmarshal. An entry without Items (legacy /
 		// refresh-stored / malformed-at-Put) falls back to the RawJSON
@@ -462,6 +468,7 @@ func apistageContentServe(
 			}
 		}
 		store.Put(contentKey, newEntry)
+		entryRef = newEntry
 		log.Debug("apistage.content_store",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -484,10 +491,18 @@ func apistageContentServe(
 	// takes gateContentEnvelope's RawJSON path. Ship 0.30.128 P-CORE-2:
 	// the gate now returns the DECODED envelope value, so the caller
 	// feeds it via jsonHandlerValue with no marshal + no unmarshal.
+	//
+	// Ship GMC / 0.30.174 — the LIST-with-pre-parsed-items branch runs
+	// through gateListItemsWithMemo, which short-circuits the per-item
+	// filterListByRBAC fan-out on a same-cohort hit. The CohortGates
+	// store is lazily attached to entryRef; the memo lives for the
+	// entry's lifetime (LRU-evicted from the content cache together
+	// with the entry).
 	var gated any
 	var gateOK bool
 	if haveParsed {
-		gated, gateOK = gateListItems(ctx, gvr, parsed)
+		memoStore := cache.CohortGateMemoStoreLoadOrInit(entryRef)
+		gated, gateOK = gateListItemsWithMemo(ctx, memoStore, gvr, parsed)
 	} else {
 		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope)
 	}

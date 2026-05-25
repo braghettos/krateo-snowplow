@@ -64,23 +64,28 @@ func TestDispatchCacheLookupKey_NoUserInfoReturnsNilHandle(t *testing.T) {
 	}
 }
 
-func TestEncodeAndWriteResolvedJSON_MatchesPre0307Encoder(t *testing.T) {
+func TestEncodeAndWriteResolvedJSON_MatchesCanonicalEncoder(t *testing.T) {
 	// Goal: prove encodeResolvedJSON + writeResolvedJSON produce the
-	// same wire bytes the dispatchers wrote at 0.30.6 (via inline
-	// json.NewEncoder + SetIndent). If this test fails, the
-	// cache-miss vs cache-hit response would diverge and any client
-	// computing a content hash would see the L1 layer.
+	// canonical compact-encoder shape Ship GMC / 0.30.174 ships
+	// (json.NewEncoder, NO SetIndent). The cache-miss + cache-hit
+	// dispatch paths both flow through encodeResolvedJSON, so as long
+	// as the helper output matches a plain json.NewEncoder.Encode they
+	// stay byte-equal to each other.
+	//
+	// Re-baseline note (per feedback_byte_identical_baselines_clean_
+	// wire_shape): the reference is a SYNTHETIC payload — no JWT, no
+	// Bearer token, no internal-field exposure — so this baseline does
+	// not encode any sensitive shape.
 	payload := map[string]any{
 		"kind":      "RESTAction",
 		"apiVersion": "templates.krateo.io/v1",
 		"metadata":  map[string]any{"name": "demo"},
 	}
 
-	// Reference: inline encoder, identical knobs to the pre-0.30.7
-	// dispatcher path.
+	// Reference: inline encoder, identical knobs to the post-0.30.174
+	// dispatcher path (NO SetIndent — Ship GMC dropped it).
 	var ref bytes.Buffer
 	refEnc := json.NewEncoder(&ref)
-	refEnc.SetIndent("", "  ")
 	if err := refEnc.Encode(payload); err != nil {
 		t.Fatalf("reference encode failed: %v", err)
 	}
@@ -92,7 +97,16 @@ func TestEncodeAndWriteResolvedJSON_MatchesPre0307Encoder(t *testing.T) {
 	}
 
 	if !bytes.Equal(ref.Bytes(), got) {
-		t.Fatalf("helper output diverges from pre-0.30.7 encoder.\nreference:%q\nhelper:%q", ref.Bytes(), got)
+		t.Fatalf("helper output diverges from canonical encoder.\nreference:%q\nhelper:%q", ref.Bytes(), got)
+	}
+
+	// Compact-shape invariant: the helper output MUST NOT contain a
+	// two-space indent ("  ") on a fresh line — that was the
+	// pre-0.30.174 shape and re-introducing it would re-inflate the
+	// wire by ~25%. Sanity-check the helper output never carries that
+	// signature.
+	if bytes.Contains(got, []byte("\n  ")) {
+		t.Fatalf("encodeResolvedJSON re-introduced two-space indent; want compact shape. got=%q", got)
 	}
 
 	// Round-trip writeResolvedJSON: verify content-type, status, body.

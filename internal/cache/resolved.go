@@ -147,6 +147,22 @@ type ResolvedEntry struct {
 	Items           []*unstructured.Unstructured
 	ItemsAPIVersion string
 	ItemsKind       string
+
+	// CohortGates — Ship GMC / 0.30.174 — per-(content-entry × cohort)
+	// memo of filterListByRBAC's kept-name set. Lazily initialized by
+	// the apistage gate via CohortGateMemoStoreLoadOrInit; nil for
+	// every entry that has not yet served a memo-eligible LIST hit.
+	//
+	// The store maps cohortKey (string, hash of UserInfo) -> opaque
+	// memo (filled by the api package). The cache package owns the
+	// storage primitive (sync.Map + bounded-LRU eviction at 256
+	// entries); the cohort semantics + key shape live in api/
+	// apistage_cohort_memo.go.
+	//
+	// Field type is *CohortGateMemoStore (a value-type pointer, lazy);
+	// readers must call CohortGateMemoStoreLoadOrInit to acquire the
+	// store atomically. Direct field access is racy and unsupported.
+	CohortGates atomic.Pointer[CohortGateMemoStore]
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set

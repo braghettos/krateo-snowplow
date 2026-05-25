@@ -220,6 +220,21 @@ func RecordRBACSnapshotMiss(kind, namespace, name string) {
 // `rbac.evaluate.snapshot.miss` WARN); not load-bearing for correctness.
 var rbacSnapshotPublishSeq atomic.Uint64
 
+// RBACGen returns the current RBAC snapshot publish generation. Bumped
+// once per successful rebuildRBACSnapshot publish. Consumers (e.g. the
+// per-cohort gate memo, Ship GMC / 0.30.174) compare a stamped gen
+// against this live value to detect a stale memo against the current
+// RBAC store.
+//
+// Lock-free: a single atomic load. Returns 0 when no snapshot has ever
+// been published (pre-readiness / cache=off) — a 0 stamp on a memo will
+// then compare equal to 0 here, but no memo is built before the snapshot
+// is live (memo population reads the live RBAC store via filterListByRBAC
+// → EvaluateRBAC, which fails closed when the snapshot is nil).
+func RBACGen() uint64 {
+	return rbacSnapshotPublishSeq.Load()
+}
+
 // Snapshot returns the current published RBAC snapshot, or nil if no
 // snapshot has been published yet (pre-readiness / cache=off). Readers
 // MUST call this ONCE per EvaluateRBAC call and thread the returned

@@ -227,15 +227,21 @@ func emitResolvedCacheLookup(log *slog.Logger, handlerKind, key string, hit bool
 	)
 }
 
-// encodeResolvedJSON marshals res with the same json.Encoder settings
-// the dispatchers used before 0.30.7 (SetIndent("", "  ")). Centralising
-// the encode here ensures the cache-hit path returns byte-identical
-// output to the cache-miss path; any divergence would break the
-// "cache=on warm response equals cache=off response" contract.
+// encodeResolvedJSON marshals res with a single canonical encoder shape.
+//
+// Ship GMC / 0.30.174 — dropped SetIndent("", "  ") for a ~25% wire-
+// size reduction at admin scale (the indented LIST envelopes were
+// dominated by per-line spaces). The cache-hit + cache-miss paths
+// remain byte-equal to each other (the contract here is internal
+// consistency); the frontend re-parses JSON regardless of indentation
+// so the change is transparent above HTTP.
+//
+// Centralising the encode here ensures every dispatch site returns
+// the same shape; any divergence would break the "cache=on warm
+// response equals cache=off response" invariant.
 func encodeResolvedJSON(res any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	enc.SetIndent("", "  ")
 	if err := enc.Encode(res); err != nil {
 		return nil, err
 	}
