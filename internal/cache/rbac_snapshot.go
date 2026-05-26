@@ -220,6 +220,60 @@ func RecordRBACSnapshotMiss(kind, namespace, name string) {
 // `rbac.evaluate.snapshot.miss` WARN); not load-bearing for correctness.
 var rbacSnapshotPublishSeq atomic.Uint64
 
+// handlerGVRSetDirty signals that the snowplow handler GVR set the
+// binding-set enumerator captured on its last call may be stale. Set
+// by EnsureResourceType / RemoveResourceType (the only two lifecycle
+// points where the registered-GVR set changes) and consumed by the
+// Phase 1 PIP seed driver to decide whether to re-enumerate before the
+// next seed pass.
+//
+// One atomic store per CRD lifecycle event — free in steady state.
+// `EnumerateBindingSetClasses` clears the flag when it captures a
+// fresh handler-GVR snapshot via `handlerGVRSetSnapshot`.
+//
+// CONCURRENCY: lock-free `atomic.Bool`. Multiple lifecycle events
+// arriving concurrently each Store(true); the next enum-time read sees
+// the OR of all of them and re-snapshots.
+//
+// Ship 0.30.183 — predicate (ζ) handler-set invalidation hook.
+var handlerGVRSetDirty atomic.Bool
+
+// MarkHandlerGVRSetDirty flips the dirty flag so the next
+// EnumerateBindingSetClasses call re-snapshots the handler GVR set
+// before predicate (ζ) runs. Called by EnsureResourceType /
+// RemoveResourceType in watcher.go.
+//
+// Public because watcher.go and binding_set_enumeration.go are in the
+// same package — but the function is exported style for clarity: this
+// is the documented invalidation point.
+func MarkHandlerGVRSetDirty() {
+	handlerGVRSetDirty.Store(true)
+}
+
+// HandlerGVRSetDirty returns whether the handler GVR set was marked
+// dirty since the last EnumerateBindingSetClasses snapshot. The Phase
+// 1 PIP seed driver checks this between seed passes; production code
+// has no other consumer.
+func HandlerGVRSetDirty() bool {
+	return handlerGVRSetDirty.Load()
+}
+
+// handlerGVRCount exposes the number of registered handler GVRs in the
+// `*.krateo.io` domain — the input set predicate (ζ) intersects rules
+// against. Updated by `handlerGVRSetSnapshot` on every enumeration
+// pass. Exposed via expvar as `snowplow_handler_gvr_count` (HG-183.11).
+// Lock-free: int64 atomic load.
+var handlerGVRCount atomic.Int64
+
+// HandlerGVRCount returns the size of the most recent
+// `*.krateo.io`-domain handler GVR set observed by
+// EnumerateBindingSetClasses. Read-only accessor for the metrics layer.
+// Returns 0 when the watcher is unwired or no krateo.io GVR is
+// registered.
+func HandlerGVRCount() int64 {
+	return handlerGVRCount.Load()
+}
+
 // RBACGen returns the current RBAC snapshot publish generation. Bumped
 // once per successful rebuildRBACSnapshot publish. Consumers (e.g. the
 // per-cohort gate memo, Ship GMC / 0.30.174) compare a stamped gen

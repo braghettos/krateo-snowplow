@@ -320,39 +320,43 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 			// non-zero `snowplow_phase1_bindingset_seed_failures_total`
 			// when the seed loop drops a class.
 			//
-			// PER-COHORT ERRORS ARE NON-FATAL — Ship A.3 / 0.30.180
-			// followup. Binding-set enumeration produces cohort classes
-			// for EVERY (user, group-subset) binding-set, including
-			// narrow ServiceAccount identities that genuinely cannot
-			// read RESTActions/widgets (their bindings permit only
-			// scoped resources). A per-cohort RBAC denial during seed
-			// is EXPECTED for narrow cohorts: those cohorts don't need
-			// a seeded L1 entry — their first /call would deny anyway.
-			// Log + count + return nil so the global seed loop completes
-			// and phase1Done flips. The cluster-wide PIP mechanism stays
-			// FOREGROUND (still gates phase1Done) but per-cohort
-			// failures no longer FAIL-CLOSE the whole pod.
+			// FAIL-CLOSED — Ship 0.30.183 (A.3-refine v3) RESTORES the
+			// architect's original PIP design after the 0.30.181
+			// graceful-skip work-around. Predicate (ζ) in
+			// binding_set_enumeration.go now prunes User-kind cohorts
+			// whose matched-binding rules have empty intersection with
+			// the snowplow handler GVR set — including the
+			// ServiceAccount-username-form subjects that motivated the
+			// 0.30.181 skip. Every cohort that SURVIVES (ζ) represents
+			// an identity whose RBAC grants overlap with snowplow
+			// handlers; a per-cohort seed error is therefore a real
+			// defect (RBAC misconfiguration, resolver bug, transport
+			// failure) and MUST block phase1Done so the kubelet
+			// startup-probe surfaces it via /readyz=503. The
+			// `phase1_seed_cohort_failures_total` counter remains the
+			// observability surface; any increment is the trigger for
+			// failure.
 			pipBindingSetSeedResolvesTotal.Add(1)
 			if err := seedCohort(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
 				pipBindingSetSeedFailuresTotal.Add(1)
-				slog.Warn("phase1.seed.cohort.skipped",
+				slog.Error("phase1.seed.cohort.error",
 					slog.String("subsystem", "cache"),
 					slog.String("cohort", cohortLogLabel(cohort)),
 					slog.Any("err", err),
-					slog.String("effect", "cohort skipped; phase1Done not blocked — narrow RBAC cohorts "+
-						"that cannot read seed targets are expected to fail and need no L1 entry"),
+					slog.String("effect", "FAIL-CLOSED: phase1Done blocked; /readyz stays 503; "+
+						"kubelet startup-probe handles. Inspect this cohort's RBAC bindings "+
+						"or resolve the upstream resolver error."),
 				)
-				// Non-fatal — return nil so the global seed loop completes.
-				return nil
+				return err
 			}
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		// g.Wait error should never fire now (per-cohort errors are swallowed
-		// above), but keep the failure-path log + counter intact so any future
-		// genuinely-fatal error mode is surfaced.
+		// Per-cohort errors propagate here under FAIL-CLOSED. Emit the
+		// failure-path log + counter so the operator sees both the
+		// per-cohort detail (above) and the aggregate failure marker.
 		log.Error("phase1.seed.failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),

@@ -127,5 +127,16 @@ func registerPIPMetrics() {
 		expvar.Publish("snowplow_phase1_enum_powerset_skipped", expvar.Func(func() any {
 			return cache.Phase1EnumPowersetSkippedTotal()
 		}))
+
+		// Ship 0.30.183 — predicate (ζ) input-set size. Exposes the
+		// number of `*.krateo.io`-domain registered GVRs (the snowplow
+		// handler GVR set predicate (ζ) intersects rules against).
+		// HG-183.11 — lets post-ship operators dump the input set
+		// authoritatively without log-grep (the
+		// 0.30.181 handler-gvr-snapshot pre-flight artifact noted the
+		// absence of this expvar as an observability gap).
+		expvar.Publish("snowplow_handler_gvr_count", expvar.Func(func() any {
+			return cache.HandlerGVRCount()
+		}))
 	})
 }

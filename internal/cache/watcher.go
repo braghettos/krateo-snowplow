@@ -594,6 +594,9 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	if shouldUseMetadataOnly(gvr) && rw.metaClient != nil {
 		rw.addResourceTypeMetadataOnlyLocked(gvr)
 		ch := rw.syncCh[gvr]
+		// Ship 0.30.183 — handler-set invalidation hook for predicate (ζ).
+		// Metadata-only path also registers a handler GVR.
+		MarkHandlerGVRSetDirty()
 		slog.Info("cache.lazy_register.metadata_only",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -624,6 +627,12 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 	// spawn the watcher so the channel closes on HasSynced.
 	rw.addResourceTypeLocked(gvr)
 	ch := rw.syncCh[gvr]
+
+	// Ship 0.30.183 — handler-set invalidation hook for predicate (ζ).
+	// Flip the dirty flag so the next EnumerateBindingSetClasses call
+	// re-snapshots the handler GVR set. One atomic store per
+	// EnsureResourceType — free.
+	MarkHandlerGVRSetDirty()
 
 	// Falsifier per plan §"Pre-flight RUN protocol" step 2: emit a
 	// log line `cache.lazy_register fired gvr=...` on first
@@ -1306,6 +1315,12 @@ func (rw *ResourceWatcher) RemoveResourceType(gvr schema.GroupVersionResource) {
 	rw.closePerGVRStopLocked(gvr)
 	// Purge every per-GVR map entry so no state outlives the informer.
 	rw.deletePerGVRStateLocked(gvr)
+
+	// Ship 0.30.183 — handler-set invalidation hook for predicate (ζ).
+	// CRD-delete tore down a handler GVR; the next EnumerateBindingSet
+	// Classes call must re-snapshot. One atomic store per
+	// RemoveResourceType — free.
+	MarkHandlerGVRSetDirty()
 
 	slog.Info("cache.resource_type.removed",
 		slog.String("subsystem", "cache"),
