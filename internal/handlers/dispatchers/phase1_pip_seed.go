@@ -125,11 +125,11 @@ const (
 )
 
 // PrewarmPIPEnabled reports whether the Ship PIP per-identity prewarm
-// seed is opted in. Defaults TRUE (active by default for the ship);
-// operator emergency-off via PREWARM_PIP_ENABLED=false.
+// seed is opted in. Defaults FALSE as of 0.30.176 (Phase A.1): the
+// PIP seed is opt-in via PREWARM_PIP_ENABLED=true.
 func PrewarmPIPEnabled() bool {
-	v := env.String(envPrewarmPIPEnabled, "true")
-	return v != "false"
+	v := env.String(envPrewarmPIPEnabled, "false")
+	return v == "true"
 }
 
 // pipCohortCap returns the operator-overridable cohort ceiling. A
