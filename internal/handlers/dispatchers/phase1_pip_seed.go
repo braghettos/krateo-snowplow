@@ -113,15 +113,24 @@ const (
 	envPrewarmPIPCohortCap = "PREWARM_PIP_COHORT_CAP"
 
 	// pipCohortTimeout is the per-cohort hard ceiling. A stuck cohort
-	// cannot wedge Phase 1 past Step 7.6's 40 s global budget.
-	pipCohortTimeout = 20 * time.Second
+	// cannot wedge Phase 1 past Step 7.6's global budget.
+	//
+	// Ship A.3 / 0.30.179 — raised 20s -> 120s. Binding-set enumeration
+	// produces more classes than the prior canonical-cohort dedupe, and
+	// each class's restactions seed walks per-namespace LIST calls (a
+	// compositions-list RESTAction emits one K8s call per namespace via
+	// the namespace iterator). A 50-namespace cluster needs ~30s per
+	// cohort to seed cleanly; 120s adds ~4x headroom.
+	pipCohortTimeout = 120 * time.Second
 
 	// pipGlobalTimeout is the absolute Step 7.6 budget. Designed to fit
-	// the architect's 326.6 s pod-start→phase1Done projection (baseline
-	// 291.6 + 35 s for PIP); the per-cohort timeout × cohort cap caps the
-	// total at 50 × 20 s = 1000 s but the parallelism + harvest dedup
-	// keep the empirical wall-clock to ≤ 40 s.
-	pipGlobalTimeout = 40 * time.Second
+	// the architect's pod-start→phase1Done projection (baseline + seed
+	// ceiling). Ship A.3 / 0.30.179 — raised 40s -> 8 minutes per the
+	// PM gate's "baseline + 8 min seed ceiling" target. The per-cohort
+	// timeout × cohort cap caps the total at 50 × 120 s = 6000 s but the
+	// parallelism + harvest dedup keep the empirical wall-clock well
+	// inside 8 min.
+	pipGlobalTimeout = 8 * time.Minute
 )
 
 // PrewarmPIPEnabled reports whether the Ship PIP per-identity prewarm
