@@ -319,16 +319,40 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 			// the dedicated failure counter so the operator sees a
 			// non-zero `snowplow_phase1_bindingset_seed_failures_total`
 			// when the seed loop drops a class.
+			//
+			// PER-COHORT ERRORS ARE NON-FATAL — Ship A.3 / 0.30.180
+			// followup. Binding-set enumeration produces cohort classes
+			// for EVERY (user, group-subset) binding-set, including
+			// narrow ServiceAccount identities that genuinely cannot
+			// read RESTActions/widgets (their bindings permit only
+			// scoped resources). A per-cohort RBAC denial during seed
+			// is EXPECTED for narrow cohorts: those cohorts don't need
+			// a seeded L1 entry — their first /call would deny anyway.
+			// Log + count + return nil so the global seed loop completes
+			// and phase1Done flips. The cluster-wide PIP mechanism stays
+			// FOREGROUND (still gates phase1Done) but per-cohort
+			// failures no longer FAIL-CLOSE the whole pod.
 			pipBindingSetSeedResolvesTotal.Add(1)
 			if err := seedCohort(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
 				pipBindingSetSeedFailuresTotal.Add(1)
-				return err
+				slog.Warn("phase1.seed.cohort.skipped",
+					slog.String("subsystem", "cache"),
+					slog.String("cohort", cohortLogLabel(cohort)),
+					slog.Any("err", err),
+					slog.String("effect", "cohort skipped; phase1Done not blocked — narrow RBAC cohorts "+
+						"that cannot read seed targets are expected to fail and need no L1 entry"),
+				)
+				// Non-fatal — return nil so the global seed loop completes.
+				return nil
 			}
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
+		// g.Wait error should never fire now (per-cohort errors are swallowed
+		// above), but keep the failure-path log + counter intact so any future
+		// genuinely-fatal error mode is surfaced.
 		log.Error("phase1.seed.failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", err),
