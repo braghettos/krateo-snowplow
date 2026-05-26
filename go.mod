@@ -3,7 +3,6 @@ module github.com/krateoplatformops/snowplow
 go 1.25.3
 
 require (
-	github.com/NYTimes/gziphandler v1.1.1
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/google/go-cmp v0.7.0
 	github.com/itchyny/gojq v0.12.17

@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/NYTimes/gziphandler"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/kubeutil"
 	"github.com/krateoplatformops/plumbing/server/use"
@@ -700,34 +699,22 @@ func main() {
 	}...)
 	defer stop()
 
-	corsHandler := use.CORS(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{
-			"Accept",
-			"Authorization",
-			"Content-Type",
-			"X-Auth-Code",
-			"X-Krateo-TraceId",
-		},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: true,
-		MaxAge:           300, // Maximum value not ignored by any of major browsers
-	})(mux)
-
-	// Ship 0.30.176 (Phase A.1) — wire-level gzip compression. MinSize
-	// 1024 B leaves small responses (/readyz, /healthz, /debug/vars)
-	// uncompressed; bodies >=1024 B compress at gzip default level (6).
-	// Clients without Accept-Encoding: gzip are served uncompressed.
-	gzipWrap, err := gziphandler.GzipHandlerWithOpts(gziphandler.MinSize(1024))
-	if err != nil {
-		log.Error("gziphandler init failed", slog.Any("err", err))
-		os.Exit(1)
-	}
-
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", *port),
-		Handler:      gzipWrap(corsHandler),
+		Addr: fmt.Sprintf(":%d", *port),
+		Handler: use.CORS(cors.Options{
+			AllowedOrigins: []string{"*"},
+			AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+			AllowedHeaders: []string{
+				"Accept",
+				"Authorization",
+				"Content-Type",
+				"X-Auth-Code",
+				"X-Krateo-TraceId",
+			},
+			ExposedHeaders:   []string{"Link"},
+			AllowCredentials: true,
+			MaxAge:           300, // Maximum value not ignored by any of major browsers
+		})(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 50 * time.Second,
 		IdleTimeout:  30 * time.Second,
