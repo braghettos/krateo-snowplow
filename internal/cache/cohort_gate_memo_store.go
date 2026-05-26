@@ -1,23 +1,30 @@
-// cohort_gate_memo_store.go — Ship GMC / 0.30.174.
+// cohort_gate_memo_store.go — Ship GMC / 0.30.174, A.2 / 0.30.178.
 //
 // The per-ResolvedEntry storage primitive for the cohort gate memo.
-// Lookup is lock-free (sync.Map.Load); Store takes a single small
-// mutex to keep the bounded-LRU eviction order consistent with the
-// sync.Map publication.
+// Lookup is lock-free (sync.Map.Load); Store is also lock-free
+// (sync.Map.LoadOrStore) — no LRU machinery, zero-bound storage per
+// Diego's 2026-05-26 ratification (Ship A.2 / 0.30.178).
 //
 // SAFETY (binding)
 //   - feedback_l1_per_user_keyed_never_cohort.md — this store holds NO
 //     resolved-output payloads; only an opaque per-cohort memo whose
-//     semantics (kept-name set + rbac generation) live in api/
-//     apistage_cohort_memo.go. The L1 RESOLVED cache itself stays
-//     per-user-keyed.
-//   - feedback_capacity_caps_empirical_per_entry_cost.md — bounded
-//     LRU at 256 entries; per-memo size is dominated by the kept-name
-//     map (api-side), not by this store's own bookkeeping.
+//     semantics (kept-name set + rbac generation + zero-bound encoded
+//     bytes) live in api/apistage_cohort_memo.go. The L1 RESOLVED
+//     cache itself stays per-user-keyed.
 //   - feedback_shared_vs_copy_is_a_concurrency_change.md — memos are
 //     opaque interface values populated by callers; THIS file makes no
 //     assumption about their mutability. Callers MUST treat stored
 //     memos as immutable after Store returns.
+//
+// ZERO-BOUND STORAGE (Ship A.2 / 0.30.178)
+//   The 0.30.174 GMC store used a `container/list`-backed LRU at 256
+//   entries per ResolvedEntry. Diego ratified zero-bound storage on
+//   2026-05-26: cohort cardinality is empirically tiny (admin +
+//   cyberjoker + a handful of per-namespace cohorts; ~tens, not
+//   hundreds), so the bookkeeping cost outweighs the bound. The store
+//   is now just a sync.Map; per-entry GC reclaims everything when the
+//   ResolvedEntry itself is LRU-evicted by the resolved-cache store
+//   (resolved.go:778, removeElementLocked).
 //
 // LIFETIME
 //   - The store is lazily attached to a ResolvedEntry via
@@ -30,47 +37,32 @@
 package cache
 
 import (
-	"container/list"
 	"sync"
 	"sync/atomic"
 )
 
-// CohortGateMemoMaxEntries is the per-ResolvedEntry LRU cap on the
-// number of distinct cohorts memoized. Per the Ship GMC brief: simple
-// counter + insertion-order list; on overflow log + evict oldest.
-//
-// 256 is well above the expected cohort cardinality (admin +
-// cyberjoker + a handful of per-namespace cohorts) and keeps per-entry
-// overhead bounded under pathological cohort churn.
-const CohortGateMemoMaxEntries = 256
-
 // CohortGateMemoStore is the per-ResolvedEntry container of cohort
 // memos. The stored value type is `any` because the memo shape
-// (keptNames + rbacGen) lives in api/ — keeping cache/ free of that
-// import. Callers Lookup/Store via type assertion on the receiving
-// end; the cap+LRU machinery here is value-shape-agnostic.
+// (keptNames + rbacGen + encoded bytes) lives in api/ — keeping cache/
+// free of that import. Callers Lookup/Store via type assertion on the
+// receiving end.
+//
+// Ship A.2 / 0.30.178 — the store is unbounded: cohort cardinality is
+// empirically tiny and eviction rides the parent ResolvedEntry's LRU
+// in the resolved-cache store. No per-store LRU machinery.
 type CohortGateMemoStore struct {
 	memos sync.Map // string (cohortKey) -> any (memo payload)
 
-	mu    sync.Mutex
-	order *list.List // front = MRU. Element.Value is the cohortKey string.
-	index map[string]*list.Element
-
-	// size mirrors order.Len() but is readable without mu for the
-	// quick "are we over cap?" check before taking the writer lock.
-	// Reconciled INSIDE mu on every mutation.
+	// size is the count of distinct cohort keys currently in memos.
+	// Bumped on first-time Store (new key); decremented on no path
+	// (zero-bound — there is no per-store eviction). Exposed via Size()
+	// for observability (snowplow_cohort_memo_entries_total expvar).
 	size atomic.Int64
-
-	// OverflowTotal counts how often the cap+evict path fired.
-	overflowTotal atomic.Uint64
 }
 
 // NewCohortGateMemoStore constructs an empty store.
 func NewCohortGateMemoStore() *CohortGateMemoStore {
-	return &CohortGateMemoStore{
-		order: list.New(),
-		index: map[string]*list.Element{},
-	}
+	return &CohortGateMemoStore{}
 }
 
 // CohortGateMemoStoreLoadOrInit atomically returns the *CohortGateMemoStore
@@ -105,53 +97,26 @@ func (s *CohortGateMemoStore) Lookup(cohortKey string) (any, bool) {
 	return v, true
 }
 
-// Store records memo under cohortKey, evicting the oldest entry when
-// the per-entry cap (CohortGateMemoMaxEntries) is exceeded. Returns
-// true if an LRU eviction fired.
+// Store records memo under cohortKey. Lock-free — sync.Map.LoadOrStore.
+// Replacement (same cohortKey stored twice) does NOT bump size. Ship A.2:
+// no eviction, no LRU touch — zero-bound storage.
 //
-// The publication ordering is intentional:
-//  1. LoadOrStore into sync.Map — readers can hit the new memo now.
-//  2. PushFront under mu — eviction order learns about the new entry.
-//
-// A concurrent Lookup between (1) and (2) returns the populated memo,
-// which is correct (memos are immutable after Store). The window is
-// bounded by the few atomics in step 2.
+// Returns false unconditionally (no eviction path). Kept the boolean
+// return so callers compiled against the 0.30.174 signature don't break.
 func (s *CohortGateMemoStore) Store(cohortKey string, memo any) bool {
 	if s == nil || cohortKey == "" || memo == nil {
 		return false
 	}
-	if _, loaded := s.memos.LoadOrStore(cohortKey, memo); loaded {
-		// Replacement of an existing cohort key — refresh the LRU
-		// touch under mu (no eviction needed) and return.
-		s.mu.Lock()
-		if el, ok := s.index[cohortKey]; ok {
-			s.order.MoveToFront(el)
-		}
-		s.mu.Unlock()
+	if _, loaded := s.memos.LoadOrStore(cohortKey, memo); !loaded {
+		s.size.Add(1)
 		return false
 	}
-
-	s.mu.Lock()
-	el := s.order.PushFront(cohortKey)
-	s.index[cohortKey] = el
-	s.size.Add(1)
-
-	evicted := false
-	for s.size.Load() > CohortGateMemoMaxEntries {
-		tail := s.order.Back()
-		if tail == nil {
-			break
-		}
-		victimKey, _ := tail.Value.(string)
-		s.order.Remove(tail)
-		delete(s.index, victimKey)
-		s.size.Add(-1)
-		s.memos.Delete(victimKey)
-		evicted = true
-		s.overflowTotal.Add(1)
-	}
-	s.mu.Unlock()
-	return evicted
+	// Replacement (key already present) — overwrite atomically. The
+	// memo is immutable after Store per the file header contract, so a
+	// concurrent reader observing the old vs new value both produce
+	// correct served bytes (the rbacGen check on hit guards staleness).
+	s.memos.Store(cohortKey, memo)
+	return false
 }
 
 // Size returns the current number of memo entries. Safe under
@@ -161,13 +126,4 @@ func (s *CohortGateMemoStore) Size() int64 {
 		return 0
 	}
 	return s.size.Load()
-}
-
-// OverflowTotal returns the cumulative count of LRU evictions fired
-// by the cap. Useful for ops correlation.
-func (s *CohortGateMemoStore) OverflowTotal() uint64 {
-	if s == nil {
-		return 0
-	}
-	return s.overflowTotal.Load()
 }

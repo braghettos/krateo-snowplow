@@ -247,6 +247,21 @@ func (rw *ResourceWatcher) Snapshot() *RBACSnapshot {
 	return rbacSnap.Load()
 }
 
+// LiveRBACSnapshot returns the current published RBAC snapshot, or nil
+// when no snapshot has been published yet (pre-readiness / cache=off).
+// Mirrors (*ResourceWatcher).Snapshot but is callable without a watcher
+// handle — used by per-cohort helpers (CohortNSACL) that have no
+// natural ResourceWatcher binding on the call site.
+//
+// Lock-free: a single atomic.Pointer load. Production code MUST follow
+// the same single-load-per-evaluation invariant the watcher's Snapshot
+// method enforces — call ONCE per logical operation and thread the
+// returned pointer through sub-reads (see AC-B.3 in rbac_snapshot.go's
+// design header).
+func LiveRBACSnapshot() *RBACSnapshot {
+	return rbacSnap.Load()
+}
+
 // RBACSnapshotForTest returns the package-level snapshot for tests in
 // this package and in evaltest. Production code uses ResourceWatcher
 // .Snapshot(); this getter exists so a test can assert publish
