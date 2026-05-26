@@ -83,6 +83,11 @@ func setNested(obj map[string]any, val any, fields ...string) error {
 // --- key-shape tests ------------------------------------------------------
 
 func TestWidgetContentKey_IdentityFree(t *testing.T) {
+	// Ship A.3 / 0.30.179 — identity is folded as BindingSetHash for
+	// identity-bound classes; the widgetContent class IGNORES it. Both
+	// keys carry a non-zero BindingSetHash to PROVE it is ignored for
+	// this class (pre-A.3 the test used Username/Groups; structurally
+	// equivalent — the discriminant is the class, not the field name).
 	adminKey := cache.ComputeKey(cache.ResolvedKeyInputs{
 		CacheEntryClass: cache.CacheEntryClassWidgetContent,
 		Group:           "widgets.templates.krateo.io",
@@ -90,8 +95,7 @@ func TestWidgetContentKey_IdentityFree(t *testing.T) {
 		Resource:        "panels",
 		Namespace:       "fireworks-app",
 		Name:            "dashboard-summary",
-		Username:        "admin",
-		Groups:          []string{"system:authenticated"},
+		BindingSetHash:  0xdeadbeefcafebabe,
 		PerPage:         5,
 		Page:            1,
 	})
@@ -102,8 +106,7 @@ func TestWidgetContentKey_IdentityFree(t *testing.T) {
 		Resource:        "panels",
 		Namespace:       "fireworks-app",
 		Name:            "dashboard-summary",
-		Username:        "cyberjoker",
-		Groups:          []string{"system:authenticated", "narrow:rbac"},
+		BindingSetHash:  0xfeedfacefeedface,
 		PerPage:         5,
 		Page:            1,
 	})
@@ -130,8 +133,7 @@ func TestWidgetContentKey_DistinctFromWidgetsClass(t *testing.T) {
 		Resource:        "panels",
 		Namespace:       "ns",
 		Name:            "w",
-		Username:        "admin",
-		Groups:          []string{"system:authenticated"},
+		BindingSetHash:  0xdeadbeef, // any non-zero identity fold
 		PerPage:         -1,
 		Page:            -1,
 	})
@@ -234,10 +236,11 @@ func TestDispatchWidgetContentKey_IdentityOmittedFromKey(t *testing.T) {
 	if adminIn == nil || cjIn == nil {
 		t.Fatalf("inputs must be non-nil when layer is on")
 	}
-	if adminIn.Username != "" || len(adminIn.Groups) != 0 {
-		t.Fatalf("identity-free inputs must carry no Username/Groups; got admin Username=%q Groups=%v",
-			adminIn.Username, adminIn.Groups)
+	if adminIn.BindingSetHash != 0 {
+		t.Fatalf("identity-free inputs must carry zero BindingSetHash; got admin BindingSetHash=%#x",
+			adminIn.BindingSetHash)
 	}
+	_ = cjIn
 }
 
 // --- gate tests ----------------------------------------------------------
@@ -536,8 +539,8 @@ func TestPopulateWidgetContentL1_PutHappensWhenEnabled(t *testing.T) {
 	if entry.Inputs == nil || entry.Inputs.CacheEntryClass != cache.CacheEntryClassWidgetContent {
 		t.Fatalf("entry.Inputs missing or wrong class: %+v", entry.Inputs)
 	}
-	if entry.Inputs.Username != "" || len(entry.Inputs.Groups) != 0 {
-		t.Fatalf("entry.Inputs MUST carry no identity; got %+v", entry.Inputs)
+	if entry.Inputs.BindingSetHash != 0 {
+		t.Fatalf("entry.Inputs MUST carry zero identity-fold for widgetContent; got %+v", entry.Inputs)
 	}
 
 	// Counter: widgetContentStoreTotal MUST have advanced.

@@ -171,6 +171,13 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // 0.30.8: the function also returns the canonical ResolvedKeyInputs so
 // the caller can stash it on the L1 entry. Refresher reuses Inputs to
 // drive a re-resolve on UPDATE/PATCH events.
+//
+// Ship A.3 / 0.30.179 — identity is folded as a single uint64 via
+// cache.BindingSetHash(ui.Username, ui.Groups) — one call per request.
+// The hash is the FNV-64a of the cohort's matched RBAC binding-pointer-
+// set; two users whose binding-set is pointer-equal collapse into ONE
+// L1 cell (per-COHORT keying). The pre-A.3 Username + sorted Groups
+// literal columns are GONE from ResolvedKeyInputs (HG-178.6 falsifier).
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
 	c := cache.ResolvedCache()
 	if c == nil {
@@ -189,11 +196,17 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
-		Username:        ui.Username,
-		Groups:          ui.Groups,
-		PerPage:         perPage,
-		Page:            page,
-		Extras:          extras,
+		BindingSetHash:  cache.BindingSetHash(ui.Username, ui.Groups),
+		// Ship A.3 / 0.30.179 Option A — representative cohort tuple for
+		// the refresher's re-resolve. Carried on Inputs but NOT folded
+		// into ComputeKey (the cell is keyed by BindingSetHash, not by
+		// the literal name). The first writer's identity is the cell's
+		// representative; cohort members produce byte-identical output.
+		RepresentativeUsername: ui.Username,
+		RepresentativeGroups:   ui.Groups,
+		PerPage:                perPage,
+		Page:                   page,
+		Extras:                 extras,
 	}
 	return cache.ComputeKey(inputs), c, &inputs
 }

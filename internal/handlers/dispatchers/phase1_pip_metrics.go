@@ -33,6 +33,15 @@ import (
 var (
 	pipSeedRestactionsTotal atomic.Uint64
 	pipSeedWidgetsTotal     atomic.Uint64
+
+	// Ship A.3 / 0.30.179 — binding-set enumeration counters. The first
+	// two are the seed-loop's grand totals (restactions + widgets across
+	// every enumerated class); the third is the failure counter per
+	// AC-178 §"Three expvar counters". The bindingset-class count itself
+	// + the powerset-skipped counter are exposed via accessors on
+	// internal/cache (single source of truth).
+	pipBindingSetSeedResolvesTotal atomic.Uint64
+	pipBindingSetSeedFailuresTotal atomic.Uint64
 )
 
 // Per-cohort counters. sync.Map keyed by cohort label, value is
@@ -103,6 +112,20 @@ func registerPIPMetrics() {
 				return true
 			})
 			return out
+		}))
+
+		// Ship A.3 / 0.30.179 — binding-set enumeration counters.
+		expvar.Publish("snowplow_phase1_bindingset_classes_total", expvar.Func(func() any {
+			return cache.Phase1EnumBindingsetClassesTotal()
+		}))
+		expvar.Publish("snowplow_phase1_bindingset_seed_resolves_total", expvar.Func(func() any {
+			return pipBindingSetSeedResolvesTotal.Load()
+		}))
+		expvar.Publish("snowplow_phase1_bindingset_seed_failures_total", expvar.Func(func() any {
+			return pipBindingSetSeedFailuresTotal.Load()
+		}))
+		expvar.Publish("snowplow_phase1_enum_powerset_skipped", expvar.Func(func() any {
+			return cache.Phase1EnumPowersetSkippedTotal()
 		}))
 	})
 }

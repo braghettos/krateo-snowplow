@@ -153,6 +153,78 @@ func CohortRBACGen(username string, groups []string) uint64 {
 	return s.gen.Load()
 }
 
+// BindingSetHash — Ship A.3 / 0.30.179 — returns the FNV-64a hash of
+// the cohort's matched RBAC binding-pointer-set. Used by the L1 cache
+// key (dispatchCacheLookupKey via ResolvedKeyInputs.BindingSetHash) to
+// fold per-user identity into a per-COHORT cell: two users whose
+// binding-set is pointer-equal share an L1 entry.
+//
+// MECHANISM
+//   - Load the live published snapshot via rbacSnap.Load().
+//   - Inject the implicit `system:authenticated` group for any non-empty
+//     username. The evaluator (evaluate.go:333-338, evaluate.go:559-564)
+//     adds CRBsByGroup["system:authenticated"] for every authenticated
+//     request REGARDLESS of whether the request's UserInfo.Groups
+//     contains it. BindingSetHash MUST mirror that behaviour or the
+//     seed-time hash (which enumerates the implicit group) would
+//     diverge from the request-time hash (where the JWT may omit it).
+//   - Collect the cohort's matched binding-pointer-set via
+//     collectCohortBindingPtrs.
+//   - Hash the union pointer-set via fnv64aPointers (FNV-64a;
+//     pointer-SET semantics).
+//
+// EMPTY SNAPSHOT — returns 0 when no snapshot has been published
+// (degrade-to-deny posture; the cache-key caller sees zero identity-
+// fold and the entry collapses with every other zero-snapshot caller
+// for the same GVR/ns/name). The serve-time RBAC gate fails closed at
+// EvaluateRBAC anyway so a wrong-identity hit is impossible — but the
+// cell would not be reusable across cohorts, which is the same shape
+// as the pre-A.3 per-user keying.
+//
+// CORRECTNESS — pointer-set semantics carry over from CohortRBACGen
+// (rbac_cohort_gen.go:118-153): two cohorts whose binding-sets are
+// pointer-equal hash to the same value, regardless of group ordering
+// or username string differences. A binding ADD / DELETE / UPDATE
+// touching this cohort's matched set produces a different pointer-set
+// and thus a different hash — the next call from this cohort lands on
+// a fresh L1 cell.
+//
+// HG-178.5 falsifier: a binding mutation against an enumerated cohort
+// MUST shift this hash for that cohort; the next /call MISSes and the
+// reseed populates the new cell.
+//
+// CONCURRENCY — lock-free. rbacSnap.Load is atomic; the snapshot is
+// immutable post-publish (rbac_snapshot.go:36-51); collectCohortBindingPtrs
+// + fnv64aPointers are pure functions.
+func BindingSetHash(username string, groups []string) uint64 {
+	snap := rbacSnap.Load()
+	if snap == nil {
+		return 0
+	}
+	// Inject implicit system:authenticated for authenticated requests —
+	// mirrors evaluate.go's behaviour. We MUST do this here (not just at
+	// seed enumeration time) so request-time + seed-time hashes match
+	// byte-for-byte regardless of whether the JWT carried the implicit
+	// group in its Groups claim.
+	effective := groups
+	if username != "" {
+		hasAuth := false
+		for _, g := range groups {
+			if g == systemAuthenticatedGroup {
+				hasAuth = true
+				break
+			}
+		}
+		if !hasAuth {
+			effective = make([]string, 0, len(groups)+1)
+			effective = append(effective, groups...)
+			effective = append(effective, systemAuthenticatedGroup)
+		}
+	}
+	ptrs := collectCohortBindingPtrs(snap, username, effective)
+	return fnv64aPointers(ptrs)
+}
+
 // CohortKeyHash hashes (sorted(groups), username) into a stable cohort
 // identity string. Exported so the GMC memo (api/apistage_cohort_memo.go)
 // and this per-cohort generator can compute the SAME key for the SAME

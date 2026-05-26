@@ -59,8 +59,7 @@ func TestComputeKey_StableAcrossCalls(t *testing.T) {
 		Resource:        "compositionsgrids",
 		Namespace:       "demo",
 		Name:            "main",
-		Username:        "alice",
-		Groups:          []string{"users", "admins"},
+		BindingSetHash:  0x0123456789abcdef, // Ship A.3 / 0.30.179
 		PerPage:         20,
 		Page:            1,
 		Extras:          map[string]any{"foo": "bar", "n": float64(7)},
@@ -75,18 +74,21 @@ func TestComputeKey_StableAcrossCalls(t *testing.T) {
 	}
 }
 
-func TestComputeKey_GroupOrderInvariant(t *testing.T) {
-	in1 := ResolvedKeyInputs{Username: "alice", Groups: []string{"a", "b", "c"}}
-	in2 := ResolvedKeyInputs{Username: "alice", Groups: []string{"c", "a", "b"}}
+// Ship A.3 / 0.30.179 — group order invariance moves from ComputeKey to
+// BindingSetHash (which sorts pointer addresses). At the ComputeKey layer
+// two inputs with the same BindingSetHash hash identically by construction.
+func TestComputeKey_BindingSetHashInvariant(t *testing.T) {
+	in1 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x42}
+	in2 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x42}
 	if ComputeKey(in1) != ComputeKey(in2) {
-		t.Fatalf("ComputeKey should be invariant under group order; got divergent keys")
+		t.Fatalf("ComputeKey should be deterministic on identical BindingSetHash; got divergent keys")
 	}
 }
 
 func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 	base := ResolvedKeyInputs{
 		CacheEntryClass: "widgets", Group: "g", Version: "v", Resource: "r",
-		Namespace: "ns", Name: "n", Username: "u", Groups: []string{"x"},
+		Namespace: "ns", Name: "n", BindingSetHash: 0x01,
 		PerPage: 1, Page: 1, Extras: map[string]any{"k": "v"},
 	}
 	mutators := []struct {
@@ -99,8 +101,7 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 		{"Resource", func(in *ResolvedKeyInputs) { in.Resource = "r2" }},
 		{"Namespace", func(in *ResolvedKeyInputs) { in.Namespace = "ns2" }},
 		{"Name", func(in *ResolvedKeyInputs) { in.Name = "n2" }},
-		{"Username", func(in *ResolvedKeyInputs) { in.Username = "u2" }},
-		{"Groups", func(in *ResolvedKeyInputs) { in.Groups = []string{"y"} }},
+		{"BindingSetHash", func(in *ResolvedKeyInputs) { in.BindingSetHash = 0x02 }},
 		{"PerPage", func(in *ResolvedKeyInputs) { in.PerPage = 2 }},
 		{"Page", func(in *ResolvedKeyInputs) { in.Page = 2 }},
 		{"Extras", func(in *ResolvedKeyInputs) { in.Extras = map[string]any{"k": "w"} }},
@@ -110,8 +111,7 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 	for _, m := range mutators {
 		t.Run(m.name, func(t *testing.T) {
 			mutated := base
-			// deep-copy slices/maps that mutators rebind
-			mutated.Groups = append([]string(nil), base.Groups...)
+			// deep-copy maps that mutators rebind
 			mutated.Extras = map[string]any{}
 			for k, v := range base.Extras {
 				mutated.Extras[k] = v
@@ -275,7 +275,7 @@ func TestResolvedCache_EmptyTreatedAsMiss(t *testing.T) {
 func TestComputeKey_EmptyStageByteIdenticalToPreShipE(t *testing.T) {
 	in := ResolvedKeyInputs{
 		CacheEntryClass: "restactions", Group: "g", Version: "v", Resource: "r",
-		Namespace: "ns", Name: "n", Username: "u", Groups: []string{"x"},
+		Namespace: "ns", Name: "n", BindingSetHash: 0xabc,
 		PerPage: 1, Page: 1,
 	}
 	withEmptyStage := in

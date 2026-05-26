@@ -32,14 +32,15 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass: "restactions",
-		Group:           "templates.krateo.io",
-		Version:         "v1",
-		Resource:        "restactions",
-		Namespace:       "team-a",
-		Name:            "list-users",
-		Username:        "cyberjoker",
-		Groups:          []string{"devs", "qa"},
+		CacheEntryClass:        "restactions",
+		Group:                  "templates.krateo.io",
+		Version:                "v1",
+		Resource:               "restactions",
+		Namespace:              "team-a",
+		Name:                   "list-users",
+		BindingSetHash:         0xc01dface,
+		RepresentativeUsername: "cyberjoker",
+		RepresentativeGroups:   []string{"devs", "qa"},
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
@@ -62,13 +63,14 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 		t.Fatalf("resolveAndPopulateL1 error: %v", err)
 	}
 
-	// Identity: the entry's OWN Username+Groups — not a SA, not empty.
+	// Ship A.3 / 0.30.179 — re-resolve runs under the REPRESENTATIVE
+	// cohort tuple recorded on Inputs (the first writer's identity).
 	if gotUser != "cyberjoker" {
-		t.Fatalf("AC-C7: re-resolve ran as %q; want the entry's own identity %q",
+		t.Fatalf("AC-C7: re-resolve ran as %q; want the cohort's representative %q",
 			gotUser, "cyberjoker")
 	}
 	if len(gotGroups) != 2 || gotGroups[0] != "devs" || gotGroups[1] != "qa" {
-		t.Fatalf("AC-C7: re-resolve groups=%v; want the entry's own [devs qa]", gotGroups)
+		t.Fatalf("AC-C7: re-resolve groups=%v; want the cohort's representative [devs qa]", gotGroups)
 	}
 	// WithL1KeyContext: the ctx carries the L1 key so dep edges re-record.
 	if gotL1Key != key {
@@ -159,14 +161,15 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass: "widgets",
-		Group:           "widgets.templates.krateo.io",
-		Version:         "v1beta1",
-		Resource:        "panels",
-		Namespace:       "demo",
-		Name:            "compositions-panel",
-		Username:        "cyberjoker",
-		Groups:          []string{"devs"},
+		CacheEntryClass:        "widgets",
+		Group:                  "widgets.templates.krateo.io",
+		Version:                "v1beta1",
+		Resource:               "panels",
+		Namespace:              "demo",
+		Name:                   "compositions-panel",
+		BindingSetHash:         0xc01dface,
+		RepresentativeUsername: "cyberjoker",
+		RepresentativeGroups:   []string{"devs"},
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
@@ -236,7 +239,7 @@ func TestPartB_NilSATransportIsIdentityOnly(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
-	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "no-sa", Username: "u"}
+	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "no-sa", RepresentativeUsername: "u"}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 

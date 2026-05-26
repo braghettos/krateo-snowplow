@@ -247,11 +247,17 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	log := slog.Default()
 	start := time.Now()
 
-	cohorts := cache.EnumerateRBACCohorts()
+	// Ship A.3 / 0.30.179 — binding-set enumeration. The PIP seed now
+	// drives one entry per ENUMERATED BINDING-SET CLASS (a cohort defined
+	// by BindingSetHash equivalence) rather than per-user-string cohort.
+	// Two users whose binding-pointer-set hashes equal share the SAME L1
+	// cell; the seed populates ONE entry per cell. See
+	// internal/cache/binding_set_enumeration.go for the algorithm.
+	cohorts := cache.EnumerateBindingSetClasses()
 	if len(cohorts) == 0 {
 		log.Info("phase1.seed.skipped",
 			slog.String("subsystem", "cache"),
-			slog.String("reason", "EnumerateRBACCohorts returned no cohorts — RBAC snapshot empty or unpublished"),
+			slog.String("reason", "EnumerateBindingSetClasses returned no classes — RBAC snapshot empty or unpublished"),
 		)
 		return nil
 	}
@@ -299,7 +305,17 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	for _, c := range cohorts {
 		cohort := c // pin loop variable
 		g.Go(func() error {
-			return seedCohort(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS)
+			// Ship A.3 / 0.30.179 — count every per-class seed resolve
+			// (one cohort goroutine = one resolve unit). Failures bump
+			// the dedicated failure counter so the operator sees a
+			// non-zero `snowplow_phase1_bindingset_seed_failures_total`
+			// when the seed loop drops a class.
+			pipBindingSetSeedResolvesTotal.Add(1)
+			if err := seedCohort(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
+				pipBindingSetSeedFailuresTotal.Add(1)
+				return err
+			}
+			return nil
 		})
 	}
 

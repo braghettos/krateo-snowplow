@@ -29,6 +29,7 @@ package cache
 import (
 	"container/list"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -170,22 +171,64 @@ type ResolvedEntry struct {
 // invalidates every in-flight cached entry — bump the constant
 // resolvedKeyVersion below as part of any such change so the salt
 // guarantees clean separation across rolling restarts.
+//
+// Ship A.3 / 0.30.179 — Username + Groups REMOVED. The identity-bound
+// classes (restactions, widgets) now key on BindingSetHash, a uint64
+// hash of the cohort's RBAC binding-pointer-set. Two users whose
+// snapshot binding-set is pointer-equal collapse into ONE L1 cell —
+// matches the cohort dedupe contract EnumerateRBACCohorts encodes
+// (rbac_cohorts.go) one tier up at the cache-key layer. apistage +
+// widgetContent classes are identity-free and ignore BindingSetHash.
+//
+// HG-178.6 falsifier: no `Username string` + `Groups []string` literal
+// columns survive in ResolvedKeyInputs for restactions/widgets.
 type ResolvedKeyInputs struct {
 	// CacheEntryClass is the entry-class discriminant — one of the string
-	// values "restactions", "widgets", or "apistage". (Renamed from
-	// HandlerKind in 0.30.118; the string VALUES are unchanged — they are
-	// hashed into the key and used as refresher registry keys.)
+	// values "restactions", "widgets", "apistage", or "widgetContent".
+	// (Renamed from HandlerKind in 0.30.118; the string VALUES are
+	// unchanged — they are hashed into the key and used as refresher
+	// registry keys.)
 	CacheEntryClass string
-	Group           string   // dispatched CR's GVR Group
-	Version         string   // dispatched CR's GVR Version
-	Resource        string   // dispatched CR's GVR Resource
-	Namespace       string   // dispatched CR namespace
-	Name            string   // dispatched CR name
-	Username        string   // bind-identity username
-	Groups          []string // bind-identity groups (will be sorted before hash)
-	PerPage         int
-	Page            int
-	Extras          map[string]any
+	Group           string // dispatched CR's GVR Group
+	Version         string // dispatched CR's GVR Version
+	Resource        string // dispatched CR's GVR Resource
+	Namespace       string // dispatched CR namespace
+	Name            string // dispatched CR name
+
+	// BindingSetHash — Ship A.3 / 0.30.179 — the FNV-64a hash of the
+	// cohort's matched RBAC binding-pointer-set, identical mechanism to
+	// CohortRBACGen's pointer-set hash (rbac_cohort_gen.go:147). Zero
+	// for identity-free classes (apistage / widgetContent); non-zero
+	// for restactions / widgets. ComputeKey folds it in only when class
+	// is non-identity-free.
+	BindingSetHash uint64
+
+	// RepresentativeUsername + RepresentativeGroups — Ship A.3 / 0.30.179
+	// Option A. The L1 cell is per-COHORT (keyed by BindingSetHash), but
+	// the REFRESHER must re-resolve under a CONCRETE identity (a request
+	// runs as a single user; objects.Get + RBAC narrowing need a username
+	// + groups). The first writer's identity is recorded here as the
+	// representative tuple for re-resolve.
+	//
+	// CORRECTNESS: every cohort member resolves to BYTE-IDENTICAL output
+	// (that is the cohort dedupe contract — feedback_l1_per_user_keyed_
+	// never_cohort.md compliant because the cohort IS the equivalence
+	// class of users producing identical resolved output). The
+	// representative is therefore EQUIVALENT to any other cohort member
+	// at resolve time. If the cohort topology changes (binding mutation),
+	// the BindingSetHash shifts, the next /call MISSes, the seed reseeds
+	// under a fresh representative — no stale-identity risk.
+	//
+	// EXCLUDED FROM COMPUTEKEY. These fields are bookkeeping carried on
+	// ResolvedEntry.Inputs, NOT key material. Two cohort members writing
+	// the same cell must NOT shift the cell's identity by name; ComputeKey
+	// skips them entirely.
+	RepresentativeUsername string
+	RepresentativeGroups   []string
+
+	PerPage int
+	Page    int
+	Extras  map[string]any
 
 	// Stage is set ONLY for CacheEntryClass=="apistage" entries (Ship E,
 	// 0.30.116). It carries the per-stage discriminator string —
@@ -207,7 +250,13 @@ type ResolvedKeyInputs struct {
 // "widgets" key — Stage=="" — hashes byte-identically to v1. A version
 // bump would needlessly rotate the whole key space on the 0.30.116
 // rolling restart for zero correctness gain.
-const resolvedKeyVersion = "v1"
+//
+// Ship A.3 / 0.30.179 — BUMPED v1 → v2. The identity field shape
+// changed (Username + Groups removed; BindingSetHash added) so every
+// pre-0.30.179 key is structurally different from a fresh key for
+// the SAME cohort. The salt rotation forces a clean break across the
+// rolling restart: pre-v2 entries never serve as v2 hits (AC-178.3).
+const resolvedKeyVersion = "v2"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed
@@ -404,44 +453,36 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	h.Write([]byte(in.Name))
 	h.Write([]byte{0})
 
-	// Identity (Username + Groups). Ship F1 (0.30.119): the api-stage
-	// content layer is IDENTITY-FREE — an api-stage entry's resolved
-	// content (a per-object GET / per-namespace LIST K8s call result) is
-	// identity-invariant: K8s RBAC is a binary gate on (gvr, ns, [name])
-	// units, it never filters items or shapes content, so the SAME
-	// content unit is shared by every user the gate admits. Omitting the
-	// identity fields makes the apistage key (gvr, ns, name-or-list,
-	// filter-hash, stage-input-hash) shared across users. The per-user
-	// narrowing moves to the SERVE-TIME RBAC gate (dispatcher path).
+	// Identity. Ship F1 (0.30.119): the api-stage content layer is
+	// IDENTITY-FREE — an api-stage entry's resolved content (a per-object
+	// GET / per-namespace LIST K8s call result) is identity-invariant.
+	// Ship G (0.30.16x): widgetContent is ALSO identity-free — the widget
+	// envelope is shared, the per-user `allowed` flag is re-derived at
+	// serve time.
+	//
+	// Ship A.3 / 0.30.179: identity-bound classes (restactions, widgets)
+	// fold in `BindingSetHash` — a uint64 hash of the cohort's matched
+	// RBAC binding-pointer-set. Two users whose binding-set is pointer-
+	// equal land on the SAME cell, dedup'ing per-user cells into per-
+	// cohort cells. The pre-A.3 shape hashed Username + sorted Groups
+	// literally — a per-user cardinality. The cohort cardinality is
+	// typically O(10) at admin scale vs O(1000+) per-user. Identical
+	// mechanism to CohortRBACGen's per-cohort generator
+	// (rbac_cohort_gen.go) one tier up at the L1 key.
 	//
 	// This is a per-CLASS key shape, NOT a per-resource switch
 	// (feedback_no_special_cases): the discriminant is the entry class,
-	// uniform for every apistage entry of every GVR. "restactions" /
-	// "widgets" keys hash Username+Groups exactly as before — byte-
-	// identical, no key-space rotation. apistage is flag-off in prod
-	// (RESOLVED_CACHE_APISTAGE_ENABLED default off), so this key change
-	// rotates nothing live.
-	//
-	// Ship G (0.30.16x): CacheEntryClassWidgetContent is ALSO identity-
-	// free — the widget envelope is identity-invariant except for the
-	// embedded `status.resourcesRefs.items[].allowed` flag, which the
-	// serve-time gateWidgetEnvelope overwrites per-request. Same shape
-	// as the F1 apistage carve-out: skip identity for the widgetContent
-	// class, leave every other class (restactions / widgets) byte-
-	// identical to the pre-Ship-G hash.
+	// uniform for every entry of every GVR. apistage + widgetContent skip
+	// the identity fold entirely; restactions + widgets fold a single 8-
+	// byte uint64. The v1→v2 resolvedKeyVersion bump rotates the key
+	// space cleanly on the rolling restart so no v1 entry serves as a
+	// v2 hit (AC-178.3).
 	if in.CacheEntryClass != CacheEntryClassApistage &&
 		in.CacheEntryClass != CacheEntryClassWidgetContent {
-		h.Write([]byte(in.Username))
-		h.Write([]byte{0})
-
-		// Groups: sort for stability across binding renderers.
-		sortedGroups := append([]string(nil), in.Groups...)
-		sort.Strings(sortedGroups)
-		for _, g := range sortedGroups {
-			h.Write([]byte(g))
-			h.Write([]byte{0})
-		}
-		h.Write([]byte{0xff}) // groups terminator
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], in.BindingSetHash)
+		h.Write(buf[:])
+		h.Write([]byte{0xff}) // identity terminator
 	}
 
 	h.Write([]byte(strconv.Itoa(in.PerPage)))

@@ -98,13 +98,19 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 
 	key := cache.ComputeKey(inputs)
 
-	// AC-C7: re-resolve under the entry's OWN identity. Username+Groups
-	// come straight off the cached Inputs — that is what makes refresh #N
-	// resolve as user U (RBAC narrowing stays user-correct).
+	// AC-C7: re-resolve under the entry's OWN identity. Ship A.3 /
+	// 0.30.179 — the entry is per-COHORT (keyed by BindingSetHash); the
+	// refresher re-resolves under the cohort's REPRESENTATIVE tuple
+	// (the first writer's Username + Groups recorded on Inputs). Cohort
+	// members produce byte-identical resolved output, so the
+	// representative is equivalent to any other cohort member at resolve
+	// time. A binding mutation that shifts the cohort topology shifts
+	// BindingSetHash, MISSes on the next /call, and the seed reseeds
+	// under a fresh representative — no stale-identity risk.
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserInfo(jwtutil.UserInfo{
-			Username: inputs.Username,
-			Groups:   inputs.Groups,
+			Username: inputs.RepresentativeUsername,
+			Groups:   inputs.RepresentativeGroups,
 		}),
 	}
 	// Ship 0.30.113 Part B — SA transport. A background refresh has no
@@ -183,7 +189,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", inputs.Username),
+			slog.String("user", inputs.RepresentativeUsername),
 			slog.Int64("stage_errors", stageErrSink.Load()),
 			slog.String("effect", "prior good entry kept; TTL is the outer net"),
 		)
@@ -199,7 +205,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
 		slog.String("handler", inputs.CacheEntryClass),
-		slog.String("user", inputs.Username),
+		slog.String("user", inputs.RepresentativeUsername),
 	)
 	return nil
 }
