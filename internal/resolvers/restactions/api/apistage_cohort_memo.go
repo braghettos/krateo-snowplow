@@ -53,10 +53,7 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"log/slog"
-	"sort"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -76,30 +73,13 @@ type cohortGateMemo struct {
 	rbacGen   uint64
 }
 
-// cohortKeyHashFromUserInfo hashes (sorted(groups), username) into a
-// stable cohort identifier. SHA-256 truncated to 16 hex chars (8 bytes).
-//
-// Empty username + empty groups yields a deterministic key — anonymous
-// requests cohort together; callers that care about anonymity drop the
-// memo upstream (gateListItemsWithMemo bypasses the memo on a missing
-// identity).
+// cohortKeyHashFromUserInfo is a thin shim over cache.CohortKeyHash so
+// in-package callers keep their existing name. Ship GMC.1 / 0.30.175
+// moved the canonical implementation to cache/ so the per-cohort gate
+// memo (here) and the per-cohort RBAC generator (cache.CohortRBACGen)
+// compute byte-identical cohort keys for the same identity.
 func cohortKeyHashFromUserInfo(username string, groups []string) string {
-	sortedGroups := append([]string(nil), groups...)
-	sort.Strings(sortedGroups)
-
-	h := sha256.New()
-	// Version prefix so a future key-shape change rotates the cohort
-	// space cleanly across rolling restarts.
-	h.Write([]byte("cohort-v1"))
-	h.Write([]byte{0})
-	h.Write([]byte(username))
-	h.Write([]byte{0})
-	for _, g := range sortedGroups {
-		h.Write([]byte(g))
-		h.Write([]byte{0})
-	}
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum[:8])
+	return cache.CohortKeyHash(username, groups)
 }
 
 // gateListItemsWithMemo is the memo-aware companion to gateListItems.
@@ -139,7 +119,11 @@ func gateListItemsWithMemo(
 		return gateListItems(ctx, gvr, parsed)
 	}
 
-	currentGen := cache.RBACGen()
+	// Ship GMC.1 / 0.30.175 — per-cohort generation. Replaces the global
+	// cache.RBACGen() stamp the 0.30.174 GMC used. Mutations to bindings
+	// NOT in this cohort's matched-set leave currentGen untouched, so
+	// admin's burst hit-rate stays ≥9/10 under multi-cohort RBAC churn.
+	currentGen := cache.CohortRBACGen(ui.Username, ui.Groups)
 
 	if v, ok := store.Lookup(cohort); ok {
 		if memo, isMemo := v.(*cohortGateMemo); isMemo && memo != nil && memo.rbacGen == currentGen {
