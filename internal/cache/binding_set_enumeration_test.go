@@ -23,6 +23,19 @@
 //                                                         falls back to single-
 //                                                         group enumeration +
 //                                                         bumps counter.
+//   TestEnumerateBindingSetClasses_PrunesServiceAccountKind        — Ship 0.30.182:
+//                                                                    bindings whose
+//                                                                    only subjects
+//                                                                    are Kind=SA
+//                                                                    produce zero
+//                                                                    user/group
+//                                                                    cohorts.
+//   TestEnumerateBindingSetClasses_PrunesServiceAccountUsernameForm — Ship 0.30.182:
+//                                                                    User-kind subjects
+//                                                                    whose name carries
+//                                                                    the system:service
+//                                                                    account: prefix are
+//                                                                    pruned from userKeys.
 
 package cache
 
@@ -222,5 +235,84 @@ func TestEnumerateBindingSetClasses_PrunesSystemAuth(t *testing.T) {
 	}
 	if !hasAuth {
 		t.Fatalf("admin cohort missing implicit system:authenticated; got Groups=%v", adminCohort.Groups)
+	}
+}
+
+// TestEnumerateBindingSetClasses_PrunesServiceAccountKind — Ship 0.30.182.
+// A binding whose ONLY subject is Kind=ServiceAccount produces NO user-
+// or group-typed cohort: SAs don't issue /call traffic and are
+// structurally out of scope for the PIP prewarm seed. The Subject-walk
+// in the relevantGroups construction skips Kind=SA; the snapshot
+// indexer routes Kind=SA into CRBsByServiceAccount (not CRBsByUser), so
+// the SA never enters userKeys. The end-to-end invariant is: zero user
+// or group cohorts emerge from a binding whose only subject is SA-kind.
+func TestEnumerateBindingSetClasses_PrunesServiceAccountKind(t *testing.T) {
+	resetGenAndSnapshot(t)
+	// Single CRB binding a Kind=ServiceAccount subject (canonical K8s
+	// SA-binding pattern). No User-kind or Group-kind subjects at all.
+	saCRB := mkCRB("sa-only-bind", saSub("krateo-system", "snowplow"))
+
+	buildSnapshot(t,
+		[]*rbacv1.ClusterRoleBinding{saCRB},
+		nil,
+	)
+
+	out := EnumerateBindingSetClasses()
+	// Expectation: zero user-cohorts AND zero group-cohorts. The SA-kind
+	// subject lands in CRBsByServiceAccount (which the enumeration never
+	// reads). userKeys + groupKeys are both empty, so no powerset
+	// emission and no group-only emission occurs.
+	if len(out) != 0 {
+		// Render the result for diagnosis if the assertion fails.
+		t.Fatalf("EnumerateBindingSetClasses on SA-only snapshot: got %d cohorts (%+v); want 0",
+			len(out), out)
+	}
+}
+
+// TestEnumerateBindingSetClasses_PrunesServiceAccountUsernameForm —
+// Ship 0.30.182. A binding whose Subject.Kind=User carries the canonical
+// K8s SA username pattern "system:serviceaccount:<ns>:<name>" is pruned
+// from userKeys at collection time. This is the primary production
+// observation behind the 0.30.182 ship: synthetic-bench clusters wire
+// per-namespace SAs as User-kind bindings whose name carries the
+// upstream-defined prefix, and those identities do NOT issue /call
+// traffic. The prune is generic by prefix (the K8s standard convention),
+// not by per-name special-case (feedback_no_special_cases).
+//
+// Mixed-binding invariant: a real User (no SA prefix) coexisting with
+// the SA-prefix User remains in the enumeration. Only the SA-prefix
+// names drop out.
+func TestEnumerateBindingSetClasses_PrunesServiceAccountUsernameForm(t *testing.T) {
+	resetGenAndSnapshot(t)
+	// One CRB binds a real User; another binds a SA-prefix User-kind
+	// subject (synthetic bench pattern that produced the 0.30.181
+	// 16-of-34 SA cohort count).
+	buildSnapshot(t,
+		[]*rbacv1.ClusterRoleBinding{
+			mkCRB("admin-bind", userSub("admin")),
+			mkCRB("sa-prefix-bind", userSub("system:serviceaccount:bench-ns-1:bench-sa")),
+		},
+		nil,
+	)
+
+	out := EnumerateBindingSetClasses()
+	// The admin cohort MUST survive; the SA-prefix User-kind cohort MUST
+	// be pruned. The result MAY contain group-only cohorts derived from
+	// system:authenticated bindings, but no cohort with the SA-prefix
+	// username may appear.
+	var sawAdmin, sawSAPrefix bool
+	for _, c := range out {
+		if c.Username == "admin" {
+			sawAdmin = true
+		}
+		if c.Username == "system:serviceaccount:bench-ns-1:bench-sa" {
+			sawSAPrefix = true
+		}
+	}
+	if !sawAdmin {
+		t.Fatalf("admin cohort was pruned along with the SA-prefix cohort; got %+v", out)
+	}
+	if sawSAPrefix {
+		t.Fatalf("SA-prefix User-kind cohort NOT pruned; got %+v", out)
 	}
 }

@@ -81,13 +81,54 @@
 // FEEDBACK_NO_SPECIAL_CASES: no hardcoded admin / system:masters
 // branches. The pruning of `system:authenticated` flows from the
 // upstream evaluator's documented implicit-group rule (evaluate.go:559).
+// The pruning of `system:serviceaccount:` flows from the same upstream
+// convention — K8s' canonical ServiceAccount username pattern (see
+// k8s.io/apiserver/pkg/authentication/serviceaccount.ServiceAccountUsernamePrefix).
+//
+// SERVICE-ACCOUNT COHORT PRUNING — Ship 0.30.182 (A.3-refine).
+//
+//   ServiceAccount identities are STRUCTURALLY OUT OF SCOPE for the PIP
+//   prewarm seed: SAs are in-cluster Go callers, not authn-JWT routers,
+//   so they never issue traffic against the /call dispatcher. Two
+//   distinct entry-points carry SA subjects into the enumeration domain
+//   and BOTH are pruned:
+//
+//     1. Subject.Kind == "ServiceAccount" appearing in a binding's
+//        Subjects list. The Subject-walk (relevantGroups construction)
+//        explicitly skips this Kind — see the switch arms in the CRB +
+//        RB loops. The snapshot indexer routes SA-kind subjects to
+//        CRBsByServiceAccount / RBsByServiceAccountByNS (not to
+//        CRBsByUser / RBsByUserByNS), so this branch is primarily
+//        defensive — future indexer changes that route SA-kind into
+//        user-keyed maps would still see SA cohorts pruned here.
+//
+//     2. Subject.Kind == "User" with Subject.Name carrying the canonical
+//        SA username prefix "system:serviceaccount:<ns>:<name>". This is
+//        a K8s authn convention: a bearer-token-authenticated SA
+//        arrives at the apiserver as a User with this prefixed name.
+//        Bindings authored against this pattern land in CRBsByUser /
+//        RBsByUserByNS, so the userKeys collection step prunes them by
+//        prefix detection at collection time.
+//
+//   Pruning by the K8s-standard prefix is analogous to the existing
+//   "system:authenticated" prune — both are upstream-defined identity
+//   conventions, not snowplow special-cases. The constant
+//   `serviceAccountUsernamePrefix` documents the source.
+//
+//   FAIL-CLOSED RESTORED. With SA cohorts pruned at enumeration, the
+//   downstream Phase 1 PIP seed loop (phase1_pip_seed.go) treats any
+//   per-cohort seed error as FAIL-CLOSED again — narrow SA cohorts can
+//   no longer surface as expected-deny failures.
 
 package cache
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	rbacv1 "k8s.io/api/rbac/v1"
 )
 
 // systemAuthenticatedGroup is the canonical implicit-group name the
@@ -95,6 +136,22 @@ import (
 // request. Pruned from the powerset domain and INJECTED back into every
 // tuple's groups at BindingSetHash time.
 const systemAuthenticatedGroup = "system:authenticated"
+
+// serviceAccountUsernamePrefix is the K8s-standard prefix that authn
+// emits for SA bearer-token requests. Defined upstream as
+// k8s.io/apiserver/pkg/authentication/serviceaccount.ServiceAccountUsernamePrefix
+// = "system:serviceaccount:". Any User-kind identity whose name starts
+// with this prefix represents an SA — pruned at enumeration time
+// because SAs do not issue /call traffic (see file header).
+const serviceAccountUsernamePrefix = "system:serviceaccount:"
+
+// isServiceAccountUsername reports whether `name` is the canonical K8s
+// SA username pattern "system:serviceaccount:<ns>:<name>". Returns
+// false on empty input. Generic over name content — no per-name
+// hardcoding (feedback_no_special_cases).
+func isServiceAccountUsername(name string) bool {
+	return strings.HasPrefix(name, serviceAccountUsernamePrefix)
+}
 
 // bindingSetPowersetCap is the empirical safety cap on
 // |relevantGroups(userKey)|. A user whose relevant-groups count exceeds
@@ -140,13 +197,25 @@ func EnumerateBindingSetClasses() []Cohort {
 		return nil
 	}
 
-	// Step 1 — userKeys = union of CRBsByUser ∪ ∪_ns RBsByUserByNS.
+	// Step 1 — userKeys = union of CRBsByUser ∪ ∪_ns RBsByUserByNS,
+	// pruning SA-style canonical usernames (system:serviceaccount:<ns>:<name>).
+	// See file header §SERVICE-ACCOUNT COHORT PRUNING for rationale: SAs
+	// don't issue /call traffic, so their cohorts produce no first-paint
+	// L1 hit and FAIL-CLOSED on narrow-SA seed denials would be spurious.
+	// Pruning by the K8s-standard prefix is generic — no per-name
+	// hardcoding (feedback_no_special_cases).
 	userKeys := map[string]struct{}{}
 	for u := range snap.CRBsByUser {
+		if isServiceAccountUsername(u) {
+			continue
+		}
 		userKeys[u] = struct{}{}
 	}
 	for _, inner := range snap.RBsByUserByNS {
 		for u := range inner {
+			if isServiceAccountUsername(u) {
+				continue
+			}
 			userKeys[u] = struct{}{}
 		}
 	}
@@ -194,17 +263,25 @@ func EnumerateBindingSetClasses() []Cohort {
 			continue
 		}
 		// Collect users + groups present in this binding's Subjects.
+		// ServiceAccount-kind subjects are skipped: SAs don't issue /call
+		// traffic, so they produce no enumerated cohorts (see file header
+		// §SERVICE-ACCOUNT COHORT PRUNING). User-kind subjects whose name
+		// carries the K8s-standard SA prefix are pruned from userKeys at
+		// collection time — the userKeys lookup below excludes them too.
 		var users, groups []string
 		for _, s := range crb.Subjects {
 			switch s.Kind {
-			case "User":
+			case rbacv1.UserKind:
 				if _, ok := userKeys[s.Name]; ok {
 					users = append(users, s.Name)
 				}
-			case "Group":
+			case rbacv1.GroupKind:
 				if _, ok := groupKeys[s.Name]; ok {
 					groups = append(groups, s.Name)
 				}
+			case rbacv1.ServiceAccountKind:
+				// SAs are structurally out of scope for /call prewarm.
+				continue
 			}
 		}
 		for _, u := range users {
@@ -223,14 +300,17 @@ func EnumerateBindingSetClasses() []Cohort {
 			var users, groups []string
 			for _, s := range rb.Subjects {
 				switch s.Kind {
-				case "User":
+				case rbacv1.UserKind:
 					if _, ok := userKeys[s.Name]; ok {
 						users = append(users, s.Name)
 					}
-				case "Group":
+				case rbacv1.GroupKind:
 					if _, ok := groupKeys[s.Name]; ok {
 						groups = append(groups, s.Name)
 					}
+				case rbacv1.ServiceAccountKind:
+					// SAs are structurally out of scope for /call prewarm.
+					continue
 				}
 			}
 			for _, u := range users {
