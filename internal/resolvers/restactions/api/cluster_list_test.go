@@ -325,7 +325,7 @@ func TestAttemptClusterListCollapse_OptInOff(t *testing.T) {
 		DependsOn:              &templates.Dependency{Iterator: ptr.To(`["a","b"]`)},
 		ClusterListWhenAllowed: nil, // opt-in OFF
 	}
-	tmp, ok := attemptClusterListCollapse(
+	tmp, ok, _ := attemptClusterListCollapse(
 		context.Background(), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
@@ -347,7 +347,7 @@ func TestAttemptClusterListCollapse_CacheDisabledShortCircuits(t *testing.T) {
 		ClusterListWhenAllowed: ptr.To(true),
 		DependsOn:              nil, // no iterator
 	}
-	tmp, ok := attemptClusterListCollapse(
+	tmp, ok, _ := attemptClusterListCollapse(
 		context.Background(), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
@@ -362,7 +362,7 @@ func TestAttemptClusterListCollapse_NoIterator(t *testing.T) {
 		ClusterListWhenAllowed: ptr.To(true),
 		DependsOn:              &templates.Dependency{Iterator: ptr.To("")},
 	}
-	tmp, ok := attemptClusterListCollapse(
+	tmp, ok, _ := attemptClusterListCollapse(
 		context.Background(), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
@@ -377,7 +377,7 @@ func TestAttemptClusterListCollapse_ApistageStoreNil(t *testing.T) {
 		ClusterListWhenAllowed: ptr.To(true),
 		DependsOn:              &templates.Dependency{Iterator: ptr.To(`[{"ns":"a"}]`)},
 	}
-	tmp, ok := attemptClusterListCollapse(
+	tmp, ok, _ := attemptClusterListCollapse(
 		context.Background(), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, false /* apistage disabled */)
 	if ok || tmp != nil {

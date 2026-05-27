@@ -97,8 +97,8 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
@@ -496,13 +496,13 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 	// Updated INSIDE the for-bodies (goroutine-scoped, no concurrency).
 	// The deferred reporter reads them after the function body exits.
 	var (
-		abortPhase            string // "init" / "restactions" / "widgets" / "panic"
-		abortCause            string // free-form short tag — ctx_err / panic / none
-		ctxErrString          string // ctx.Err().Error() at abort site, or ""
-		processedRestactions  int
-		processedWidgets      int
-		emittedFinalAbortLog  bool
-		recoveredPanic        any
+		abortPhase           string // "init" / "restactions" / "widgets" / "panic"
+		abortCause           string // free-form short tag — ctx_err / panic / none
+		ctxErrString         string // ctx.Err().Error() at abort site, or ""
+		processedRestactions int
+		processedWidgets     int
+		emittedFinalAbortLog bool
+		recoveredPanic       any
 	)
 	abortPhase = "init"
 
@@ -609,7 +609,7 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
 			return fmt.Errorf("cohort %q restactions seed: %w", cohortLabel, err)
 		}
-		if err := seedOneRestaction(cohortCtx, ref, authnNS); err != nil {
+		if err := seedOneRestaction(cohortCtx, cohortLabel, ref, authnNS); err != nil {
 			// Ship 0.30.187 D1: per-target containment. Bump the
 			// per-(cohort, target) failure counter and continue with
 			// the next restaction so a single bad target does not
@@ -739,8 +739,8 @@ func withCohortSeedContext(ctx context.Context, cohort cache.Cohort,
 //     dep tracker records edges against the L1 key.
 //   - restactions.Resolve same entrypoint at restactions.go:183-189.
 //   - encodeResolvedJSON + cacheHandle.Put + ensureWatcherInformerForGVR
-//     + cache.Deps().Record — same Put shape as restactions.go:212-230.
-func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, authnNS string) error {
+//   - cache.Deps().Record — same Put shape as restactions.go:212-230.
+func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string) error {
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
 		return fmt.Errorf("fetch RESTAction %s/%s: %s", ref.Namespace, ref.Name, got.Err.Message)
@@ -783,10 +783,40 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 		return fmt.Errorf("unstructured -> RESTAction %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 
+	// Ship 0.30.192 — pure-additive per-stage timing sink for cost
+	// attribution. The 0.30.179 cluster-list-deny / per-NS iterator
+	// fallback at iter_serial=1 is the architect's TRACED hypothesis
+	// for the 46s/restaction wall-clock on the four 0.30.189-sentinel
+	// cohorts — but the "5K namespaces × ~10ms" projection was
+	// invalidated by the cluster reality (62 ns actual). This sink lets
+	// the resolver record per-stage ElapsedMs + ClusterListUsed +
+	// ClusterListDenyGate + IteratorCalls + IteratorElapsedMs so the
+	// failing cohort's 46s can be attributed to a real code path.
+	//
+	// SINK ISOLATION (feedback_shared_vs_copy_is_a_concurrency_change):
+	// one sink per seedOneRestaction invocation; never shared across
+	// cohorts. The sink's sync.Mutex is defensive — the resolver writes
+	// only from the parent goroutine (between stages) — but a future
+	// path that records from an errgroup worker stays race-safe.
+	stageTimingSink := cache.NewPIPStageTimingSink()
+	restactionStart := time.Now()
+	defer func() {
+		snapshot := stageTimingSink.Snapshot()
+		slog.Default().Info("phase1.seed.restaction.timing",
+			slog.String("subsystem", "cache"),
+			slog.String("cohort", cohortLabel),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.Int64("elapsed_ms_total", time.Since(restactionStart).Milliseconds()),
+			slog.Int("stages_total", len(snapshot)),
+			slog.Any("stages", snapshot),
+		)
+	}()
+
 	// Install the L1 key on ctx BEFORE Resolve so the inner-call dep
 	// tracker records edges against this entry — matches
 	// restactions.go:180-182.
 	resCtx := cache.WithL1KeyContext(ctx, key)
+	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
 		In:      &cr,

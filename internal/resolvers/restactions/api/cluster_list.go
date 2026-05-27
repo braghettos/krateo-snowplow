@@ -75,13 +75,19 @@ const shapeCheckSlowThreshold = 10 * time.Millisecond
 // identity-free apistage L1 entry on the miss path. Subsequent
 // cluster-list-permitted users hit the cache.
 //
-// Returns (newTmp, useClusterList):
+// Returns (newTmp, useClusterList, denyGate):
 //
 //   - useClusterList==false — gate denied (no opt-in, cache disabled,
 //     snapshot pre-readiness, RBAC deny, GVR derivation failed, or shape
 //     check failed). The caller keeps its existing iterator tmp slice.
 //   - useClusterList==true  — newTmp is a one-element slice; the caller
 //     replaces tmp.
+//
+// denyGate is the 0.30.192 instrumentation seam (purely additive, no
+// behaviour change): 0 means the gate passed (useClusterList==true);
+// 1-7 means the corresponding gate triggered the false return — see the
+// PIPStageTiming.ClusterListDenyGate doc on cache/pip_stage_timing.go for
+// the value table.
 //
 // The helper performs FIVE structural gates in order, short-circuiting
 // on the first failure (no wasted work):
@@ -111,18 +117,18 @@ func attemptClusterListCollapse(
 	ep endpoints.Endpoint,
 	apistageStore *cache.ResolvedCacheStore,
 	apistageEnabled bool,
-) ([]httpcall.RequestOptions, bool) {
+) ([]httpcall.RequestOptions, bool, int) {
 	// Gate 1: opt-in.
 	if !ptr.Deref(apiCall.ClusterListWhenAllowed, false) {
-		return nil, false
+		return nil, false, 1
 	}
 	// Gate 2: cache-off + Servable. AC-D5.13.
 	if cache.Disabled() {
-		return nil, false
+		return nil, false, 2
 	}
 	rw := cache.Global()
 	if rw == nil {
-		return nil, false
+		return nil, false, 2
 	}
 	if rw.Snapshot() == nil {
 		// Pre-readiness window — Ship B's atomic.Pointer[RBACSnapshot]
@@ -134,13 +140,13 @@ func attemptClusterListCollapse(
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("reason", "ship-b-snapshot-not-published"),
 		)
-		return nil, false
+		return nil, false, 2
 	}
 	// Gate 3: iterator present. A no-iterator stage has nothing to
 	// collapse — the field is a no-op.
 	if apiCall.DependsOn == nil || apiCall.DependsOn.Iterator == nil ||
 		*apiCall.DependsOn.Iterator == "" {
-		return nil, false
+		return nil, false, 3
 	}
 	// Apistage L1 is the storage substrate for the identity-free
 	// cluster-list entry. When apistageEnabled is false, the storage
@@ -148,7 +154,7 @@ func attemptClusterListCollapse(
 	// the entry would not survive across requests, so the gate denies
 	// to keep flag-off behaviour byte-identical to pre-D.5.
 	if !apistageEnabled || apistageStore == nil {
-		return nil, false
+		return nil, false, 2
 	}
 
 	// Gate 4: derive the target GVR from the first iterator element.
@@ -158,7 +164,7 @@ func attemptClusterListCollapse(
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 		)
-		return nil, false
+		return nil, false, 4
 	}
 
 	// Gate 5: RBAC permission. cluster-scope list on the target GVR.
@@ -166,7 +172,7 @@ func attemptClusterListCollapse(
 	if userErr != nil {
 		// No identity on context — degrade to iterator path; the
 		// per-user token / SA-dispatch downstream narrows correctly.
-		return nil, false
+		return nil, false, 5
 	}
 	permitOpts := rbac.EvaluateOptions{
 		Username:  user.Username,
@@ -186,7 +192,7 @@ func attemptClusterListCollapse(
 			slog.Bool("permit", permit),
 			slog.Any("eval_err", evalErr),
 		)
-		return nil, false
+		return nil, false, 5
 	}
 
 	// All five gates passed. Build the cluster-scope call.
@@ -218,7 +224,7 @@ func attemptClusterListCollapse(
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
 		)
-		return nil, false
+		return nil, false, 6
 	}
 
 	// AC-D5.14 — multi-element shape check. ≤10ms budget.
@@ -244,7 +250,7 @@ func attemptClusterListCollapse(
 			slog.String("shape_reason", shapeReason),
 			slog.Int("envelope_bytes", len(rawEnvelope)),
 		)
-		return nil, false
+		return nil, false, 7
 	}
 
 	// Store the validated envelope under the identity-free apistage key
@@ -277,7 +283,7 @@ func attemptClusterListCollapse(
 		slog.Duration("dispatch_elapsed", time.Since(dispatchStart)),
 		slog.Duration("shape_check_elapsed", shapeElapsed),
 	)
-	return []httpcall.RequestOptions{clusterCall}, true
+	return []httpcall.RequestOptions{clusterCall}, true, 0
 }
 
 // deriveTargetGVRForClusterList runs ONE jq evaluation of the

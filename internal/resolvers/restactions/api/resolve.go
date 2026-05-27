@@ -245,6 +245,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// sites are no-ops, and this resolve is byte-identical to 0.30.119.
 	stageErrSink := cache.StageErrorSinkFromContext(ctx)
 
+	// Ship 0.30.192 — pure-additive per-stage timing sink. Installed by
+	// phase1_pip_seed.go's seedOneRestaction so cost-attribution data
+	// flows into a structured slog line. Production /call requests
+	// install no sink; pipTimingSink is nil and every recorder branch
+	// below is a nil-receiver no-op (no behavioural change).
+	pipTimingSink := cache.PIPStageTimingSinkFrom(ctx)
+
 	for _, id := range names {
 		// Get the api with this identifier
 		apiCall, ok := apiMap[id]
@@ -254,6 +261,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 		if apiCall.Headers == nil {
 			apiCall.Headers = []string{headerAcceptJSON}
+		}
+
+		// Ship 0.30.192 — per-stage timing recorder. stageTiming is a
+		// stack-local value; recordStageTiming closes over it and the
+		// outer pipTimingSink. On a nil sink (production /call path)
+		// recordStageTiming is still called (one nil-receiver no-op);
+		// no behavioural change. Stage early-exits (continue / return
+		// dict) MUST call recordStageTiming() first so the failed
+		// stage's wall-clock is captured for cost attribution.
+		stageStart := time.Now()
+		stageTiming := cache.PIPStageTiming{StageID: id}
+		recordStageTiming := func() {
+			stageTiming.ElapsedMs = time.Since(stageStart).Milliseconds()
+			pipTimingSink.Append(stageTiming)
 		}
 
 		// Tag 0.30.9 Sub-scope A: detect userAccessFilter.
@@ -307,6 +328,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// bearer token to a SA-marked stage). Returning
 				// an empty result for this stage and continuing.
 				dict[id] = map[string]any{"items": []any{}}
+				recordStageTiming()
 				continue
 			}
 			ep = *saEP
@@ -315,6 +337,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			if err != nil {
 				log.Error("unable to resolve api endpoint reference",
 					slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
+				recordStageTiming()
 				return dict
 			}
 			ep = resolved
@@ -334,6 +357,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		tmp := createRequestOptions(ctx, log, apiCall, dict)
 		if len(tmp) == 0 {
 			log.Warn("empty request options for http call", slog.Any("name", id))
+			recordStageTiming()
 			continue
 		}
 
@@ -351,9 +375,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// Default-off + RBAC-deny + shape-fail all yield
 		// useClusterList=false; tmp keeps its iterator fan-out and the
 		// path is byte-identical to pre-D.5 (AC-D5.6).
-		if newTmp, useClusterList := attemptClusterListCollapse(
+		//
+		// Ship 0.30.192 — capture cluster_list outcome + deny gate for
+		// per-stage timing instrumentation. The third return value is
+		// the deny-gate number (0 = no deny, 1-7 = which gate); see
+		// cache/pip_stage_timing.go PIPStageTiming.ClusterListDenyGate
+		// for the value table.
+		stageTiming.ClusterListAttempted = ptr.Deref(apiCall.ClusterListWhenAllowed, false)
+		if newTmp, useClusterList, denyGate := attemptClusterListCollapse(
 			ctx, log, apiCall, dict, ep, apistageStore, apistageEnabled); useClusterList {
 			tmp = newTmp
+			stageTiming.ClusterListUsed = true
+			stageTiming.ClusterListDenyGate = denyGate // 0 on success
+		} else {
+			stageTiming.ClusterListUsed = false
+			stageTiming.ClusterListDenyGate = denyGate
 		}
 
 		// 0.30.92 widening: lazy-register the informer for every
@@ -405,6 +441,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		var dictMu sync.Mutex
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(iterParallelism(ctx))
+
+		// Ship 0.30.192 — record iterator fan-out cost. tmp slice
+		// length is the call count (1 after cluster-list collapse,
+		// N per-NS after the iterator path); iterStart anchors the
+		// wall-clock that g.Wait() closes below.
+		stageTiming.IteratorCalls = len(tmp)
+		iterStart := time.Now()
 
 		// Ship 0.30.121 R1-b — the operator kill-switch. Compute once per
 		// stage: verbose is permitted ONLY when the RESTAction asked for it
@@ -801,8 +844,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		if err := g.Wait(); err != nil {
 			log.Debug("api stage short-circuited on hard error",
 				slog.String("name", id), slog.Any("err", err))
+			stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
+			recordStageTiming()
 			return dict
 		}
+		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
 
 		// Tag 0.30.9 Sub-scope A: refilter the SA-dispatched result
 		// in-process. Runs AFTER all dispatched calls for this API
@@ -822,6 +868,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// entry is gone; an iterator stage produces N content entries,
 		// one per call, assembled into dict[id] by the N jsonHandler
 		// merges exactly as before.
+
+		// Ship 0.30.192 — emit per-stage timing on normal completion.
+		// Records ElapsedMs (stage-total wall-clock) + IteratorElapsedMs
+		// (g.Wait()-bounded fan-out cost) for the cohort timing log line.
+		recordStageTiming()
 	}
 
 	removeManagedFields(dict)
