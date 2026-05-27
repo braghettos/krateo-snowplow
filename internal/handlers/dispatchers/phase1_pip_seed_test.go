@@ -28,7 +28,69 @@ package dispatchers
 
 import (
 	"testing"
+	"time"
 )
+
+// TestComputeCohortTimeout is the Ship 0.30.190 Fix A falsifier. It
+// pins the proportional per-cohort timeout contract that replaced the
+// fixed pipCohortTimeout=120s ceiling.
+//
+// Pre-0.30.190 defect: a 132-widget sentinel cohort needed ~198s
+// (132 × 1.5s empirical per-target) but the fixed 120s ceiling
+// DeadlineExceeded'd before any per-target error path could run,
+// flipping cohort status to "failed" while widget_seed_failure_total
+// stayed empty.
+//
+// A regression that reverts to a fixed ceiling fails this test —
+// the sentinel row expects ~218s, well above any conceivable fixed
+// constant a regression would re-introduce.
+func TestComputeCohortTimeout(t *testing.T) {
+	cases := []struct {
+		name        string
+		restactions int
+		widgets     int
+		wantSec     int
+	}{
+		// Empty / floor: base seconds, no per-target add.
+		{"empty cohort", 0, 0, pipCohortBaseSec},
+		// Normal admin cohort (~22 widgets): 20 + 23*1.5 = 54s.
+		{"normal admin 22 widgets", 1, 22, pipCohortBaseSec + 23*pipCohortPerTargetMs/1000},
+		// Sentinel cohort (~132 widgets): 20 + 133*1.5 = 219s — well
+		// above the pre-0.30.190 120s ceiling that triggered the
+		// 0.30.189 DeadlineExceeded.
+		{"sentinel 132 widgets", 1, 132, pipCohortBaseSec + 133*pipCohortPerTargetMs/1000},
+		// Oversized cohort hits the absolute cap (10 min).
+		{"oversized hits cap", 100, 500, pipCohortMaxSec},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeCohortTimeout(tc.restactions, tc.widgets)
+			want := time.Duration(tc.wantSec) * time.Second
+			if got != want {
+				t.Errorf("computeCohortTimeout(%d, %d) = %v; want %v",
+					tc.restactions, tc.widgets, got, want)
+			}
+		})
+	}
+}
+
+// TestComputeCohortTimeout_SentinelExceedsLegacy222 documents the
+// Ship 0.30.190 Fix A invariant directly: the sentinel cohort
+// (~132 widgets) MUST get a budget strictly greater than the
+// pre-0.30.190 fixed ceiling of 120s. A regression that quietly
+// re-shrinks the per-target factor below the empirical 1.5s/target
+// is caught here.
+func TestComputeCohortTimeout_SentinelExceedsLegacy120s(t *testing.T) {
+	got := computeCohortTimeout(1, 132)
+	legacy := 120 * time.Second
+	if got <= legacy {
+		t.Fatalf("Ship 0.30.190 invariant violated: sentinel cohort "+
+			"(132 widgets) timeout=%v ≤ legacy 120s ceiling — the "+
+			"proportional model must give an oversized cohort a "+
+			"budget strictly greater than the pre-0.30.190 fixed "+
+			"ceiling that caused the 0.30.189 DeadlineExceeded", got)
+	}
+}
 
 // TestPhase1PIPSeedKey_NoSliceUsesDispatcherDefaultTuple is the D2
 // falsifier. It pins the contract that the walker's seed-key derivation

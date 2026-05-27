@@ -41,11 +41,16 @@
 // per cohort is N_restactions×envelope_bytes + N_widgets×envelope_bytes
 // — same OOM profile as the F2 content pass per cohort.
 //
-// PER-COHORT TIMEOUT — 20 s hard ceiling per cohort, set via
-// context.WithTimeout inside the per-cohort closure. A stuck cohort
-// thus cannot wedge Phase 1 past Step 7.6's 40 s global budget; the
-// timeout firing returns ctx.Err() up the errgroup which propagates as
-// the cohort's seed-failure (FAIL-CLOSED).
+// PER-COHORT TIMEOUT — proportional to target count (Ship 0.30.190).
+// computeCohortTimeout returns pipCohortBaseSec + targets*1.5s, capped
+// at pipCohortMaxSec (10 min). Set via context.WithTimeout inside the
+// per-cohort closure. A stuck cohort thus cannot wedge Phase 1 past
+// Step 7.6's 15 min global budget; the timeout firing returns
+// ctx.Err() up the errgroup which propagates as the cohort's
+// seed-failure (FAIL-CLOSED). Pre-0.30.190: fixed 120s ceiling
+// DeadlineExceeded'd the 132-widget sentinel cohort before any
+// per-target error path ran; the proportional model gives an oversized
+// cohort a budget proportional to its target count.
 //
 // FEEDBACK_CHECK_K8S_CLIENTGO_PRIOR_ART: client-go has no equivalent
 // for per-RBAC-cohort prewarm. RBAC subject enum is a custom snowplow
@@ -113,26 +118,55 @@ const (
 	// without a code change — emergency lever only.
 	envPrewarmPIPCohortCap = "PREWARM_PIP_COHORT_CAP"
 
-	// pipCohortTimeout is the per-cohort hard ceiling. A stuck cohort
-	// cannot wedge Phase 1 past Step 7.6's global budget.
+	// Per-cohort budget — proportional to the cohort's target count
+	// (restactions + harvested widgets). Ship 0.30.190 replaced the
+	// pre-0.30.190 fixed `pipCohortTimeout = 120 s` ceiling with the
+	// computeCohortTimeout helper below.
 	//
-	// Ship A.3 / 0.30.179 — raised 20s -> 120s. Binding-set enumeration
-	// produces more classes than the prior canonical-cohort dedupe, and
-	// each class's restactions seed walks per-namespace LIST calls (a
-	// compositions-list RESTAction emits one K8s call per namespace via
-	// the namespace iterator). A 50-namespace cluster needs ~30s per
-	// cohort to seed cleanly; 120s adds ~4x headroom.
-	pipCohortTimeout = 120 * time.Second
+	// WHY proportional. Ship 0.30.179 raised the per-cohort ceiling
+	// 20s -> 120s because binding-set enumeration produces more classes
+	// than the prior canonical-cohort dedupe and each class's
+	// restactions seed walks per-namespace LIST calls. The fixed 120s
+	// ceiling held for ~22-widget cohorts but DeadlineExceeded'd the
+	// 0.30.189 sentinel cohort (system:cohort:group-only:v1) at
+	// ~132 widgets — 132 × ~1.5s empirical per-target ≈ 198s, exceeding
+	// the 120s ceiling. The whole-cohort timeout fires BEFORE any
+	// per-target error path runs, so widget_seed_failure_total stayed
+	// empty while cohort status flipped to "failed".
+	//
+	// THE FIX is uniform across all cohorts (feedback_no_special_cases):
+	//   secs = pipCohortBaseSec + targets * pipCohortPerTargetMs / 1000
+	//   secs = min(secs, pipCohortMaxSec)
+	// A 22-widget cohort gets ~54s; a 132-widget cohort gets ~218s; both
+	// follow the same rule. pipCohortMaxSec is a hard 10-minute absolute
+	// cap so an absurd cohort can never wedge Phase 1 indefinitely.
+	pipCohortBaseSec     = 20   // floor for small/empty cohorts
+	pipCohortPerTargetMs = 1500 // empirical per-(resolve+Put) cost
+	pipCohortMaxSec      = 600  // 10-minute absolute cap
 
-	// pipGlobalTimeout is the absolute Step 7.6 budget. Designed to fit
-	// the architect's pod-start→phase1Done projection (baseline + seed
-	// ceiling). Ship A.3 / 0.30.179 — raised 40s -> 8 minutes per the
-	// PM gate's "baseline + 8 min seed ceiling" target. The per-cohort
-	// timeout × cohort cap caps the total at 50 × 120 s = 6000 s but the
-	// parallelism + harvest dedup keep the empirical wall-clock well
-	// inside 8 min.
-	pipGlobalTimeout = 8 * time.Minute
+	// pipGlobalTimeout is the absolute Step 7.6 budget. Ship 0.30.190
+	// raised 8 min -> 15 min in lockstep with the per-cohort proportional
+	// model — under GOMAXPROCS errgroup parallelism the empirical
+	// wall-clock stays well inside 15 min even at 50 cohorts × max cap.
+	pipGlobalTimeout = 15 * time.Minute
 )
+
+// computeCohortTimeout returns a per-cohort wall-clock budget that
+// scales with the number of targets (restactions + widgets) in the
+// cohort. Replaces the fixed 120s ceiling at Ship 0.30.190.
+//
+// Uniform across all cohorts — no special cases (feedback_no_special_cases).
+// Pure function (no shared state); safe to call from the cohort
+// errgroup goroutines (no feedback_shared_vs_copy_is_a_concurrency_change
+// implication).
+func computeCohortTimeout(restactionCount, widgetCount int) time.Duration {
+	targets := restactionCount + widgetCount
+	secs := pipCohortBaseSec + (targets * pipCohortPerTargetMs / 1000)
+	if secs > pipCohortMaxSec {
+		secs = pipCohortMaxSec
+	}
+	return time.Duration(secs) * time.Second
+}
 
 // PrewarmPIPEnabled reports whether the Ship PIP per-identity prewarm
 // seed is opted in. Defaults FALSE as of 0.30.176 (Phase A.1): the
@@ -473,9 +507,15 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 		slog.Int("widgets", len(widgetEntries)),
 	)
 
-	// Per-cohort hard ceiling — 20 s. A stuck cohort cannot wedge Step
-	// 7.6 past its global budget.
-	cctx, ccancel := context.WithTimeout(ctx, pipCohortTimeout)
+	// Per-cohort hard ceiling — proportional to the cohort's target
+	// count (Ship 0.30.190). A stuck cohort cannot wedge Step 7.6 past
+	// its global budget; an oversized cohort (e.g. the
+	// system:cohort:group-only:v1 sentinel introduced in 0.30.189 with
+	// ~6× the widget load of a normal cohort) still gets a budget
+	// proportional to its target count rather than the prior fixed 120s
+	// ceiling that DeadlineExceeded'd before any per-target error path
+	// could run.
+	cctx, ccancel := context.WithTimeout(ctx, computeCohortTimeout(len(restactionRefs), len(widgetEntries)))
 	defer ccancel()
 
 	// Build the per-cohort ctx: SA transport seam preserved (so the
