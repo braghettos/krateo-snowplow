@@ -1,4 +1,5 @@
-// apistage_cohort_memo.go — Ship GMC / 0.30.174, A.2 / 0.30.178.
+// apistage_cohort_memo.go — Ship GMC / 0.30.174, A.2 / 0.30.178,
+// Phase B / 0.30.185.
 //
 // PROBLEM
 //   filterListByRBAC at apistage.go:176 runs per-item EvaluateRBAC over
@@ -8,6 +9,20 @@
 //   the resolver pays the per-item EvaluateRBAC fan-out on EACH request.
 //   At admin-cohort scale (10K-50K compositions) the work dominates the
 //   cold path.
+//
+// PHASE B / 0.30.185 EXTENSION
+//   Even with the Ship A.2 permitAll envelope cache, the resolver still
+//   pays the per-call EvalValue (gojq) + listEnvelopeValue + CopyJSONMap
+//   cost on every warm /call. The pre-flight cyberjoker-cold-pprof-cpu
+//   capture shows ~30-40% of cold-CPU concentrated in those three sites
+//   for the admin/cyberjoker LIST stages. Phase B extends cohortGateMemo
+//   with a `postJQEncoded` sub-cache keyed by (stage-id × jqID) — where
+//   jqID = xxhash.Sum64String(filter). On a HIT, the cached post-jq
+//   bytes are json.Unmarshal'd into a fresh isolated value tree and fed
+//   direct into the stage dict, skipping gojq + listEnvelopeValue +
+//   CopyJSONMap entirely. Population is LAZY: the first request for a
+//   given (cohort, stage-id, jqID) runs the canonical path and captures
+//   the post-jq value via a single-line hook in jsonHandlerCore.
 //
 // SOLUTION (Ship GMC / 0.30.174 + A.2 / 0.30.178)
 //   Memoize the kept-name set per (content-entry × cohort). Cohort is
@@ -73,6 +88,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -94,6 +110,16 @@ import (
 // The whole struct is BUILT ONCE on populate then NEVER mutated. Hit
 // readers consume it lock-free; the cache.CohortGateMemoStore guards
 // the (cohortKey -> *cohortGateMemo) lookup with sync.Map.
+//
+// PHASE B / 0.30.185: postJQEncoded is the EXCEPTION to the struct-
+// immutability contract — it is a sync.Map populated LAZILY on the FIRST
+// request per (stage-id, jqID), then read by every subsequent request.
+// The struct itself is never reassigned (the sync.Map header is set
+// once at populate); only the map contents grow over the memo's lifetime.
+// Concurrent populate is dedupe'd by sync.Map.LoadOrStore — multiple
+// goroutines computing the same (stage-id, jqID) write byte-identical
+// payloads, so the LoadOrStore winner's bytes are correct for every
+// reader.
 type cohortGateMemo struct {
 	rbacGen uint64
 
@@ -115,6 +141,24 @@ type cohortGateMemo struct {
 	// per-call listEnvelopeValue + DeepCopyJSON cost.
 	encodedJSON []byte
 	encodedGzip []byte
+
+	// postJQEncoded is the Phase B / 0.30.185 lazy sub-cache for post-jq
+	// stage output bytes. Keyed by postJQKey (stage-id || jqID), value
+	// is *postJQEntry holding the JSON-encoded post-jq bytes. The map
+	// header itself is built ONCE at memo populate (here); ENTRIES are
+	// populated lazily by jsonHandlerCore's onPostJQ hook the FIRST time
+	// a request with the matching filter runs against the cohort.
+	//
+	// Concurrent populate is dedupe'd by sync.Map.LoadOrStore — multiple
+	// goroutines marshalling the same post-jq value write identical
+	// bytes. The first writer wins; losers discard their bytes.
+	//
+	// Gated by the permitAll fast-path. On !permitAll cohorts the post-
+	// jq output varies per cohort but the canonical filterListByRBAC
+	// path already produces correct bytes; the cache is not engaged.
+	// See apistage_postjq.go for the lookup/store helpers and the
+	// (cohort, jqID, stage-id) key composition.
+	postJQEncoded sync.Map // postJQKey -> *postJQEntry
 }
 
 // cohortKeyHashFromUserInfo is a thin shim over cache.CohortKeyHash so
@@ -124,6 +168,69 @@ type cohortGateMemo struct {
 // compute byte-identical cohort keys for the same identity.
 func cohortKeyHashFromUserInfo(username string, groups []string) string {
 	return cache.CohortKeyHash(username, groups)
+}
+
+// gateListItemsWithMemoEx is the Phase B / 0.30.185 super-set of
+// gateListItemsWithMemo: same gating behaviour, but additionally
+// returns the *cohortGateMemo + cohort key on a hit or just-populated
+// miss so the caller can plumb the post-jq sub-cache (apistage_postjq.go).
+// On nil-store / no-identity / fail-closed branches, memo + cohort are
+// zero/nil.
+//
+// gateListItemsWithMemo is the original (memo-less) entry point retained
+// for non-postJQ callers (the refresh path, tests).
+func gateListItemsWithMemoEx(
+	ctx context.Context,
+	store *cache.CohortGateMemoStore,
+	gvr schema.GroupVersionResource,
+	parsed parsedListEnvelope,
+) (any, bool, *cohortGateMemo, string) {
+	if store == nil {
+		v, ok := gateListItems(ctx, gvr, parsed)
+		return v, ok, nil, ""
+	}
+
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		v, ok := gateListItems(ctx, gvr, parsed)
+		return v, ok, nil, ""
+	}
+	cohort := cohortKeyHashFromUserInfo(ui.Username, ui.Groups)
+	if cohort == "" {
+		v, ok := gateListItems(ctx, gvr, parsed)
+		return v, ok, nil, ""
+	}
+
+	currentGen := cache.CohortRBACGen(ui.Username, ui.Groups)
+
+	if v, ok := store.Lookup(cohort); ok {
+		if memo, isMemo := v.(*cohortGateMemo); isMemo && memo != nil && memo.rbacGen == currentGen {
+			return cohortGateMemoServe(ctx, gvr, parsed, memo, cohort), true, memo, cohort
+		}
+	}
+
+	memo, served := populateCohortGateMemo(ctx, gvr, parsed, ui.Username, ui.Groups, cohort, currentGen)
+	if !served {
+		return nil, false, nil, ""
+	}
+	store.Store(cohort, memo)
+
+	log := xcontext.Logger(ctx)
+	log.Debug("apistage.cohort_gate_memo.store",
+		slog.String("subsystem", "cache"),
+		slog.String("event", "memo_store"),
+		slog.String("gvr", gvr.String()),
+		slog.String("cohort", cohort),
+		slog.Uint64("rbac_gen", currentGen),
+		slog.Bool("permit_all", memo.permitAll),
+		slog.Int("kept_names", len(memo.keptNames)),
+		slog.Int("items_total", len(parsed.items)),
+		slog.Int("encoded_json", len(memo.encodedJSON)),
+		slog.Int("encoded_gzip", len(memo.encodedGzip)),
+		slog.Int64("memo_size", store.Size()),
+	)
+
+	return cohortGateMemoServe(ctx, gvr, parsed, memo, cohort), true, memo, cohort
 }
 
 // gateListItemsWithMemo is the memo-aware companion to gateListItems.
@@ -138,6 +245,10 @@ func cohortKeyHashFromUserInfo(username string, groups []string) string {
 // happens for non-entry callers (legacy refresh paths, tests); it must
 // stay safe so the memo can be wired incrementally without breaking
 // the wider gate surface.
+//
+// Retained for non-postJQ callers; Phase B / 0.30.185 added the Ex
+// variant above. Both share the populate path; the Ex variant just
+// surfaces the memo + cohort pair to its caller.
 func gateListItemsWithMemo(
 	ctx context.Context,
 	store *cache.CohortGateMemoStore,
@@ -290,6 +401,23 @@ func populateCohortGateMemo(
 		cache.RecordCohortMemoBytes(len(encoded) + len(gz))
 		cache.RecordCohortMemoEncodedBytes(len(encoded) + len(gz))
 
+		// Phase B / 0.30.185 — per-entry size slog at populate time.
+		// HG-PB.14 requires per-entry distribution (p50/p95/p99/max)
+		// for empirical cap derivation; the cohort_memo.populate line
+		// here is the source for the post-deploy log-grep aggregator.
+		xcontext.Logger(ctx).Info("cohort_memo.populate",
+			slog.String("subsystem", "cache"),
+			slog.String("event", "memo_populate"),
+			slog.String("gvr", gvr.String()),
+			slog.String("cohort", cohort),
+			slog.Bool("permit_all", true),
+			slog.Int("items_total", len(parsed.items)),
+			slog.Int("encoded_json_bytes", len(encoded)),
+			slog.Int("encoded_gzip_bytes", len(gz)),
+			slog.Int("postjq_bytes", 0), // lazy — bumped at populate time below
+			slog.Int("kept_names", 0),
+		)
+
 		return memo, true
 	}
 
@@ -316,6 +444,24 @@ func populateCohortGateMemo(
 		keptNames: keptNames,
 	}
 	cache.RecordCohortMemoBytes(bytesEstimate)
+
+	// Phase B / 0.30.185 — per-entry size slog at populate time.
+	// HG-PB.14 instrumentation: same line shape as the permitAll path
+	// so the post-deploy aggregator can compute distributions over the
+	// full cohort population (permitAll + narrow combined).
+	xcontext.Logger(ctx).Info("cohort_memo.populate",
+		slog.String("subsystem", "cache"),
+		slog.String("event", "memo_populate"),
+		slog.String("gvr", gvr.String()),
+		slog.String("cohort", cohort),
+		slog.Bool("permit_all", false),
+		slog.Int("items_total", len(parsed.items)),
+		slog.Int("encoded_json_bytes", 0),
+		slog.Int("encoded_gzip_bytes", 0),
+		slog.Int("postjq_bytes", 0),
+		slog.Int("kept_names", len(keptNames)),
+	)
+
 	return memo, true
 }
 
@@ -349,6 +495,22 @@ func populateMemoFromCanonicalFilter(
 		bytesEstimate += len(key) + 16
 	}
 	cache.RecordCohortMemoBytes(bytesEstimate)
+
+	// Phase B / 0.30.185 — per-entry size slog at populate time (fallback
+	// canonical-filter populate path). Cohort key is unknown at this
+	// site (the caller picks it up from UserInfo); omit cohort here.
+	xcontext.Logger(ctx).Info("cohort_memo.populate",
+		slog.String("subsystem", "cache"),
+		slog.String("event", "memo_populate_canonical"),
+		slog.String("gvr", gvr.String()),
+		slog.Bool("permit_all", false),
+		slog.Int("items_total", len(parsed.items)),
+		slog.Int("encoded_json_bytes", 0),
+		slog.Int("encoded_gzip_bytes", 0),
+		slog.Int("postjq_bytes", 0),
+		slog.Int("kept_names", len(memo.keptNames)),
+	)
+
 	return memo, true
 }
 

@@ -355,22 +355,53 @@ func (c callPathVerb) GetVerb() string {
 	return c.verb
 }
 
+// apistageContentServeResult is the rich return value of
+// apistageContentServe — Phase B / 0.30.185. Replaces the prior triple
+// return (value, served, ok) so we can carry the post-jq cache
+// discriminators (PostJQHit / PostJQValue / Memo) without sprinkling
+// out-args through the resolve.go worker.
+//
+//   - OK==false  — not pivot-servable; caller falls through to the
+//     non-pivot dispatch branches.
+//   - OK==true, Served==false — fail-closed (no identity / GET denied);
+//     caller falls through to the apiserver branch.
+//   - OK==true, Served==true, PostJQHit==false — Value is the gated
+//     envelope as a decoded structured value (canonical Ship A.2 path);
+//     caller feeds it via jsonHandlerValue (gojq runs as today).
+//   - OK==true, Served==true, PostJQHit==true — PostJQValue is the
+//     already-post-jq decoded value (json.Unmarshal of cached bytes);
+//     caller feeds it via the post-jq fast-path (skips gojq +
+//     listEnvelopeValue + CopyJSONMap).
+//
+// Memo / CohortKey / JQID / StageID are populated whenever the call
+// flowed through the per-cohort memo and the cohort + filter are
+// eligible for post-jq caching (permitAll, filter != nil, jqID != 0,
+// no slice). They let the caller install a `capturePostJQ` hook on the
+// PostJQHit==false path to lazily populate the cache after gojq runs.
+type apistageContentServeResult struct {
+	Value       any
+	PostJQValue any
+	PostJQHit   bool
+	Served      bool
+	OK          bool
+
+	// Memo + jqID + cohort key are non-nil/non-zero ONLY when the call
+	// flowed through the permitAll cohort memo AND the call is post-jq-
+	// cache-eligible (filter set, no slice). The resolve.go caller uses
+	// these to wire a capturePostJQ closure into jsonHandlerOptions.
+	Memo      *cohortGateMemo
+	CohortKey string
+	JQID      uint64
+	StageID   string
+	GVR       schema.GroupVersionResource
+}
+
 // apistageContentServe is the Ship F1 content-keyed serve pipeline for
 // one K8s call. It is invoked from resolve.go's g.Go worker when the
 // resolver pivot is on AND the content-keyed api-stage L1 is enabled.
 //
-// Returns (value, served, ok):
-//   - ok==false  — the content layer cannot serve this call (it is not
-//     pivot-servable: a write verb, an external URL, a metadata-only
-//     GVR, a pre-sync informer, a non-apiserver path). The caller falls
-//     through to the non-pivot dispatch branches, byte-identical to a
-//     flag-off resolve.
-//   - ok==true, served==false — fail-closed: no identity on ctx, or a
-//     GET the requester is denied. The caller falls through to the
-//     apiserver branch, whose per-user token narrows correctly.
-//   - ok==true, served==true — `value` is the RBAC-GATED envelope as an
-//     already-DECODED structured value (Ship 0.30.128 P-CORE-2). The
-//     caller feeds it to jsonHandlerValue — no marshal, no unmarshal.
+// Returns an apistageContentServeResult — see the doc on that type for
+// the OK/Served/PostJQHit truth table.
 //
 // Pipeline (per the F1 spec):
 //  1. content key from call.Path via ParseAPIServerPathToDep.
@@ -378,27 +409,43 @@ func (c callPathVerb) GetVerb() string {
 //     MISS: dispatch UN-GATED (WithApistageContentResolve) + Put.
 //  3. gate with the request identity, returning the DECODED envelope
 //     value (the single F1 gate site — runs on hit AND miss).
+//  4. Phase B / 0.30.185 — when the cohort memo's permitAll fast-path
+//     fires AND the stage filter is set AND no slice pagination is in
+//     play, consult the postJQEncoded sub-cache for a HIT before
+//     returning. The HIT bypasses gojq entirely.
 //
 // On the prewarm path (cache.ApistagePrewarmFromContext, wired by F2)
 // step 3 is skipped — the prewarm resolve has no requester; it only
 // populates the content entry. F1 leaves the skip-point; F2 sets the
 // marker.
+//
+// `filter` is the stage's getter.filter (handler.go:94 opts.filter);
+// nil means no jq stage and the post-jq cache is not engaged.
+// `stageID` is the RESTAction stage map-key (resolve.go line 248);
+// composed into the post-jq cache key so the same envelope under
+// different stage names produces distinct entries.
+// `sliceActive` reports whether dict["slice"] is set; when true the
+// jq input shape differs across requests and the post-jq cache is
+// not engaged for this call.
 func apistageContentServe(
 	ctx context.Context,
 	store *cache.ResolvedCacheStore,
 	call httpcall.RequestOptions,
-) (value any, served bool, ok bool) {
+	filter *string,
+	stageID string,
+	sliceActive bool,
+) apistageContentServeResult {
 	log := xcontext.Logger(ctx)
 
 	// Content-keyed entries describe apiserver GET/LIST calls only — the
 	// same shape dispatchViaInformer can serve. A write verb or a
 	// non-apiserver path is not a content unit.
 	if ptr.Deref(call.Verb, http.MethodGet) != http.MethodGet {
-		return nil, false, false
+		return apistageContentServeResult{}
 	}
 	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path)
 	if !parseOK {
-		return nil, false, false
+		return apistageContentServeResult{}
 	}
 	contentKey := cache.ComputeKey(contentKeyInputs(gvr, ns, name))
 	isList := name == ""
@@ -447,7 +494,7 @@ func apistageContentServe(
 			cache.WithApistageContentResolve(ctx), call)
 		if !dispatchedOK {
 			// Not pivot-servable — the content layer cannot serve it.
-			return nil, false, false
+			return apistageContentServeResult{}
 		}
 		envelope = dispatched
 		newEntry := &cache.ResolvedEntry{
@@ -484,8 +531,77 @@ func apistageContentServe(
 		// Prewarm: no requester — populate the content entry only, do not
 		// gate or feed dict[id]. served=false tells the caller not to use
 		// the bytes (the prewarm resolve discards dict).
-		return nil, false, true
+		return apistageContentServeResult{OK: true}
 	}
+
+	// Phase B / 0.30.185 — HOT-PATH SHORT-CIRCUIT (architect review item 3).
+	//
+	// BEFORE we run gateListItemsWithMemoEx (which calls
+	// cohortGateMemoServe → listEnvelopeValue → CopyJSONMap and pays a
+	// deep-copy on the cached items every hit), try a CHEAP peek into
+	// the cohort memo store for a postJQ HIT. The peek does ONLY:
+	//   - UserInfo(ctx) + cohort hash (the same hashes the memo serve
+	//     would compute anyway),
+	//   - sync.Map.Load on the memo store (lock-free),
+	//   - rbacGen + permitAll boolean checks,
+	//   - sync.Map.Load on the postJQ sub-cache.
+	// On HIT: json.Unmarshal the cached bytes into a fresh isolated
+	// value tree and return — SKIPPING listEnvelopeValue, CopyJSONMap,
+	// gojq Parse/Compile/Run entirely. This is the load-bearing CPU
+	// win Phase B markets: cyberjoker / admin warm cold-paths bypass
+	// the per-entry deep-copy on hit.
+	//
+	// On MISS (no memo yet / stale stamp / !permitAll / no postJQ
+	// entry): fall through to the canonical gateListItemsWithMemoEx
+	// path; the post-jq capture closure is installed by the caller
+	// from the returned Memo/CohortKey/JQID metadata.
+	//
+	// Only runs on the LIST-with-pre-parsed-items branch (haveParsed) —
+	// the GET-by-name / unmarshal-fallback path does not have a memo
+	// and is not eligible for the cache.
+	if haveParsed {
+		memoStore := cache.CohortGateMemoStoreLoadOrInit(entryRef)
+		if peekMemo, peekCohort, peekJQID, peekRaw, peekHit := peekCohortMemoForPostJQ(
+			ctx, memoStore, filter, stageID, sliceActive,
+		); peekHit {
+			postJQ, uerr := unmarshalCohortPostJQ(peekRaw)
+			if uerr != nil {
+				// Defensive — a marshal we wrote should not fail to
+				// round-trip. If it does, fall through to the canonical
+				// path so the request still completes correctly.
+				log.Warn("apistage.postjq_unmarshal_failed",
+					slog.String("subsystem", "cache"),
+					slog.String("gvr", gvr.String()),
+					slog.String("cohort", peekCohort),
+					slog.String("stage_id", stageID),
+					slog.Uint64("jq_id", peekJQID),
+					slog.Any("err", uerr),
+				)
+			} else {
+				log.Debug("apistage.postjq_hit",
+					slog.String("subsystem", "cache"),
+					slog.String("event", "postjq_hit"),
+					slog.String("gvr", gvr.String()),
+					slog.String("cohort", peekCohort),
+					slog.String("stage_id", stageID),
+					slog.Uint64("jq_id", peekJQID),
+					slog.Int("bytes", len(peekRaw)),
+				)
+				return apistageContentServeResult{
+					PostJQValue: postJQ,
+					PostJQHit:   true,
+					Served:      true,
+					OK:          true,
+					Memo:        peekMemo,
+					CohortKey:   peekCohort,
+					JQID:        peekJQID,
+					StageID:     stageID,
+					GVR:         gvr,
+				}
+			}
+		}
+	}
+
 	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
 	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
 	// takes gateContentEnvelope's RawJSON path. Ship 0.30.128 P-CORE-2:
@@ -498,19 +614,55 @@ func apistageContentServe(
 	// store is lazily attached to entryRef; the memo lives for the
 	// entry's lifetime (LRU-evicted from the content cache together
 	// with the entry).
+	//
+	// Phase B / 0.30.185 — gateListItemsWithMemoEx additionally returns
+	// the matched *cohortGateMemo + cohort key so the caller can plumb
+	// the post-jq sub-cache. When the memo flow doesn't apply
+	// (!haveParsed), memo/cohort are zero and the post-jq cache is
+	// bypassed.
 	var gated any
 	var gateOK bool
+	var memo *cohortGateMemo
+	var cohortKey string
 	if haveParsed {
 		memoStore := cache.CohortGateMemoStoreLoadOrInit(entryRef)
-		gated, gateOK = gateListItemsWithMemo(ctx, memoStore, gvr, parsed)
+		gated, gateOK, memo, cohortKey = gateListItemsWithMemoEx(ctx, memoStore, gvr, parsed)
 	} else {
 		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope)
 	}
 	if !gateOK {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
-		return nil, false, true
+		return apistageContentServeResult{OK: true}
 	}
-	return gated, true, true
+
+	// Phase B / 0.30.185 — post-jq LAZY POPULATE eligibility. The HIT
+	// case was already handled by the peek-and-short-circuit above; we
+	// only reach here on a miss (no memo / stale memo / !permitAll /
+	// no postJQ entry). If the populated memo is permitAll AND the
+	// filter is set AND no slice is active, return the metadata so the
+	// caller installs a capturePostJQ hook that writes the cache after
+	// gojq runs.
+	jqID, jqIDOK := JQIDFromFilter(filter)
+	eligible := memo != nil && memo.permitAll && jqIDOK && !sliceActive && stageID != ""
+	if eligible {
+		return apistageContentServeResult{
+			Value:     gated,
+			Served:    true,
+			OK:        true,
+			Memo:      memo,
+			CohortKey: cohortKey,
+			JQID:      jqID,
+			StageID:   stageID,
+			GVR:       gvr,
+		}
+	}
+
+	// Ineligible for post-jq cache — canonical Ship A.2 / 0.30.178 path.
+	return apistageContentServeResult{
+		Value:  gated,
+		Served: true,
+		OK:     true,
+	}
 }
 
 // ptrTo returns a pointer to v — a local generic helper so the content

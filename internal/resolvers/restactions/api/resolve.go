@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -214,6 +215,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			"offset":  (opts.Page - 1) * opts.PerPage,
 		}
 	}
+	// Phase B / 0.30.185 — capture once outside the worker. The cohort
+	// postJQ cache cannot serve requests where dict["slice"] is set,
+	// since jsonHandlerCore's jq input includes the slice subkey and
+	// the cached post-jq bytes were computed without it. The worker
+	// reads this flag before calling apistageContentServe.
+	_, sliceActive := dict["slice"]
 
 	log.Info("base dict for api resolver", slog.Any("dict", dict))
 
@@ -616,30 +623,98 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// to the 0.30.118 pivot path.
 				if resolverUseInformer() == "true" {
 					if apistageEnabled {
-						if gatedVal, served, ok := apistageContentServe(gctx, apistageStore, call); ok {
-							if served {
-								// Ship 0.30.128 P-CORE-2: the gated envelope
-								// is already a decoded structured value —
-								// feed it direct (no marshal, no unmarshal).
-								if err := feedValue(gatedVal); err != nil {
-									return err
+						r := apistageContentServe(gctx, apistageStore, call, apiCall.Filter, id, sliceActive)
+						if r.OK {
+							if r.Served {
+								// Phase B / 0.30.185 — dispatch label captures
+								// the served sub-path for the structured log;
+								// the depthForLog + Info log are emitted ONCE
+								// at the end of the served block (AC-6: every
+								// resolve.go depthForLog call site must be
+								// the canonical mapDepth gate).
+								dispatchLabel := "apistage-content"
+								switch {
+								case r.PostJQHit:
+									// Post-jq cache HIT — cached bytes were
+									// json.Unmarshal'd into a fresh isolated
+									// value tree by apistageContentServe;
+									// feed it through the post-filter merge
+									// path (skips gojq + listEnvelopeValue +
+									// CopyJSONMap).
+									if err := feedPostJQValue(r.PostJQValue, &dictMu, dict, id); err != nil {
+										return err
+									}
+									dispatchLabel = "apistage-content-postjq-hit"
+								case r.Memo != nil && r.JQID != 0 && r.StageID != "":
+									// Eligible for lazy populate (permitAll
+									// cohort + filter set + no slice + jqID
+									// computable). Install a capturePostJQ
+									// hook so the post-jq value is
+									// marshalled + stored after gojq runs.
+									// The hook is per-call; rebuild the
+									// closures against an hOpts copy.
+									localOpts := hOpts
+									captureCtx := gctx
+									captureMemo := r.Memo
+									captureCohort := r.CohortKey
+									captureJQID := r.JQID
+									captureStageID := r.StageID
+									captureGVR := r.GVR
+									localOpts.capturePostJQ = func(v any) {
+										// json.Marshal of gojq's result
+										// types (nil/bool/number/string/
+										// []any/map[string]any) does not
+										// fail in practice; if it does,
+										// log and skip the cache write.
+										raw, merr := json.Marshal(v)
+										if merr != nil {
+											xcontext.Logger(captureCtx).Warn("apistage.postjq_marshal_failed",
+												slog.String("subsystem", "cache"),
+												slog.String("gvr", captureGVR.String()),
+												slog.String("cohort", captureCohort),
+												slog.String("stage_id", captureStageID),
+												slog.Uint64("jq_id", captureJQID),
+												slog.Any("err", merr),
+											)
+											return
+										}
+										storeCohortPostJQ(captureCtx, captureMemo, captureGVR,
+											captureCohort, captureStageID, captureJQID, raw)
+									}
+									localInnerValueFn := jsonHandlerValue(captureCtx, localOpts)
+									localFeed := func(v any) error {
+										dictMu.Lock()
+										defer dictMu.Unlock()
+										return localInnerValueFn(v)
+									}
+									if err := localFeed(r.Value); err != nil {
+										return err
+									}
+									dispatchLabel = "apistage-content-postjq-populate"
+								default:
+									// Ship 0.30.128 P-CORE-2: the gated
+									// envelope is already a decoded value —
+									// feed direct (canonical path, no
+									// post-jq cache).
+									if err := feedValue(r.Value); err != nil {
+										return err
+									}
 								}
-								// Ship #6 — see depthForLog (support.go).
 								depth := depthForLog(ctx, log, &dictMu, dict)
 								log.Info("api successfully resolved",
 									slog.String("name", id),
 									slog.String("host", call.Endpoint.ServerURL),
 									slog.String("path", call.Path),
 									slog.Int("depth", depth),
-									slog.String("dispatch", "apistage-content"),
+									slog.String("dispatch", dispatchLabel),
 								)
 								return nil
 							}
-							// served=false — fail-closed (no identity / GET
+							// Served=false — fail-closed (no identity / GET
 							// denied): fall through to the apiserver branch,
 							// whose per-user token narrows correctly.
 						}
-						// ok=false — the content layer could not serve this
+						// OK=false — the content layer could not serve this
 						// call (not pivot-servable: write verb, external URL,
 						// metadata-only GVR, pre-sync). Fall through.
 					} else if raw, served := dispatchViaInformer(gctx, call); served {

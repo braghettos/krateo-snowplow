@@ -17,6 +17,23 @@ type jsonHandlerOptions struct {
 	key    string
 	out    map[string]any
 	filter *string
+
+	// capturePostJQ, Phase B / 0.30.185, is invoked with the post-jq
+	// result of THIS call right after EvalValue returns and before the
+	// merge into out[key]. Used by the cohort post-jq cache populate
+	// site (apistage_postjq.go via apistageContentServe) to marshal +
+	// store the post-jq value for future hits.
+	//
+	// Fires ONLY on the single-value success branch (where the existing
+	// `tmp = v` happens). Multi-yield, parse/compile/runtime error, and
+	// zero-yield branches do NOT fire — caching errors / undefined
+	// results is incorrect per the PM-ratified ErrMultiYield/empty
+	// policies.
+	//
+	// Nil-safe — when filter is nil OR capturePostJQ is nil, the hook
+	// is a no-op. The default (request path with no apistage permitAll
+	// cohort eligibility) is nil, so this is byte-neutral pre-Phase-B.
+	capturePostJQ func(v any)
 }
 
 // jsonHandler is the HTTP-body-shaped entry point — the form
@@ -116,6 +133,13 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 			// Single value. Current: json.Unmarshal(s) -> tmp. Ship A:
 			// tmp = v directly (the §3.1-3.3 equivalence proof).
 			tmp = v
+			// Phase B / 0.30.185 — fire the post-jq capture hook. Only
+			// the single-yield success branch caches; other branches
+			// (error / empty / multi-yield) follow the PM-ratified
+			// recompute-don't-cache policy.
+			if opts.capturePostJQ != nil {
+				opts.capturePostJQ(tmp)
+			}
 		}
 	}
 
