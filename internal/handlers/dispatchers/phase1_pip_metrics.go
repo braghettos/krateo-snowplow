@@ -18,6 +18,24 @@
 // is gated such that under PREWARM_PIP_ENABLED=false the counters
 // register at zero and never increment — operator sees fresh zeros
 // rather than a missing key.
+//
+// Ship 0.30.187 D1: two additional observability surfaces address the
+// 0.30.186 silent widget-seed-failure mode where a single cohort's
+// widget seed errors (e.g. RBAC denial on a particular widget for the
+// group:devs cohort) were logged but produced no operator-visible
+// signal of WHICH widget broke WHICH cohort.
+//
+//   - snowplow_phase1_widget_seed_failure_total
+//       expvar.Func returning map["cohort|widget_name|gvr"] -> uint64
+//       Bumped at every seedOneWidget error.
+//   - snowplow_phase1_restaction_seed_failure_total
+//       Symmetric counter for restaction failures (same defect class).
+//   - snowplow_phase1_cohort_seed_status
+//       expvar.Func returning map["cohort"] -> "success"|"partial"|"failed"
+//       Set per cohort goroutine: "success" iff every restaction+widget
+//       Put completed; "partial" iff any per-(restaction/widget) error
+//       was recorded; "failed" iff the cohort timed out or errored
+//       fatally before reaching any target.
 
 package dispatchers
 
@@ -51,6 +69,58 @@ var (
 	pipSeedRestactionsByCohort sync.Map
 	pipSeedWidgetsByCohort     sync.Map
 )
+
+// Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
+// "cohort|name|gvr" (widgets) or "cohort|namespace/name" (restactions);
+// value is *atomic.Uint64. The composite key keeps the per-cohort and
+// per-target dimensions independent: an operator inspecting
+// /debug/vars sees the exact widget that broke the exact cohort.
+//
+// Per-cohort seed status. Keyed by cohort label; value is a *atomic.Pointer[string]
+// holding "success", "partial", or "failed". A pointer to an interned
+// string keeps the load/store atomic.
+var (
+	pipWidgetSeedFailureByKey     sync.Map
+	pipRestactionSeedFailureByKey sync.Map
+	pipCohortSeedStatus           sync.Map
+)
+
+// cohort seed status constants. Kept as package-level strings so the
+// expvar Func returns stable values (no per-call allocation).
+const (
+	cohortStatusSuccess = "success"
+	cohortStatusPartial = "partial"
+	cohortStatusFailed  = "failed"
+)
+
+// incFailureCounter bumps the per-(cohort, target) failure counter.
+// Same lazy-allocation shape as incCohortCounter.
+func incFailureCounter(m *sync.Map, compositeKey string) {
+	if v, ok := m.Load(compositeKey); ok {
+		v.(*atomic.Uint64).Add(1)
+		return
+	}
+	fresh := new(atomic.Uint64)
+	actual, loaded := m.LoadOrStore(compositeKey, fresh)
+	if loaded {
+		actual.(*atomic.Uint64).Add(1)
+		return
+	}
+	fresh.Add(1)
+}
+
+// recordCohortSeedStatus writes the per-cohort seed status. Idempotent:
+// "partial" overrides "success" only; "failed" overrides any prior
+// status. The recorder is called from a single goroutine per cohort
+// (the runPIPSeed errgroup task) so no cross-goroutine race exists, but
+// the sync.Map keeps the published view consistent for the expvar
+// reader.
+func recordCohortSeedStatus(cohortLabel, status string) {
+	// Last-write-wins is acceptable here: per cohort there's exactly one
+	// writer (the errgroup goroutine). The architect's intent is that
+	// the FINAL status set by that goroutine is the published status.
+	pipCohortSeedStatus.Store(cohortLabel, status)
+}
 
 // incCohortCounter increments the per-cohort counter for the given
 // label. The counter is lazily allocated on first observation; the
@@ -126,6 +196,36 @@ func registerPIPMetrics() {
 		}))
 		expvar.Publish("snowplow_phase1_enum_powerset_skipped", expvar.Func(func() any {
 			return cache.Phase1EnumPowersetSkippedTotal()
+		}))
+
+		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so
+		// operators see WHICH widget/restaction broke WHICH cohort.
+		// Composite key shape: "cohort|name|gvr" (widgets) /
+		// "cohort|namespace/name" (restactions).
+		expvar.Publish("snowplow_phase1_widget_seed_failure_total", expvar.Func(func() any {
+			out := map[string]uint64{}
+			pipWidgetSeedFailureByKey.Range(func(k, v any) bool {
+				out[k.(string)] = v.(*atomic.Uint64).Load()
+				return true
+			})
+			return out
+		}))
+		expvar.Publish("snowplow_phase1_restaction_seed_failure_total", expvar.Func(func() any {
+			out := map[string]uint64{}
+			pipRestactionSeedFailureByKey.Range(func(k, v any) bool {
+				out[k.(string)] = v.(*atomic.Uint64).Load()
+				return true
+			})
+			return out
+		}))
+		// Per-cohort seed status: "success" | "partial" | "failed".
+		expvar.Publish("snowplow_phase1_cohort_seed_status", expvar.Func(func() any {
+			out := map[string]string{}
+			pipCohortSeedStatus.Range(func(k, v any) bool {
+				out[k.(string)] = v.(string)
+				return true
+			})
+			return out
 		}))
 	})
 }

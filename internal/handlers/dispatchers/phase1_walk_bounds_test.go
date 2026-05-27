@@ -53,8 +53,12 @@ func TestPhase1Walk_MaxDepthTruncation(t *testing.T) {
 	// At depth == phase1MaxWalkDepth+1 the depth gate fires: walk returns
 	// nil immediately, never touching widgets.Resolve. If the cap were
 	// removed walk would call the resolver and fail (no apiserver).
-	// Signature (Ship G, 0.30.16x): walk(ctx, in, gvr, depth, page, perPage).
-	if err := w.walk(context.Background(), widget, schema.GroupVersionResource{}, phase1MaxWalkDepth+1, 5, 5); err != nil {
+	// Signature (Ship 0.30.187 D2): walk(ctx, in, gvr, depth, page,
+	// perPage, keyPerPage, keyPage). The resolution tuple (5, 5) is the
+	// PREWARM_PAGE_LIMIT default; the seed-key tuple (-1, -1) matches
+	// the dispatcher's paginationInfo default — what the depth-gate test
+	// uses is irrelevant since the gate fires before any cell write.
+	if err := w.walk(context.Background(), widget, schema.GroupVersionResource{}, phase1MaxWalkDepth+1, 5, 5, -1, -1); err != nil {
 		t.Fatalf("walk past the depth cap must return nil (truncate), got err: %v", err)
 	}
 
@@ -64,7 +68,7 @@ func TestPhase1Walk_MaxDepthTruncation(t *testing.T) {
 	}
 
 	// A deep nil widget must also be safe (defensive).
-	if err := w.walk(context.Background(), nil, schema.GroupVersionResource{}, phase1MaxWalkDepth+5, 5, 5); err != nil {
+	if err := w.walk(context.Background(), nil, schema.GroupVersionResource{}, phase1MaxWalkDepth+5, 5, 5, -1, -1); err != nil {
 		t.Errorf("walk(nil widget, deep) must return nil, got: %v", err)
 	}
 

@@ -642,7 +642,13 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	// The root has no /call Path of its own, so it resolves under the
 	// bounded PREWARM_PAGE_LIMIT default; each descended child overrides
 	// with its own declared slice when present (Ship 0.30.127).
-	return w.walk(rctx, root, gvr, 0, prewarmPageLimit(), prewarmPageLimit())
+	//
+	// Ship 0.30.187 D2: the seed-key tuple for a root navigation widget
+	// is (-1, -1). The frontend's first request URL for a root widget
+	// carries no slice params so the dispatcher's paginationInfo returns
+	// (-1, -1); the seed Put must use the same tuple. Resolution tuple
+	// stays = prewarmPageLimit() (the 0.30.127 storm guard).
+	return w.walk(rctx, root, gvr, 0, prewarmPageLimit(), prewarmPageLimit(), -1, -1)
 }
 
 // Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,
@@ -704,12 +710,24 @@ type phase1Walker struct {
 // PREWARM_PAGE_LIMIT default; a child whose `/call` Path carries explicit
 // page/perPage overrides it.
 //
+// keyPerPage/keyPage are the dispatcher-lookup KEY tuple (Ship 0.30.187
+// D2). They are DECOUPLED from page/perPage: for a widget reached via a
+// /call Path with no declared slice, page/perPage = prewarmPageLimit()
+// (the 0.30.127 storm guard) but keyPerPage/keyPage = (-1, -1) — what
+// the dispatcher's paginationInfo returns at serve time for a request
+// with no URL slice params. For a widget reached via a /call Path with
+// declared page/perPage the two tuples are equal. The decoupling fixes
+// the 0.30.186 14/17 first-nav-hit defect where the PIP seed Put landed
+// in cell (5, 5) but the serve-time dispatcher looked up (-1, -1).
+//
 // gvr is THIS widget's GroupVersionResource (Ship G, 0.30.16x) — threaded
 // from the root site (passed by resolveNavigationRoot) and from the
 // recursive site (got.GVR from objects.Get at the child fetch). It feeds
 // populateWidgetContentL1's identity-free cache key so the F2 walker's
-// Put MATCHES the serve-time dispatcher's key composition.
-func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, gvr schema.GroupVersionResource, depth int, page, perPage int) error {
+// Put MATCHES the serve-time dispatcher's key composition. The content
+// L1 key uses the KEY tuple symmetrically (same dispatcher-match
+// invariant).
+func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, gvr schema.GroupVersionResource, depth int, page, perPage int, keyPerPage, keyPage int) error {
 	log := slog.Default()
 	if in == nil {
 		return nil
@@ -734,12 +752,18 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	w.apiRefHarvester.harvestApiRef(in)
 
 	// Ship PIP (0.30.173) Step 7.6a — harvest this navigation widget CR
-	// together with the GVR + pagination tuple it resolved under so the
-	// per-cohort seed loop (runPIPSeed) can Put a widgets top-level L1
-	// entry per cohort × widget. Sibling of apiRefHarvester; rides the
-	// EXISTING walk, no second traversal. nil-safe — flag-off is a
+	// together with the GVR + pagination tuples it was reached under so
+	// the per-cohort seed loop (runPIPSeed) can Put a widgets top-level
+	// L1 entry per cohort × widget. Sibling of apiRefHarvester; rides
+	// the EXISTING walk, no second traversal. nil-safe — flag-off is a
 	// clean no-op.
-	w.navWidgetHarvester.harvestNavWidget(in, gvr, perPage, page)
+	//
+	// Ship 0.30.187 D2: TWO tuples are passed — the RESOLUTION tuple
+	// (perPage, page) is the bounded prewarm pagination used by
+	// widgets.Resolve; the KEY tuple (keyPerPage, keyPage) is the
+	// dispatcher-lookup tuple the seed Put uses so the cell matches
+	// serve-time.
+	w.navWidgetHarvester.harvestNavWidget(in, gvr, perPage, page, keyPerPage, keyPage)
 
 	// Ship G defect-fix (AC-G.5): install the widgetContent L1 key on the
 	// ctx BEFORE widgets.Resolve. The resolver's inner-call dep recording
@@ -752,8 +776,13 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// exactly: cacheKey computed BEFORE Resolve, ctx decorated with
 	// WithL1KeyContext, then Resolve called. The key MUST match the key
 	// populateWidgetContentL1 Puts under — both call widgetContentL1Key
-	// with the SAME (gvr, ns, name, perPage, page) tuple.
-	wcKey, _ := widgetContentL1Key(gvr, in.GetNamespace(), in.GetName(), perPage, page)
+	// with the SAME tuple.
+	//
+	// Ship 0.30.187 D2: widgetContentL1Key uses the KEY tuple
+	// (keyPerPage, keyPage) — symmetric with the per-user PIP seed —
+	// so the content cell matches the dispatcher's serve-time lookup
+	// (which composes its key from paginationInfo's URL-derived tuple).
+	wcKey, _ := widgetContentL1Key(gvr, in.GetNamespace(), in.GetName(), keyPerPage, keyPage)
 	resolveCtx := ctx
 	if wcKey != "" {
 		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
@@ -811,7 +840,11 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// extras; extras-bearing serve-time requests will MISS the prewarmed
 	// entry and fall through to the existing per-user L1, the correct
 	// degraded posture.
-	populateWidgetContentL1(ctx, gvr, in, perPage, page, res)
+	//
+	// Ship 0.30.187 D2: populateWidgetContentL1 uses the KEY tuple — the
+	// content L1 cell must match the dispatcher's serve-time lookup
+	// (which composes its key from paginationInfo's URL-derived tuple).
+	populateWidgetContentL1(ctx, gvr, in, keyPerPage, keyPage, res)
 
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
 	children := extractResourcesRefsItems(res.Object)
@@ -858,6 +891,14 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 			childPage, childPerPage = p, pp
 		}
 
+		// Ship 0.30.187 D2 — derive the dispatcher-lookup KEY tuple from
+		// the child's /call Path. The KEY tuple is what paginationInfo
+		// returns at serve time for a request hitting the same URL:
+		// (-1, -1) for no-slice paths, the declared (perPage, page) for
+		// sliced paths. The resolution tuple stays bounded by
+		// prewarmPageLimit() (above) — the 0.30.127 storm guard.
+		childKeyPerPage, childKeyPage := deriveSeedKeyTuple(child.Path)
+
 		// Fetch the child widget CR under the SA-credentialed ctx. The
 		// resolver mutates the object in place, so a fresh fetch per
 		// child is required.
@@ -877,13 +918,15 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// Recurse into the child widget subtree. childPage/childPerPage
 		// are the pagination the child resolves under — its declared
 		// `slice` from the `/call` Path, or the PREWARM_PAGE_LIMIT default
-		// (Ship 0.30.127).
+		// (Ship 0.30.127). childKeyPerPage/childKeyPage are the
+		// dispatcher-lookup KEY tuple — decoupled from the resolution
+		// tuple per Ship 0.30.187 D2 so the seed cell matches serve-time.
 		//
 		// Ship G (0.30.16x): got.GVR is the child widget's GVR — threaded
 		// from objects.Get's return shape (internal/objects/get.go:22-26)
 		// so populateWidgetContentL1 down the recursion has the GVR the
 		// serve-time dispatcher will compose its key under.
-		_ = w.walk(ctx, got.Unstructured, got.GVR, depth+1, childPage, childPerPage)
+		_ = w.walk(ctx, got.Unstructured, got.GVR, depth+1, childPage, childPerPage, childKeyPerPage, childKeyPage)
 	}
 	return nil
 }

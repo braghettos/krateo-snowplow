@@ -84,6 +84,7 @@ import (
 	"github.com/krateoplatformops/snowplow/apis"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
@@ -156,11 +157,29 @@ func pipCohortCap() int {
 // Phase-1 walk together with the GVR + pagination tuple it resolved
 // under. The seed loop re-resolves the SAME CR per cohort under per-
 // cohort identity and Puts the per-user widgets L1 entry.
+//
+// Ship 0.30.187 D2: the RESOLUTION tuple (PerPage, Page — passed to
+// widgets.Resolve) is DECOUPLED from the dispatcher-lookup KEY tuple
+// (KeyPerPage, KeyPage — passed to dispatchCacheLookupKey). Pre-0.30.187
+// both used the walker's prewarmPageLimit() default for no-slice
+// widgets, but the dispatcher's serve-time paginationInfo defaults to
+// (-1, -1) when the request URL carries no ?page/?perPage params —
+// seed→serve cells thus missed on every no-slice widget. The seed-key
+// tuple is now derived via deriveSeedKeyTuple from the /call Path the
+// walker reached the widget through; the resolution tuple stays
+// bounded by prewarmPageLimit() as the 0.30.127 storm guard.
 type navWidgetEntry struct {
 	W       *unstructured.Unstructured
 	GVR     schema.GroupVersionResource
-	PerPage int
-	Page    int
+	PerPage int // resolution tuple — passed to widgets.Resolve
+	Page    int // resolution tuple — passed to widgets.Resolve
+
+	// Ship 0.30.187 D2 — dispatcher-lookup KEY tuple. Set to (-1, -1)
+	// for widgets reached via a /call Path with no slice declared (the
+	// dispatcher's paginationInfo default), or to the declared (page,
+	// perPage) when the Path carries them. See deriveSeedKeyTuple.
+	KeyPerPage int
+	KeyPage    int
 }
 
 // navWidgetHarvester accumulates the deduplicated navigation widget
@@ -186,21 +205,36 @@ func newNavWidgetHarvester() *navWidgetHarvester {
 }
 
 // harvestNavWidget records a navigation widget CR plus the GVR +
-// pagination it resolved under. Nil-safe: a nil harvester / nil widget
-// is a no-op (flag-off Phase 1 passes no harvester). Deduplicated by
-// the canonical (gvr, ns, name, perPage, page) tuple.
-func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr schema.GroupVersionResource, perPage, page int) {
+// pagination tuples it was reached under. Nil-safe: a nil harvester /
+// nil widget is a no-op (flag-off Phase 1 passes no harvester).
+//
+// Ship 0.30.187 D2: TWO pagination tuples are now passed.
+//   - resolvePerPage/resolvePage: what the walker passes to
+//     widgets.Resolve (bounded by prewarmPageLimit() for no-slice
+//     widgets — the 0.30.127 storm guard).
+//   - keyPerPage/keyPage: what the per-cohort seed loop passes to
+//     dispatchCacheLookupKey — derived from the /call Path the walker
+//     reached the widget through so the cell matches the dispatcher's
+//     serve-time lookup. See deriveSeedKeyTuple.
+//
+// Dedupe is over (gvr, ns, name, keyPerPage, keyPage) — the dispatcher-
+// key tuple — because that is the cell the seed populates. Two
+// different roots reaching the same widget via the same key tuple yield
+// one Put (idempotent — the resolver output is per-cohort identical for
+// a given key tuple).
+func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr schema.GroupVersionResource,
+	resolvePerPage, resolvePage, keyPerPage, keyPage int) {
 	if h == nil || w == nil {
 		return
 	}
-	key := navWidgetHarvestKey(gvr, w.GetNamespace(), w.GetName(), perPage, page)
+	key := navWidgetHarvestKey(gvr, w.GetNamespace(), w.GetName(), keyPerPage, keyPage)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, seen := h.entries[key]; seen {
 		// First-write-wins. The dedupe is intentional: the walk's
 		// visited-set in phase1Walker.walk already prevents re-traversal,
 		// so a second harvest for the same key only happens across roots
-		// (idempotent — same CR + same pagination yields identical Put).
+		// (idempotent — same CR + same key tuple yields identical Put).
 		return
 	}
 	// Deep-copy the CR so a downstream resolver mutation does not race
@@ -211,11 +245,45 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 	// a single *unstructured. The DeepCopy is bounded by the widget CR
 	// size (small) and runs once per distinct widget.
 	h.entries[key] = navWidgetEntry{
-		W:       w.DeepCopy(),
-		GVR:     gvr,
-		PerPage: perPage,
-		Page:    page,
+		W:          w.DeepCopy(),
+		GVR:        gvr,
+		PerPage:    resolvePerPage,
+		Page:       resolvePage,
+		KeyPerPage: keyPerPage,
+		KeyPage:    keyPage,
 	}
+}
+
+// deriveSeedKeyTuple computes the dispatcher-lookup key tuple
+// (perPage, page) the per-cohort seed Put MUST use for a widget the
+// walker reached via the given /call Path. Ship 0.30.187 D2.
+//
+// CONTRACT: the returned tuple MUST equal what the dispatcher's
+// paginationInfo (helpers.go:50-76) returns at serve time for a request
+// with that Path's query parameters.
+//
+//   - Empty path (root navigation widget — fetched directly via
+//     objects.Get, no /call Path) → the frontend's first request
+//     URL carries no slice params → paginationInfo returns (-1, -1) →
+//     seed-key tuple = (-1, -1).
+//   - Path with no page/perPage params → ParseCallPathPagination
+//     returns ok=false → paginationInfo returns (-1, -1) →
+//     seed-key tuple = (-1, -1).
+//   - Path with explicit ?page=N&perPage=M → ParseCallPathPagination
+//     returns the declared values → paginationInfo at serve time
+//     returns the same → seed-key tuple = (perPage=M, page=N).
+//
+// The returned order is (perPage, page) — matches the seedOneWidget
+// argument order to dispatchCacheLookupKey.
+func deriveSeedKeyTuple(callPath string) (perPage, page int) {
+	if callPath == "" {
+		return -1, -1
+	}
+	p, pp, ok := util.ParseCallPathPagination(callPath)
+	if !ok {
+		return -1, -1
+	}
+	return pp, p
 }
 
 // navWidgetHarvestKey is the canonical dedup key for harvested
@@ -372,8 +440,24 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 }
 
 // seedCohort seeds one cohort's per-user restactions + widgets L1
-// entries. Per-cohort timeout + per-cohort error containment: an error
-// returned here aborts the errgroup and FAIL-CLOSES Phase 1.
+// entries. Per-cohort timeout + per-cohort error containment.
+//
+// Ship 0.30.187 D1: per-target errors are NON-FATAL — they bump the
+// per-(cohort, target) failure counter (visible at /debug/vars) and
+// mark the cohort status as "partial", but the loop continues so the
+// remaining seed targets land. The cohort's final status (success /
+// partial / failed) is published via recordCohortSeedStatus. A
+// timeout / outer-ctx cancel still returns an error (the cohort status
+// is "failed") so the caller can surface that mode separately.
+//
+// RATIONALE for non-fatal per-target errors: pre-0.30.187 the FIRST
+// widget-seed error for a cohort returned immediately. cyberjoker is in
+// group:devs; that cohort's restactions seeded but widgets seed
+// errored on widget #1 (likely RBAC denial on a narrow nav widget),
+// and seedCohort returned after the first widget so the remaining 16
+// widgets of group:devs were never seeded — the 14/17 first-nav cold
+// miss on the 0.30.186 cyberjoker run. With per-target containment a
+// single bad widget broke ONE cell, not 16.
 func seedCohort(ctx context.Context, cohort cache.Cohort,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
@@ -402,6 +486,11 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 	// bindings.
 	cohortCtx := withCohortSeedContext(cctx, cohort, saEP, saRC)
 
+	// Track whether ANY per-target Put errored — if so the cohort
+	// status is "partial"; if not it's "success". A timeout / ctx
+	// cancel below sets "failed" and short-circuits.
+	hadFailure := false
+
 	// Restactions seed loop — drain the harvester, one Put per
 	// (cohort, restaction).
 	for _, ref := range restactionRefs {
@@ -413,17 +502,27 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 				slog.Any("err", err),
 				slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 			)
+			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
 			return fmt.Errorf("cohort %q restactions seed: %w", cohortLabel, err)
 		}
 		if err := seedOneRestaction(cohortCtx, ref, authnNS); err != nil {
-			log.Error("phase1.seed.cohort.error",
+			// Ship 0.30.187 D1: per-target containment. Bump the
+			// per-(cohort, target) failure counter and continue with
+			// the next restaction so a single bad target does not
+			// abort the cohort.
+			hadFailure = true
+			incFailureCounter(&pipRestactionSeedFailureByKey,
+				cohortLabel+"|"+ref.Namespace+"/"+ref.Name)
+			log.Warn("phase1.seed.cohort.target_skipped",
 				slog.String("subsystem", "cache"),
 				slog.String("cohort", cohortLabel),
 				slog.String("phase", "restactions"),
 				slog.String("restaction", ref.Namespace+"/"+ref.Name),
 				slog.Any("err", err),
+				slog.String("effect", "this target skipped; cohort continues — see "+
+					"snowplow_phase1_restaction_seed_failure_total at /debug/vars"),
 			)
-			return fmt.Errorf("cohort %q restactions %s/%s: %w", cohortLabel, ref.Namespace, ref.Name, err)
+			continue
 		}
 		pipSeedRestactionsTotal.Add(1)
 		incCohortCounter(&pipSeedRestactionsByCohort, cohortLabel)
@@ -440,25 +539,43 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 				slog.Any("err", err),
 				slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 			)
+			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
 			return fmt.Errorf("cohort %q widgets seed: %w", cohortLabel, err)
 		}
 		if err := seedOneWidget(cohortCtx, e, authnNS); err != nil {
-			log.Error("phase1.seed.cohort.error",
+			// Ship 0.30.187 D1: per-target containment for widget
+			// seeds — see the restactions block above. Composite key:
+			// "cohort|widget_name|gvr".
+			hadFailure = true
+			incFailureCounter(&pipWidgetSeedFailureByKey,
+				cohortLabel+"|"+e.W.GetNamespace()+"/"+e.W.GetName()+"|"+e.GVR.String())
+			log.Warn("phase1.seed.cohort.target_skipped",
 				slog.String("subsystem", "cache"),
 				slog.String("cohort", cohortLabel),
 				slog.String("phase", "widgets"),
 				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+				slog.String("gvr", e.GVR.String()),
 				slog.Any("err", err),
+				slog.String("effect", "this widget skipped for this cohort; loop continues — "+
+					"see snowplow_phase1_widget_seed_failure_total at /debug/vars"),
 			)
-			return fmt.Errorf("cohort %q widget %s/%s: %w", cohortLabel, e.W.GetNamespace(), e.W.GetName(), err)
+			continue
 		}
 		pipSeedWidgetsTotal.Add(1)
 		incCohortCounter(&pipSeedWidgetsByCohort, cohortLabel)
 	}
 
+	// Publish the cohort's final status.
+	if hadFailure {
+		recordCohortSeedStatus(cohortLabel, cohortStatusPartial)
+	} else {
+		recordCohortSeedStatus(cohortLabel, cohortStatusSuccess)
+	}
+
 	log.Info("phase1.seed.cohort.complete",
 		slog.String("subsystem", "cache"),
 		slog.String("cohort", cohortLabel),
+		slog.Bool("had_per_target_failure", hadFailure),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 	return nil
@@ -585,12 +702,21 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 // dispatcher's canonical key. STRUCTURALLY MATCHES widgets.go:148-231:
 //
 //   - dispatchCacheLookupKey("widgets", group, version, resource, ns,
-//     name, perPage, page, nil) with the SAME perPage+page tuple the
-//     walker resolved the widget under (so cohort A's first /call with
-//     the same pagination hits the SAME cell — HG-PIP.3).
+//     name, KeyPerPage, KeyPage, nil) with the DISPATCHER-LOOKUP key
+//     tuple (Ship 0.30.187 D2 decoupling) so cohort A's first /call with
+//     no URL slice params hits the SAME cell as the seed Put. Pre-D2
+//     this used the RESOLUTION tuple (prewarmPageLimit()) which never
+//     matched the dispatcher's paginationInfo default of (-1, -1) and
+//     caused the 0.30.186 14/17 first-nav-hit defect.
 //   - cache.WithL1KeyContext(ctx, key) before Resolve so the inner-call
 //     dep tracker records edges.
-//   - widgets.Resolve at widgets.go:187-193 (same entrypoint).
+//   - widgets.Resolve at widgets.go:187-193 (same entrypoint). The
+//     RESOLUTION tuple (e.PerPage, e.Page) stays bounded by
+//     prewarmPageLimit() — the 0.30.127 storm guard. For no-slice
+//     navigation widgets the resolved output is structurally invariant
+//     under pagination (no row fan-out at the top widget level — row
+//     data flows from declared-slice child resourcesRefs which carry
+//     their own URL-matching pagination).
 //   - encodeResolvedJSON + cacheHandle.Put + recordWidgetDeps —
 //     matches widgets.go:215-231 (recordWidgetDeps calls
 //     ensureWatcherInformerForGVR for the widget GVR + apiRef GVR +
@@ -600,10 +726,16 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		return nil
 	}
 
+	// Ship 0.30.187 D2: the dispatcher-lookup key uses the KEY tuple
+	// (KeyPerPage, KeyPage) — derived from the /call Path the walker
+	// reached this widget through so the cell matches the dispatcher's
+	// serve-time paginationInfo. The resolution tuple (e.PerPage,
+	// e.Page) is still used for widgets.Resolve below (the 0.30.127
+	// storm guard).
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.PerPage, e.Page, nil)
+		e.KeyPerPage, e.KeyPage, nil)
 	if handle == nil || key == "" {
 		// L1 disabled or no identity — same defensive skip as
 		// seedOneRestaction.
