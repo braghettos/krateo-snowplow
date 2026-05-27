@@ -27,68 +27,44 @@
 package dispatchers
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/krateoplatformops/plumbing/endpoints"
+	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 )
 
-// TestComputeCohortTimeout is the Ship 0.30.190 Fix A falsifier. It
-// pins the proportional per-cohort timeout contract that replaced the
-// fixed pipCohortTimeout=120s ceiling.
+// TestPipCohortTimeout_RestoredToFixed120s is the Ship 0.30.191 SCOPE
+// CORRECTION falsifier. It pins the contract that the per-cohort
+// timeout is the FIXED 120s value (0.30.179 baseline) — the 0.30.190
+// proportional-timeout model (computeCohortTimeout) has been reverted
+// because the underlying premise (a measured "1.5s/widget × 132
+// widgets = 198s" projection) was an INFERENCE from a file header
+// comment, not an empirical measurement. Per
+// feedback_data_driven_workflow + feedback_empirical_root_cause_trace_
+// before_fix the 0.30.191 ship instruments the abort cause FIRST;
+// any future timeout change must follow from that measurement.
 //
-// Pre-0.30.190 defect: a 132-widget sentinel cohort needed ~198s
-// (132 × 1.5s empirical per-target) but the fixed 120s ceiling
-// DeadlineExceeded'd before any per-target error path could run,
-// flipping cohort status to "failed" while widget_seed_failure_total
-// stayed empty.
-//
-// A regression that reverts to a fixed ceiling fails this test —
-// the sentinel row expects ~218s, well above any conceivable fixed
-// constant a regression would re-introduce.
-func TestComputeCohortTimeout(t *testing.T) {
-	cases := []struct {
-		name        string
-		restactions int
-		widgets     int
-		wantSec     int
-	}{
-		// Empty / floor: base seconds, no per-target add.
-		{"empty cohort", 0, 0, pipCohortBaseSec},
-		// Normal admin cohort (~22 widgets): 20 + 23*1.5 = 54s.
-		{"normal admin 22 widgets", 1, 22, pipCohortBaseSec + 23*pipCohortPerTargetMs/1000},
-		// Sentinel cohort (~132 widgets): 20 + 133*1.5 = 219s — well
-		// above the pre-0.30.190 120s ceiling that triggered the
-		// 0.30.189 DeadlineExceeded.
-		{"sentinel 132 widgets", 1, 132, pipCohortBaseSec + 133*pipCohortPerTargetMs/1000},
-		// Oversized cohort hits the absolute cap (10 min).
-		{"oversized hits cap", 100, 500, pipCohortMaxSec},
+// A regression that re-adds the proportional model would either
+// re-introduce computeCohortTimeout (caught by compile-error in this
+// package — the symbol no longer exists) or change the constant value
+// (caught by this test).
+func TestPipCohortTimeout_RestoredToFixed120s(t *testing.T) {
+	if pipCohortTimeout != 120*time.Second {
+		t.Fatalf("Ship 0.30.191 invariant violated: pipCohortTimeout = %v; want 120s — "+
+			"the 0.30.190 proportional-timeout model was reverted per the SCOPE "+
+			"CORRECTION; instrument the abort cause first, then change the timeout "+
+			"if-and-only-if the data says so", pipCohortTimeout)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := computeCohortTimeout(tc.restactions, tc.widgets)
-			want := time.Duration(tc.wantSec) * time.Second
-			if got != want {
-				t.Errorf("computeCohortTimeout(%d, %d) = %v; want %v",
-					tc.restactions, tc.widgets, got, want)
-			}
-		})
-	}
-}
-
-// TestComputeCohortTimeout_SentinelExceedsLegacy222 documents the
-// Ship 0.30.190 Fix A invariant directly: the sentinel cohort
-// (~132 widgets) MUST get a budget strictly greater than the
-// pre-0.30.190 fixed ceiling of 120s. A regression that quietly
-// re-shrinks the per-target factor below the empirical 1.5s/target
-// is caught here.
-func TestComputeCohortTimeout_SentinelExceedsLegacy120s(t *testing.T) {
-	got := computeCohortTimeout(1, 132)
-	legacy := 120 * time.Second
-	if got <= legacy {
-		t.Fatalf("Ship 0.30.190 invariant violated: sentinel cohort "+
-			"(132 widgets) timeout=%v ≤ legacy 120s ceiling — the "+
-			"proportional model must give an oversized cohort a "+
-			"budget strictly greater than the pre-0.30.190 fixed "+
-			"ceiling that caused the 0.30.189 DeadlineExceeded", got)
+	if pipGlobalTimeout != 8*time.Minute {
+		t.Fatalf("Ship 0.30.191 invariant violated: pipGlobalTimeout = %v; want 8m — "+
+			"reverted in lockstep with pipCohortTimeout", pipGlobalTimeout)
 	}
 }
 
@@ -150,5 +126,127 @@ func TestPhase1PIPSeedKey_RootWidgetUsesDispatcherDefaultTuple(t *testing.T) {
 			"/call Path and the dispatcher's first request for it carries "+
 			"no slice params, so paginationInfo returns (-1, -1)",
 			keyPerPage, keyPage)
+	}
+}
+
+// TestSeedCohort_CtxCancelEmitsAbortLog is the Ship 0.30.191 Fix C
+// falsifier. It pins the contract that when seedCohort's per-cohort
+// context is already cancelled at loop entry, the deferred reporter
+// emits a single greppable `phase1.cohort.abort` log line carrying
+// the abort cause + phase + processed counts + elapsed_ms +
+// cohort_timeout_ms — the load-bearing fields the post-deploy
+// validation grep relies on.
+//
+// A regression that removes the deferred reporter (or fails to thread
+// the local counters into the loop) fails this test.
+//
+// SCOPE: this test drives the cancelled-ctx + restactions-phase path
+// (1 restaction ref, 0 widgets, parent ctx pre-cancelled). seedCohort
+// hits cctx.Err() != nil on the first loop iteration, sets
+// abortCause="ctx_err" + abortPhase="restactions", records cohort
+// status "failed", and returns. The deferred reporter then emits the
+// `phase1.cohort.abort` log line.
+func TestSeedCohort_CtxCancelEmitsAbortLog(t *testing.T) {
+	var buf bytes.Buffer
+	h := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
+	prevDefault := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+
+	// Pre-cancelled parent ctx — seedCohort's cctx, derived via
+	// context.WithTimeout(ctx, ...), inherits the cancellation
+	// immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// 1 restaction ref — never resolved because the ctx-check at the
+	// top of the loop fires first and returns. The ref's content is
+	// irrelevant; the abort path runs before seedOneRestaction.
+	refs := []templatesv1.ObjectReference{{
+		Reference: templatesv1.Reference{
+			Name:      "test-restaction",
+			Namespace: "test-ns",
+		},
+		APIVersion: "templates.krateo.io/v1",
+		Resource:   "restactions",
+	}}
+
+	cohort := cache.Cohort{
+		Username: "test-cohort",
+	}
+	// Zero-value endpoints + nil REST config — withCohortSeedContext
+	// just installs the fields on the ctx; they are never dereferenced
+	// because seedOneRestaction is never reached.
+	err := seedCohort(ctx, cohort, refs, nil /* widgets */, endpoints.Endpoint{}, nil /* rc */, "test-authn-ns")
+	if err == nil {
+		t.Fatalf("Fix C: seedCohort with pre-cancelled ctx returned nil; want non-nil error so the errgroup sees the cohort failure")
+	}
+
+	// Assert the deferred reporter emitted the phase1.cohort.abort
+	// line with the load-bearing fields the post-deploy grep relies
+	// on.
+	logText := buf.String()
+	if !strings.Contains(logText, "phase1.cohort.abort") {
+		t.Fatalf("Fix C: expected `phase1.cohort.abort` log line; got:\n%s", logText)
+	}
+
+	// Decode the JSON record lines and find the abort line.
+	var found map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logText), "\n") {
+		var rec map[string]any
+		if jerr := json.Unmarshal([]byte(line), &rec); jerr != nil {
+			continue
+		}
+		if msg, _ := rec["msg"].(string); msg == "phase1.cohort.abort" {
+			found = rec
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("Fix C: could not decode phase1.cohort.abort record from:\n%s", logText)
+	}
+
+	// Pin every load-bearing field.
+	mustString := func(k, want string) {
+		t.Helper()
+		got, _ := found[k].(string)
+		if got != want {
+			t.Errorf("Fix C: log field %q = %q; want %q (full record: %+v)", k, got, want, found)
+		}
+	}
+	mustString("cohort", "test-cohort")
+	mustString("phase", "restactions")
+	mustString("abort_cause", "ctx_err")
+	// ctx_err carries the underlying cancellation reason — non-empty
+	// is the contract; the exact string ("context canceled") is set by
+	// the stdlib.
+	if s, _ := found["ctx_err"].(string); s == "" {
+		t.Errorf("Fix C: log field ctx_err is empty; want non-empty cancellation reason")
+	}
+
+	// Numeric fields are decoded as float64 by encoding/json.
+	mustNum := func(k string, want float64) {
+		t.Helper()
+		got, _ := found[k].(float64)
+		if got != want {
+			t.Errorf("Fix C: log field %q = %v; want %v (full record: %+v)", k, got, want, found)
+		}
+	}
+	mustNum("restactions_total", 1)
+	mustNum("widgets_total", 0)
+	mustNum("restactions_processed", 0)
+	mustNum("widgets_processed", 0)
+	mustNum("cohort_timeout_ms", float64(pipCohortTimeout.Milliseconds()))
+
+	// elapsed_ms must be present and non-negative.
+	if _, ok := found["elapsed_ms"]; !ok {
+		t.Errorf("Fix C: log field elapsed_ms missing (full record: %+v)", found)
+	}
+
+	// Also verify the cohort was marked failed.
+	if v, ok := pipCohortSeedStatus.Load("test-cohort"); !ok {
+		t.Errorf("Fix C: cohort status not recorded; want %q", cohortStatusFailed)
+	} else if status, _ := v.(string); status != cohortStatusFailed {
+		t.Errorf("Fix C: cohort status = %q; want %q", status, cohortStatusFailed)
 	}
 }

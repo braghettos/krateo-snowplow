@@ -41,16 +41,18 @@
 // per cohort is N_restactions×envelope_bytes + N_widgets×envelope_bytes
 // — same OOM profile as the F2 content pass per cohort.
 //
-// PER-COHORT TIMEOUT — proportional to target count (Ship 0.30.190).
-// computeCohortTimeout returns pipCohortBaseSec + targets*1.5s, capped
-// at pipCohortMaxSec (10 min). Set via context.WithTimeout inside the
-// per-cohort closure. A stuck cohort thus cannot wedge Phase 1 past
-// Step 7.6's 15 min global budget; the timeout firing returns
-// ctx.Err() up the errgroup which propagates as the cohort's
-// seed-failure (FAIL-CLOSED). Pre-0.30.190: fixed 120s ceiling
-// DeadlineExceeded'd the 132-widget sentinel cohort before any
-// per-target error path ran; the proportional model gives an oversized
-// cohort a budget proportional to its target count.
+// PER-COHORT TIMEOUT (restored 0.30.191 SCOPE CORRECTION). Set via
+// context.WithTimeout inside the per-cohort closure. A stuck cohort
+// thus cannot wedge Phase 1 past Step 7.6's global budget; the timeout
+// firing returns ctx.Err() up the errgroup which propagates as the
+// cohort's seed-failure path. The 0.30.190 proportional-timeout model
+// (computeCohortTimeout) was REVERTED at 0.30.191: it was an INFERENCE
+// from a file header comment ("1.5s/widget × 132 widgets = 198s"), not
+// a measurement. Per feedback_data_driven_workflow +
+// feedback_empirical_root_cause_trace_before_fix we are NOT raising the
+// ceiling until 0.30.191 instrumentation tells us which abort cause
+// actually fires for the 0.30.189 sentinel cohort. The 120s fixed
+// ceiling is the 0.30.179 value.
 //
 // FEEDBACK_CHECK_K8S_CLIENTGO_PRIOR_ART: client-go has no equivalent
 // for per-RBAC-cohort prewarm. RBAC subject enum is a custom snowplow
@@ -118,55 +120,33 @@ const (
 	// without a code change — emergency lever only.
 	envPrewarmPIPCohortCap = "PREWARM_PIP_COHORT_CAP"
 
-	// Per-cohort budget — proportional to the cohort's target count
-	// (restactions + harvested widgets). Ship 0.30.190 replaced the
-	// pre-0.30.190 fixed `pipCohortTimeout = 120 s` ceiling with the
-	// computeCohortTimeout helper below.
+	// pipCohortTimeout is the per-cohort hard ceiling. A stuck cohort
+	// cannot wedge Phase 1 past Step 7.6's global budget.
 	//
-	// WHY proportional. Ship 0.30.179 raised the per-cohort ceiling
-	// 20s -> 120s because binding-set enumeration produces more classes
-	// than the prior canonical-cohort dedupe and each class's
-	// restactions seed walks per-namespace LIST calls. The fixed 120s
-	// ceiling held for ~22-widget cohorts but DeadlineExceeded'd the
-	// 0.30.189 sentinel cohort (system:cohort:group-only:v1) at
-	// ~132 widgets — 132 × ~1.5s empirical per-target ≈ 198s, exceeding
-	// the 120s ceiling. The whole-cohort timeout fires BEFORE any
-	// per-target error path runs, so widget_seed_failure_total stayed
-	// empty while cohort status flipped to "failed".
+	// Ship A.3 / 0.30.179 — raised 20s -> 120s. Binding-set enumeration
+	// produces more classes than the prior canonical-cohort dedupe, and
+	// each class's restactions seed walks per-namespace LIST calls (a
+	// compositions-list RESTAction emits one K8s call per namespace via
+	// the namespace iterator). A 50-namespace cluster needs ~30s per
+	// cohort to seed cleanly; 120s adds ~4x headroom.
 	//
-	// THE FIX is uniform across all cohorts (feedback_no_special_cases):
-	//   secs = pipCohortBaseSec + targets * pipCohortPerTargetMs / 1000
-	//   secs = min(secs, pipCohortMaxSec)
-	// A 22-widget cohort gets ~54s; a 132-widget cohort gets ~218s; both
-	// follow the same rule. pipCohortMaxSec is a hard 10-minute absolute
-	// cap so an absurd cohort can never wedge Phase 1 indefinitely.
-	pipCohortBaseSec     = 20   // floor for small/empty cohorts
-	pipCohortPerTargetMs = 1500 // empirical per-(resolve+Put) cost
-	pipCohortMaxSec      = 600  // 10-minute absolute cap
+	// Ship 0.30.191 SCOPE CORRECTION restored this fixed value from the
+	// 0.30.190 proportional-timeout model (computeCohortTimeout). The
+	// 0.30.190 raise was an INFERENCE from a file header comment, not a
+	// measurement of the actual 0.30.189 sentinel-cohort abort cause —
+	// 0.30.191 ships the instrumentation that will tell us empirically
+	// which abort cause fires before any further timeout change.
+	pipCohortTimeout = 120 * time.Second
 
-	// pipGlobalTimeout is the absolute Step 7.6 budget. Ship 0.30.190
-	// raised 8 min -> 15 min in lockstep with the per-cohort proportional
-	// model — under GOMAXPROCS errgroup parallelism the empirical
-	// wall-clock stays well inside 15 min even at 50 cohorts × max cap.
-	pipGlobalTimeout = 15 * time.Minute
+	// pipGlobalTimeout is the absolute Step 7.6 budget. Designed to fit
+	// the architect's pod-start→phase1Done projection (baseline + seed
+	// ceiling). Ship A.3 / 0.30.179 — raised 40s -> 8 minutes per the
+	// PM gate's "baseline + 8 min seed ceiling" target. The per-cohort
+	// timeout × cohort cap caps the total at 50 × 120 s = 6000 s but the
+	// parallelism + harvest dedup keep the empirical wall-clock well
+	// inside 8 min.
+	pipGlobalTimeout = 8 * time.Minute
 )
-
-// computeCohortTimeout returns a per-cohort wall-clock budget that
-// scales with the number of targets (restactions + widgets) in the
-// cohort. Replaces the fixed 120s ceiling at Ship 0.30.190.
-//
-// Uniform across all cohorts — no special cases (feedback_no_special_cases).
-// Pure function (no shared state); safe to call from the cohort
-// errgroup goroutines (no feedback_shared_vs_copy_is_a_concurrency_change
-// implication).
-func computeCohortTimeout(restactionCount, widgetCount int) time.Duration {
-	targets := restactionCount + widgetCount
-	secs := pipCohortBaseSec + (targets * pipCohortPerTargetMs / 1000)
-	if secs > pipCohortMaxSec {
-		secs = pipCohortMaxSec
-	}
-	return time.Duration(secs) * time.Second
-}
 
 // PrewarmPIPEnabled reports whether the Ship PIP per-identity prewarm
 // seed is opted in. Defaults FALSE as of 0.30.176 (Phase A.1): the
@@ -492,6 +472,18 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 // widgets of group:devs were never seeded — the 14/17 first-nav cold
 // miss on the 0.30.186 cyberjoker run. With per-target containment a
 // single bad widget broke ONE cell, not 16.
+//
+// Ship 0.30.191 Fix C — abort-cause instrumentation. Every path that
+// flips cohort status to "failed" now also emits a single greppable
+// log line `phase1.cohort.abort` carrying which phase fired the abort
+// (restactions / widgets / panic / pre-flight), the abort cause
+// (ctx_err with the underlying ctx.Err string, panic with the recovered
+// value, etc.), how many targets the cohort had processed by then, the
+// elapsed wall-clock, and the per-cohort timeout in milliseconds. The
+// log line is emitted by a deferred reporter so a panic mid-loop is
+// also captured (a recover() in the same defer prevents the goroutine
+// from crashing the errgroup). All instrumentation fields are uniform
+// across cohorts (feedback_no_special_cases): no per-cohort branching.
 func seedCohort(ctx context.Context, cohort cache.Cohort,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
@@ -500,6 +492,20 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 	cohortLabel := cohortLogLabel(cohort)
 	start := time.Now()
 
+	// Ship 0.30.191 Fix C — local counters threaded through the loops.
+	// Updated INSIDE the for-bodies (goroutine-scoped, no concurrency).
+	// The deferred reporter reads them after the function body exits.
+	var (
+		abortPhase            string // "init" / "restactions" / "widgets" / "panic"
+		abortCause            string // free-form short tag — ctx_err / panic / none
+		ctxErrString          string // ctx.Err().Error() at abort site, or ""
+		processedRestactions  int
+		processedWidgets      int
+		emittedFinalAbortLog  bool
+		recoveredPanic        any
+	)
+	abortPhase = "init"
+
 	log.Info("phase1.seed.cohort.start",
 		slog.String("subsystem", "cache"),
 		slog.String("cohort", cohortLabel),
@@ -507,16 +513,68 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 		slog.Int("widgets", len(widgetEntries)),
 	)
 
-	// Per-cohort hard ceiling — proportional to the cohort's target
-	// count (Ship 0.30.190). A stuck cohort cannot wedge Step 7.6 past
-	// its global budget; an oversized cohort (e.g. the
-	// system:cohort:group-only:v1 sentinel introduced in 0.30.189 with
-	// ~6× the widget load of a normal cohort) still gets a budget
-	// proportional to its target count rather than the prior fixed 120s
-	// ceiling that DeadlineExceeded'd before any per-target error path
-	// could run.
-	cctx, ccancel := context.WithTimeout(ctx, computeCohortTimeout(len(restactionRefs), len(widgetEntries)))
+	// Per-cohort hard ceiling. A stuck cohort cannot wedge Step 7.6
+	// past its global budget. Fixed 120s (0.30.179 value); the
+	// 0.30.190 proportional-timeout model was REVERTED at 0.30.191 per
+	// the SCOPE CORRECTION — we instrument first, then fix.
+	cctx, ccancel := context.WithTimeout(ctx, pipCohortTimeout)
 	defer ccancel()
+
+	// Ship 0.30.191 Fix C — deferred abort-cause reporter. Runs whether
+	// the body returns normally, returns an error, or panics. Emits one
+	// `phase1.cohort.abort` log line when the cohort's status is
+	// "failed" (timeout, ctx cancel, panic). Pure observational —
+	// returns no value, mutates no shared state.
+	//
+	// The recover() catches a downstream panic in seedOneRestaction /
+	// seedOneWidget — pre-0.30.191 such a panic crashed the cohort
+	// goroutine + (potentially) the pod via the errgroup propagation.
+	// Now the panic is logged + the cohort is marked failed + the
+	// error is returned up the errgroup; the caller's runPIPSeed loop
+	// already treats per-cohort errors as non-fatal (0.30.180), so a
+	// panic in one cohort no longer wedges all of Phase 1.
+	defer func() {
+		if r := recover(); r != nil {
+			recoveredPanic = r
+			abortPhase = "panic"
+			abortCause = "panic"
+			ctxErrString = ""
+			// We're recovering INSIDE the deferred closure — emit the
+			// abort log line below and mark cohort failed. The caller
+			// (errgroup) will not see an error because we're swallowing
+			// the panic here, but recordCohortSeedStatus and the abort
+			// log line make the failure visible.
+			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
+		}
+		// Only emit the abort log line for cohorts that ACTUALLY failed
+		// (the inline abort branches set abortCause non-empty before
+		// returning; success / partial paths leave it ""). This avoids
+		// log spam for the success path.
+		if abortCause == "" {
+			return
+		}
+		if emittedFinalAbortLog {
+			return
+		}
+		emittedFinalAbortLog = true
+		fields := []any{
+			slog.String("subsystem", "cache"),
+			slog.String("cohort", cohortLabel),
+			slog.String("phase", abortPhase),
+			slog.String("abort_cause", abortCause),
+			slog.String("ctx_err", ctxErrString),
+			slog.Int("restactions_total", len(restactionRefs)),
+			slog.Int("widgets_total", len(widgetEntries)),
+			slog.Int("restactions_processed", processedRestactions),
+			slog.Int("widgets_processed", processedWidgets),
+			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			slog.Int64("cohort_timeout_ms", pipCohortTimeout.Milliseconds()),
+		}
+		if recoveredPanic != nil {
+			fields = append(fields, slog.Any("panic", recoveredPanic))
+		}
+		log.Info("phase1.cohort.abort", fields...)
+	}()
 
 	// Build the per-cohort ctx: SA transport seam preserved (so the
 	// resolver dispatches via the SA-credentialed inner-call path that
@@ -533,14 +591,20 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 
 	// Restactions seed loop — drain the harvester, one Put per
 	// (cohort, restaction).
+	abortPhase = "restactions"
 	for _, ref := range restactionRefs {
 		if err := cctx.Err(); err != nil {
+			abortCause = "ctx_err"
+			ctxErrString = err.Error()
 			log.Error("phase1.seed.cohort.timeout",
 				slog.String("subsystem", "cache"),
 				slog.String("cohort", cohortLabel),
 				slog.String("phase", "restactions"),
 				slog.Any("err", err),
+				slog.Int("restactions_processed", processedRestactions),
+				slog.Int("widgets_processed", processedWidgets),
 				slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+				slog.Int64("cohort_timeout_ms", pipCohortTimeout.Milliseconds()),
 			)
 			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
 			return fmt.Errorf("cohort %q restactions seed: %w", cohortLabel, err)
@@ -566,18 +630,25 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 		}
 		pipSeedRestactionsTotal.Add(1)
 		incCohortCounter(&pipSeedRestactionsByCohort, cohortLabel)
+		processedRestactions++
 	}
 
 	// Widgets seed loop — drain the harvested widget entries, one Put
 	// per (cohort, widget).
+	abortPhase = "widgets"
 	for _, e := range widgetEntries {
 		if err := cctx.Err(); err != nil {
+			abortCause = "ctx_err"
+			ctxErrString = err.Error()
 			log.Error("phase1.seed.cohort.timeout",
 				slog.String("subsystem", "cache"),
 				slog.String("cohort", cohortLabel),
 				slog.String("phase", "widgets"),
 				slog.Any("err", err),
+				slog.Int("restactions_processed", processedRestactions),
+				slog.Int("widgets_processed", processedWidgets),
 				slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+				slog.Int64("cohort_timeout_ms", pipCohortTimeout.Milliseconds()),
 			)
 			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
 			return fmt.Errorf("cohort %q widgets seed: %w", cohortLabel, err)
@@ -603,6 +674,7 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 		}
 		pipSeedWidgetsTotal.Add(1)
 		incCohortCounter(&pipSeedWidgetsByCohort, cohortLabel)
+		processedWidgets++
 	}
 
 	// Publish the cohort's final status.
@@ -616,6 +688,8 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 		slog.String("subsystem", "cache"),
 		slog.String("cohort", cohortLabel),
 		slog.Bool("had_per_target_failure", hadFailure),
+		slog.Int("restactions_processed", processedRestactions),
+		slog.Int("widgets_processed", processedWidgets),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 	return nil

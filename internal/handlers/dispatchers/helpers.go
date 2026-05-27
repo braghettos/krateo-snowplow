@@ -321,16 +321,17 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		slog.Int("extras_len", len(extras)),
 	)
 
-	// Ship 0.30.190 Fix B — additive single-line stderr lane.
-	// The slog.Info above is the authoritative emit; the existing call
-	// stays ON regardless of this knob. This extra fmt.Fprintf is a
-	// pragmatic robustness fallback for the 0.30.189 validation gap
-	// where the tester could not grep the multi-line pretty-handler
-	// JSON via kubectl logs (candidates: pretty-handler multi-line
-	// formatting, kubelet log rotation, otel daemonset filter — can't
-	// be disambiguated from code alone). Greppable as a single line
-	// with every field inline. Default OFF; chart values.yaml flips
-	// it ON for the 0.30.190 ship and OFF for steady-state.
+	// Ship 0.30.190 Fix B / 0.30.191 carried-forward — additive
+	// single-line stderr lane. The slog.Info above is the authoritative
+	// emit; the existing call stays ON regardless of this knob. This
+	// extra fmt.Fprintf is a pragmatic robustness fallback for the
+	// 0.30.189 validation gap where the tester could not grep the multi-
+	// line pretty-handler JSON via kubectl logs (candidates: pretty-
+	// handler multi-line formatting, kubelet log rotation, otel
+	// daemonset filter — can't be disambiguated from code alone).
+	// Greppable as a single line with every field inline. Default OFF;
+	// chart values.yaml flips it ON for diagnostic ships and OFF for
+	// steady-state.
 	//
 	// feedback_no_park_broken_behind_flag does NOT apply: this is an
 	// ADDITIVE diagnostic lane, not a correctness fix parked behind a
