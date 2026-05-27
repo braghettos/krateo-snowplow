@@ -227,17 +227,24 @@ type cacheHandle interface {
 //
 // We log at INFO so a casual grep on production logs proves whether
 // L1 is firing.
-func emitResolvedCacheLookup(log *slog.Logger, handlerKind, key string, hit bool, residentBytes int) {
-	if log == nil {
-		return
+//
+// Ship OBS-1 (0.30.186): in addition to the log line, bump the
+// per-(handlerKind, gvrString) hit/miss counter in
+// l1_lookup_metrics.go so /debug/vars exposes the same signal
+// without requiring log-line scraping. The bump is one atomic add
+// per call — already on the request-path serial budget.
+func emitResolvedCacheLookup(log *slog.Logger, handlerKind, gvrString, key string, hit bool, residentBytes int) {
+	if log != nil {
+		log.Info("resolved_cache.lookup",
+			slog.String("subsystem", "cache"),
+			slog.String("handler", handlerKind),
+			slog.String("gvr", gvrString),
+			slog.String("key_hash", key),
+			slog.Bool("hit", hit),
+			slog.Int("resident_bytes", residentBytes),
+		)
 	}
-	log.Info("resolved_cache.lookup",
-		slog.String("subsystem", "cache"),
-		slog.String("handler", handlerKind),
-		slog.String("key_hash", key),
-		slog.Bool("hit", hit),
-		slog.Int("resident_bytes", residentBytes),
-	)
+	recordL1Lookup(handlerKind, gvrString, hit)
 }
 
 // encodeResolvedJSON marshals res with a single canonical encoder shape.

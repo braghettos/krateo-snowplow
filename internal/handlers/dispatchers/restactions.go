@@ -120,7 +120,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		perPage, page, extras)
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
-			emitResolvedCacheLookup(log, "restactions", cacheKey, true, len(entry.RawJSON))
+			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
 			writeResolvedJSON(wri, entry.RawJSON)
 			log.Info("RESTAction successfully resolved",
@@ -131,7 +131,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			)
 			return
 		}
-		emitResolvedCacheLookup(log, "restactions", cacheKey, false, 0)
+		emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, false, 0)
 		pcs.l1Hit = "miss"
 	}
 

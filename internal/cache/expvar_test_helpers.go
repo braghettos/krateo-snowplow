@@ -33,4 +33,5 @@ package cache
 func RegisterExpvarForTest() {
 	registerFallthroughExpvar()
 	registerControllerHealthExpvar()
+	registerRefresherMetrics()
 }

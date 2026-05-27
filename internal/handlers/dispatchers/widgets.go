@@ -120,7 +120,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
 				cache.RecordApiserverFallthrough(req.Context(),
 					cache.ReasonWidgetContentHit, got.GVR.String())
-				emitResolvedCacheLookup(log, "widgetContent",
+				emitResolvedCacheLookup(log, "widgetContent", got.GVR.String(),
 					contentKey, true, len(gated))
 				pcs.l1Hit = "content-hit"
 				writeResolvedJSON(wri, gated)
@@ -151,7 +151,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		perPage, page, extras)
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
-			emitResolvedCacheLookup(log, "widgets", cacheKey, true, len(entry.RawJSON))
+			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
 			writeResolvedJSON(wri, entry.RawJSON)
 			log.Info("Widget successfully resolved",
@@ -160,7 +160,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			)
 			return
 		}
-		emitResolvedCacheLookup(log, "widgets", cacheKey, false, 0)
+		emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, false, 0)
 		pcs.l1Hit = "miss"
 	}
 
