@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -245,6 +246,78 @@ func emitResolvedCacheLookup(log *slog.Logger, handlerKind, gvrString, key strin
 		)
 	}
 	recordL1Lookup(handlerKind, gvrString, hit)
+}
+
+// emitDispatchCacheKeyDiag — Ship 0.30.188 — pure-additive diagnostic
+// instrumentation for the PIP-seed vs dispatcher-get key-divergence
+// investigation (architect's TRACED diff on `BindingSetHash`). Emits a
+// structured slog line carrying ALL the components that fold into
+// `dispatchCacheLookupKey`'s ComputeKey, so the three emit sites (PIP
+// seed Put, dispatcher Get, per-user fallback Put) can be diff'd line-
+// by-line for ONE widget/restaction to identify which field(s) drive
+// the seed→serve miss.
+//
+// IDENTITY EXTRACTION: pulls Username + Groups from xcontext.UserInfo
+// (the cohort ctx for seed sites, the request ctx for dispatcher
+// sites). On missing/unparseable identity (defence in depth — should
+// never happen at these sites since they all already nil-checked the
+// handle) we emit a sentinel "anonymous" / empty groups so the log
+// still differentiates the divergent component.
+//
+// BindingSetHash is read from `inputs.BindingSetHash` — the SAME value
+// that ComputeKey folded into the returned cacheKey — rather than re-
+// computing it. This guarantees the logged hash and the cache key are
+// derived from the same snapshot read.
+//
+// NIL-GUARD: a nil `inputs` (cache disabled or identity missing) is
+// permitted; the function still emits with BindingSetHash=0 so the
+// "why was the lookup skipped" question is greppable. The dispatcher
+// callers MUST still nil-check the handle separately.
+//
+// COST: one slog.Info per /call per site. Volume = O(num_widgets +
+// num_restactions × num_cohorts) at startup (PIP seed) + O(/call rate)
+// at serve time. Acceptable for the diagnostic ship; revert
+// 0.30.189+ once the divergent field is identified.
+func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context,
+	cacheKey string, inputs *cache.ResolvedKeyInputs,
+	handlerKind, group, version, resource, namespace, name string,
+	perPage, page int, extras map[string]any,
+) {
+	if log == nil {
+		return
+	}
+	var (
+		username string
+		groups   []string
+	)
+	if ui, err := xcontext.UserInfo(ctx); err == nil {
+		username = ui.Username
+		groups = ui.Groups
+	}
+	var bindingSetHash uint64
+	if inputs != nil {
+		bindingSetHash = inputs.BindingSetHash
+	} else {
+		// Compute directly so the field still differentiates — the
+		// cache-disabled / no-identity branch returns nil inputs, but
+		// the architect's diff is interested in the hash value itself.
+		bindingSetHash = cache.BindingSetHash(username, groups)
+	}
+	log.Info("dispatch.cache_key.computed",
+		slog.String("subsystem", "cache"),
+		slog.String("site", site),
+		slog.String("key_hash", cacheKey),
+		slog.Uint64("binding_set_hash", bindingSetHash),
+		slog.String("username", username),
+		slog.Any("groups", groups),
+		slog.String("handler_kind", handlerKind),
+		slog.String("gvr", fmt.Sprintf("%s/%s, Resource=%s", group, version, resource)),
+		slog.String("namespace", namespace),
+		slog.String("name", name),
+		slog.Int("per_page", perPage),
+		slog.Int("page", page),
+		slog.Int("extras_len", len(extras)),
+	)
 }
 
 // encodeResolvedJSON marshals res with a single canonical encoder shape.

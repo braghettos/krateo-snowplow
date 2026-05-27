@@ -643,6 +643,14 @@ func seedOneRestaction(ctx context.Context, ref templatesv1.ObjectReference, aut
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		-1, -1, nil)
+	// Ship 0.30.188 — diagnostic slog: emit the seed-side cache key +
+	// its components so it can be diff'd against the dispatcher_get and
+	// per_user_fallback_put log lines at widgets.go / restactions.go.
+	emitDispatchCacheKeyDiag(slog.Default(), "seed", ctx,
+		key, inputs, "restactions",
+		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		-1, -1, nil)
 	if handle == nil || key == "" {
 		// L1 disabled OR no identity on ctx — defensive skip. PIP's
 		// cohort ctx ALWAYS installs WithUserInfo, so an empty key here
@@ -733,6 +741,14 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	// e.Page) is still used for widgets.Resolve below (the 0.30.127
 	// storm guard).
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "widgets",
+		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
+		e.W.GetNamespace(), e.W.GetName(),
+		e.KeyPerPage, e.KeyPage, nil)
+	// Ship 0.30.188 — diagnostic slog: emit the widget seed Put cache
+	// key + components so it can be diff'd against the dispatcher_get
+	// and per_user_fallback_put log lines at widgets.go.
+	emitDispatchCacheKeyDiag(slog.Default(), "seed", ctx,
+		key, inputs, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
 		e.KeyPerPage, e.KeyPage, nil)

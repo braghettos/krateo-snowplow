@@ -149,6 +149,15 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		perPage, page, extras)
+	// Ship 0.30.188 — diagnostic slog: emit the dispatcher-side cache
+	// key + its components so it can be diff'd against the PIP seed Put
+	// log line at phase1_pip_seed.go and the per-user-fallback Put line
+	// below. Pure-additive instrumentation per architect's TRACED diff.
+	emitDispatchCacheKeyDiag(log, "dispatcher_get", req.Context(),
+		cacheKey, cacheInputs, "widgets",
+		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		perPage, page, extras)
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
@@ -219,6 +228,17 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if cacheHandle != nil && cacheKey != "" {
+		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback Put
+		// site's cache key + components so they can be diff'd against the
+		// dispatcher_get (above) and seed (phase1_pip_seed.go) emissions
+		// for the SAME widget. If a PIP seed Put existed under a different
+		// key, this Put establishes the cohort's "real" served cell; the
+		// divergent field(s) identify the seed/dispatcher key mismatch.
+		emitDispatchCacheKeyDiag(log, "per_user_fallback_put", req.Context(),
+			cacheKey, cacheInputs, "widgets",
+			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+			perPage, page, extras)
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,

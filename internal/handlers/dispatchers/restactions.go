@@ -118,6 +118,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		perPage, page, extras)
+	// Ship 0.30.188 — diagnostic slog: emit the dispatcher-side cache
+	// key + components symmetrically with widgets.go for the PIP-seed
+	// vs dispatcher-get key-divergence investigation.
+	emitDispatchCacheKeyDiag(log, "dispatcher_get", req.Context(),
+		cacheKey, cacheInputs, "restactions",
+		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		perPage, page, extras)
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
@@ -210,6 +218,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 	if cacheHandle != nil && cacheKey != "" {
+		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback
+		// Put site's cache key + components symmetrically with widgets.go.
+		emitDispatchCacheKeyDiag(log, "per_user_fallback_put", req.Context(),
+			cacheKey, cacheInputs, "restactions",
+			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+			perPage, page, extras)
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,
