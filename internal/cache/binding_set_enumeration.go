@@ -96,6 +96,88 @@ import (
 // tuple's groups at BindingSetHash time.
 const systemAuthenticatedGroup = "system:authenticated"
 
+// groupOnlyCohortSentinel is the synthetic identity for the
+// authenticated-group-only cohort (users with zero User-kind bindings
+// who derive ALL their access from Group-kind bindings).
+//
+// Why a sentinel — Ship 0.30.189.
+//
+//   The PIP seed enumerator (line 302) and the dispatcher's request-time
+//   `BindingSetHash` (rbac_cohort_gen.go:199) MUST hash to the same
+//   value for a group-only user, or the L1 cell the seed populated and
+//   the cell the dispatcher reads diverge.
+//
+//   Pre-0.30.189: the enumerator emitted `("", [g])` for a group-only
+//   cohort. Request-time the user arrives as `("cyberjoker", [devs])`.
+//   `BindingSetHash` injects `system:authenticated` for any non-empty
+//   username (mirroring evaluate.go:337-338); the seed enumerator's
+//   `""` empty username path does NOT inject. Hash diverged →
+//   first-visit L1 misses for every group-only user.
+//
+// Why a SENTINEL and not a representative username.
+//
+//   A real cohort member would carry their private User-kind bindings
+//   (a single user-named CRB) into the hash, leaking those bindings
+//   across every group-only user in the same cohort. Diego rejected
+//   that approach 2026-05-27. The sentinel is a UNIVERSAL constant —
+//   `CRBsByUser[sentinel] == ∅` by construction (verified at startup
+//   via the collision check in main.go). No real subject ever collides.
+//
+// Why this name shape.
+//
+//   Mirrors Kubernetes' own synthetic principal pattern
+//   (`system:anonymous`, `system:authenticated`, `system:serviceaccount:*`).
+//   The `:v1` suffix is a future-rotation anchor: a future ship that
+//   changes the sentinel's semantics rotates to `:v2` cleanly across a
+//   rolling restart.
+//
+// Collision risk + mitigation.
+//
+//   If a cluster admin literally creates a User-kind subject named
+//   `system:cohort:group-only:v1`, the snapshot would bind real
+//   bindings to the sentinel, breaking the invariant. Standard
+//   Kubernetes config rejects `system:*` user names at admission; the
+//   startup check in main.go (post-snapshot publish) panics on
+//   collision to make a misconfiguration loud-at-boot rather than
+//   silent-at-request.
+//
+// See project_0_30_189_design_2026_05_27.
+const groupOnlyCohortSentinel = "system:cohort:group-only:v1"
+
+// normalizeIdentityForCohort returns groupOnlyCohortSentinel when
+// `username` has zero User-kind bindings anywhere in the snapshot
+// (no CRBsByUser entry, no RBsByUserByNS entry across all namespaces),
+// otherwise returns `username` unchanged.
+//
+// Pure function over the immutable published snapshot — caller must
+// have already done rbacSnap.Load() and pass the result. No internal
+// load so callers stay on the single-snapshot-per-evaluation invariant
+// (AC-B.3).
+//
+// Idempotence: normalize(normalize(u)) == normalize(u). The sentinel
+// itself returns unchanged (it has no real bindings by construction).
+// The empty string returns unchanged (anonymous identity — separate
+// cohort from group-only authenticated).
+func normalizeIdentityForCohort(snap *RBACSnapshot, username string) string {
+	if username == "" || username == groupOnlyCohortSentinel {
+		return username
+	}
+	if snap == nil {
+		// No snapshot — degrade to deny path. Return the original
+		// username; the cohort will not match anyway.
+		return username
+	}
+	if len(snap.CRBsByUser[username]) > 0 {
+		return username
+	}
+	for ns := range snap.RBsByUserByNS {
+		if len(snap.RBsByUserByNS[ns][username]) > 0 {
+			return username
+		}
+	}
+	return groupOnlyCohortSentinel
+}
+
 // bindingSetPowersetCap is the empirical safety cap on
 // |relevantGroups(userKey)|. A user whose relevant-groups count exceeds
 // this falls back to single-group enumeration (one tuple per group) and
@@ -288,19 +370,32 @@ func EnumerateBindingSetClasses() []Cohort {
 		}
 	}
 
-	// Enumerate every user-key, then the empty-user (Group-only cohorts:
-	// the snapshot's group-keys without a paired user identity).
+	// Enumerate every user-key, then the group-only cohorts (identities
+	// whose User-kind binding-set is empty but who match some Group
+	// binding).
 	for u := range userKeys {
 		enumerateUser(u)
 	}
-	// Empty-user: cover identities that arrive with no User-kind binding
-	// match but match some Group binding. We enumerate per individual
-	// group (each group on its own is a distinct cohort representative);
-	// this is enough because EvaluateRBAC's Group-subject matcher fires
-	// per-group, so a multi-group anonymous request resolves through the
-	// per-group bindings independently.
+	// Group-only cohort: cover identities that arrive with no User-kind
+	// binding match but match some Group binding (e.g. cyberjoker, whose
+	// access derives entirely from `devs` and `system:authenticated`).
+	//
+	// Ship 0.30.189: use groupOnlyCohortSentinel rather than "" as the
+	// emitted username. The request-time BindingSetHash normalises a
+	// real group-only user (e.g. "cyberjoker") to the SAME sentinel via
+	// normalizeIdentityForCohort, so seed-time and request-time hashes
+	// converge. Pre-0.30.189 the empty-username path skipped
+	// system:authenticated injection (rbac_cohort_gen.go:210 gates on
+	// `username != ""`), which the dispatcher's hashed-tuple for an
+	// authenticated user DID include — guaranteed divergence for every
+	// group-only user.
+	//
+	// We enumerate per individual group (each group on its own is a
+	// distinct cohort representative); EvaluateRBAC's Group-subject
+	// matcher fires per-group, so a multi-group group-only request
+	// resolves through the per-group bindings independently.
 	for g := range groupKeys {
-		storeTuple(&byHash, "", []string{g})
+		storeTuple(&byHash, groupOnlyCohortSentinel, []string{g})
 	}
 
 	// Step 5 — materialise + sort by (Username, Groups[0]).

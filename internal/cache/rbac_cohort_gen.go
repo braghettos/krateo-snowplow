@@ -130,12 +130,21 @@ var cohortGenMap sync.Map // cohortKey (string) -> *cohortGenState
 // at populate time anyway (filterListByRBAC returns identityOK=false
 // when EvaluateRBAC degrades to deny without a snapshot).
 func CohortRBACGen(username string, groups []string) uint64 {
+	snap := rbacSnap.Load()
+	// Ship 0.30.189 — normalise group-only identity to the sentinel so
+	// CohortRBACGen partitions match the seed-time / dispatcher-time
+	// hash partition. Real users with zero User-kind bindings collapse
+	// to a single cohort gen stamp keyed by the sentinel; users with
+	// User-kind bindings keep their own gen. CohortKeyHash is left
+	// untouched downstream (memo partition is correctness-bound at
+	// gen-bump, not key partition) — see project_0_30_189_design.
+	username = normalizeIdentityForCohort(snap, username)
+
 	key := CohortKeyHash(username, groups)
 
 	stateAny, _ := cohortGenMap.LoadOrStore(key, &cohortGenState{})
 	s := stateAny.(*cohortGenState)
 
-	snap := rbacSnap.Load()
 	if snap == nil {
 		// No published snapshot — return whatever gen we already have
 		// (0 on first call). Don't attempt to compute a hash against a
@@ -201,11 +210,29 @@ func BindingSetHash(username string, groups []string) uint64 {
 	if snap == nil {
 		return 0
 	}
+	// Ship 0.30.189 — normalise group-only identity to the sentinel
+	// BEFORE injecting system:authenticated + collecting pointers. The
+	// PIP seed enumerator emits the sentinel for the group-only cohort
+	// (binding_set_enumeration.go:319); the dispatcher's request-time
+	// call arrives with the real username (e.g. "cyberjoker"). Both
+	// callers reach this line; both normalise to the same sentinel
+	// when the user has zero User-kind bindings → the hashed pointer-
+	// set is identical → the L1 cell the seed populated is the cell
+	// the dispatcher reads. Users WITH User-kind bindings (admin)
+	// pass through unchanged; their own per-user cohort is preserved.
+	username = normalizeIdentityForCohort(snap, username)
+
 	// Inject implicit system:authenticated for authenticated requests —
 	// mirrors evaluate.go's behaviour. We MUST do this here (not just at
 	// seed enumeration time) so request-time + seed-time hashes match
 	// byte-for-byte regardless of whether the JWT carried the implicit
 	// group in its Groups claim.
+	//
+	// After 0.30.189 normalisation `username != ""` now also covers the
+	// sentinel, which is correct: the group-only cohort IS an
+	// authenticated identity (real authenticated users with zero User-
+	// kind bindings) and so MUST carry system:authenticated through the
+	// hash.
 	effective := groups
 	if username != "" {
 		hasAuth := false

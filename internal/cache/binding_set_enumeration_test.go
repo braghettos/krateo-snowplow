@@ -182,6 +182,163 @@ func TestEnumerateBindingSetClasses_BasicDedupe(t *testing.T) {
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Ship 0.30.189 — sentinel-based cohort identity normalisation.
+//
+// The PIP seed enumerator emits `(groupOnlyCohortSentinel, [g])` for the
+// authenticated-group-only cohort; the request-time dispatcher's
+// BindingSetHash normalises a real group-only user (e.g. "cyberjoker")
+// to the same sentinel. Both reach the same L1 cell.
+//
+// These tests are the falsifier for project_0_30_189_design_2026_05_27.
+// ─────────────────────────────────────────────────────────────────────
+
+// TestBindingSetHash_GroupOnlyUser_MatchesSentinel — POSITIVE gate.
+// A real user with zero User-kind bindings, holding only Group-kind
+// access via "devs", MUST hash identically to the sentinel cohort
+// emitted by the PIP enumerator for the same group. Pre-0.30.189 they
+// diverged: the empty-username path skipped system:authenticated
+// injection; the real-user path included it. First-visit L1 miss.
+func TestBindingSetHash_GroupOnlyUser_MatchesSentinel(t *testing.T) {
+	resetGenAndSnapshot(t)
+	// devs CRB — binds the Group "devs"; no User-kind bindings exist
+	// for cyberjoker. Plus an unrelated admin CRB to keep the snapshot
+	// realistic (admin has User-kind bindings → does NOT normalise).
+	buildSnapshot(t,
+		[]*rbacv1.ClusterRoleBinding{
+			mkCRB("devs-bind", groupSub("devs")),
+			mkCRB("admin-bind", userSub("admin")),
+		},
+		nil,
+	)
+
+	// Real user with zero User-kind bindings — request-time path.
+	hCyber := BindingSetHash("cyberjoker", []string{"devs"})
+	// Sentinel cohort — PIP seed enumerator path.
+	hSentinel := BindingSetHash(groupOnlyCohortSentinel, []string{"devs"})
+
+	if hCyber == 0 || hSentinel == 0 {
+		t.Fatalf("BindingSetHash returned 0 for a cohort with matched bindings (cyber=%#x sentinel=%#x)",
+			hCyber, hSentinel)
+	}
+	if hCyber != hSentinel {
+		t.Fatalf("Ship 0.30.189 falsifier: group-only user hash does NOT match sentinel hash "+
+			"(cyberjoker=%#x sentinel=%#x) — PIP seed and dispatcher would diverge on the L1 key",
+			hCyber, hSentinel)
+	}
+}
+
+// TestBindingSetHash_UserWithBindings_DistinctFromSentinel — NEGATIVE
+// gate. A user with User-kind CRBs (admin) MUST NOT collapse to the
+// sentinel. Their hash must include their per-user bindings — the
+// sentinel cohort is restricted to identities with zero User-kind
+// bindings.
+//
+// This is the over-collapse guardrail. If normalisation were applied
+// indiscriminately, admin's private CRBs would leak into the group-
+// only cohort's L1 cell — RBAC cross-user leak. The test asserts
+// the boundary holds.
+func TestBindingSetHash_UserWithBindings_DistinctFromSentinel(t *testing.T) {
+	resetGenAndSnapshot(t)
+	buildSnapshot(t,
+		[]*rbacv1.ClusterRoleBinding{
+			mkCRB("admin-bind", userSub("admin")), // admin has a User-kind CRB
+			mkCRB("devs-bind", groupSub("devs")),
+		},
+		nil,
+	)
+
+	hAdmin := BindingSetHash("admin", []string{"devs"})
+	hSentinel := BindingSetHash(groupOnlyCohortSentinel, []string{"devs"})
+	hCyber := BindingSetHash("cyberjoker", []string{"devs"})
+
+	if hAdmin == hSentinel {
+		t.Fatalf("over-collapse: admin (User-kind CRB) hashed to sentinel cohort (%#x) — "+
+			"admin's private bindings would leak into group-only L1 cell",
+			hAdmin)
+	}
+	// Sanity: cyber still collapses; admin does not.
+	if hCyber != hSentinel {
+		t.Fatalf("regression: cyberjoker stopped collapsing to sentinel (cyber=%#x sentinel=%#x)",
+			hCyber, hSentinel)
+	}
+}
+
+// TestSentinelInvariant_NoRealBindings — the invariant the startup
+// collision check enforces: the snapshot built by buildSnapshot()
+// (which routes through rebuildSubjectIndexes — the production code
+// path) MUST NOT carry any real binding under
+// CRBsByUser[groupOnlyCohortSentinel]. If a test fixture's mkCRB seeded
+// the sentinel name, the production startup check would panic.
+func TestSentinelInvariant_NoRealBindings(t *testing.T) {
+	resetGenAndSnapshot(t)
+	snap := buildSnapshot(t,
+		[]*rbacv1.ClusterRoleBinding{
+			mkCRB("admin-bind", userSub("admin")),
+			mkCRB("devs-bind", groupSub("devs")),
+			mkCRB("auth-bind", groupSub("system:authenticated")),
+		},
+		nil,
+	)
+	if n := len(snap.CRBsByUser[groupOnlyCohortSentinel]); n != 0 {
+		t.Fatalf("sentinel invariant violated: CRBsByUser[%q] has %d entries; expected 0",
+			groupOnlyCohortSentinel, n)
+	}
+	for ns, byUser := range snap.RBsByUserByNS {
+		if n := len(byUser[groupOnlyCohortSentinel]); n != 0 {
+			t.Fatalf("sentinel invariant violated: RBsByUserByNS[%q][%q] has %d entries; expected 0",
+				ns, groupOnlyCohortSentinel, n)
+		}
+	}
+}
+
+// TestNormalizeIdempotence — normalize(normalize(u)) == normalize(u)
+// for every input class:
+//   - empty username (anonymous) → "" stays ""
+//   - sentinel → sentinel stays sentinel
+//   - real user WITH bindings → stays that user
+//   - real user WITHOUT bindings → collapses to sentinel, which then stays sentinel
+//
+// Property: a second-pass through the normaliser must be a no-op. This
+// guards against a future refactor that double-normalises a code path
+// (cache miss + cache miss-on-miss) and accidentally re-expands the
+// sentinel.
+func TestNormalizeIdempotence(t *testing.T) {
+	resetGenAndSnapshot(t)
+	snap := buildSnapshot(t,
+		[]*rbacv1.ClusterRoleBinding{
+			mkCRB("admin-bind", userSub("admin")),
+			mkCRB("devs-bind", groupSub("devs")),
+		},
+		nil,
+	)
+
+	cases := []struct {
+		name string
+		in   string
+		want string // expected after FIRST normalisation
+	}{
+		{"empty", "", ""},
+		{"sentinel", groupOnlyCohortSentinel, groupOnlyCohortSentinel},
+		{"user_with_user_kind_crb", "admin", "admin"},
+		{"user_without_bindings_collapses", "cyberjoker", groupOnlyCohortSentinel},
+		{"user_without_bindings_random", "no-such-user", groupOnlyCohortSentinel},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			first := normalizeIdentityForCohort(snap, c.in)
+			if first != c.want {
+				t.Fatalf("first normalisation of %q = %q; want %q", c.in, first, c.want)
+			}
+			second := normalizeIdentityForCohort(snap, first)
+			if second != first {
+				t.Fatalf("idempotence violated: normalize(%q) = %q; normalize(%q) = %q",
+					c.in, first, first, second)
+			}
+		})
+	}
+}
+
 // TestEnumerateBindingSetClasses_PrunesSystemAuth — the implicit
 // system:authenticated group is INJECTED into every authenticated tuple's
 // effective groups, but NOT part of the powerset domain. The enumerator

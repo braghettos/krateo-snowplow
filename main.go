@@ -293,6 +293,42 @@ func main() {
 					}
 					syncCancel()
 
+					// Ship 0.30.189 — sentinel-collision sanity check.
+					// `groupOnlyCohortSentinel` ("system:cohort:group-only:v1")
+					// is the synthetic identity used to normalise the
+					// authenticated-group-only cohort so the PIP seed and
+					// the request-time dispatcher hash to the same L1
+					// cell. Invariant: CRBsByUser[sentinel] == ∅ and
+					// RBsByUserByNS[ns][sentinel] == ∅ for all ns. A real
+					// User-kind subject literally named that string would
+					// break the invariant (the sentinel would gain real
+					// bindings → group-only cohort would leak admin-like
+					// access at hash time). Standard k8s admission
+					// rejects `system:*` user names; this check guards
+					// against misconfigured clusters / test fixtures by
+					// failing loud at boot rather than silently at
+					// request time.
+					if snap := cache.LiveRBACSnapshot(); snap != nil {
+						const sentinel = "system:cohort:group-only:v1"
+						if n := len(snap.CRBsByUser[sentinel]); n > 0 {
+							log.Error("cache: sentinel collision — a ClusterRoleBinding has subject Name="+sentinel,
+								slog.Int("crb_count", n),
+								slog.String("hint", "rename the offending subject or change groupOnlyCohortSentinel; sentinel must be unique"),
+							)
+							os.Exit(1)
+						}
+						for ns, byUser := range snap.RBsByUserByNS {
+							if n := len(byUser[sentinel]); n > 0 {
+								log.Error("cache: sentinel collision — a RoleBinding has subject Name="+sentinel,
+									slog.String("namespace", ns),
+									slog.Int("rb_count", n),
+									slog.String("hint", "rename the offending subject or change groupOnlyCohortSentinel; sentinel must be unique"),
+								)
+								os.Exit(1)
+							}
+						}
+					}
+
 					// Ship D.2 (0.30.143) — F-3 cache. Start the
 					// AUTHN_NAMESPACE-scoped Secrets informer so the
 					// per-user `<user>-clientconfig` lookup the
