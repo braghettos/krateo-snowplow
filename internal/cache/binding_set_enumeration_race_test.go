@@ -33,83 +33,157 @@ import (
 	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // TestEnumerateBindingSetClasses_RaceWithRBACMutation drives concurrent
 // readers + a re-publishing writer with the -race detector enabled.
+//
+// Ship 0.30.184 extension: the writer now permutes Group-subject CRBs
+// (rotating `devs` ↔ `admins`) and injects one Group-subject RoleBinding
+// per cycle. A reader-side KEEP-arm assertion verifies that a Group
+// cohort whose role carries `composition.krateo.io/*` (krateo overlap)
+// survives the Group-kind predicate under concurrent snapshot mutation.
+//
 // Failure modes the test would surface:
 //
-//   - Data race on snap.CRBsByUser map access (impossible by design,
-//     but if a future refactor mutated a published snapshot's maps
-//     in place this would catch it).
+//   - Data race on snap.CRBsByUser / CRBsByGroup map access (impossible
+//     by design, but if a future refactor mutated a published snapshot's
+//     maps in place this would catch it).
 //   - Inconsistent BindingSetHash between the snapshot-Load inside
-//     pruneUserKindSubjectZeta and the storeTuple's hash computation
-//     (would manifest as a cohort whose stored hash != BindingSetHash
-//     re-computed against the SAME snapshot).
-//   - Panic on a nil snapshot mid-Load (snap.Load() is atomic.Pointer;
-//     this catches any future regression where binding_set_enumeration
-//     code reads a snapshot field without nil-checking the Load
-//     return).
+//     pruneUserKindSubjectZeta / pruneGroupKindSubjectZeta and the
+//     storeTuple's hash computation (would manifest as a cohort whose
+//     stored hash != BindingSetHash re-computed against the SAME
+//     snapshot).
+//   - Panic on a nil snapshot mid-Load (snap.Load() is atomic.Pointer).
+//   - KEEP-arm Group cohort (krateo overlap) sporadically missing from
+//     the enumeration output — would surface as keepArmMisses > 0.
 //
 // Per `feedback_shared_vs_copy_is_a_concurrency_change`: this test is
 // the required concurrent -race gate for the shared-snapshot-pointer
-// shape of predicate (ζ)'s data flow.
+// shape of predicate (ζ)'s data flow, including the Group-kind
+// extension (Ship 0.30.184).
 func TestEnumerateBindingSetClasses_RaceWithRBACMutation(t *testing.T) {
 	// Run for 2 seconds — the brief specifies a 2s reader window.
 	const testDuration = 2 * time.Second
 	const readerCount = 16
 	const writerInterval = 10 * time.Millisecond
 
+	// `keep-arm-group` is the deterministic Group-kind cohort the
+	// reader-side assertion looks for. It is ALWAYS bound to a
+	// ClusterRole whose PolicyRule grants templates.krateo.io/restactions
+	// (mirrors authn-group-krateo-system semantics) — predicate (ζ)
+	// MUST KEEP it under every writer permutation. A miss in any reader
+	// iteration would be a concurrency defect.
+	const keepArmGroup = "keep-arm-group"
+
 	// Initial snapshot. The writer goroutine permutes the CRB list each
 	// iteration; the snapshot pointer always carries a coherent view.
 	resetGenAndSnapshot(t)
 	makeSnap := func(seed int) {
-		// Build a fresh snapshot with a permuted set of CRBs. The
-		// permutation is just a rotation of the userSub names so each
-		// snapshot has the SAME shape but distinct pointer values —
-		// triggers fresh `rbacSnap.Store` cycles the readers race
-		// against.
+		// User-kind CRBs (existing 0.30.183 coverage).
 		crbs := []*rbacv1.ClusterRoleBinding{
-			mkCRB("admin-bind", userSub("admin")),
-			mkCRB("alice-bind", userSub("alice@krateo.io")),
-			mkCRB("devs-bind", groupSub("devs")),
+			mkCRBWithRole("admin-bind", "admin-bind-role", userSub("admin")),
+			mkCRBWithRole("alice-bind", "alice-bind-role", userSub("alice@krateo.io")),
 		}
-		// Permute by the seed — swap subjects pair-wise.
+		// Permute User subjects by the seed — swap subjects pair-wise.
 		if seed%2 == 1 {
 			crbs[0], crbs[1] = crbs[1], crbs[0]
 		}
-		// Mix in one mutation-shaped CRB so the snapshot's
-		// rebuildSubjectIndexes traverses different paths each
-		// iteration.
+		// Mix in one mutation-shaped User CRB so the snapshot's
+		// rebuildSubjectIndexes traverses different paths each iteration.
 		if seed%3 == 0 {
-			crbs = append(crbs, mkCRB("system-cm-bind", userSub("system:controller-manager")))
+			crbs = append(crbs,
+				mkCRBWithRole("system-cm-bind", "system-cm-bind-role",
+					userSub("system:controller-manager")))
 		}
-		// One ClusterRole so predicate (ζ) has a real role to walk on
-		// the non-system: subjects (admin/alice). We use noKrateoRule
-		// which prunes via empty-intersection for the readers.
+
+		// Group-kind CRBs (Ship 0.30.184 extension). Rotate `devs` ↔
+		// `admins` to exercise the Group-walk under mutation.
+		devsBind := mkCRBWithRole("devs-bind", "devs-bind-role", groupSub("devs"))
+		adminsBind := mkCRBWithRole("admins-bind", "admins-bind-role", groupSub("admins"))
+		if seed%4 == 0 {
+			devsBind, adminsBind = adminsBind, devsBind
+		}
+		crbs = append(crbs, devsBind, adminsBind)
+
+		// KEEP-arm Group cohort — ALWAYS present, ALWAYS bound to a role
+		// whose rule overlaps templates.krateo.io/restactions. Predicate
+		// (ζ) MUST KEEP it on every snapshot.
+		crbs = append(crbs,
+			mkCRBWithRole("keep-arm-bind", "keep-arm-bind-role",
+				groupSub(keepArmGroup)))
+
+		// Inject one Group-subject RoleBinding per cycle (the brief's
+		// "Inject one Group-subject RB into RoleBindingsByNS per cycle"
+		// requirement). Namespace rotates so the snapshot's
+		// RBsByGroupByNS shape varies each iteration.
+		ns := "team-a"
+		if seed%2 == 1 {
+			ns = "team-b"
+		}
+		rb := &rbacv1.RoleBinding{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "rbac.authorization.k8s.io/v1",
+				Kind:       "RoleBinding",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      "race-rb",
+			},
+			Subjects: []rbacv1.Subject{groupSub("devs")},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "Role",
+				Name:     "race-rb-role",
+			},
+		}
+		rbs := map[string][]*rbacv1.RoleBinding{ns: {rb}}
+
+		// ClusterRoles. User-kind subjects bound to no-krateo rules so
+		// predicate (ζ) prunes them (existing 0.30.183 coverage). The
+		// KEEP-arm Group is bound to a krateo.io-overlap rule so it
+		// survives. The devs/admins Groups are bound to no-krateo rules
+		// so they prune under the Group-kind predicate — that is
+		// acceptable for the test's KEEP-arm-only assertion.
 		snap := &RBACSnapshot{
 			ClusterRoleBindings: crbs,
-			RoleBindingsByNS:    nil,
+			RoleBindingsByNS:    rbs,
 			ClusterRolesByName: map[string]*rbacv1.ClusterRole{
 				"admin-bind-role":     mkClusterRole("admin-bind-role", []rbacv1.PolicyRule{noKrateoRule}),
 				"alice-bind-role":     mkClusterRole("alice-bind-role", []rbacv1.PolicyRule{noKrateoRule}),
 				"devs-bind-role":      mkClusterRole("devs-bind-role", []rbacv1.PolicyRule{noKrateoRule}),
+				"admins-bind-role":    mkClusterRole("admins-bind-role", []rbacv1.PolicyRule{noKrateoRule}),
 				"system-cm-bind-role": mkClusterRole("system-cm-bind-role", []rbacv1.PolicyRule{noKrateoRule}),
+				"keep-arm-bind-role":  mkClusterRole("keep-arm-bind-role", []rbacv1.PolicyRule{krateoTemplatesRule}),
 			},
-			RolesByNSName: map[string]*rbacv1.Role{},
+			RolesByNSName: map[string]*rbacv1.Role{
+				ns + "/race-rb-role": {
+					ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "race-rb-role"},
+					Rules:      []rbacv1.PolicyRule{noKrateoRule},
+				},
+			},
 		}
 		rebuildSubjectIndexes(snap)
 		PublishRBACSnapshotForTest(snap)
 	}
 	makeSnap(0)
 
+	// Capture the production handler GVR set — the readers test the
+	// KEEP-arm Group invariant via direct predicate invocation (the
+	// global ResourceWatcher is unwired in unit tests).
+	handlerSet := snowplowHandlerGVRSetForTest
+
 	var (
-		wg     sync.WaitGroup
-		stop   atomic.Bool
-		errCnt atomic.Uint64
+		wg              sync.WaitGroup
+		stop            atomic.Bool
+		errCnt          atomic.Uint64
+		keepArmMisses   atomic.Uint64
+		keepArmAttempts atomic.Uint64
 	)
 
-	// Readers — 16 goroutines spinning EnumerateBindingSetClasses.
+	// Readers — 16 goroutines spinning EnumerateBindingSetClasses AND
+	// the direct Group-kind predicate against the KEEP-arm Group.
 	for i := 0; i < readerCount; i++ {
 		wg.Add(1)
 		go func() {
@@ -117,14 +191,33 @@ func TestEnumerateBindingSetClasses_RaceWithRBACMutation(t *testing.T) {
 			for !stop.Load() {
 				out := EnumerateBindingSetClasses()
 				// Validate every returned Cohort is internally
-				// consistent: either Username is non-empty (User-kind
-				// cohort whose hash must be non-zero) OR Groups is
-				// non-empty (Group-kind cohort). A cohort with both
-				// empty would indicate a snapshot tear.
+				// consistent.
 				for _, c := range out {
 					if c.Username == "" && len(c.Groups) == 0 {
 						errCnt.Add(1)
 					}
+				}
+				// KEEP-arm assertion: the keep-arm-group bound to a
+				// templates.krateo.io-overlap role MUST survive the
+				// Group-kind predicate on every snapshot the writer
+				// publishes. Invoke pruneGroupKindSubjectZeta directly
+				// with the production handler set (the enumerator-
+				// internal handlerGVRSet is nil in unit tests, so we
+				// cannot use the enumeration output for this check).
+				snap := rbacSnap.Load()
+				if snap == nil {
+					continue
+				}
+				refs := collectMatchedRoleRefsForGroup(snap, keepArmGroup)
+				if len(refs) == 0 {
+					// Mid-publish window — snapshot may not yet carry
+					// the bind. Don't count as a miss.
+					continue
+				}
+				keepArmAttempts.Add(1)
+				if pruneGroupKindSubjectZeta(keepArmGroup, refs, snap, handlerSet) {
+					// PRUNE on a krateo-overlap role is a regression.
+					keepArmMisses.Add(1)
 				}
 			}
 		}()
@@ -151,6 +244,13 @@ func TestEnumerateBindingSetClasses_RaceWithRBACMutation(t *testing.T) {
 
 	if errCnt.Load() > 0 {
 		t.Errorf("snapshot-tear detected: %d cohort entries had empty Username + empty Groups", errCnt.Load())
+	}
+	if keepArmMisses.Load() > 0 {
+		t.Errorf("HG-184.9 KEEP-arm regression: %d/%d Group-kind predicate invocations pruned `%s` despite krateoTemplatesRule overlap",
+			keepArmMisses.Load(), keepArmAttempts.Load(), keepArmGroup)
+	}
+	if keepArmAttempts.Load() == 0 {
+		t.Errorf("HG-184.9 KEEP-arm assertion never executed (keepArmAttempts=0); test scaffolding broken")
 	}
 }
 

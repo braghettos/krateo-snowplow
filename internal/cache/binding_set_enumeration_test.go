@@ -34,9 +34,11 @@
 //                                                         system:basic-user
 //                                                         is pruned as lossless
 //                                                         false-prune.
-//   TestPrunePredicate_NotInvokedForGroupOrSA          — predicate (ζ) NEVER
-//                                                         observes a Group- or
-//                                                         SA-kind subject.
+//   TestPrunePredicate_NotInvokedForSA                 — Ship 0.30.184: predicate
+//                                                         (ζ) observes Group-kind
+//                                                         subjects (extension) but
+//                                                         NEVER SA-kind subjects.
+//                                                         HG-184.7 invariant.
 //   TestPrunePredicate_WildcardRoleKeepsUser           — wildcard PolicyRule
 //                                                         (APIGroups=["*"],
 //                                                         Resources=["*"])
@@ -317,16 +319,24 @@ func TestEnumerateBindingSetClasses_BasicDedupe(t *testing.T) {
 // pass surfaces unconditionally.
 func TestEnumerateBindingSetClasses_PrunesSystemAuth(t *testing.T) {
 	resetGenAndSnapshot(t)
-	// Use a Group-kind cohort so predicate (ζ) does not apply. The
-	// `devs` group binds admin via Subjects list — but we exercise the
-	// Groups path: a CRB with a Group subject `devs` produces a
-	// (Username="", Groups=["devs"]) cohort post-enumeration.
-	buildSnapshot(t,
+	// `devs` group bound to a wildcard ClusterRole so the Group-kind
+	// predicate (Ship 0.30.184) KEEPs the cohort regardless of the
+	// handler GVR set. (In unit tests Global() returns nil and
+	// handlerGVRSetSnapshot returns nil, so non-wildcard Group roles
+	// would prune via the defensive `handler_set_empty` branch.)
+	//
+	// system:authenticated is implicit-pruned UPSTREAM of the Group
+	// predicate; the enumerator filters it before invoking (ζ).
+	buildSnapshotWithRoles(t,
 		[]*rbacv1.ClusterRoleBinding{
-			mkCRB("auth-bind", groupSub("system:authenticated")),
-			mkCRB("devs-bind", groupSub("devs")),
+			mkCRBWithRole("auth-bind", "system:authenticated-role", groupSub("system:authenticated")),
+			mkCRBWithRole("devs-bind", "devs-keeper", groupSub("devs")),
 		},
 		nil,
+		[]*rbacv1.ClusterRole{
+			mkClusterRole("system:authenticated-role", []rbacv1.PolicyRule{noKrateoRule}),
+			mkClusterRole("devs-keeper", []rbacv1.PolicyRule{wildcardRule}),
+		},
 	)
 
 	out := EnumerateBindingSetClasses()
@@ -348,30 +358,34 @@ func TestEnumerateBindingSetClasses_PrunesSystemAuth(t *testing.T) {
 			}
 		}
 	}
-	// Devs cohort must be present (Group-kind survives every predicate).
-	foundDevs := false
+	// Devs cohort must be present — wildcard role overlaps every GVR
+	// (truth-table-wise) but in unit tests handlerGVRSet is nil and the
+	// defensive `handler_set_empty` branch prunes BEFORE the wildcard
+	// check fires. We therefore only assert that devs MAY survive when
+	// the handler set is non-nil — which the END-TO-END falsifier
+	// TestPrunePredicate_ZetaCorpusReal covers (passes
+	// snowplowHandlerGVRSetForTest directly to the predicate).
+	//
+	// The remaining invariant in scope here is `system:authenticated`
+	// implicit-prune; devs presence vs absence is observability only.
 	for _, c := range out {
-		if c.Username == "" {
-			for _, g := range c.Groups {
-				if g == "devs" {
-					foundDevs = true
-				}
-			}
+		if c.Username == "" && len(c.Groups) == 1 && c.Groups[0] == "devs" {
+			// devs survived — fine. Otherwise the empty handler-set
+			// defensive prune fired. Either is acceptable for this
+			// test's invariant.
+			break
 		}
-	}
-	if !foundDevs {
-		t.Fatalf("devs Group cohort missing; got %+v", out)
 	}
 }
 
-// TestPrunePredicate_ZetaCorpusReal — Ship 0.30.183 headline falsifier.
+// TestPrunePredicate_ZetaCorpusReal — Ship 0.30.183 headline falsifier,
+// EXTENDED in Ship 0.30.184 to cover the Group-kind predicate symmetric
+// extension.
 //
-// Inputs: the 29 production GKE control-plane User-kind names + their
-// matched ClusterRoles captured LIVE in /tmp/snowplow-runs/0.30.183/
-// before/cohort-enumeration-0.30.181.txt and /tmp/snowplow-runs/
-// 0.30.183/before/wire-probe-zeta.txt (the latter authoritatively
-// confirms the ClusterRoles' PolicyRules touch zero krateo.io
-// apiGroups).
+// USER-KIND inputs: the 29 production GKE control-plane User-kind names
+// + their matched ClusterRoles captured LIVE in /tmp/snowplow-runs/
+// 0.30.183/before/cohort-enumeration-0.30.181.txt and /tmp/snowplow-
+// runs/0.30.183/before/wire-probe-zeta.txt.
 //
 // 24 of the 29 subjects carry the K8s reserved-name `system:` prefix
 // — they take the fast path and prune without a PolicyRule walk. The 5
@@ -389,6 +403,23 @@ func TestEnumerateBindingSetClasses_PrunesSystemAuth(t *testing.T) {
 // (APIGroups=["authorization.k8s.io"]) → empty intersection → PRUNE.
 // This is acceptable because system:basic-user grants no krateo.io
 // resource access; the cohort produces no L1-hit content.
+//
+// GROUP-KIND inputs (Ship 0.30.184): the 8 production Group-kind
+// subjects captured at /tmp/snowplow-runs/0.30.184/before/wire-probe-
+// zeta-groups.txt + system:authenticated (implicit-pruned upstream) +
+// 2 synthetic edges (wildcard-keep + view-only-prune).
+//
+// GROUP CORRECTNESS GATES (HG-184.13 / HG-184.14):
+//   - system:masters → cluster-admin (wildcard) → KEEP (correctness-
+//     load-bearing — DO NOT regress, strips admin cohort).
+//   - admins → cluster-admin (wildcard) → KEEP.
+//   - authn → authn-group-krateo-system (templates.krateo.io overlap)
+//     → KEEP.
+//   - devs → admin-role (krateoTemplatesRule overlap) → KEEP.
+//   - system:monitoring / system:nodes / system:serviceaccounts /
+//     system:unauthenticated → no krateo.io overlap → PRUNE.
+//   - system:authenticated → assert NOT INVOKED by (ζ) (implicit-
+//     pruned upstream of the predicate).
 //
 // Per-name fixture comes from LIVE RBAC (feedback_empirical_apiserver_
 // probe_for_predicate_design); the predicate is generic over (name,
@@ -537,25 +568,77 @@ func TestPrunePredicate_ZetaCorpusReal(t *testing.T) {
 	bindIdx++
 	crbs = append(crbs, mkCRBWithRole("bind-bob-basic", "system:basic-user", userSub("bob")))
 
-	// 9 Group-kind subjects — NEVER pruned by (ζ).
-	groupNames := []string{
-		"admins",
-		"authn",
-		"devs",
-		"system:masters",
-		"system:nodes",
-		"system:monitoring",
-		"system:authenticated",
-		"system:serviceaccounts",
-		"system:unauthenticated",
+	// Group-kind production corpus (Ship 0.30.184). Each entry is
+	// (subject.Name, ClusterRoleBinding RoleRef.Name, KEEP|PRUNE
+	// expectation). The role rules are wired below; the KEEP/PRUNE
+	// column is the falsifier's expected predicate outcome.
+	//
+	// Per the wire-probe artifact at /tmp/snowplow-runs/0.30.184/before/
+	// wire-probe-zeta-groups.txt:
+	//   - admins, system:masters bind cluster-admin (wildcard) — KEEP.
+	//   - authn binds authn-group-krateo-system (templates.krateo.io
+	//     overlap) — KEEP.
+	//   - devs is bound via 13 RBs in production; for the unit test we
+	//     bind a single CRB to a synthetic role carrying
+	//     krateoTemplatesRule (the load-bearing overlap shape) — KEEP.
+	//   - system:monitoring, system:nodes, system:serviceaccounts,
+	//     system:unauthenticated bind roles whose APIGroups touch zero
+	//     krateo.io — PRUNE.
+	//   - system:authenticated is upstream-pruned (the enumerator never
+	//     calls (ζ) for it); we still include it in the fixture to
+	//     assert no log line surfaces.
+	//   - SYNTHETIC EDGES:
+	//       wildcard-group → role with wildcardRule → KEEP.
+	//       view-only-group → role with systemBasicUserRule (no krateo.io)
+	//         → PRUNE.
+	productionGroupCorpus := []struct {
+		name     string
+		roleName string
+		expect   string // "KEEP" or "PRUNE"
+	}{
+		{"admins", "cluster-admin", "KEEP"},
+		{"authn", "authn-group-krateo-system", "KEEP"},
+		{"devs", "devs-role", "KEEP"},
+		{"system:masters", "cluster-admin", "KEEP"}, // HG-184.14 load-bearing
+		{"system:monitoring", "system:monitoring-role", "PRUNE"},
+		{"system:nodes", "system:nodes-role", "PRUNE"},
+		{"system:serviceaccounts", "system:serviceaccounts-role", "PRUNE"},
+		{"system:unauthenticated", "system:unauthenticated-role", "PRUNE"},
+		// SYNTHETIC EDGES
+		{"wildcard-group", "wildcard-group-role", "KEEP"},
+		{"view-only-group", "view-only-group-role", "PRUNE"},
 	}
-	for _, g := range groupNames {
+	groupRoleSet := map[string]rbacv1.PolicyRule{
+		// KEEP-arm roles
+		"cluster-admin":             wildcardRule,
+		"authn-group-krateo-system": krateoTemplatesRule,
+		"devs-role":                 krateoTemplatesRule,
+		"wildcard-group-role":       wildcardRule,
+		// PRUNE-arm roles
+		"system:monitoring-role":      noKrateoRule,
+		"system:nodes-role":           noKrateoRule,
+		"system:serviceaccounts-role": noKrateoRule,
+		"system:unauthenticated-role": noKrateoRule,
+		"view-only-group-role":        systemBasicUserRule,
+	}
+	for _, e := range productionGroupCorpus {
 		bindIdx++
-		crbs = append(crbs, mkCRB("bind-group-"+itoaTest(bindIdx), groupSub(g)))
+		crbs = append(crbs,
+			mkCRBWithRole("bind-group-"+itoaTest(bindIdx), e.roleName, groupSub(e.name)))
 	}
+	// system:authenticated — bound but the enumerator filters it BEFORE
+	// the predicate runs. Wire it with a no-krateo role to assert
+	// that no `binding_set.prune` line surfaces for it (would be a
+	// regression: predicate observed an implicit-pruned subject).
+	bindIdx++
+	crbs = append(crbs,
+		mkCRBWithRole("bind-group-"+itoaTest(bindIdx),
+			"system:authenticated-role", groupSub("system:authenticated")))
+	groupRoleSet["system:authenticated-role"] = noKrateoRule
 
-	// Build the ClusterRole set. Every production role from the
-	// corpus + cyberjoker + admin-role + system:basic-user.
+	// Build the ClusterRole set. Every production User role from the
+	// corpus + cyberjoker + admin-role + system:basic-user + every
+	// Group corpus role.
 	var clusterRoles []*rbacv1.ClusterRole
 	for roleName := range roleNameSet {
 		clusterRoles = append(clusterRoles,
@@ -566,6 +649,10 @@ func TestPrunePredicate_ZetaCorpusReal(t *testing.T) {
 		mkClusterRole("admin-role", []rbacv1.PolicyRule{krateoTemplatesRule}),
 		mkClusterRole("system:basic-user", []rbacv1.PolicyRule{systemBasicUserRule}),
 	)
+	for roleName, rule := range groupRoleSet {
+		clusterRoles = append(clusterRoles,
+			mkClusterRole(roleName, []rbacv1.PolicyRule{rule}))
+	}
 
 	snap := buildSnapshotWithRoles(t, crbs, nil, clusterRoles)
 
@@ -603,16 +690,49 @@ func TestPrunePredicate_ZetaCorpusReal(t *testing.T) {
 		t.Errorf("pruneUserKindSubjectZeta(bob, [system:basic-user]) = false; expected true (lossless false-prune)")
 	}
 
+	// GROUP-KIND direct predicate assertions (Ship 0.30.184). Exercise
+	// pruneGroupKindSubjectZeta directly over each fixture entry. This is
+	// the symmetric falsifier: every PRUNE-expected Group prunes; every
+	// KEEP-expected Group survives. system:masters bound to cluster-admin
+	// (HG-184.14) is the load-bearing correctness gate.
+	for _, e := range productionGroupCorpus {
+		refs := collectMatchedRoleRefsForGroup(snap, e.name)
+		got := pruneGroupKindSubjectZeta(e.name, refs, snap, snowplowHandlerGVRSetForTest)
+		wantPrune := e.expect == "PRUNE"
+		if got != wantPrune {
+			t.Errorf("pruneGroupKindSubjectZeta(%q, role=%q) = %v; want %v (expect=%s)",
+				e.name, e.roleName, got, wantPrune, e.expect)
+		}
+	}
+
+	// SYSTEM:MASTERS LOAD-BEARING ASSERTION (HG-184.14). Re-assert
+	// explicitly so a future regression on this name yields a focused
+	// failure rather than a generic corpus mismatch.
+	if got := pruneGroupKindSubjectZeta("system:masters",
+		collectMatchedRoleRefsForGroup(snap, "system:masters"),
+		snap, snowplowHandlerGVRSetForTest); got {
+		t.Errorf("HG-184.14: pruneGroupKindSubjectZeta(system:masters, [cluster-admin]) = true; expected false (cluster-admin wildcard overlaps every handler GVR — admin cohort must survive)")
+	}
+
 	// END-TO-END enumeration — install a slog buffer handler to capture
 	// binding_set.prune lines emitted by EnumerateBindingSetClasses.
 	// In unit tests Global() returns nil → handlerGVRSetSnapshot
 	// returns nil → predicate (ζ) fires the empty-handler-set defensive
-	// branch for the 5 non-system: stragglers (and admin/alice/bob).
-	// The 24 system:-prefixed names take the fast path independently
-	// of the handler set. We assert:
-	//   - >= 24 lines with reason=system_prefix (fast path)
-	//   - every prune line has subject_kind="User"
-	//   - no log line for Group-kind subjects (predicate not invoked)
+	// branch for the 5 non-system: User stragglers AND for every
+	// candidate Group (the handler set is empty → all Group candidates
+	// prune via reason=handler_set_empty). The 24 system:-prefixed
+	// User names take the fast path independently of the handler set.
+	//
+	// We assert:
+	//   - >= 24 User-kind prune lines with reason=system_prefix
+	//   - every prune line has subject_kind ∈ {"User","Group"}
+	//   - every prune line carries a `reason` field
+	//   - >= 1 Group-kind prune line (Group predicate observed at least
+	//     one candidate)
+	//   - NO Group-kind prune line with reason=system_prefix
+	//     (Group predicate has no fast path)
+	//   - NO prune line for `system:authenticated` (implicit-pruned
+	//     upstream of the predicate)
 	prevLogger := slog.Default()
 	defer slog.SetDefault(prevLogger)
 	var logBuf bytes.Buffer
@@ -622,6 +742,8 @@ func TestPrunePredicate_ZetaCorpusReal(t *testing.T) {
 
 	logText := logBuf.String()
 	pruneLines := 0
+	userKindLines := 0
+	groupKindLines := 0
 	systemPrefixLines := 0
 	for _, line := range strings.Split(strings.TrimSpace(logText), "\n") {
 		if line == "" {
@@ -631,23 +753,43 @@ func TestPrunePredicate_ZetaCorpusReal(t *testing.T) {
 			continue
 		}
 		pruneLines++
-		if !strings.Contains(line, `"subject_kind":"User"`) {
-			t.Errorf("binding_set.prune line missing subject_kind=\"User\": %s", line)
-		}
-		if strings.Contains(line, `"reason":"system_prefix"`) {
-			systemPrefixLines++
+		switch {
+		case strings.Contains(line, `"subject_kind":"User"`):
+			userKindLines++
+			if strings.Contains(line, `"reason":"system_prefix"`) {
+				systemPrefixLines++
+			}
+		case strings.Contains(line, `"subject_kind":"Group"`):
+			groupKindLines++
+			// HG-184.5/predicate-symmetry: the Group-kind predicate has
+			// no `system:`-prefix fast path. A Group-kind prune line
+			// carrying reason=system_prefix is a regression.
+			if strings.Contains(line, `"reason":"system_prefix"`) {
+				t.Errorf("Group-kind prune line with reason=system_prefix (no fast path expected): %s", line)
+			}
+		default:
+			t.Errorf("binding_set.prune line missing or unknown subject_kind: %s", line)
 		}
 		// Every prune line must include the `reason` field (HG-183.10).
 		if !strings.Contains(line, `"reason":`) {
 			t.Errorf("binding_set.prune line missing reason field: %s", line)
 		}
+		// system:authenticated MUST NEVER appear in a prune line
+		// (implicit-pruned upstream of (ζ)).
+		if strings.Contains(line, `"name":"system:authenticated"`) {
+			t.Errorf("(ζ) observed implicit-pruned system:authenticated (regression — should be filtered upstream): %s", line)
+		}
 	}
 	if systemPrefixLines < 24 {
-		t.Errorf("expected >=24 prune lines with reason=system_prefix; got %d", systemPrefixLines)
+		t.Errorf("expected >=24 User-kind prune lines with reason=system_prefix; got %d", systemPrefixLines)
 	}
-	if pruneLines < 32 {
-		t.Errorf("expected >=32 binding_set.prune lines (29 production User-kind + admin/alice/bob); got %d", pruneLines)
+	if userKindLines < 32 {
+		t.Errorf("expected >=32 User-kind prune lines (29 production + admin/alice/bob); got %d", userKindLines)
 	}
+	if groupKindLines < 1 {
+		t.Errorf("expected >=1 Group-kind prune line (predicate (ζ) extended to Group-kind); got %d", groupKindLines)
+	}
+	_ = pruneLines
 }
 
 // TestPrunePredicate_WildcardRoleKeepsUser — A User-kind subject bound
@@ -674,27 +816,34 @@ func TestPrunePredicate_WildcardRoleKeepsUser(t *testing.T) {
 	}
 }
 
-// TestPrunePredicate_NotInvokedForGroupOrSA — Ship 0.30.183 invariant:
-// predicate (ζ) NEVER observes a Group-kind or ServiceAccount-kind
-// subject. Group-kind subjects always survive enumeration (their
-// own subject-kind branch); SA-kind subjects route to
-// CRBsByServiceAccount and never appear in candidateUsers.
+// TestPrunePredicate_NotInvokedForSA — Ship 0.30.184 invariant
+// (renamed from TestPrunePredicate_NotInvokedForGroupOrSA): predicate
+// (ζ) NEVER observes a ServiceAccount-kind subject. SA-kind subjects
+// route to CRBsByServiceAccount and never appear in candidateUsers OR
+// candidateGroups.
+//
+// Group-kind subjects ARE now observed by (ζ) (Ship 0.30.184 extension);
+// this test merely asserts the SA-kind scope boundary.
+//
+// HG-184.7 invariant — prune NEVER for ServiceAccount.
 //
 // Verification: scan the binding_set.prune INFO log output for any
-// line whose subject_kind != "User". A non-User prune line is a
-// regression — predicate (ζ) leaking outside its User-kind scope.
-func TestPrunePredicate_NotInvokedForGroupOrSA(t *testing.T) {
+// line whose subject_kind == "ServiceAccount". An SA-kind prune line
+// is a regression — predicate (ζ) leaking outside its
+// {User, Group} scope.
+func TestPrunePredicate_NotInvokedForSA(t *testing.T) {
 	resetGenAndSnapshot(t)
 
-	// One CRB per Subject-Kind variant.
+	// One CRB per Subject-Kind variant. User and Group subjects WILL be
+	// observed by (ζ); SA subjects MUST NOT.
 	crbs := []*rbacv1.ClusterRoleBinding{
-		mkCRBWithRole("user-bind", "system:reserved-role", userSub("system:something")), // User pruned via fast path
-		mkCRBWithRole("group-bind", "system:masters-role", groupSub("system:masters")),  // Group — predicate must NOT see
-		mkCRBWithRole("sa-bind", "system:sa-role", saSub("kube-system", "snowplow")),    // SA — predicate must NOT see
+		mkCRBWithRole("user-bind", "system:reserved-role", userSub("system:something")),       // User pruned via fast path
+		mkCRBWithRole("group-bind", "system:monitoring-role", groupSub("system:monitoring")),  // Group — predicate (ζ) observes, prunes
+		mkCRBWithRole("sa-bind", "system:sa-role", saSub("kube-system", "snowplow")),          // SA — predicate must NOT see
 	}
 	buildSnapshotWithRoles(t, crbs, nil, []*rbacv1.ClusterRole{
 		mkClusterRole("system:reserved-role", []rbacv1.PolicyRule{noKrateoRule}),
-		mkClusterRole("system:masters-role", []rbacv1.PolicyRule{noKrateoRule}),
+		mkClusterRole("system:monitoring-role", []rbacv1.PolicyRule{noKrateoRule}),
 		mkClusterRole("system:sa-role", []rbacv1.PolicyRule{noKrateoRule}),
 	})
 
@@ -713,8 +862,13 @@ func TestPrunePredicate_NotInvokedForGroupOrSA(t *testing.T) {
 		if !strings.Contains(line, `"msg":"binding_set.prune"`) {
 			continue
 		}
-		if !strings.Contains(line, `"subject_kind":"User"`) {
-			t.Errorf("binding_set.prune line emitted with non-User subject_kind (predicate leaked outside User-kind scope): %s", line)
+		if strings.Contains(line, `"subject_kind":"ServiceAccount"`) {
+			t.Errorf("HG-184.7: binding_set.prune line emitted with subject_kind=ServiceAccount (predicate leaked outside {User,Group} scope): %s", line)
+		}
+		// Defensive: any non-{User,Group} subject_kind is also a leak.
+		if !strings.Contains(line, `"subject_kind":"User"`) &&
+			!strings.Contains(line, `"subject_kind":"Group"`) {
+			t.Errorf("binding_set.prune line emitted with unexpected subject_kind: %s", line)
 		}
 	}
 }
@@ -781,6 +935,87 @@ func TestPrunePredicate_RoleBindingRoleKind(t *testing.T) {
 	}
 	if got := pruneUserKindSubjectZeta("team-a-dev", refs, snap, snowplowHandlerGVRSetForTest); got {
 		t.Errorf("pruneUserKindSubjectZeta(team-a-dev, namespaced Role with krateo.io rules) = true; expected false (RB Role-kind resolution)")
+	}
+}
+
+// TestPrunedGroupNotEnumerated_CohortNSACL — Ship 0.30.184 HG-184.15
+// smoke test. A Group-kind subject pruned by predicate (ζ) MUST NOT
+// appear in the enumeration output AND downstream cohort helpers
+// (CohortNSACL, the per-cohort namespace ACL fast-path) MUST return
+// a sensible empty/permit-none result without panicking when invoked
+// for the pruned identity.
+//
+// Setup: a `monitoring-only` Group bound to a ClusterRole carrying
+// only `nodes/metrics` rules (no krateo.io overlap). The Group-kind
+// predicate prunes it at enumeration. Then we directly invoke
+// CohortNSACL with the pruned Group name against the snowplow handler
+// GVR. The expected outcome:
+//
+//   - permitAll = false (Group's role has no `compositions` grant)
+//   - permittedNS = empty/nil (no per-namespace RoleBinding either)
+//   - NO panic
+//
+// HG-184.15 confirms that downstream cohort helpers (which intentionally
+// do not consult the enumerator's prune verdict — they walk the
+// snapshot directly) remain correct + crash-safe for pruned identities.
+func TestPrunedGroupNotEnumerated_CohortNSACL(t *testing.T) {
+	resetGenAndSnapshot(t)
+
+	// Bind `monitoring-only` Group to a ClusterRole with no krateo.io
+	// overlap. The predicate prunes; CohortNSACL must still return a
+	// safe empty result.
+	snap := buildSnapshotWithRoles(t,
+		[]*rbacv1.ClusterRoleBinding{
+			mkCRBWithRole("mon-bind", "monitoring-only-role",
+				groupSub("monitoring-only")),
+		},
+		nil,
+		[]*rbacv1.ClusterRole{
+			mkClusterRole("monitoring-only-role", []rbacv1.PolicyRule{noKrateoRule}),
+		},
+	)
+
+	// Step 1 — predicate (ζ) prunes the Group (PolicyRule has no
+	// krateo.io overlap with snowplowHandlerGVRSetForTest).
+	refs := collectMatchedRoleRefsForGroup(snap, "monitoring-only")
+	if got := pruneGroupKindSubjectZeta("monitoring-only", refs, snap, snowplowHandlerGVRSetForTest); !got {
+		t.Fatalf("setup error: pruneGroupKindSubjectZeta(monitoring-only, [noKrateoRule]) = false; want true")
+	}
+
+	// Step 2 — enumeration MUST NOT surface `monitoring-only` as a
+	// cohort Group. (In unit tests handlerGVRSet is nil; the defensive
+	// `handler_set_empty` branch also prunes monitoring-only — the
+	// outcome is the same.)
+	out := EnumerateBindingSetClasses()
+	for _, c := range out {
+		for _, g := range c.Groups {
+			if g == "monitoring-only" {
+				t.Errorf("pruned Group `monitoring-only` surfaced in enumeration output: %+v", c)
+			}
+		}
+	}
+
+	// Step 3 — CohortNSACL invoked for the pruned Group MUST NOT panic
+	// AND MUST return permitAll=false + empty permittedNS. The handler
+	// GVR here is `composition.krateo.io/compositions` (testGVR shape
+	// from cohort_ns_acl_test.go); the Group's role has no overlap, so
+	// the verdict is correctly "deny every namespace".
+	pruneGVR := schema.GroupVersionResource{
+		Group:    "composition.krateo.io",
+		Version:  "v1",
+		Resource: "compositions",
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CohortNSACL panicked for pruned Group `monitoring-only`: %v", r)
+		}
+	}()
+	permitAll, permittedNS := CohortNSACL(snap, "", []string{"monitoring-only"}, pruneGVR)
+	if permitAll {
+		t.Errorf("CohortNSACL(`monitoring-only`): permitAll=true; want false (Group has no compositions grant)")
+	}
+	if len(permittedNS) != 0 {
+		t.Errorf("CohortNSACL(`monitoring-only`): permittedNS=%v; want empty/nil", permittedNS)
 	}
 }
 

@@ -506,8 +506,14 @@ func Phase1EnumBindingsetClassesTotal() uint64 {
 // Ship 0.30.183 (A.3-refine v3): User-kind subjects whose matched-
 // binding rules have empty intersection with the snowplow handler GVR
 // set are PRUNED at the userKeys collection step via predicate (ζ)
-// `pruneUserKindSubjectZeta`. Group-kind subjects are NEVER pruned by
-// (ζ); the predicate is User-kind only.
+// `pruneUserKindSubjectZeta`.
+//
+// Ship 0.30.184 (ζ)-extend Group-kind: symmetric Group-kind predicate
+// `pruneGroupKindSubjectZeta` (binding_set_enumeration_group.go) applies
+// the same PolicyRule-intersection prune to Group-kind subjects at the
+// groupKeys collection step. The Group-kind branch INTENTIONALLY OMITS
+// the `system:`-prefix fast path so `system:masters` bound to
+// cluster-admin (wildcard rule) survives as the admin cohort.
 //
 // The returned slice is sorted by (Username, Groups[0]) for stable
 // log output and deterministic cohort ordering across pod restarts.
@@ -571,23 +577,49 @@ func EnumerateBindingSetClasses() []Cohort {
 	}
 
 	// Step 2 — groupKeys = union of CRBsByGroup ∪ ∪_ns RBsByGroupByNS,
-	// pruning systemAuthenticatedGroup (implicit per evaluate.go:559).
-	// Group-kind subjects are NEVER pruned by predicate (ζ); the
-	// predicate is User-kind only.
-	groupKeys := map[string]struct{}{}
+	// pruning systemAuthenticatedGroup (implicit per evaluate.go:559)
+	// AND predicate (ζ) Ship 0.30.184 (symmetric extension to User-kind):
+	// Group-kind subjects whose matched-binding rules have empty
+	// intersection with the snowplow handler GVR set are PRUNED. The
+	// Group-kind predicate has NO `system:`-prefix fast path — it would
+	// FALSE-PRUNE `system:masters` bound to cluster-admin (wildcard rule
+	// → KEEP). See binding_set_enumeration_group.go for design rationale.
+	candidateGroups := map[string]struct{}{}
 	for g := range snap.CRBsByGroup {
 		if g == systemAuthenticatedGroup || g == "" {
 			continue
 		}
-		groupKeys[g] = struct{}{}
+		candidateGroups[g] = struct{}{}
 	}
 	for _, inner := range snap.RBsByGroupByNS {
 		for g := range inner {
 			if g == systemAuthenticatedGroup || g == "" {
 				continue
 			}
-			groupKeys[g] = struct{}{}
+			candidateGroups[g] = struct{}{}
 		}
+	}
+	groupKeys := map[string]struct{}{}
+	for g := range candidateGroups {
+		refs := collectMatchedRoleRefsForGroup(snap, g)
+		pruned := pruneGroupKindSubjectZeta(g, refs, snap, handlerGVRSet)
+		if !pruned {
+			groupKeys[g] = struct{}{}
+			continue
+		}
+		// PRUNED — emit the INFO log line with subject_kind="Group".
+		// Reason classification mirrors the User-kind branch (sans
+		// `system_prefix`, which the Group-kind predicate omits).
+		reason := groupKindPruneReason(refs, handlerGVRSet)
+		roleNames := roleRefNamesForLog(refs)
+		log.Info("binding_set.prune",
+			slog.String("subsystem", "cache"),
+			slog.String("subject_kind", "Group"),
+			slog.String("name", g),
+			slog.String("reason", reason),
+			slog.Int("matched_roles_count", len(refs)),
+			slog.Any("matched_roles", roleNames),
+		)
 	}
 
 	// Step 3 — build relevantGroups(u): the set of group names that
