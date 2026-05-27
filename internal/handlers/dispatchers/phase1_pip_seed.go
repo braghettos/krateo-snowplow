@@ -910,7 +910,33 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	// (feedback_shared_vs_copy_is_a_concurrency_change.md).
 	in := e.W.DeepCopy()
 
+	// Ship 0.30.193 Checkpoint 1 — install per-widget PIP timing sink.
+	// Mirrors the restaction shape at lines 802-813: sink lives for the
+	// duration of THIS widget's resolve; the deferred log emits a
+	// phase1.seed.widget.timing line with widget identity + total
+	// wall-clock + stages (the widget's apiref phase re-enters
+	// restactions.Resolve which itself appends per-stage entries to the
+	// SAME sink, so per-restaction stage breakdowns flow through here).
+	//
+	// SINK ISOLATION (feedback_shared_vs_copy_is_a_concurrency_change):
+	// one sink per seedOneWidget invocation; never shared across
+	// widgets or cohorts.
+	stageTimingSink := cache.NewPIPStageTimingSink()
+	widgetStart := time.Now()
+	defer func() {
+		snapshot := stageTimingSink.Snapshot()
+		slog.Default().Info("phase1.seed.widget.timing",
+			slog.String("subsystem", "cache"),
+			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+			slog.String("gvr", e.GVR.String()),
+			slog.Int64("elapsed_ms_total", time.Since(widgetStart).Milliseconds()),
+			slog.Int("stages_total", len(snapshot)),
+			slog.Any("stages", snapshot),
+		)
+	}()
+
 	resCtx := cache.WithL1KeyContext(ctx, key)
+	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 
 	res, err := widgets.Resolve(resCtx, widgets.ResolveOptions{
 		In:      in,

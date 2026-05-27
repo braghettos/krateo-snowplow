@@ -1,31 +1,39 @@
-// pip_stage_timing.go — Ship 0.30.192 PURE-ADDITIVE INSTRUMENTATION.
+// pip_stage_timing.go — Ship 0.30.192 + 0.30.193 PURE-ADDITIVE INSTRUMENTATION.
 //
-// Per-stage timing sink for PIP seed cohort restactions. The 0.30.179
-// cluster-list-deny / per-NS iterator fallback at iter_serial=1 is the
-// architect's TRACED hypothesis for the 46s/restaction wall-clock on
-// the four 0.30.189-sentinel cohorts (system:cohort:group-only:v1
-// etc.), but the cost-attribution is unverified: their "~5K namespaces
-// × ~10ms" projection was invalidated by the cluster reality
-// (62 namespaces actually present). This file lets the resolver record
-// per-stage timing + cluster-list outcome + iterator-call counts during
-// a seed pass so we can attribute the 46s to a real code path before
-// designing the 0.30.193 fix.
+// Per-stage timing sink for PIP seed cohort restactions. Ship 0.30.193
+// extends the 0.30.192 stage-level capture (ClusterListUsed,
+// IteratorElapsedMs, IteratorCalls) with FOUR new checkpoint families
+// designed to pinpoint the 91s wall-clock gap between iterator end and
+// stage end observed on the sentinel cohort's allCompositions stage at
+// 0.30.192:
 //
-// CONCURRENCY: one PIPStageTimingSink is created per seedOneRestaction
-// invocation and attached to that goroutine's context — there is NO
-// cross-goroutine sharing within a sink. The inner-call iterator loop
-// in resolve.go DOES run goroutines that share the parent ctx (and
-// therefore the sink), but only the parent goroutine reads/writes
-// stage-level fields between/around the errgroup.Wait — never inside
-// the worker. The sync.Mutex is defensive (so a future code path that
-// records from a worker is race-safe), not a correctness requirement
-// for today's call sites.
+//   C3: per-call apistageContentServe hit/miss/elapsed
+//   C4: populateCohortGateMemo permitAll/input/kept/elapsed
+//   Defensive: dispatch + parse + put + envelope bytes (cluster_list.go)
+//
+// CONCURRENCY: one PIPStageTimingSink is created per seedOneRestaction /
+// seedOneWidget invocation and attached to that goroutine's context.
+// The inner-call iterator runs an errgroup with up to GOMAXPROCS workers
+// — these workers DO concurrently call AccumulateContentServe and
+// AccumulateMemoPopulate. The sink's existing sync.Mutex now protects
+// BOTH:
+//   - currentStage pointer reassignment by the parent goroutine between
+//     stages (BeginStage / EndStage)
+//   - worker-side AccumulateContentServe / AccumulateMemoPopulate /
+//     AccumulateDefensive that read currentStage and mutate the struct.
+// At GOMAXPROCS-typical 16 workers and per-call work ~10ms, mutex
+// contention is sub-µs — negligible vs the 73s iterator wall-clock the
+// stage is trying to attribute.
 //
 // PURE-ADDITIVE: nil-safe everywhere — a ctx without WithPIPStageTimingSink
 // returns a nil *PIPStageTimingSink from PIPStageTimingSinkFrom, and
 // every sink-method short-circuits on a nil receiver. Production paths
-// (the live /call request, the SA content-warm) carry no sink and pay
-// zero overhead beyond the nil-receiver branch.
+// (the live /call request, the SA content-warm, the L1 refresher) carry
+// no sink and pay zero overhead beyond the nil-receiver branch.
+// REFRESHER-SAFETY (feedback_refresher_populate_amplification): the
+// L1 refresher does NOT install a sink → PIPStageTimingSinkFrom returns
+// nil → every Accumulate* call is a nil-receiver no-op → ZERO refresher
+// amplification.
 
 package cache
 
@@ -35,12 +43,9 @@ import (
 )
 
 // PIPStageTiming captures per-stage cost-attribution data for ONE
-// spec.api[] stage inside a seedOneRestaction resolve. The architect's
-// 0.30.192 instrumentation spec (4 checkpoints); the minimum-acceptable
-// scope shipped is fields 1-5 (StageID, elapsed_ms_total/_inner,
-// ClusterListUsed, ClusterListDenyGate, IteratorCalls). Per-call
-// content-hit and apistage-memo fields are RESERVED — populated by
-// follow-up instrumentation when those checkpoints are wired.
+// spec.api[] stage inside a seedOneRestaction resolve. Ship 0.30.193
+// extends the 0.30.192 fields with content-serve / memo-populate /
+// defensive-prefetch sub-stage timings.
 type PIPStageTiming struct {
 	// StageID is the spec.api[].name of the stage (e.g.
 	// "compositions-by-ns"). Used in log diff between cohorts.
@@ -65,7 +70,7 @@ type PIPStageTiming struct {
 	// ClusterListDenyGate.
 	ClusterListUsed bool `json:"cl_used"`
 
-	// ClusterListDenyGate is the gate number (1-5) that triggered the
+	// ClusterListDenyGate is the gate number (1-7) that triggered the
 	// false return from attemptClusterListCollapse — see cluster_list.go
 	// :86-104. 0 means no deny (gate passed, ClusterListUsed=true) OR
 	// the helper was not attempted. Values:
@@ -90,29 +95,93 @@ type PIPStageTiming struct {
 	// endpoint-resolution / gate-check cost.
 	IteratorElapsedMs int64 `json:"iter_elapsed_ms"`
 
-	// ContentHits / ContentMisses — reserved for the Checkpoint 3
-	// apistageContentServe instrumentation; ship-0.30.192 does NOT
-	// populate these (deferred to keep the diff small). Left in the
-	// struct so the slog JSON envelope shape is the same once they
-	// land.
+	// ContentHits / ContentMisses — Ship 0.30.193 Checkpoint 3. Counts
+	// of apistageContentServe outcomes (hit on store.Get, miss
+	// triggering dispatchViaInformer + Put). Accumulated by workers.
 	ContentHits   int `json:"content_hits"`
 	ContentMisses int `json:"content_misses"`
 
-	// ApistageMemoPermitAll / ApistageMemoKeptCount — reserved for
-	// Checkpoint 4 (populateCohortGateMemo). Same forward-compat
-	// rationale as Content{Hits,Misses}.
+	// ContentElapsedMs — Ship 0.30.193 Checkpoint 3. Aggregate
+	// wall-clock cost of all apistageContentServe invocations for this
+	// stage (sum of per-call elapsed). For an N-fanout stage the
+	// per-call cost serialised would sum to N × per_call_ms; under the
+	// bounded errgroup the WALL-clock is IteratorElapsedMs and this
+	// figure is the SUM of CPU-busy time across workers — a
+	// throughput-shape indicator.
+	ContentElapsedMs int64 `json:"content_elapsed_ms"`
+
+	// ApistageMemoPermitAll — Ship 0.30.193 Checkpoint 4. The last-seen
+	// CohortNSACL verdict for this stage's content (true = cluster-wide
+	// list grant; false = namespace-scoped). When a stage produces N
+	// content entries (iterator path with no collapse) this captures the
+	// verdict of the most-recent populate; for the cluster-list collapse
+	// path there is one entry so the value is unambiguous.
 	ApistageMemoPermitAll bool `json:"memo_permit_all"`
-	ApistageMemoKeptCount int  `json:"memo_kept_count"`
+
+	// ApistageMemoInputCount — Ship 0.30.193 Checkpoint 4. The
+	// parsed.items length the LAST populateCohortGateMemo call observed
+	// for this stage. For 29,907-composition clusters this confirms the
+	// memo populate is in fact walking 29,907 items.
+	ApistageMemoInputCount int `json:"memo_input_count"`
+
+	// ApistageMemoKeptCount — Ship 0.30.193 Checkpoint 4. The post-ACL
+	// kept-set size from the LAST populateCohortGateMemo call. For
+	// permitAll=true this equals input_count (every item kept); for
+	// permitAll=false it is the per-namespace-grant filtered subset.
+	ApistageMemoKeptCount int `json:"memo_kept_count"`
+
+	// ApistageMemoPopulateElapsedMs — Ship 0.30.193 Checkpoint 4.
+	// Aggregate wall-clock cost of all populateCohortGateMemo calls for
+	// this stage. If this dominates the 91s gap, the long-pole fix is
+	// to move populate off the cold path (lazy populate, or strip the
+	// RBAC fast-path on >10K items).
+	ApistageMemoPopulateElapsedMs int64 `json:"memo_populate_elapsed_ms"`
+
+	// DefensiveDispatchElapsedMs — Ship 0.30.193 Defensive prefetch
+	// breakdown. The dispatchViaInformer call inside
+	// attemptClusterListCollapse (cluster_list.go:213) that produces the
+	// raw cluster-scope envelope. Cluster-list collapse path only;
+	// non-collapse stages leave this 0.
+	DefensiveDispatchElapsedMs int64 `json:"defensive_dispatch_elapsed_ms"`
+
+	// DefensiveParseElapsedMs — Ship 0.30.193 Defensive prefetch
+	// breakdown. The parseListEnvelope call inside
+	// attemptClusterListCollapse (cluster_list.go:268) — the SECOND
+	// unmarshal whose cost was never measured. If this dominates, the
+	// fix is to dedup the double-unmarshal between validateClusterListShape
+	// and parseListEnvelope.
+	DefensiveParseElapsedMs int64 `json:"defensive_parse_elapsed_ms"`
+
+	// DefensivePutElapsedMs — Ship 0.30.193 Defensive prefetch
+	// breakdown. The apistageStore.Put call inside
+	// attemptClusterListCollapse (cluster_list.go:273) — the LRU insert
+	// of the validated envelope.
+	DefensivePutElapsedMs int64 `json:"defensive_put_elapsed_ms"`
+
+	// DefensiveEnvelopeBytes — Ship 0.30.193 Defensive prefetch
+	// breakdown. The byte length of the dispatched cluster-scope
+	// envelope (cluster_list.go:213's rawEnvelope). At 29,907 compositions
+	// this is expected to be ~100 MB; a smaller value means the
+	// dispatch returned a subset (informer not fully synced).
+	DefensiveEnvelopeBytes int64 `json:"defensive_envelope_bytes"`
 }
 
 // PIPStageTimingSink collects per-stage timings for a single
-// seedOneRestaction call. Constructed by the caller (phase1_pip_seed.go)
+// seedOneRestaction / seedOneWidget call. Constructed by the caller
 // and attached to ctx via WithPIPStageTimingSink. The resolver reads
 // the sink from ctx via PIPStageTimingSinkFrom and appends one entry
 // per spec.api[] stage.
+//
+// Ship 0.30.193 extends the sink to support worker-side accumulation
+// into a "current stage" pointer via BeginStage / EndStage. Workers
+// call AccumulateContentServe / AccumulateMemoPopulate /
+// AccumulateDefensive — all of these acquire mu, read s.current, and
+// mutate fields in-place. If s.current is nil (no stage in progress
+// or sink not wired) every Accumulate* is a no-op.
 type PIPStageTimingSink struct {
-	mu     sync.Mutex
-	stages []PIPStageTiming
+	mu      sync.Mutex
+	stages  []PIPStageTiming
+	current *PIPStageTiming // pointer to the in-flight stage; nil between stages
 }
 
 // NewPIPStageTimingSink constructs an empty sink. Returns a non-nil
@@ -121,10 +190,52 @@ func NewPIPStageTimingSink() *PIPStageTimingSink {
 	return &PIPStageTimingSink{stages: make([]PIPStageTiming, 0, 8)}
 }
 
-// Append adds a finalised PIPStageTiming entry to the sink. Nil-safe
-// receiver: a nil sink (no ctx wiring) is a no-op so the resolver's
-// stage loop can always call sink.Append() unguarded after the
-// PIPStageTimingSinkFrom lookup.
+// BeginStage registers a *PIPStageTiming as the in-flight stage for
+// this sink. Workers' Accumulate* calls write into *stage under mu.
+// Nil-safe: a nil receiver or nil stage is a no-op.
+//
+// Concurrency contract: the resolver's stage loop is single-threaded
+// at the BeginStage / EndStage boundaries (the parent goroutine of
+// the errgroup). BeginStage MUST be called BEFORE g.Go workers can
+// start; EndStage MUST be called AFTER g.Wait() returns. Between
+// BeginStage and EndStage, workers may concurrently call Accumulate*
+// — the sink's mu serialises those writes.
+func (s *PIPStageTimingSink) BeginStage(stage *PIPStageTiming) {
+	if s == nil || stage == nil {
+		return
+	}
+	s.mu.Lock()
+	s.current = stage
+	s.mu.Unlock()
+}
+
+// EndStage commits the in-flight stage to the stages slice and clears
+// the current pointer. The committed entry is a COPY of *stage at the
+// moment of EndStage (after the parent goroutine has set ElapsedMs +
+// IteratorElapsedMs). Nil-safe.
+//
+// The copy happens under mu so a late worker that races with EndStage
+// either:
+//   - lands its write BEFORE EndStage clears current (write captured)
+//   - finds s.current == nil and no-ops
+// In both cases the committed entry is well-formed; there is no
+// torn-struct read.
+func (s *PIPStageTimingSink) EndStage() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.current != nil {
+		s.stages = append(s.stages, *s.current)
+		s.current = nil
+	}
+	s.mu.Unlock()
+}
+
+// Append adds a finalised PIPStageTiming entry to the sink directly,
+// bypassing the BeginStage/EndStage flow. Used by the 0.30.192 stage
+// loop for stage entries that completed before Ship 0.30.193 wired
+// BeginStage/EndStage — kept for back-compat. Nil-safe.
 func (s *PIPStageTimingSink) Append(t PIPStageTiming) {
 	if s == nil {
 		return
@@ -132,6 +243,66 @@ func (s *PIPStageTimingSink) Append(t PIPStageTiming) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stages = append(s.stages, t)
+}
+
+// AccumulateContentServe records ONE apistageContentServe outcome
+// into the in-flight stage. Called from worker goroutines after the
+// hit/miss branch resolves. Nil-safe (no sink, no current stage).
+func (s *PIPStageTimingSink) AccumulateContentServe(hit bool, elapsedMs int64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return
+	}
+	if hit {
+		s.current.ContentHits++
+	} else {
+		s.current.ContentMisses++
+	}
+	s.current.ContentElapsedMs += elapsedMs
+}
+
+// AccumulateMemoPopulate records ONE populateCohortGateMemo outcome
+// into the in-flight stage. permitAll / inputCount / keptCount are
+// overwritten (the LAST populate's values win — at the cluster-list
+// collapse path there is exactly one populate per stage). elapsedMs
+// is accumulated (multi-populate stages sum). Nil-safe.
+func (s *PIPStageTimingSink) AccumulateMemoPopulate(permitAll bool, inputCount, keptCount int, elapsedMs int64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return
+	}
+	s.current.ApistageMemoPermitAll = permitAll
+	s.current.ApistageMemoInputCount = inputCount
+	s.current.ApistageMemoKeptCount = keptCount
+	s.current.ApistageMemoPopulateElapsedMs += elapsedMs
+}
+
+// AccumulateDefensive records the defensive-prefetch sub-stage timings
+// from attemptClusterListCollapse into the in-flight stage. envBytes
+// is overwritten (one defensive prefetch per stage); dispatch / parse
+// / put elapsed are accumulated (back-compat for any future
+// multi-defensive flow). Nil-safe.
+func (s *PIPStageTimingSink) AccumulateDefensive(envBytes int64, dispatchMs, parseMs, putMs int64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return
+	}
+	s.current.DefensiveEnvelopeBytes = envBytes
+	s.current.DefensiveDispatchElapsedMs += dispatchMs
+	s.current.DefensiveParseElapsedMs += parseMs
+	s.current.DefensivePutElapsedMs += putMs
 }
 
 // Snapshot returns a defensive copy of the sink's stages slice. The

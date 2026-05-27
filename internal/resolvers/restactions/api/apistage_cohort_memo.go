@@ -73,6 +73,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -237,11 +238,37 @@ func populateCohortGateMemo(
 	cohort string,
 	currentGen uint64,
 ) (*cohortGateMemo, bool) {
+	// Ship 0.30.193 Checkpoint 4 — populateCohortGateMemo timing.
+	// Captures permitAll, input_items_count, kept_names_count,
+	// elapsed_ms across every populate path (ACL fast-path, canonical
+	// fallback). The sink is installed ONLY at PIP seed; production
+	// /call has no sink → every Accumulate* below is a no-op.
+	//
+	// inputCount is set once at function entry (parsed.items length —
+	// it is the same input regardless of populate branch). permitAll +
+	// keptCount + elapsed are set by the deferred record below; the
+	// nested closure captures the locals so each return path sets them
+	// before the defer fires.
+	pipSink := cache.PIPStageTimingSinkFrom(ctx)
+	t0 := time.Now()
+	inputCount := len(parsed.items)
+	var recordedPermitAll bool
+	var recordedKeptCount int
+	defer func() {
+		pipSink.AccumulateMemoPopulate(recordedPermitAll, inputCount,
+			recordedKeptCount, time.Since(t0).Milliseconds())
+	}()
+
 	snap := cache.LiveRBACSnapshot()
 	if snap == nil {
 		// Pre-readiness / cache=off — fall through to the canonical
 		// filter, which itself fails closed on a missing snapshot.
-		return populateMemoFromCanonicalFilter(ctx, gvr, parsed, currentGen)
+		memo, ok := populateMemoFromCanonicalFilter(ctx, gvr, parsed, currentGen)
+		if ok && memo != nil {
+			recordedPermitAll = memo.permitAll
+			recordedKeptCount = len(memo.keptNames)
+		}
+		return memo, ok
 	}
 
 	permitAll, permittedNS := cache.CohortNSACL(snap, username, groups, gvr)
@@ -263,7 +290,12 @@ func populateCohortGateMemo(
 				slog.String("cohort", cohort),
 				slog.Any("err", err),
 			)
-			return populateMemoFromCanonicalFilter(ctx, gvr, parsed, currentGen)
+			memo, ok := populateMemoFromCanonicalFilter(ctx, gvr, parsed, currentGen)
+			if ok && memo != nil {
+				recordedPermitAll = memo.permitAll
+				recordedKeptCount = len(memo.keptNames)
+			}
+			return memo, ok
 		}
 		gz, err := gzipBytes(encoded)
 		if err != nil {
@@ -289,6 +321,10 @@ func populateCohortGateMemo(
 		// Observability — bump aggregate counters.
 		cache.RecordCohortMemoBytes(len(encoded) + len(gz))
 		cache.RecordCohortMemoEncodedBytes(len(encoded) + len(gz))
+
+		// Ship 0.30.193 C4 — permitAll path: every input item kept.
+		recordedPermitAll = true
+		recordedKeptCount = inputCount
 
 		return memo, true
 	}
@@ -316,6 +352,11 @@ func populateCohortGateMemo(
 		keptNames: keptNames,
 	}
 	cache.RecordCohortMemoBytes(bytesEstimate)
+
+	// Ship 0.30.193 C4 — !permitAll path: keptNames is the filtered subset.
+	recordedPermitAll = false
+	recordedKeptCount = len(keptNames)
+
 	return memo, true
 }
 

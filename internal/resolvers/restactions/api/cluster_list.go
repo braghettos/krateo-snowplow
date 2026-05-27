@@ -209,9 +209,19 @@ func attemptClusterListCollapse(
 	// requests would re-read it. Prefetching lets us reject before
 	// caching, and on the success path we Put the validated envelope
 	// directly so the worker loop hits the cache (no double-dispatch).
+	//
+	// Ship 0.30.193 Defensive prefetch breakdown — capture the
+	// dispatch / parse / put sub-stage timings + envelope bytes on the
+	// success path (the only path that does work whose cost matters for
+	// the cohort allCompositions 91s gap). Fail-paths (unservable
+	// dispatch, shape fallback) leave the accumulator at zero — the
+	// sink-side AccumulateDefensive is gated on the success return
+	// below at line 286.
+	pipSink := cache.PIPStageTimingSinkFrom(ctx)
 	dispatchStart := time.Now()
 	rawEnvelope, dispatchedOK := dispatchViaInformer(
 		cache.WithApistageContentResolve(ctx), clusterCall)
+	defensiveDispatchMs := time.Since(dispatchStart).Milliseconds()
 	if !dispatchedOK {
 		// Pre-sync informer / metadata-only GVR / passthrough mode —
 		// the pivot cannot serve this call. The iterator path can
@@ -265,12 +275,35 @@ func attemptClusterListCollapse(
 	// Pre-parse the LIST envelope's items so subsequent content-Get
 	// hits gate without a re-unmarshal (matches the apistageContentServe
 	// miss-path behaviour at apistage.go:455-462).
+	//
+	// Ship 0.30.193 — measure the parseListEnvelope cost here: this is
+	// the SECOND unmarshal of rawEnvelope (validateClusterListShape did
+	// the first at line 232). At 29,907 compositions / ~100 MB JSON
+	// envelope the architect's hypothesis is that this re-unmarshal +
+	// the Put may dominate the 91s gap.
+	parseStart := time.Now()
 	if p, parseOK := parseListEnvelope(gvr, rawEnvelope); parseOK {
 		newEntry.Items = p.items
 		newEntry.ItemsAPIVersion = p.apiVersion
 		newEntry.ItemsKind = p.kind
 	}
+	defensiveParseMs := time.Since(parseStart).Milliseconds()
+
+	putStart := time.Now()
 	apistageStore.Put(contentKey, newEntry)
+	defensivePutMs := time.Since(putStart).Milliseconds()
+
+	// Ship 0.30.193 — accumulate the defensive prefetch breakdown into
+	// the in-flight PIP stage. Nil-safe sink: production /call has no
+	// sink → no-op. The parent goroutine of the resolver stage loop
+	// owns sink.current at this point (BeginStage has fired, no g.Go
+	// has been launched yet) — no mu contention from worker writes.
+	pipSink.AccumulateDefensive(
+		int64(len(rawEnvelope)),
+		defensiveDispatchMs,
+		defensiveParseMs,
+		defensivePutMs,
+	)
 
 	cache.RecordApiserverFallthrough(ctx,
 		cache.ReasonClusterListDispatch, gvr.String())
@@ -282,6 +315,8 @@ func attemptClusterListCollapse(
 		slog.Int("envelope_bytes", len(rawEnvelope)),
 		slog.Duration("dispatch_elapsed", time.Since(dispatchStart)),
 		slog.Duration("shape_check_elapsed", shapeElapsed),
+		slog.Int64("defensive_parse_ms", defensiveParseMs),
+		slog.Int64("defensive_put_ms", defensivePutMs),
 	)
 	return []httpcall.RequestOptions{clusterCall}, true, 0
 }

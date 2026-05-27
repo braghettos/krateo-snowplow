@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
@@ -390,6 +391,27 @@ func apistageContentServe(
 ) (value any, served bool, ok bool) {
 	log := xcontext.Logger(ctx)
 
+	// Ship 0.30.193 Checkpoint 3 — per-call apistageContentServe
+	// instrumentation. The sink is installed ONLY on the PIP seed paths
+	// (seedOneRestaction, seedOneWidget); production /call requests
+	// have no sink → PIPStageTimingSinkFrom returns nil → every
+	// Accumulate* below is a nil-receiver no-op (zero overhead beyond
+	// one ctx.Value lookup + one nil-check per call).
+	//
+	// hitObserved is set by the hit branch below; on every return we
+	// record (hitObserved, time.Since(t0)). For non-pivot-servable
+	// short-circuit returns (write verbs, malformed paths) hitObserved
+	// stays false; the sample is recorded as a "miss" (no
+	// dispatch/Put — sub-µs cost). That's fine: the sentinel cohort's
+	// allCompositions stage is pivot-servable on the cluster-list
+	// collapse path; the early-return branches are zero-cost noise.
+	pipSink := cache.PIPStageTimingSinkFrom(ctx)
+	t0 := time.Now()
+	var hitObserved bool
+	defer func() {
+		pipSink.AccumulateContentServe(hitObserved, time.Since(t0).Milliseconds())
+	}()
+
 	// Content-keyed entries describe apiserver GET/LIST calls only — the
 	// same shape dispatchViaInformer can serve. A write verb or a
 	// non-apiserver path is not a content unit.
@@ -419,6 +441,7 @@ func apistageContentServe(
 	var haveParsed bool
 	var entryRef *cache.ResolvedEntry
 	if entry, hit := store.Get(contentKey); hit && entry != nil {
+		hitObserved = true // Ship 0.30.193 C3 — observed cache hit.
 		envelope = entry.RawJSON
 		entryRef = entry
 		// R3: a LIST entry stored with pre-parsed Items — gate directly

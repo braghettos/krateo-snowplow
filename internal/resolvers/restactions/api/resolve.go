@@ -270,11 +270,30 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// no behavioural change. Stage early-exits (continue / return
 		// dict) MUST call recordStageTiming() first so the failed
 		// stage's wall-clock is captured for cost attribution.
+		//
+		// Ship 0.30.193 — register the stage with the sink so workers'
+		// AccumulateContentServe / AccumulateMemoPopulate /
+		// AccumulateDefensive calls (called from concurrent goroutines
+		// inside the iterator errgroup) can accumulate into THIS
+		// stage's struct. BeginStage takes a *PIPStageTiming pointer;
+		// recordStageTiming calls EndStage which COMMITS the in-flight
+		// stage to the sink's stages slice. A nil sink makes both
+		// BeginStage and EndStage no-ops.
 		stageStart := time.Now()
 		stageTiming := cache.PIPStageTiming{StageID: id}
+		pipTimingSink.BeginStage(&stageTiming)
 		recordStageTiming := func() {
 			stageTiming.ElapsedMs = time.Since(stageStart).Milliseconds()
-			pipTimingSink.Append(stageTiming)
+			if pipTimingSink != nil {
+				// Ship 0.30.193 — sink-aware finalisation. EndStage
+				// commits the in-flight stage; Append is no longer
+				// invoked because the stage is already tracked under
+				// the sink's current pointer. The previously-set
+				// ElapsedMs / IteratorElapsedMs / ClusterListUsed /
+				// ClusterListDenyGate fields are captured by the
+				// EndStage copy.
+				pipTimingSink.EndStage()
+			}
 		}
 
 		// Tag 0.30.9 Sub-scope A: detect userAccessFilter.

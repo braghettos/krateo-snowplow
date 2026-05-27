@@ -5,11 +5,13 @@ import (
 	"log/slog"
 	"net/http"
 	"reflect"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	xenv "github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/maps"
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	crdschema "github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
 
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/apiref"
@@ -37,7 +39,37 @@ type ResolveOptions struct {
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
 
+	// Ship 0.30.193 Checkpoint 1 — widget-resolve phase wall-clocks.
+	// Captured per-phase so seedOneWidget's deferred log can attribute
+	// total widget-resolve cost across apiref / widgetData / resrefs /
+	// validate. The sink is checked once to skip overhead on the
+	// production /call path (no sink installed → no log emitted by
+	// caller); phase locals are still computed (4 × time.Now → ~120ns)
+	// to keep the code path uniform per feedback_no_special_cases.
+	pipSink := cache.PIPStageTimingSinkFrom(ctx)
+	phaseApirefMs := int64(0)
+	phaseWidgetDataMs := int64(0)
+	phaseResRefsMs := int64(0)
+	phaseValidateMs := int64(0)
+	defer func() {
+		// Only emit the structured phase-timing log when a sink is
+		// wired (PIP seed path). Production /call has no sink → no log
+		// → zero additional log overhead.
+		if pipSink == nil {
+			return
+		}
+		log.Info("phase1.seed.widget.phase.timing",
+			slog.String("subsystem", "cache"),
+			slog.Int64("apiref_ms", phaseApirefMs),
+			slog.Int64("widget_data_ms", phaseWidgetDataMs),
+			slog.Int64("resrefs_ms", phaseResRefsMs),
+			slog.Int64("validate_ms", phaseValidateMs),
+		)
+	}()
+
+	apirefStart := time.Now()
 	ds, err := resolveApiRef(ctx, opts)
+	phaseApirefMs = time.Since(apirefStart).Milliseconds()
 	if err != nil {
 		log.Error("unable to resolve api reference", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
@@ -56,7 +88,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// materialising the unbounded list at the resolver layer.
 	injectSlice(ds, opts.PerPage, opts.Page)
 
+	widgetDataStart := time.Now()
 	widgetData, err := resolveWidgetData(ctx, opts.In, ds)
+	phaseWidgetDataMs = time.Since(widgetDataStart).Milliseconds()
 	if err != nil {
 		log.Error("unable to resolve widget data", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
@@ -70,7 +104,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		return opts.In, err
 	}
 
+	resRefsStart := time.Now()
 	resourcesRefsResults, err := resolveResourceRefs(ctx, opts.In, ds)
+	phaseResRefsMs = time.Since(resRefsStart).Milliseconds()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, err
@@ -104,11 +140,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		}
 	}
 
+	validateStart := time.Now()
 	if xenv.TestMode() {
 		err = crdschema.ValidateObjectStatus(ctx, opts.RC, opts.In.Object)
 	} else {
 		err = crdschema.ValidateObjectStatus(ctx, nil, opts.In.Object)
 	}
+	phaseValidateMs = time.Since(validateStart).Milliseconds()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, &apierrors.StatusError{
