@@ -82,6 +82,23 @@ func TestApistageContentKey_ClusterScopeDistinctFromNamespaced(t *testing.T) {
 }
 
 // ---------- AC-D5.14 — defensive multi-element shape check ----------
+//
+// Ship 0.30.194 Fix B — validateClusterListShape now also returns the
+// parsedListEnvelope from its single decode (the call site previously
+// did a SECOND parseListEnvelope of the same bytes). The tests assert
+// (ok, reason) the same way; the happy-path test additionally asserts
+// the returned parsedListEnvelope's items/apiVersion/kind match what
+// parseListEnvelope would produce.
+
+// testShapeGVR is a stable GVR used across the shape-check tests; the
+// gvr is consulted ONLY when envelope.APIVersion / envelope.Kind are
+// empty (a happens-when-defensive-tests fallback path), so the choice
+// is irrelevant on the happy paths.
+var testShapeGVR = schema.GroupVersionResource{
+	Group:    "composition.krateo.io",
+	Version:  "v1-2-2",
+	Resource: "githubscaffoldingwithcompositionpages",
+}
 
 func TestValidateClusterListShape_HappyPath(t *testing.T) {
 	raw := mustJSON(t, map[string]any{
@@ -100,9 +117,89 @@ func TestValidateClusterListShape_HappyPath(t *testing.T) {
 			},
 		},
 	})
-	ok, reason := validateClusterListShape(raw)
+	parsed, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if !ok {
 		t.Fatalf("validateClusterListShape: expected ok=true on well-formed envelope; reason=%q", reason)
+	}
+	if len(parsed.items) != 2 {
+		t.Fatalf("validateClusterListShape: expected 2 items in parsed envelope; got %d", len(parsed.items))
+	}
+	if parsed.apiVersion != "composition.krateo.io/v1-2-2" {
+		t.Fatalf("validateClusterListShape: apiVersion=%q want composition.krateo.io/v1-2-2", parsed.apiVersion)
+	}
+	if parsed.kind != "GithubScaffoldingWithCompositionPagesList" {
+		t.Fatalf("validateClusterListShape: kind=%q want GithubScaffoldingWithCompositionPagesList", parsed.kind)
+	}
+	// Byte-compat with parseListEnvelope — the items unwrap pattern is
+	// []*unstructured.Unstructured{Object: it} where it is the
+	// json.Unmarshal'd map[string]any. Spot-check that the first item's
+	// metadata.name round-trips through the wrap.
+	if got := parsed.items[0].GetName(); got != "a" {
+		t.Fatalf("validateClusterListShape: items[0].GetName()=%q want \"a\"", got)
+	}
+	if got := parsed.items[1].GetNamespace(); got != "ns-2" {
+		t.Fatalf("validateClusterListShape: items[1].GetNamespace()=%q want \"ns-2\"", got)
+	}
+}
+
+// TestValidateClusterListShape_ParseListEnvelopeEquivalence — Ship
+// 0.30.194 Fix B byte-compat gate. The architect's dedup design relies
+// on validateClusterListShape producing a parsedListEnvelope that is
+// structurally identical to parseListEnvelope's output for the same
+// raw bytes + gvr. This test runs both functions on the same input
+// and asserts items count, apiVersion, kind, and per-item ns/name
+// round-trip equivalence.
+func TestValidateClusterListShape_ParseListEnvelopeEquivalence(t *testing.T) {
+	raw := mustJSON(t, map[string]any{
+		"apiVersion": "composition.krateo.io/v1-2-2",
+		"kind":       "GithubScaffoldingWithCompositionPagesList",
+		"items": []any{
+			map[string]any{
+				"apiVersion": "composition.krateo.io/v1-2-2",
+				"kind":       "GithubScaffoldingWithCompositionPages",
+				"metadata":   map[string]any{"name": "a", "namespace": "ns-1"},
+			},
+			map[string]any{
+				"apiVersion": "composition.krateo.io/v1-2-2",
+				"kind":       "GithubScaffoldingWithCompositionPages",
+				"metadata":   map[string]any{"name": "b", "namespace": "ns-2"},
+			},
+			map[string]any{
+				"apiVersion": "composition.krateo.io/v1-2-2",
+				"kind":       "GithubScaffoldingWithCompositionPages",
+				"metadata":   map[string]any{"name": "c", "namespace": "ns-3"},
+			},
+		},
+	})
+	vParsed, ok, reason := validateClusterListShape(testShapeGVR, raw)
+	if !ok {
+		t.Fatalf("validateClusterListShape: ok=false on well-formed envelope; reason=%q", reason)
+	}
+	pParsed, ok := parseListEnvelope(testShapeGVR, raw)
+	if !ok {
+		t.Fatalf("parseListEnvelope: ok=false on well-formed envelope")
+	}
+	if len(vParsed.items) != len(pParsed.items) {
+		t.Fatalf("items count mismatch: validate=%d parse=%d",
+			len(vParsed.items), len(pParsed.items))
+	}
+	if vParsed.apiVersion != pParsed.apiVersion {
+		t.Fatalf("apiVersion mismatch: validate=%q parse=%q",
+			vParsed.apiVersion, pParsed.apiVersion)
+	}
+	if vParsed.kind != pParsed.kind {
+		t.Fatalf("kind mismatch: validate=%q parse=%q",
+			vParsed.kind, pParsed.kind)
+	}
+	for i := range vParsed.items {
+		if vParsed.items[i].GetName() != pParsed.items[i].GetName() {
+			t.Fatalf("item[%d] name mismatch: validate=%q parse=%q",
+				i, vParsed.items[i].GetName(), pParsed.items[i].GetName())
+		}
+		if vParsed.items[i].GetNamespace() != pParsed.items[i].GetNamespace() {
+			t.Fatalf("item[%d] namespace mismatch: validate=%q parse=%q",
+				i, vParsed.items[i].GetNamespace(), pParsed.items[i].GetNamespace())
+		}
 	}
 }
 
@@ -112,7 +209,7 @@ func TestValidateClusterListShape_KindNotList(t *testing.T) {
 		"kind":       "SingleObject", // does NOT end in List
 		"items":      []any{map[string]any{"apiVersion": "v1", "kind": "ConfigMap"}},
 	})
-	ok, reason := validateClusterListShape(raw)
+	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if ok {
 		t.Fatalf("validateClusterListShape: expected ok=false when kind does not end in List; reason=%q", reason)
 	}
@@ -127,7 +224,7 @@ func TestValidateClusterListShape_EmptyItems(t *testing.T) {
 		"kind":       "ConfigMapList",
 		"items":      []any{},
 	})
-	ok, reason := validateClusterListShape(raw)
+	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if ok {
 		t.Fatalf("validateClusterListShape: expected ok=false on empty items; reason=%q", reason)
 	}
@@ -145,7 +242,7 @@ func TestValidateClusterListShape_ItemMissingApiVersion(t *testing.T) {
 			map[string]any{"kind": "ConfigMap"},
 		},
 	})
-	ok, reason := validateClusterListShape(raw)
+	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if ok {
 		t.Fatalf("validateClusterListShape: expected ok=false when an item lacks apiVersion; reason=%q", reason)
 	}
@@ -162,7 +259,7 @@ func TestValidateClusterListShape_ItemMissingKind(t *testing.T) {
 			map[string]any{"apiVersion": "v1"},
 		},
 	})
-	ok, reason := validateClusterListShape(raw)
+	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if ok {
 		t.Fatalf("validateClusterListShape: expected ok=false when an item lacks kind; reason=%q", reason)
 	}
@@ -172,7 +269,7 @@ func TestValidateClusterListShape_ItemMissingKind(t *testing.T) {
 }
 
 func TestValidateClusterListShape_MalformedJSON(t *testing.T) {
-	ok, reason := validateClusterListShape([]byte("{not-json"))
+	_, ok, reason := validateClusterListShape(testShapeGVR, []byte("{not-json"))
 	if ok {
 		t.Fatalf("validateClusterListShape: expected ok=false on malformed JSON; reason=%q", reason)
 	}
@@ -212,7 +309,7 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 	const runs = 5
 	for i := 0; i < runs; i++ {
 		start := time.Now()
-		ok, reason := validateClusterListShape(raw)
+		_, ok, reason := validateClusterListShape(testShapeGVR, raw)
 		elapsed := time.Since(start)
 		total += elapsed
 		if !ok {
@@ -480,7 +577,7 @@ func TestValidateClusterListShape_RaceConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
-				if ok, _ := validateClusterListShape(raw); !ok {
+				if _, ok, _ := validateClusterListShape(testShapeGVR, raw); !ok {
 					t.Errorf("concurrent validateClusterListShape returned ok=false unexpectedly")
 					return
 				}

@@ -1,4 +1,5 @@
-// apistage_cohort_memo_test.go — Ship GMC / 0.30.174.
+// apistage_cohort_memo_test.go — Ship GMC / 0.30.174,
+// A.2-trim / 0.30.194.
 //
 // Test plane for the per-cohort gate memo:
 //
@@ -11,13 +12,17 @@
 //       AC-GMC.5: filtered item set equal to baseline (set equality on
 //                  metadata.name)
 //   - concurrent same-cohort cold-miss → memo populate (-race clean).
+//
+// Ship 0.30.194 Fix A removed the dead encodedJSON/encodedGzip fields
+// from cohortGateMemo (they were populated on the permitAll path but
+// never read by the serve path). The TestCohortMemo_PermitAllStorageContract
+// and TestGzipBytes_RoundTrip cases that guarded those fields/helper
+// have been dropped alongside the removal — they would not compile,
+// and they no longer correspond to any in-process invariant.
 
 package api
 
 import (
-	"bytes"
-	"compress/gzip"
-	"io"
 	"strconv"
 	"sync"
 	"testing"
@@ -135,58 +140,22 @@ func TestCohortMemo_StorageContract(t *testing.T) {
 	}
 }
 
-// TestCohortMemo_PermitAllStorageContract — Ship A.2 / 0.30.178: the
-// permitAll fast-path stores encodedJSON + encodedGzip alongside the
-// permitAll flag. This unit-level proof verifies AC-178.4 (encoded-
-// bytes cache populates for ALL permitAll cohorts, no threshold).
+// TestCohortMemo_PermitAllStorageContract — Ship A.2 / 0.30.178, trimmed
+// at A.2-trim / 0.30.194. The permitAll fast-path now stores ONLY the
+// permitAll flag + rbacGen; the never-read encodedJSON/encodedGzip
+// fields were removed by Fix A. The trimmed invariant: a permitAll memo
+// has permitAll=true and keptNames=nil (the serve path rebuilds the
+// envelope from parsed.items).
 func TestCohortMemo_PermitAllStorageContract(t *testing.T) {
 	memo := &cohortGateMemo{
-		rbacGen:     42,
-		permitAll:   true,
-		encodedJSON: []byte(`{"items":[]}`),
-		encodedGzip: []byte("\x1f\x8b\x08\x00"), // gzip magic
+		rbacGen:   42,
+		permitAll: true,
 	}
 	if !memo.permitAll {
 		t.Fatalf("permitAll=false on a permitAll memo")
 	}
-	if len(memo.encodedJSON) == 0 {
-		t.Fatalf("encodedJSON empty on permitAll memo")
-	}
-	if len(memo.encodedGzip) == 0 {
-		t.Fatalf("encodedGzip empty on permitAll memo")
-	}
 	if memo.keptNames != nil {
 		t.Fatalf("keptNames non-nil on permitAll memo: %v", memo.keptNames)
-	}
-}
-
-// TestGzipBytes_RoundTrip verifies the helper's gzip output decompresses
-// back to the input — the byte-identity gate (HG-178.2) requires that
-// (gunzip(encodedGzip) == encodedJSON) holds.
-func TestGzipBytes_RoundTrip(t *testing.T) {
-	src := []byte(`{"apiVersion":"composition.krateo.io/v1","kind":"CompositionList","items":[{"metadata":{"name":"a","namespace":"team-a"}}]}`)
-	gz, err := gzipBytes(src)
-	if err != nil {
-		t.Fatalf("gzipBytes failed: %v", err)
-	}
-	if len(gz) == 0 {
-		t.Fatalf("gzipBytes returned empty bytes")
-	}
-	// Gzip magic header check.
-	if !(gz[0] == 0x1f && gz[1] == 0x8b) {
-		t.Fatalf("gzipBytes output missing gzip magic: %x %x", gz[0], gz[1])
-	}
-	// Round-trip via gzip.NewReader for byte-identity.
-	rd, err := gzip.NewReader(bytes.NewReader(gz))
-	if err != nil {
-		t.Fatalf("gzip.NewReader on gzipBytes output failed: %v", err)
-	}
-	decoded, err := io.ReadAll(rd)
-	if err != nil {
-		t.Fatalf("read decoded gzip: %v", err)
-	}
-	if string(decoded) != string(src) {
-		t.Fatalf("gzip round-trip mismatch: decoded=%q want=%q", decoded, src)
 	}
 }
 

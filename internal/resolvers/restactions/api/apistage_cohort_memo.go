@@ -1,4 +1,5 @@
-// apistage_cohort_memo.go — Ship GMC / 0.30.174, A.2 / 0.30.178.
+// apistage_cohort_memo.go — Ship GMC / 0.30.174, A.2 / 0.30.178,
+// A.2-trim / 0.30.194.
 //
 // PROBLEM
 //   filterListByRBAC at apistage.go:176 runs per-item EvaluateRBAC over
@@ -21,8 +22,8 @@
 //   on the LIST at populate time:
 //
 //     - permitAll == true   — cluster-wide list grant; every item kept.
-//                              ALSO populates encodedJSON + encodedGzip
-//                              for zero-CPU serve on hit.
+//                              The serve path returns the parsed envelope
+//                              directly — no encoded-bytes cache needed.
 //     - permitAll == false  — RoleBinding-only grants; keptNames is
 //                              filtered by the binding namespaces (no
 //                              per-item EvaluateRBAC, just a map lookup
@@ -33,6 +34,17 @@
 //   On hit: walk entry.Items, keep items whose "namespace/name" is in
 //   the memo's keptNames set, skip filterListByRBAC entirely.
 //   On miss / stale: run the CohortNSACL fast-path; populate the memo.
+//
+// SHIP 0.30.194 — DEAD-ENCODE REMOVAL (Fix A)
+//   The A.2 design populated encodedJSON + encodedGzip on the permitAll
+//   path expecting a future plumb-through to the HTTP serve layer. That
+//   plumb-through never materialised: cohortGateMemoServe re-builds the
+//   envelope value per hit via listEnvelopeValue(parsed.items) and the
+//   downstream stage consumes the map[string]any value, not the bytes.
+//   The cached bytes were NEVER READ. At admin-cohort scale they cost
+//   ~363 MB / json.Marshal + ~100 MB / gzipBytes per populate — 52s of
+//   wasted CPU during the cold-path PIP seed. Fix A removes the dead
+//   fields and the dead work; the serve path is unchanged.
 //
 // SAFETY (binding contracts)
 //   - feedback_l1_per_user_keyed_never_cohort.md — the L1 RESOLVED
@@ -45,15 +57,13 @@
 //     references a specific resource by name. CohortNSACL is generic
 //     over RBAC rules; no hardcoded admin / cluster-admin / system:masters
 //     fast-paths.
-//   - feedback_shared_vs_copy_is_a_concurrency_change.md — keptNames,
-//     encodedJSON, encodedGzip are BUILT ONCE on memo populate then
-//     READ-ONLY for every hit. The cache.CohortGateMemoStore guards
-//     concurrent populate/read with a sync.Map; the memo struct itself
-//     is never mutated post-store.
-//   - feedback_no_naive_compression_middleware.md — gzip compresses
-//     ONCE on memo populate (permitAll path) and stores the bytes in
-//     the memo. Warm reads can be served from pre-compressed bytes —
-//     zero compression CPU on hits. NOT a response-time middleware.
+//   - feedback_shared_vs_copy_is_a_concurrency_change.md — keptNames
+//     is BUILT ONCE on memo populate then READ-ONLY for every hit. The
+//     cache.CohortGateMemoStore guards concurrent populate/read with a
+//     sync.Map; the memo struct itself is never mutated post-store.
+//     Fix A REMOVES fields (encodedJSON, encodedGzip) — it strengthens
+//     the read-only invariant; it never introduces a copy→shared
+//     transition.
 //
 // FAIL-CLOSED
 //   - Missing UserInfo / no identity => memo bypass + the underlying
@@ -68,10 +78,7 @@
 package api
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"log/slog"
 	"time"
 
@@ -86,11 +93,12 @@ import (
 // list, stamped with the rbacGen the memo was built against.
 //
 // Ship A.2 / 0.30.178 extends the memo with the CohortNSACL verdict
-// (permitAll) + zero-bound encoded-bytes cache (encodedJSON,
-// encodedGzip) populated only on the permitAll fast-path. Per-cohort
-// variability is too high on the !permitAll branch to make encoded-
-// bytes caching profitable; the keptNames + per-item map lookup serves
-// those cohorts.
+// (permitAll). Per-cohort variability is too high on the !permitAll
+// branch to make encoded-bytes caching profitable; the keptNames +
+// per-item map lookup serves those cohorts. The permitAll branch
+// returns the parsed envelope value directly at serve time (no encoded-
+// bytes cache — Fix A / 0.30.194 removed the never-read encoded fields
+// that the original A.2 design had populated speculatively).
 //
 // The whole struct is BUILT ONCE on populate then NEVER mutated. Hit
 // readers consume it lock-free; the cache.CohortGateMemoStore guards
@@ -99,8 +107,7 @@ type cohortGateMemo struct {
 	rbacGen uint64
 
 	// permitAll captures the CohortNSACL verdict for this (entry × cohort).
-	// true: cluster-wide list grant — every item is kept; the memo also
-	// populates encodedJSON + encodedGzip.
+	// true: cluster-wide list grant — every item is kept.
 	// false: namespace-scoped grants only — keptNames is the filter.
 	permitAll bool
 
@@ -108,14 +115,6 @@ type cohortGateMemo struct {
 	// cohort can list. A nil/empty map means "no items kept" — the
 	// caller's range-over-nil walk yields an empty served envelope.
 	keptNames map[string]struct{}
-
-	// encodedJSON, encodedGzip are populated ONLY when permitAll. The
-	// encoded LIST envelope (apiVersion + kind + items) and its gzip
-	// transcoding, computed ONCE at populate time. Zero-bound (no size
-	// threshold). Hit readers serve these directly without paying the
-	// per-call listEnvelopeValue + DeepCopyJSON cost.
-	encodedJSON []byte
-	encodedGzip []byte
 }
 
 // cohortKeyHashFromUserInfo is a thin shim over cache.CohortKeyHash so
@@ -200,8 +199,6 @@ func gateListItemsWithMemo(
 		slog.Bool("permit_all", memo.permitAll),
 		slog.Int("kept_names", len(memo.keptNames)),
 		slog.Int("items_total", len(parsed.items)),
-		slog.Int("encoded_json", len(memo.encodedJSON)),
-		slog.Int("encoded_gzip", len(memo.encodedGzip)),
 		slog.Int64("memo_size", store.Size()),
 	)
 
@@ -214,8 +211,13 @@ func gateListItemsWithMemo(
 // snapshot) it falls back to the canonical filterListByRBAC and returns
 // (memo, true) or (nil, false).
 //
-// permitAll fast-path: every item kept; encodedJSON + encodedGzip
-// populated for zero-CPU serve.
+// permitAll fast-path: every item kept; stamp the rbacGen + permitAll
+// flag and return. Serve-side rebuilds the envelope per hit via
+// listEnvelopeValue(parsed.items). Ship 0.30.194 Fix A removed the
+// dead encodedJSON/encodedGzip populate that the original A.2 design
+// had populated speculatively — those fields were never read by
+// cohortGateMemoServe and cost ~52s of cold-path CPU (~363 MB
+// json.Marshal + ~100 MB gzip per populate at admin-cohort scale).
 //
 // !permitAll fast-path: keptNames built from item.GetNamespace()
 // membership in permittedNS — single map lookup per item, no
@@ -274,53 +276,13 @@ func populateCohortGateMemo(
 	permitAll, permittedNS := cache.CohortNSACL(snap, username, groups, gvr)
 
 	if permitAll {
-		// Cluster-wide list grant — keep every item, encode the envelope
-		// and gzip it ONCE. Zero-bound: no size threshold.
-		envelopeValue := listEnvelopeValue(parsed.apiVersion, parsed.kind, parsed.items)
-		encoded, err := json.Marshal(envelopeValue)
-		if err != nil {
-			// json.Marshal on a map[string]any produced by
-			// parseListEnvelope cannot fail under the json package's
-			// documented contract (every reachable value is map / slice
-			// / scalar / json.Number from the prior json.Unmarshal).
-			// Defensive: fall back to canonical filter.
-			xcontext.Logger(ctx).Warn("apistage.cohort_gate_memo.permitAll_encode_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.String("cohort", cohort),
-				slog.Any("err", err),
-			)
-			memo, ok := populateMemoFromCanonicalFilter(ctx, gvr, parsed, currentGen)
-			if ok && memo != nil {
-				recordedPermitAll = memo.permitAll
-				recordedKeptCount = len(memo.keptNames)
-			}
-			return memo, ok
-		}
-		gz, err := gzipBytes(encoded)
-		if err != nil {
-			// Same defensive posture — gzip on a byte slice cannot
-			// fail in the standard library outside of OOM. Skip the
-			// gzip cache; the serve path falls through to encodedJSON.
-			xcontext.Logger(ctx).Warn("apistage.cohort_gate_memo.permitAll_gzip_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.String("cohort", cohort),
-				slog.Any("err", err),
-			)
-			gz = nil
-		}
-
+		// Cluster-wide list grant — keep every item. The serve path
+		// rebuilds the envelope per hit via listEnvelopeValue(parsed.items);
+		// no encoded-bytes cache (Fix A / 0.30.194).
 		memo := &cohortGateMemo{
-			rbacGen:     currentGen,
-			permitAll:   true,
-			encodedJSON: encoded,
-			encodedGzip: gz,
+			rbacGen:   currentGen,
+			permitAll: true,
 		}
-
-		// Observability — bump aggregate counters.
-		cache.RecordCohortMemoBytes(len(encoded) + len(gz))
-		cache.RecordCohortMemoEncodedBytes(len(encoded) + len(gz))
 
 		// Ship 0.30.193 C4 — permitAll path: every input item kept.
 		recordedPermitAll = true
@@ -397,9 +359,10 @@ func populateMemoFromCanonicalFilter(
 // or just-populated MISS):
 //
 //   - permitAll: return listEnvelopeValue(parsed.apiVersion, parsed.kind,
-//     parsed.items) — every item served. (The encoded bytes in the memo
-//     are cached for future plumb-through to the HTTP serve layer;
-//     today's caller consumes the decoded value via jsonHandlerValue.)
+//     parsed.items) — every item served. Ship 0.30.194 Fix A confirmed
+//     this is the only consumer of the permitAll memo at serve time;
+//     the previously cached encodedJSON/encodedGzip bytes were never
+//     read here and have been removed from the memo struct.
 //   - !permitAll: walk parsed.items, keep those whose ns/name is in
 //     memo.keptNames.
 //
@@ -422,8 +385,6 @@ func cohortGateMemoServe(
 			slog.String("cohort", cohort),
 			slog.Uint64("rbac_gen", memo.rbacGen),
 			slog.Int("items_total", len(parsed.items)),
-			slog.Int("encoded_json", len(memo.encodedJSON)),
-			slog.Int("encoded_gzip", len(memo.encodedGzip)),
 		)
 		return listEnvelopeValue(parsed.apiVersion, parsed.kind, parsed.items)
 	}
@@ -448,28 +409,6 @@ func cohortGateMemoServe(
 		slog.Int("kept", len(kept)),
 	)
 	return listEnvelopeValue(parsed.apiVersion, parsed.kind, kept)
-}
-
-// gzipBytes compresses src with the default gzip level. Returns the
-// compressed bytes; on any error returns the error and nil bytes. The
-// caller treats a non-nil error as "skip the gzip cache" — the serve
-// path then falls through to encodedJSON.
-//
-// Per feedback_no_naive_compression_middleware: compression happens
-// ONCE at memo populate time. Warm reads serve pre-compressed bytes
-// from memory — zero CPU cost on hits. This is the value-layer cache
-// pattern that feedback explicitly endorses.
-func gzipBytes(src []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
-	if _, err := gw.Write(src); err != nil {
-		_ = gw.Close()
-		return nil, err
-	}
-	if err := gw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }
 
 // itemNSName renders the "namespace/name" key used by keptNames. A

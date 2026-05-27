@@ -53,6 +53,7 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -237,9 +238,13 @@ func attemptClusterListCollapse(
 		return nil, false, 6
 	}
 
-	// AC-D5.14 — multi-element shape check. ≤10ms budget.
+	// AC-D5.14 — multi-element shape check. ≤10ms budget. Ship 0.30.194
+	// Fix B — validateClusterListShape now also returns the
+	// parsedListEnvelope from its single decode (it was previously
+	// followed by a second parseListEnvelope of the same bytes — ~11s
+	// wasted on 363 MB envelopes at admin-cohort scale).
 	shapeStart := time.Now()
-	shapeOK, shapeReason := validateClusterListShape(rawEnvelope)
+	parsed, shapeOK, shapeReason := validateClusterListShape(gvr, rawEnvelope)
 	shapeElapsed := time.Since(shapeStart)
 	if shapeElapsed > shapeCheckSlowThreshold {
 		log.Warn("cluster_list.shape_check.slow",
@@ -267,27 +272,29 @@ func attemptClusterListCollapse(
 	// BEFORE returning the cluster-scope call. The worker loop's
 	// apistageContentServe will then Get-hit on this entry and skip the
 	// redundant dispatchViaInformer call.
+	//
+	// Ship 0.30.194 Fix B — populate Items / ItemsAPIVersion / ItemsKind
+	// from the parsedListEnvelope validateClusterListShape returned. The
+	// shape-check decode is byte-identical to parseListEnvelope's decode
+	// (same struct tags, same []map[string]any item shape, same
+	// []*unstructured.Unstructured{Object: it} wrap), so the resulting
+	// entry observed by apistageContentServe is byte-identical to the
+	// pre-Fix-B path.
 	contentKey := cache.ComputeKey(contentKeyInputs(gvr, "", ""))
 	newEntry := &cache.ResolvedEntry{
-		RawJSON: rawEnvelope,
-		Inputs:  ptrTo(contentKeyInputs(gvr, "", "")),
+		RawJSON:         rawEnvelope,
+		Inputs:          ptrTo(contentKeyInputs(gvr, "", "")),
+		Items:           parsed.items,
+		ItemsAPIVersion: parsed.apiVersion,
+		ItemsKind:       parsed.kind,
 	}
-	// Pre-parse the LIST envelope's items so subsequent content-Get
-	// hits gate without a re-unmarshal (matches the apistageContentServe
-	// miss-path behaviour at apistage.go:455-462).
-	//
-	// Ship 0.30.193 — measure the parseListEnvelope cost here: this is
-	// the SECOND unmarshal of rawEnvelope (validateClusterListShape did
-	// the first at line 232). At 29,907 compositions / ~100 MB JSON
-	// envelope the architect's hypothesis is that this re-unmarshal +
-	// the Put may dominate the 91s gap.
-	parseStart := time.Now()
-	if p, parseOK := parseListEnvelope(gvr, rawEnvelope); parseOK {
-		newEntry.Items = p.items
-		newEntry.ItemsAPIVersion = p.apiVersion
-		newEntry.ItemsKind = p.kind
-	}
-	defensiveParseMs := time.Since(parseStart).Milliseconds()
+	// defensiveParseMs is retained at zero — Fix B folded the second
+	// unmarshal into the shape check, so there is no separate parse
+	// stage to time. The PIPStageTiming.AccumulateDefensive signature
+	// stays unchanged (additive instrumentation) so seed/diff dashboards
+	// keep their existing columns; the column now legitimately reads 0
+	// after Fix B.
+	const defensiveParseMs int64 = 0
 
 	putStart := time.Now()
 	apistageStore.Put(contentKey, newEntry)
@@ -460,9 +467,10 @@ func clusterScopePathFor(gvr schema.GroupVersionResource) string {
 
 // validateClusterListShape enforces AC-D5.14's defensive multi-element
 // shape check on the raw cluster-scope LIST envelope. Returns
-// (true, "") on a well-formed envelope; (false, reason) otherwise. The
-// reason string is for the WARN log line — it never reaches the
-// fall-through counter (only the closed-enum FallthroughReason does).
+// (parsed, true, "") on a well-formed envelope; (zero, false, reason)
+// otherwise. The reason string is for the WARN log line — it never
+// reaches the fall-through counter (only the closed-enum
+// FallthroughReason does).
 //
 // Definition (PM-ratified, §AC-D5.14):
 //
@@ -470,31 +478,51 @@ func clusterScopePathFor(gvr schema.GroupVersionResource) string {
 //   - .items is a non-empty array of objects
 //   - each item has non-nil apiVersion AND non-nil kind strings
 //
-// The check decodes the envelope ONCE. Two json.Unmarshal passes
-// would breach the AC-D5.14 ≤10ms budget on a multi-MB envelope; the
-// single decode here is essentially the same cost
-// apistageContentServe's miss-path parseListEnvelope already pays.
-func validateClusterListShape(raw []byte) (bool, string) {
+// Ship 0.30.194 Fix B — dedup with parseListEnvelope. The previous
+// signature returned only (ok, reason) and the caller subsequently
+// called parseListEnvelope(gvr, rawEnvelope) to obtain the items —
+// a SECOND json.Unmarshal of the same 363 MB envelope. Both decodes
+// produced byte-identical output (same struct shape, same item-wrap
+// pattern). The dedup widens the local envelope shape to match
+// parseListEnvelope's APIVersion + Items contract and threads the
+// parsed slice back through the return value; the caller drops its
+// second parseListEnvelope call and consumes parsed.items directly.
+//
+// Item-wrap contract: items are wrapped as
+// []*unstructured.Unstructured{Object: it} where `it` is the
+// json.Unmarshal'd map[string]any. This matches parseListEnvelope
+// (apistage.go:149-152) exactly — the wrapping is structurally
+// identical, the items decode from the SAME raw bytes via the SAME
+// json package contract, so downstream consumers (gateListItems,
+// cohortGateMemoServe, apistageContentServe) observe byte-identical
+// values whether the entry was populated via parseListEnvelope or
+// via this defensive prefetch path.
+//
+// gvr is consulted ONLY when envelope.APIVersion / envelope.Kind are
+// empty — the apiserver always emits both on a real cluster-scope
+// LIST, so the fallback is for the defensive-tests path only.
+func validateClusterListShape(gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool, string) {
 	var envelope struct {
-		Kind  string           `json:"kind"`
-		Items []map[string]any `json:"items"`
+		APIVersion string           `json:"apiVersion"`
+		Kind       string           `json:"kind"`
+		Items      []map[string]any `json:"items"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return false, "envelope-unmarshal-failed"
+		return parsedListEnvelope{}, false, "envelope-unmarshal-failed"
 	}
 	if !strings.HasSuffix(envelope.Kind, "List") {
-		return false, "envelope-kind-not-list"
+		return parsedListEnvelope{}, false, "envelope-kind-not-list"
 	}
 	if len(envelope.Items) == 0 {
 		// AC-D5.14 says non-empty items. A genuinely-empty cluster also
 		// hits this — but the iterator path's empty-result handling is
 		// safer than a cached zero-item entry that could mask later
 		// populations until TTL eviction. Fall back to the iterator.
-		return false, "envelope-items-empty"
+		return parsedListEnvelope{}, false, "envelope-items-empty"
 	}
 	for i, it := range envelope.Items {
 		if it == nil {
-			return false, "envelope-item-nil"
+			return parsedListEnvelope{}, false, "envelope-item-nil"
 		}
 		// Non-nil string check: present AND of type string AND non-empty
 		// would be stricter than AC-D5.14, which only requires "non-nil
@@ -503,12 +531,27 @@ func validateClusterListShape(raw []byte) (bool, string) {
 		apiV, apiOK := it["apiVersion"].(string)
 		kind, kindOK := it["kind"].(string)
 		if !apiOK || apiV == "" {
-			return false, "envelope-item-missing-apiVersion"
+			return parsedListEnvelope{}, false, "envelope-item-missing-apiVersion"
 		}
 		if !kindOK || kind == "" {
-			return false, "envelope-item-missing-kind"
+			return parsedListEnvelope{}, false, "envelope-item-missing-kind"
 		}
 		_ = i
 	}
-	return true, ""
+
+	// Build the parsedListEnvelope from the single decoded envelope —
+	// byte-identical to parseListEnvelope's output at apistage.go:149-161.
+	items := make([]*unstructured.Unstructured, 0, len(envelope.Items))
+	for _, it := range envelope.Items {
+		items = append(items, &unstructured.Unstructured{Object: it})
+	}
+	apiVersion := envelope.APIVersion
+	if apiVersion == "" {
+		apiVersion = apiVersionForGVR(gvr)
+	}
+	kind := envelope.Kind
+	if kind == "" {
+		kind = listKindForResource(gvr.Resource)
+	}
+	return parsedListEnvelope{items: items, apiVersion: apiVersion, kind: kind}, true, ""
 }
