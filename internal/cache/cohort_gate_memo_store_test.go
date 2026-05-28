@@ -1,17 +1,21 @@
-// cohort_gate_memo_store_test.go — Ship GMC / 0.30.174, A.2 / 0.30.178.
+// cohort_gate_memo_store_test.go — Ship GMC / 0.30.174, A.2 / 0.30.178,
+// Ship 3 / 0.30.197.
 //
 // Concurrency falsifier per feedback_shared_vs_copy_is_a_concurrency_change:
-// the per-ResolvedEntry cohort store is a sync.Map (zero-bound, Ship A.2).
-// The test drives N goroutines into the same store with overlapping cohort
-// keys and asserts:
+// the per-ResolvedEntry cohort store is a sync.Map for lock-free Lookup +
+// an insertion-order eviction cap touched only on the Store miss path
+// (Ship 3). The tests drive N goroutines into the same store with
+// overlapping cohort keys and assert:
 //
 //   - No data race (-race must report clean).
-//   - Every published cohort key is observable by a Lookup.
-//   - Size grows linearly with distinct cohort keys (no cap, no eviction).
+//   - Every published cohort key (within the cap window) is observable.
+//   - Size stays bounded by CACHE_COHORT_MEMO_CAP (eviction decrements).
+//   - The lock-free Lookup hot path has no recency machinery (benchmark).
 
 package cache
 
 import (
+	"math/rand"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -49,26 +53,112 @@ func TestCohortGateMemoStore_ConcurrentSameCohortPopulate(t *testing.T) {
 	}
 }
 
-// TestCohortGateMemoStore_ZeroBoundGrowth — Ship A.2 / 0.30.178: the
-// store has no LRU and no eviction. Inserting N distinct cohort keys
-// must leave Size() at N and every key observable by Lookup.
-func TestCohortGateMemoStore_ZeroBoundGrowth(t *testing.T) {
+// TestCohortGateMemoStore_BoundedGrowth — Ship 3 / 0.30.197: the store
+// re-bounds the last O(cohorts) memory structure via an insertion-order
+// cap (CACHE_COHORT_MEMO_CAP). Inserting N >> cap distinct cohort keys
+// must leave Size() <= cap (eviction decrements). This FAILS against the
+// pre-Ship-3 zero-bound code (which leaves Size() == N), proving it is a
+// real falsifier, not a tautology.
+func TestCohortGateMemoStore_BoundedGrowth(t *testing.T) {
+	t.Setenv("CACHE_COHORT_MEMO_CAP", "64")
 	s := NewCohortGateMemoStore()
 
-	const n = 1024 // well above the pre-A.2 cap of 256 — verifies no eviction.
+	const (
+		n   = 1024
+		cap = 64
+	)
+	for i := 0; i < n; i++ {
+		key := "c-" + strconv.Itoa(i)
+		s.Store(key, &struct{ k string }{k: key})
+	}
+	if got := s.Size(); got > cap {
+		t.Fatalf("Size after %d distinct insertions = %d, want <= %d (bounded)", n, got, cap)
+	}
+	// Insertion-order eviction: the newest-inserted keys survive; the
+	// last key MUST still be observable.
+	last := "c-" + strconv.Itoa(n-1)
+	if _, ok := s.Lookup(last); !ok {
+		t.Fatalf("Lookup(%q) missed; newest-inserted key must survive", last)
+	}
+	// The oldest-inserted key MUST have been evicted.
+	if _, ok := s.Lookup("c-0"); ok {
+		t.Fatalf("Lookup(c-0) hit; oldest-inserted key must be evicted under cap %d", cap)
+	}
+	if got := s.OverflowTotal(); got == 0 {
+		t.Fatalf("OverflowTotal = 0; expected eviction to have fired with %d insertions over cap %d", n, cap)
+	}
+}
+
+// TestCohortGateMemoStore_UnboundedEscapeHatch — Ship 3 / 0.30.197:
+// CACHE_COHORT_MEMO_CAP <= 0 restores the 0.30.178 zero-bound behavior
+// (the provisional/removable cache contract). Inserting N distinct keys
+// leaves Size() == N with no eviction.
+func TestCohortGateMemoStore_UnboundedEscapeHatch(t *testing.T) {
+	t.Setenv("CACHE_COHORT_MEMO_CAP", "0")
+	s := NewCohortGateMemoStore()
+
+	const n = 1024
 	for i := 0; i < n; i++ {
 		key := "c-" + strconv.Itoa(i)
 		s.Store(key, &struct{ k string }{k: key})
 	}
 	if got := s.Size(); got != int64(n) {
-		t.Fatalf("Size after %d distinct insertions = %d, want %d", n, got, n)
+		t.Fatalf("Size after %d insertions with cap<=0 = %d, want %d (unbounded)", n, got, n)
 	}
-	// Every inserted key MUST still be present — no LRU eviction.
 	for i := 0; i < n; i++ {
 		key := "c-" + strconv.Itoa(i)
 		if _, ok := s.Lookup(key); !ok {
-			t.Fatalf("Lookup(%q) missed; expected present (zero-bound store)", key)
+			t.Fatalf("Lookup(%q) missed; cap<=0 must not evict", key)
 		}
+	}
+	if got := s.OverflowTotal(); got != 0 {
+		t.Fatalf("OverflowTotal = %d with cap<=0; want 0 (no eviction)", got)
+	}
+}
+
+// TestCohortGateMemoStore_ConcurrentStoreEvictRace — Ship 3 / 0.30.197.
+// MANDATORY -race: this is a lock-free->bounded concurrency change. cap=8,
+// 64 goroutines each Store distinct keys while concurrently Looking up
+// random keys. After wg.Wait(): Size() <= cap and a recently-inserted key
+// (never a candidate for eviction) still Looks up.
+func TestCohortGateMemoStore_ConcurrentStoreEvictRace(t *testing.T) {
+	t.Setenv("CACHE_COHORT_MEMO_CAP", "8")
+	s := NewCohortGateMemoStore()
+
+	const (
+		workers  = 64
+		perWkr   = 32
+		capLimit = 8
+	)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(w)))
+			for j := 0; j < perWkr; j++ {
+				key := "w" + strconv.Itoa(w) + "-k" + strconv.Itoa(j)
+				s.Store(key, &struct{ k string }{k: key})
+				// Concurrent lock-free Lookup of an arbitrary key.
+				probe := "w" + strconv.Itoa(rng.Intn(workers)) + "-k" + strconv.Itoa(rng.Intn(perWkr))
+				_, _ = s.Lookup(probe)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if got := s.Size(); got > capLimit {
+		t.Fatalf("Size after concurrent stores = %d, want <= %d (bounded under race)", got, capLimit)
+	}
+	// Re-Store a fresh key now (no contention) — it must be present and
+	// Size still bounded.
+	fresh := "fresh-after-wait"
+	s.Store(fresh, &struct{ k string }{k: fresh})
+	if _, ok := s.Lookup(fresh); !ok {
+		t.Fatalf("Lookup(%q) missed; a just-inserted key must survive", fresh)
+	}
+	if got := s.Size(); got > capLimit {
+		t.Fatalf("Size after fresh insert = %d, want <= %d", got, capLimit)
 	}
 }
 
@@ -140,4 +230,30 @@ func TestCohortGateMemoStore_LookupEmptyKey(t *testing.T) {
 	if got := s.Size(); got != 0 {
 		t.Fatalf("Size after empty-key Store = %d, want 0", got)
 	}
+}
+
+// BenchmarkCohortGateMemoStore_LookupHit — Ship 3 / 0.30.197 head-on
+// proof that the read path is unchanged. Pre-populate 34 keys (today's
+// cohort scale), then b.RunParallel pure Lookup hits. The Lookup path is
+// a single sync.Map.Load with NO lock and NO recency touch, so ns/op
+// must be within noise of the pre-Ship-3 zero-bound build.
+func BenchmarkCohortGateMemoStore_LookupHit(b *testing.B) {
+	s := NewCohortGateMemoStore()
+	const keys = 34
+	for i := 0; i < keys; i++ {
+		key := "c-" + strconv.Itoa(i)
+		s.Store(key, &struct{ k string }{k: key})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := "c-" + strconv.Itoa(i%keys)
+			if _, ok := s.Lookup(key); !ok {
+				b.Fatalf("Lookup(%q) missed during benchmark", key)
+			}
+			i++
+		}
+	})
 }

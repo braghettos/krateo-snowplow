@@ -30,6 +30,14 @@
 //     as total_bytes; lets ops distinguish encoded-cache vs keptNames-
 //     only memo growth.
 //
+//   - snowplow_cohort_memo_overflow_total — uint64 aggregate count of
+//     insertion-order evictions fired by the per-entry cap
+//     (CACHE_COHORT_MEMO_CAP, Ship 3 / 0.30.197). Walks the resolved-
+//     cache store at scrape time and sums OverflowTotal() per entry.
+//     A non-zero, growing value signals a cohort-cardinality-pressured
+//     content cell (per-user-binding RBAC topology); 0 at today's
+//     ~34-cohort scale. Lock-free per-store read (atomic.Uint64.Load).
+//
 // AGGREGATE GRANULARITY (per Diego 2026-05-26 ratification): no
 // per-cohort breakdown — the cohort space is bounded and operator-
 // readable from the gate-memo log lines already emitted by
@@ -116,6 +124,32 @@ func cohortMemoEntriesTotal() int64 {
 	return sum
 }
 
+// cohortMemoOverflowTotal walks the live resolved-cache store and sums
+// the OverflowTotal() of every entry's attached CohortGateMemoStore.
+// Used by the snowplow_cohort_memo_overflow_total expvar Func —
+// evaluated at scrape time. Same cost profile as cohortMemoEntriesTotal
+// (O(N entries) under the store mutex; per-store read is a lock-free
+// atomic.Uint64.Load). Returns 0 when the resolved cache is inactive.
+func cohortMemoOverflowTotal() uint64 {
+	c := resolvedCacheInstance
+	if c == nil {
+		return 0
+	}
+	var sum uint64
+	c.mu.Lock()
+	for _, el := range c.index {
+		item, ok := el.Value.(*lruItem)
+		if !ok || item == nil || item.entry == nil {
+			continue
+		}
+		if store := item.entry.CohortGates.Load(); store != nil {
+			sum += store.OverflowTotal()
+		}
+	}
+	c.mu.Unlock()
+	return sum
+}
+
 // cohortMemoMetricsOnce guards the expvar.Publish calls so they run at
 // most once per process even if invoked from both init() and a test
 // helper. expvar.Publish panics on duplicate key; sync.Once prevents
@@ -144,6 +178,9 @@ func registerCohortMemoMetrics() {
 		}))
 		expvar.Publish("snowplow_cohort_memo_encoded_bytes_cached_total", expvar.Func(func() any {
 			return cohortGateMemoEncodedBytesCachedTotal.Load()
+		}))
+		expvar.Publish("snowplow_cohort_memo_overflow_total", expvar.Func(func() any {
+			return cohortMemoOverflowTotal()
 		}))
 	})
 }

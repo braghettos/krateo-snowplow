@@ -156,9 +156,11 @@ type ResolvedEntry struct {
 	//
 	// The store maps cohortKey (string, hash of UserInfo) -> opaque
 	// memo (filled by the api package). The cache package owns the
-	// storage primitive (sync.Map + bounded-LRU eviction at 256
-	// entries); the cohort semantics + key shape live in api/
-	// apistage_cohort_memo.go.
+	// storage primitive (sync.Map for lock-free Lookup + an
+	// insertion-order eviction cap touched only on the Store miss
+	// path, CACHE_COHORT_MEMO_CAP default 128; cap <= 0 => unbounded,
+	// Ship 3 / 0.30.197); the cohort semantics + key shape live in
+	// api/apistage_cohort_memo.go.
 	//
 	// Field type is *CohortGateMemoStore (a value-type pointer, lazy);
 	// readers must call CohortGateMemoStoreLoadOrInit to acquire the
