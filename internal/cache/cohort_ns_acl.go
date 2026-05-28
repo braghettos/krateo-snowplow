@@ -158,22 +158,87 @@ func CohortNSACL(
 	return false, permittedNS
 }
 
+// nsaclAllServiceAccountsGroup / nsaclServiceAccountsNamespacePfx mirror the
+// well-known ServiceAccount synthetic group names (rbac/evaluate.go:577-578).
+// Package-local copies because cache/ cannot import rbac/ (rbac/ imports
+// cache/ → cycle). Kept byte-faithful so CohortNSACL's SA group expansion
+// agrees with EvaluateRBAC's.
+const (
+	nsaclAllServiceAccountsGroup     = "system:serviceaccounts"
+	nsaclServiceAccountsNamespacePfx = "system:serviceaccounts:"
+)
+
+// parseCohortSAUsername decodes the canonical
+// "system:serviceaccount:<ns>:<name>" form — byte-faithful to
+// rbac/evaluate.go:parseServiceAccountUsername (package-local copy, no
+// import cycle). Returns (ns, name, true) on success; ("","",false) for a
+// non-ServiceAccount username. Used by the cohort collect functions so the
+// SA's bindings land identically to how EvaluateRBAC routes them.
+func parseCohortSAUsername(u string) (string, string, bool) {
+	const prefix = "system:serviceaccount:"
+	if len(u) <= len(prefix) || u[:len(prefix)] != prefix {
+		return "", "", false
+	}
+	rest := u[len(prefix):]
+	i := -1
+	for j := 0; j < len(rest); j++ {
+		if rest[j] == ':' {
+			i = j
+			break
+		}
+	}
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", false
+	}
+	return rest[:i], rest[i+1:], true
+}
+
+// cohortEffectiveGroups returns the group set used for Group-subject
+// matching, mirroring rbac/evaluate.go:effectiveGroups. For a canonical
+// ServiceAccount identity it appends the two synthetic SA groups
+// Kubernetes adds implicitly (system:serviceaccounts +
+// system:serviceaccounts:<ns>); for any other identity it returns the
+// caller's groups unchanged (no allocation). This keeps CohortNSACL's
+// Group-kind landings in agreement with EvaluateRBAC for the SA.
+func cohortEffectiveGroups(groups []string, isSA bool, saNS string) []string {
+	if !isSA {
+		return groups
+	}
+	out := make([]string, 0, len(groups)+2)
+	out = append(out, groups...)
+	out = append(out, nsaclAllServiceAccountsGroup, nsaclServiceAccountsNamespacePfx+saNS)
+	return out
+}
+
 // collectCohortClusterBindings returns the union of ClusterRoleBindings
 // the (username, groups) cohort matches. The set is a pointer SUPERSET
 // of the post-anySubjectMatches set — same correctness barrier as
 // selectCRBCandidates in rbac/evaluate.go:302-349. Pointer-dedup.
 //
-// SA-kind / catch-all are NOT collected here — the GMC memo's caller is
-// always a User+Groups identity (jwtutil.UserInfo on the resolver path,
-// apistage_cohort_memo.go:127). collectCohortBindingIDs (rbac_cohort_gen.go)
-// makes the same choice. Future SA cohort support is additive (one more
-// snap landing + one more matcher branch).
+// Ship 1.1 — ServiceAccount-kind landings are now collected, in symmetry
+// with the User and Group landings (feedback_predicate_subject_kind_symmetry,
+// the ζ User-only HARD-REVERT lesson: add SA to BOTH paths, never one).
+// When the cohort username is a canonical ServiceAccount
+// (system:serviceaccount:<ns>:<name>) this reads CRBsByServiceAccount[<ns>/<name>]
+// AND expands `groups` with the two synthetic SA groups — exactly what
+// selectCRBCandidates (evaluate.go:340-342) + effectiveGroups
+// (evaluate.go:592-603) do — so CohortNSACL and EvaluateRBAC AGREE for the
+// SA. The pre-Ship-1.1 code read only CRBsByUser/CRBsByGroup, so the
+// snowplow SA's `*/*` grant (a ServiceAccount-kind subject filed under
+// CRBsByServiceAccount) was structurally invisible → permitAll=false → the
+// SA discovery re-walk's `namespaces` stage kept 0/62 → 0 children. STRICTLY
+// ADDITIVE: only the SA's REAL grants are added (matching EvaluateRBAC);
+// User/Group/other cohorts are byte-unchanged (isSA=false → no new landings,
+// groups unchanged).
 func collectCohortClusterBindings(
 	snap *RBACSnapshot, username string, groups []string,
 ) []*rbacv1.ClusterRoleBinding {
 	if snap == nil {
 		return nil
 	}
+
+	saNS, saName, isSA := parseCohortSAUsername(username)
+	groups = cohortEffectiveGroups(groups, isSA, saNS)
 
 	seen := make(map[*rbacv1.ClusterRoleBinding]struct{})
 	var out []*rbacv1.ClusterRoleBinding
@@ -202,6 +267,11 @@ func collectCohortClusterBindings(
 		}
 		add(snap.CRBsByGroup[g])
 	}
+	// ServiceAccount-kind landing — mirrors selectCRBCandidates
+	// (evaluate.go:340-342). Only fires for a canonical SA username.
+	if isSA {
+		add(snap.CRBsByServiceAccount[saNS+"/"+saName])
+	}
 	return out
 }
 
@@ -213,7 +283,14 @@ func collectCohortClusterBindings(
 //
 //	RBsByUserByNS[ns][username] ∪
 //	RBsByGroupByNS[ns][g] for each g ∈ groups ∪
-//	RBsByGroupByNS[ns]["system:authenticated"] (when username != "")
+//	RBsByGroupByNS[ns]["system:authenticated"] (when username != "") ∪
+//	RBsByServiceAccountByNS[ns][<ns>/<name>] (when username is a canonical SA)
+//
+// Ship 1.1 — ServiceAccount-kind landings collected in symmetry with the
+// cluster path (feedback_predicate_subject_kind_symmetry), mirroring
+// selectRBCandidates (evaluate.go:387-391) + the synthetic-SA-group
+// expansion (effectiveGroups, evaluate.go:592-603). STRICTLY ADDITIVE —
+// isSA=false leaves the result byte-unchanged.
 //
 // Returns an empty map when no namespace has a matching binding (the
 // caller's range-over-nil is zero iterations).
@@ -223,6 +300,9 @@ func collectCohortNamespaceBindings(
 	if snap == nil {
 		return nil
 	}
+
+	saNS, saName, isSA := parseCohortSAUsername(username)
+	groups = cohortEffectiveGroups(groups, isSA, saNS)
 
 	out := make(map[string][]*rbacv1.RoleBinding)
 	addNS := func(ns string, rbs []*rbacv1.RoleBinding) {
@@ -274,6 +354,15 @@ func collectCohortNamespaceBindings(
 	if username != "" {
 		for ns, inner := range snap.RBsByGroupByNS {
 			addNS(ns, inner["system:authenticated"])
+		}
+	}
+
+	// ServiceAccount-kind RBs per namespace — mirrors selectRBCandidates
+	// (evaluate.go:387-391). Only fires for a canonical SA username.
+	if isSA {
+		key := saNS + "/" + saName
+		for ns, inner := range snap.RBsByServiceAccountByNS {
+			addNS(ns, inner[key])
 		}
 	}
 
