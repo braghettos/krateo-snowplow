@@ -60,6 +60,21 @@ const (
 	ScopePlurals           = "plurals"
 	ScopeNestedCall        = "nested-call"
 	ScopeResolverInnerCall = "resolver-inner-call"
+
+	// ScopeBootPrewarmWalk — Gate 1 (0.30.201-diag) DIAGNOSTIC scope.
+	// NOT a /call-class route: it is stamped on the Phase 1 prewarm
+	// discovery-walk context (phase1_walk.go withPhase1SAContext) so the
+	// existing RecordApiserverFallthrough calls on that path (KindFor at
+	// resourcesrefs/resolve.go, informer-not-synced/not-servable at
+	// informer_dispatch.go) become LIVE during boot and land in
+	// snowplow_apiserver_fallthrough_cells keyed
+	// "boot-prewarm-walk|<gvr>|<reason>". This discriminates the Gate-1
+	// sub-cause (discovery-not-ready vs informer-not-synced vs
+	// apiRef-resolved-but-empty) for the navmenu's boot children=0
+	// observation. It is NEVER registered as a route (RegisterScopedRoute
+	// is not called for it), so AssertReadPathsScoped's route-coverage
+	// check is unaffected. Diagnostic-only; removable with the gate.
+	ScopeBootPrewarmWalk = "boot-prewarm-walk"
 )
 
 // validScopeNames is the boot-time validation set used by
@@ -77,6 +92,7 @@ var validScopeNames = map[string]struct{}{
 	ScopePlurals:           {},
 	ScopeNestedCall:        {},
 	ScopeResolverInnerCall: {},
+	ScopeBootPrewarmWalk:   {},
 }
 
 // routeScopeRegistry records the routes whose middleware chain has

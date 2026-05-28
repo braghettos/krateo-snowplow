@@ -643,6 +643,18 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	rctx := xcontext.BuildContext(ctx, opts...)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
+	// Gate 1 (0.30.201-diag) — stamp the DIAGNOSTIC boot-prewarm-walk
+	// fallthrough scope so the existing RecordApiserverFallthrough calls
+	// on the discovery-walk path (KindFor at resourcesrefs/resolve.go,
+	// informer-not-synced/not-servable at informer_dispatch.go) become
+	// LIVE during boot and land in snowplow_apiserver_fallthrough_cells
+	// keyed "boot-prewarm-walk|<gvr>|<reason>". Without this the walk
+	// context carries no scope (fallthrough_ctx.go lists "Phase 1 walker"
+	// as a non-/call path) so those recorders no-op and the Gate-1
+	// sub-cause discrimination (discovery vs informer-sync vs
+	// resolved-but-empty) would be blind. Telemetry-only; no behaviour
+	// change (RecordApiserverFallthrough never short-circuits the walk).
+	rctx = cache.WithFallthroughScope(rctx, cache.ScopeBootPrewarmWalk)
 	// Ship 0.30.127 — FORK B (deliberate, Diego-confirmed). The
 	// discovery walk does NOT mark its context cache.WithPrewarmIterSerial,
 	// so the RESTAction resolver runs its inner-call iterator fan-out at
@@ -895,6 +907,38 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
 	children := extractResourcesRefsItems(res.Object)
+
+	// Gate 1 (0.30.201-diag) — record the boot children-count for THIS
+	// walked widget so the navmenu's boot-walk children-count is
+	// deterministically readable over the LB at /debug/vars (expvar) AND
+	// emitted as a bounded structured log line. recordWalkChildren
+	// computes the recurse-pass + parse-pass counts over the same slice
+	// the descent loop below consumes, so the published counts are
+	// byte-faithful to what the walk actually descends. Telemetry-only —
+	// no behaviour change.
+	recordWalkChildren(gvr, in.GetNamespace(), in.GetName(), depth, children)
+	{
+		recurseCount, parseCount := 0, 0
+		for _, child := range children {
+			if walkShouldRecurse(child) {
+				recurseCount++
+			}
+			if _, ok := util.ParseCallPathToObjectRef(child.Path); ok {
+				parseCount++
+			}
+		}
+		log.Info("phase1.walk.children_observed",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", in.GetNamespace()),
+			slog.String("name", in.GetName()),
+			slog.Int("depth", depth),
+			slog.Int("children", len(children)),
+			slog.Int("recurse", recurseCount),
+			slog.Int("parse", parseCount),
+		)
+	}
+
 	for _, child := range children {
 		if ctx.Err() != nil {
 			return ctx.Err()
