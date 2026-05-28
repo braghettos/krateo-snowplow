@@ -116,34 +116,51 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// On MISS we fall through to the existing per-user widget L1 lookup
 	// below — the expected path when F2 has not warmed this
 	// (gvr, ns, name, perPage, page) tuple.
-	contentKey, contentHandle, _ := dispatchWidgetContentKey(req.Context(),
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
-		perPage, page, extras)
-	if contentHandle != nil {
-		if entry, ok := contentHandle.Get(contentKey); ok {
-			if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
-				cache.RecordApiserverFallthrough(req.Context(),
-					cache.ReasonWidgetContentHit, got.GVR.String())
-				emitResolvedCacheLookup(log, "widgetContent", got.GVR.String(),
-					contentKey, true, len(gated))
-				pcs.l1Hit = "content-hit"
-				writeResolvedJSON(wri, gated)
-				log.Info("Widget successfully resolved",
-					slog.String("duration", util.ETA(start)),
-					slog.String("l1", "content-hit"),
-				)
-				return
+	//
+	// Ship (task #69) — RBAC-sensitivity routing guard. The identity-free
+	// widgetContent layer's serve-gate (gateWidgetEnvelope) only narrows
+	// status.resourcesRefs.items[].allowed per requester; it NEVER narrows
+	// status.widgetData. An apiRef-driven render-template widget
+	// (piechart/table over an aggregating apiRef RA) renders from
+	// status.widgetData, so serving it from the shared identity-free cell
+	// would leak the SA-maximal aggregate cross-user. isRBACSensitiveApiRefWidget
+	// runs PRE-RESOLVE on the fetched widget CR (got.Unstructured carries
+	// spec.apiRef / spec.widgetDataTemplate / spec.resourcesRefsTemplate —
+	// no extra apiserver round-trip). When it classifies the widget, the
+	// ENTIRE identity-free lookup block is skipped and control falls
+	// straight through to the per-cohort `widgets` L1 lookup below
+	// (dispatchCacheLookupKey), which is RBAC-narrowed at resolve under
+	// each cohort's own identity → no shared cell, no leak.
+	if !isRBACSensitiveApiRefWidget(got.Unstructured.Object) {
+		contentKey, contentHandle, _ := dispatchWidgetContentKey(req.Context(),
+			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+			perPage, page, extras)
+		if contentHandle != nil {
+			if entry, ok := contentHandle.Get(contentKey); ok {
+				if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
+					cache.RecordApiserverFallthrough(req.Context(),
+						cache.ReasonWidgetContentHit, got.GVR.String())
+					emitResolvedCacheLookup(log, "widgetContent", got.GVR.String(),
+						contentKey, true, len(gated))
+					pcs.l1Hit = "content-hit"
+					writeResolvedJSON(wri, gated)
+					log.Info("Widget successfully resolved",
+						slog.String("duration", util.ETA(start)),
+						slog.String("l1", "content-hit"),
+					)
+					return
+				}
+				// served==false — fail-closed (no identity / malformed
+				// stored envelope). Fall through to the existing per-user
+				// L1 lookup, which symmetrically nil-checks UserInfo at
+				// dispatchCacheLookupKey.
 			}
-			// served==false — fail-closed (no identity / malformed
-			// stored envelope). Fall through to the existing per-user
-			// L1 lookup, which symmetrically nil-checks UserInfo at
-			// dispatchCacheLookupKey.
+			// Content-layer MISS — fall through to the per-user L1 lookup
+			// below. Record the diagnostic counter.
+			cache.RecordApiserverFallthrough(req.Context(),
+				cache.ReasonWidgetContentMissPerUserFallback, got.GVR.String())
 		}
-		// Content-layer MISS — fall through to the per-user L1 lookup
-		// below. Record the diagnostic counter.
-		cache.RecordApiserverFallthrough(req.Context(),
-			cache.ReasonWidgetContentMissPerUserFallback, got.GVR.String())
 	}
 
 	// Tag 0.30.7: L1 resolved-output cache lookup. Same gating

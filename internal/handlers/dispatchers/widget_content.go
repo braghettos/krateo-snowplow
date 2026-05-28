@@ -62,6 +62,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -166,6 +167,77 @@ func populateWidgetContentL1(
 	if log == nil {
 		log = slog.Default()
 	}
+
+	// Ship 1.3 (lever 1) — defense-in-depth empty-store guard. Do NOT Put
+	// a transient-empty poison SHELL. The identity-free content cell is
+	// hit by the frontend at the SAME (perPage, page) the walker seeds;
+	// once an EMPTY shell lands there it is served as a permanent stale
+	// HIT (the >3,100-cycle defect, project_prewarm_page_offset_bug). Lever
+	// 2 makes the refresher CORRECT such a cell, but a cell that is never
+	// poisoned at boot needs no correction — so we refuse to store the
+	// poison shape in the first place.
+	//
+	// The poison SHAPE (mechanism-uniform, no widget-name/GVR special-case
+	// per feedback_no_special_cases): the widget DECLARES an apiRef AND a
+	// resourcesRefsTemplate (so its entire status.resourcesRefs.items list
+	// is BUILT by fanning the template over the apiRef RA's data), yet the
+	// resolved status.resourcesRefs.items came back EMPTY. Under the SA-
+	// maximal walk identity (withPhase1SAContext — Ship 1.1 CohortNSACL
+	// `*/*` permitAll=true) an empty result for an apiRef+template-driven
+	// widget means the apiRef RA was TRANSIENTLY empty at walk time (the
+	// boot data-availability window), NOT a genuine zero. We skip the Put;
+	// the cell stays unseeded → the serve-time path falls through to the
+	// per-user/cohort L1 (apiRef-RA-narrowed, correct) until lever 2's
+	// refresher or a later walk pass stores a populated shell.
+	//
+	// Diego directive (Ship 1.3): the empty-check keys ONLY on
+	// status.resourcesRefs.items — the authoritative per-user-narrowed data
+	// path — NEVER on status.widgetData.items (not a data signal here).
+	//
+	// A widget with NO apiRef, or with ONLY a static spec.resourcesRefs
+	// (no template), or one that genuinely yields zero template items is
+	// PRESERVED: we guard exclusively the apiRef+template-driven shape that
+	// resolved empty. recordWidgetDeps is also skipped on the guarded path
+	// — there is no entry to dep-track.
+	// Ship (task #69) — RBAC-sensitivity routing guard. An apiRef-driven
+	// render-template widget (piechart/table over an aggregating apiRef RA)
+	// renders from status.widgetData, which the serve-time gate NEVER
+	// narrows per-user — so the identity-free cell would serve every user
+	// the SA-maximal aggregate (a cross-user leak). NEVER write the
+	// identity-free cell for such a widget; the serve path routes it to the
+	// per-cohort `widgets` L1 (RBAC-narrowed at resolve under each cohort's
+	// own identity). recordWidgetDeps is also skipped — there is no
+	// identity-free entry to dep-track. Checked BEFORE the empty-shell guard
+	// because classification supersedes it (a classified widget never
+	// touches this cell at all, empty or populated).
+	if isRBACSensitiveApiRefWidget(res.Object) {
+		log.Debug("widget_content.populate.skip_rbac_sensitive",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", in.GetNamespace()),
+			slog.String("name", in.GetName()),
+			slog.Int("perPage", perPage),
+			slog.Int("page", page),
+			slog.String("reason", "apiRef+render-template widget renders from status.widgetData (not narrowed by the serve-gate) — routed to the per-cohort widgets L1; not seeding identity-free cell"),
+		)
+		bumpWidgetContentSkippedRBACSensitive()
+		return
+	}
+
+	if shouldSkipEmptyWidgetShell(res) {
+		log.Debug("widget_content.populate.skip_empty_shell",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", in.GetNamespace()),
+			slog.String("name", in.GetName()),
+			slog.Int("perPage", perPage),
+			slog.Int("page", page),
+			slog.String("reason", "apiRef+resourcesRefsTemplate widget resolved with empty status.resourcesRefs.items — transient-empty poison shell; not seeding identity-free cell"),
+		)
+		bumpWidgetContentSkippedEmptyShell()
+		return
+	}
+
 	encoded, err := encodeResolvedJSON(res)
 	if err != nil {
 		// A failed encode at prewarm is non-fatal — the serve-time
@@ -195,6 +267,128 @@ func populateWidgetContentL1(
 	recordWidgetDeps(log, key, gvr, res)
 }
 
+// isRBACSensitiveApiRefWidget reports whether `obj` (a widget CR's
+// `.Object` map — either the fetched CR at serve time or the resolved
+// envelope at populate time, both of which carry the original `spec.*`)
+// is an apiRef-driven widget whose RENDERED OUTPUT is RBAC-sensitive and
+// therefore MUST NOT be served from the identity-free `widgetContent`
+// cell.
+//
+// WHY THIS EXISTS (the leak class this closes). The identity-free
+// `widgetContent` cell is shared across users (keyed by widget+pagination,
+// NOT identity). The serve-time gate (gateWidgetEnvelope) only re-derives
+// `status.resourcesRefs.items[].allowed` per requester — it NEVER narrows
+// `status.widgetData`. So a piechart/table that renders ENTIRELY from
+// `status.widgetData` (series.total, data=${.list}) computed by an apiRef
+// RA that aggregates cross-namespace would serve EVERY user the SA-maximal
+// full aggregate → cross-user leak. The fix routes these widgets to the
+// per-cohort `widgets` L1, which is RBAC-correct by construction (each
+// cohort resolves the apiRef RA under its OWN identity → narrowed at
+// resolve; no shared cell, no serve-gate, no leak).
+//
+// SHAPE-BASED, no widget-name/GVR literal (feedback_no_special_cases).
+// True IFF the widget DECLARES a non-empty spec.apiRef AND declares at
+// least one render template (spec.widgetDataTemplate OR
+// spec.resourcesRefsTemplate) — i.e. its rendered output is BUILT from the
+// apiRef RA's data.
+//
+// Over-classifying is BENIGN: a misclassified widget simply takes the
+// per-cohort path, which is never a leak (just one extra per-cohort cell).
+// An identity-invariant widget without an apiRef OR without any template
+// stays false → keeps using the identity-free layer.
+//
+// Accessor errors are treated as "absent" (the accessor returns a zero
+// value alongside the error). A read failure on the apiRef name yields
+// false (no apiRef ⇒ not classified); a read failure on a template yields
+// a zero-length slice for that template (so it does not contribute to the
+// OR). This is the conservative direction for the predicate: a transient
+// read failure de-classifies, falling back to the identity-free layer —
+// which is the unchanged pre-fix posture, never a new leak path (the gate
+// still runs on that layer).
+//
+// LOAD-BEARING INVARIANT (arch-rev-70) — error-direction symmetry with the
+// resolver. The de-classify-on-error direction is SAFE ONLY because the
+// resolver's resolveWidgetData (internal/resolvers/widgets/resolve.go:184-188)
+// reads the SAME accessor (widgets.GetWidgetDataTemplate) and, on the same
+// read error, FAILS SOFT to static-only widgetData — it builds NO
+// cross-namespace aggregate. So a widget the predicate de-classifies (and
+// therefore routes to the shared identity-free cell) cannot, on that same
+// error, contain a leak-bearing aggregate. If the resolver ever stopped
+// failing soft on this error while the predicate still de-classified, the
+// SA-maximal aggregate would land in the identity-free cell → reopening the
+// cross-user leak. These two sites MUST stay symmetric.
+func isRBACSensitiveApiRefWidget(obj map[string]any) bool {
+	if obj == nil {
+		return false
+	}
+	apiRef, err := widgets.GetApiRef(obj)
+	if err != nil || apiRef.Name == "" {
+		return false
+	}
+	wdt, _ := widgets.GetWidgetDataTemplate(obj)
+	rrt, _ := widgets.GetResourcesRefsTemplate(obj)
+	return len(wdt) > 0 || len(rrt) > 0
+}
+
+// shouldSkipEmptyWidgetShell reports whether the resolved widget `res` is
+// a TRANSIENT-EMPTY POISON SHELL that must NOT be stored into the
+// identity-free content cell (Ship 1.3 lever 1).
+//
+// True IFF ALL hold:
+//   - the widget DECLARES a non-empty spec.apiRef (its data source is an
+//     external RESTAction), AND
+//   - the widget DECLARES a non-empty spec.resourcesRefsTemplate (so its
+//     ENTIRE status.resourcesRefs.items list is built by fanning the
+//     template over the apiRef RA's resolved data — there is no static
+//     resourcesRefs floor that would survive an empty apiRef), AND
+//   - the resolved status.resourcesRefs.items came back EMPTY.
+//
+// Under the SA-maximal walk identity (Ship 1.1 CohortNSACL `*/*`
+// permitAll=true) an empty result for such a widget can only be a
+// transient apiRef-RA emptiness at boot — never a genuine RBAC-narrowed
+// zero (the SA sees everything). Storing it would poison the cell the
+// frontend hits. A widget without an apiRef, without a template, or with
+// a non-empty resolved list is NOT a poison shell and is stored normally.
+//
+// Per the Ship 1.3 directive the emptiness check keys ONLY on
+// status.resourcesRefs.items — never status.widgetData.items.
+func shouldSkipEmptyWidgetShell(res *unstructured.Unstructured) bool {
+	if res == nil {
+		return false
+	}
+	obj := res.Object
+
+	// Declares a non-empty apiRef? (GetApiRef defaults Resource/APIVersion
+	// even for an absent block, so gate on the apiRef NAME being present.)
+	apiRef, err := widgets.GetApiRef(obj)
+	if err != nil || apiRef.Name == "" {
+		return false
+	}
+
+	// Declares a resourcesRefsTemplate? (If the list is built only from a
+	// static spec.resourcesRefs, an empty result is authoritative — not a
+	// poison shape — so we do not guard it.)
+	tpl, err := widgets.GetResourcesRefsTemplate(obj)
+	if err != nil || len(tpl) == 0 {
+		return false
+	}
+
+	// Resolved status.resourcesRefs.items empty?
+	items, ok, err := maps.NestedSlice(obj, "status", "resourcesRefs", "items")
+	if err != nil {
+		// Read failure — be conservative and let the Put proceed (the
+		// serve-time gate still narrows per-user; a false-negative here is
+		// the unchanged pre-1.3 behaviour, never a leak).
+		return false
+	}
+	if ok && len(items) > 0 {
+		return false
+	}
+	// items absent or empty AND the widget is apiRef+template-driven →
+	// transient-empty poison shell.
+	return true
+}
+
 // gateWidgetEnvelope applies the serve-time per-user RBAC gate to a raw
 // widget envelope retrieved from the identity-free content layer — the
 // Ship G analogue of F1's gateContentEnvelope. It walks the embedded
@@ -222,6 +416,28 @@ func populateWidgetContentL1(
 // Sub-microsecond per item (typed-RBAC snapshot lookup, no apiserver
 // round-trip). N items per widget ≈ tens; gate budget per hit ≈ <50µs
 // CPU, dominated by the json.Unmarshal of the cached body.
+//
+// FLAG, NOT DROP — Diego's ACCEPTED tradeoff (Ship 1.3, 2026-05-29). The
+// gate re-derives `allowed` per requester but does NOT remove not-allowed
+// items from status.resourcesRefs.items. This is the SAME shape a cold
+// per-user resolve produces (resourcesrefs/resolve.go:88-115 appends every
+// item unconditionally, flagging — never dropping — the not-allowed ones),
+// so the gated body is byte-equivalent to a cold resolve. The boundary is
+// the FLAG, by design:
+//   - the frontend renders ONLY items with allowed==true. When the SA-
+//     maximal shell (lever 2 populates the full list under the SA identity)
+//     is served to cyberjoker (krateo-system only), every cross-namespace
+//     panel re-derives allowed==false → the frontend renders 0; admin
+//     re-derives allowed==true → renders the full set.
+//   - the per-request RBAC gate at the dispatch entrypoint (widgets.go /
+//     restactions.go checkDispatchRBAC, and EvaluateRBAC on every /call)
+//     independently DENIES any attempt to FETCH a not-allowed item's
+//     `path` — so a not-allowed item is metadata only, never actionable.
+//   - ACCEPTED residue: a not-allowed item's metadata (id / path / name /
+//     namespace) remains in the served bytes flagged allowed==false. Diego
+//     ruled this acceptable (flag, not drop); a drop is intentionally NOT
+//     added. status.widgetData.items is NEVER consulted as a data signal
+//     (Diego directive) — resourcesRefs.items is the authoritative path.
 func gateWidgetEnvelope(
 	ctx context.Context,
 	raw []byte,

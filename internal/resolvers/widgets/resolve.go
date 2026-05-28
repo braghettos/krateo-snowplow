@@ -181,6 +181,17 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 
 	src := GetWidgetData(obj.Object)
 
+	// LOAD-BEARING INVARIANT (task #69 / arch-rev-70) — error-direction
+	// symmetry with the cache routing predicate. A widgetDataTemplate read
+	// error here MUST fail-soft to the STATIC-ONLY widgetData (`src`, no
+	// aggregate built). The cache predicate
+	// (dispatchers.isRBACSensitiveApiRefWidget) reads the SAME accessor
+	// (GetWidgetDataTemplate) and, on the same error, DE-CLASSIFIES the
+	// widget → routes it to the identity-free widgetContent cell. These two
+	// sites MUST stay symmetric: if a read error here ever started building
+	// the cross-namespace aggregate while the predicate still de-classified,
+	// the SA-maximal aggregate would land in the shared identity-free cell —
+	// reopening the cross-user leak task #69 closed. Keep both fail-soft.
 	wdt, err := GetWidgetDataTemplate(obj.Object)
 	if err != nil {
 		log.Warn("unable to get widgetDataTemplate", slog.Any("err", err))

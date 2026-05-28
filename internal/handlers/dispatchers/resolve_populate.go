@@ -120,10 +120,52 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// time. A binding mutation that shifts the cohort topology shifts
 	// BindingSetHash, MISSes on the next /call, and the seed reseeds
 	// under a fresh representative — no stale-identity risk.
+	//
+	// Ship 1.3 (lever 2) — the IDENTITY-FREE classes (widgetContent /
+	// apistage) carry NO representative identity: their key skips the
+	// identity fold (ComputeKey, resolved.go:611-612) and their populate
+	// sites never set RepresentativeUsername/Groups, so the tuple above
+	// would be ("", nil). Re-resolving under that EMPTY identity drives
+	// CohortNSACL("") -> no bindings -> permitAll=false -> the apiRef RA's
+	// per-namespace stage drops every item -> status.resourcesRefs.items
+	// is re-stored EMPTY: the refresher RE-POISONS the cell it is meant to
+	// correct (the >3,100-cycle defect, project_prewarm_page_offset_bug).
+	//
+	// The identity-free cell holds an SA-MAXIMAL SHELL by construction —
+	// the F2 walker Put()s it under withPhase1SAContext (phase1_walk.go),
+	// and the serve-time gate (gateWidgetEnvelope, widget_content.go)
+	// re-derives status.resourcesRefs.items[].allowed PER REQUESTER, so
+	// the body that leaves the pod is per-user-narrowed regardless of the
+	// shell's identity. The REFRESH must therefore re-resolve under the
+	// SAME SA canonical identity the boot walk used, NOT the empty tuple,
+	// so it CORRECTS the shell (full resourcesRefs.items) instead of
+	// re-poisoning it. Ship 1.1 made the SA's CohortNSACL `*/*`
+	// permitAll=true (CohortNSACL ServiceAccount-kind landing), so the
+	// canonical `system:serviceaccount:<ns>:<name>` identity yields the
+	// full list. The username is derived from the SA token's JWT `sub`
+	// claim via phase1SAUsername (no Go literal — feedback_no_special_cases)
+	// — the EXACT seam withPhase1SAContext uses. When the SA token is
+	// absent (unit test / outside-cluster) we fall back to the
+	// representative tuple, the unchanged degraded posture.
+	refreshUser := inputs.RepresentativeUsername
+	refreshGroups := inputs.RepresentativeGroups
+	if isIdentityFreeClass(inputs.CacheEntryClass) {
+		if saEP != nil {
+			if saUser, ok := phase1SAUsername(saEP.Token); ok {
+				refreshUser = saUser
+				// SA identity is username-only — the SA's grant lands via
+				// its ServiceAccount-kind binding, matched by username in
+				// EvaluateRBAC + CohortNSACL. Mirrors withPhase1SAContext,
+				// which installs WithUserInfo{Username: saUser} with no
+				// Groups.
+				refreshGroups = nil
+			}
+		}
+	}
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserInfo(jwtutil.UserInfo{
-			Username: inputs.RepresentativeUsername,
-			Groups:   inputs.RepresentativeGroups,
+			Username: refreshUser,
+			Groups:   refreshGroups,
 		}),
 	}
 	// Ship 0.30.113 Part B — SA transport. A background refresh has no
@@ -202,7 +244,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
-			slog.String("user", inputs.RepresentativeUsername),
+			slog.String("user", refreshUser),
 			slog.Int64("stage_errors", stageErrSink.Load()),
 			slog.String("effect", "prior good entry kept; TTL is the outer net"),
 		)
@@ -223,10 +265,23 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
 		slog.String("handler", inputs.CacheEntryClass),
-		slog.String("user", inputs.RepresentativeUsername),
+		slog.String("user", refreshUser),
 		slog.Bool("pinned", prePinned),
 	)
 	return nil
+}
+
+// isIdentityFreeClass reports whether the entry class is one of the two
+// SHARED, identity-free cache classes whose ComputeKey skips the identity
+// fold (resolved.go:611-612): the widget-content shell and the api-stage
+// content cell. Both hold an SA-maximal SHELL that the serve-time gate
+// (gateWidgetEnvelope) narrows per-requester; their refresh therefore
+// re-resolves under the SA canonical identity (lever 2) rather than the
+// empty representative tuple. Kept as a single predicate so the two
+// call-class checks stay symmetric and the rule is stated once.
+func isIdentityFreeClass(class string) bool {
+	return class == cache.CacheEntryClassWidgetContent ||
+		class == cache.CacheEntryClassApistage
 }
 
 // resolveOnceProd is the production resolve-and-encode implementation.
