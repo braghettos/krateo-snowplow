@@ -52,6 +52,29 @@ const (
 	envResolvedCacheTTLSeconds   = "RESOLVED_CACHE_TTL_SECONDS"
 	envResolvedCacheSummaryEvery = "RESOLVED_CACHE_SUMMARY_EVERY_SECONDS"
 
+	// envResolvedCacheMaxResidentBytes is the Ship 4a (0.30.198) byte
+	// budget for the PINNED resident region — the eviction-protected cells
+	// (expensive prewarmed RAFullList full-list caches). Resident bytes are
+	// accounted SEPARATELY from the transient LRU byte budget
+	// (RESOLVED_CACHE_MAX_BYTES) and are SKIPPED by the LRU sweep.
+	//
+	// This is the Ship 4a memory KILL-SWITCH (per the coordinator's
+	// single-flag directive — NO new boolean feature flag): it is a TUNABLE
+	// byte cap, consistent with RESOLVED_CACHE_MAX_BYTES. Setting it to 0
+	// DISABLES pinning — every cell that would otherwise be pinned is stored
+	// TRANSIENT instead (LRU-evictable), so the resident region exerts zero
+	// memory pressure. A positive value is a hard ceiling: a Put that would
+	// push resident bytes past it is stored TRANSIENT (un-pinned) rather
+	// than evicting another pinned cell, so a runaway pin set degrades to
+	// LRU rather than OOMing the pod.
+	//
+	// 4a itself is gated entirely under CACHE_ENABLED (ResolvedCacheEnabled);
+	// there is NO 4a-specific boolean. Removability comes from the layer's
+	// clean code separation (the raFullList class + apiRef Get/Put + this
+	// resident region are wholesale-deletable per project_caching_is_provisional),
+	// not from a runtime toggle.
+	envResolvedCacheMaxResidentBytes = "RESOLVED_CACHE_MAX_RESIDENT_BYTES"
+
 	// envResolvedCacheApistageEnabled is the Ship E (0.30.116) opt-in
 	// gate for the per-api-stage L1 key-swap. Default OFF — flag-off the
 	// RESTAction resolver runs byte-identical to 0.30.115 (AC-E1). It is
@@ -72,6 +95,20 @@ const (
 	defaultResolvedCacheMaxBytes            = int64(2) * 1024 * 1024 * 1024 // 2 GiB
 	defaultResolvedCacheTTLSeconds          = 3600
 	defaultResolvedCacheSummaryEverySeconds = 300 // 5 min aggregate INFO line
+
+	// defaultResolvedCacheMaxResidentBytes — Ship 4a (0.30.198). The
+	// resident region holds the EXPENSIVE prewarmed RAFullList cells
+	// (e.g. admin's full compositions-panels list — ~18 MiB at 49K panels,
+	// per feedback_zero_cold_navigations_hard_requirement). The expensive
+	// cohorts are FEW + stable (broad-RBAC admin-class cohorts), so the
+	// resident set is O(few-cohorts × ~tens-of-MiB). 512 MiB holds ~28 such
+	// 18 MiB cells with headroom; it is INSIDE the 24 GiB pod / GOMEMLIMIT
+	// envelope and is a SEPARATE budget from the 2 GiB transient LRU. The
+	// value is the design-time floor; the tester re-derives it empirically
+	// from the per-cohort envelope cost × expensive-cohort count under the
+	// real cluster (feedback_capacity_caps_empirical_per_entry_cost) before
+	// the default is finalised.
+	defaultResolvedCacheMaxResidentBytes = int64(512) * 1024 * 1024 // 512 MiB
 )
 
 // CacheEntryClassApistage is the ResolvedKeyInputs.CacheEntryClass
@@ -109,6 +146,34 @@ const CacheEntryClassApistage = "apistage"
 // the cache key (ComputeKey) AND used as the refresher registry key.
 // Rotating it would invalidate every in-flight entry.
 const CacheEntryClassWidgetContent = "widgetContent"
+
+// CacheEntryClassRAFullList is the ResolvedKeyInputs.CacheEntryClass
+// discriminant for Ship 4a (0.30.198) — the page-INDEPENDENT RESTAction
+// full-result-list cache. Sibling to apistage / widgetContent. It caches
+// the RA's OWN resolved Status map (apiref/resolve.go's ra.Status) resolved
+// UNPAGINATED (PerPage=0/Page=0 → no `.slice` injected → the RA's output jq
+// `.slice.perPage // ($sorted|length)` returns the FULL sorted set).
+//
+// The cell is keyed by the RA's identity (its gvr/ns/name), the cohort
+// (BindingSetHash — identity-bound, same as restactions/widgets), and the
+// NON-slice Extras, with PerPage/Page FORCED to 0 (page-independent). Every
+// paginated /call that matches on non-slice inputs and differs ONLY in slice
+// (page/perPage) SHARES this one cell; the per-/call page is then applied as
+// a cheap Go-slice at serve time (see ra_full_list_slice.go). Widgets that
+// feed the same RA under the same cohort/extras land on the SAME cell — the
+// chokepoint dedupe across widgets.
+//
+// IDENTITY-BOUND (NOT identity-free): RA output is RBAC-narrowed (the
+// userAccessFilter `namespaces` stage), so two cohorts can see different
+// rows. ComputeKey therefore folds BindingSetHash for this class exactly as
+// it does for restactions/widgets. The per-request RBAC gate (apistage
+// cohort-gate + UAF narrowing) is UNTOUCHED — this cell sits ABOVE it,
+// keyed per-cohort, never cross-cohort.
+//
+// The string VALUE "raFullList" is load-bearing: it is hashed into the
+// cache key (ComputeKey) AND used as the refresher registry key. Rotating
+// it would invalidate every in-flight entry.
+const CacheEntryClassRAFullList = "raFullList"
 
 // ResolvedEntry is the L1 cache value. The pre-encoded JSON bytes are
 // what we hand back on a hit; storing the encoded form (rather than the
@@ -166,6 +231,24 @@ type ResolvedEntry struct {
 	// readers must call CohortGateMemoStoreLoadOrInit to acquire the
 	// store atomically. Direct field access is racy and unsupported.
 	CohortGates atomic.Pointer[CohortGateMemoStore]
+
+	// Pinned — Ship 4a (0.30.198) — marks the entry as RESIDENT: it lives
+	// in a separate byte budget (maxResidentBytes) and is SKIPPED by the
+	// transient LRU eviction sweep (evictUntilUnderCapsLocked). Set true
+	// ONLY for EXPENSIVE prewarmed RAFullList cells (measured-cost
+	// predicate — resolve wall-ms or envelope bytes over a threshold), so
+	// admin's first compositions-page visit hits a warm cell rather than a
+	// thrash-evicted seed (the prior cold-nav failure mode —
+	// feedback_zero_cold_navigations_hard_requirement). A pinned entry is
+	// still TTL- and DELETE-evictable; only LRU pressure spares it. The
+	// refresher re-pins (Pinned=true) on every re-resolve so a dirty-mark
+	// never demotes a pinned cell to transient.
+	//
+	// Read/written ONLY under ResolvedCacheStore.mu (it participates in the
+	// resident byte accounting). The field is set on the *ResolvedEntry
+	// before Put; Put reads it under mu to decide resident vs transient
+	// accounting.
+	Pinned bool
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set
@@ -289,6 +372,18 @@ type ResolvedCacheStore struct {
 
 	curBytes int64
 
+	// Ship 4a (0.30.198) — PINNED resident region. maxResidentBytes is the
+	// separate byte budget for entries with ResolvedEntry.Pinned==true;
+	// curResidentBytes tracks the live resident weight. Resident entries are
+	// SKIPPED by evictUntilUnderCapsLocked (the transient LRU sweep) and are
+	// NOT counted in curBytes — the two budgets are independent. A
+	// maxResidentBytes of 0 DISABLES pinning (Put stores everything
+	// transient). residentEntries is the live resident entry count, surfaced
+	// in Stats for the prewarm-coverage falsifier.
+	maxResidentBytes int64
+	curResidentBytes int64
+	residentEntries  int
+
 	// Falsifier counters (atomic; safe to read without mu).
 	hitTotal         atomic.Uint64
 	missTotal        atomic.Uint64
@@ -318,6 +413,19 @@ type ResolvedCacheStore struct {
 	// counters. Classified off entry.Inputs.CacheEntryClass.
 	widgetContentStoreTotal atomic.Uint64
 	widgetContentEvictTotal atomic.Uint64
+
+	// Ship 4a (0.30.198) raFullList + resident-region counters.
+	// raFullListStoreTotal counts Put()s of a "raFullList"-kind entry;
+	// raFullListEvictTotal counts evictions of one (TTL/DELETE — a pinned
+	// raFullList is never LRU-evicted; an un-pinned one can be).
+	// residentPinTotal counts Put()s that landed in the resident region
+	// (Pinned honoured); residentDemoteTotal counts Put()s that REQUESTED a
+	// pin but were stored transient instead (maxResidentBytes==0 or the
+	// resident budget would overflow) — the kill-switch / degrade signal.
+	raFullListStoreTotal atomic.Uint64
+	raFullListEvictTotal atomic.Uint64
+	residentPinTotal     atomic.Uint64
+	residentDemoteTotal  atomic.Uint64
 }
 
 type lruItem struct {
@@ -410,6 +518,13 @@ func ResolvedCache() *ResolvedCacheStore {
 			int64FromEnv(envResolvedCacheMaxBytes, defaultResolvedCacheMaxBytes),
 			time.Duration(intFromEnv(envResolvedCacheTTLSeconds, defaultResolvedCacheTTLSeconds))*time.Second,
 		)
+		// Ship 4a (0.30.198) — wire the resident-region budget. A 0 value is
+		// VALID and explicitly DISABLES pinning (kill-switch), so it is read
+		// directly rather than through newResolvedCache's positive-default
+		// guard. int64FromEnv returns the default only when the var is unset
+		// or unparseable; an explicit "0" disables pinning.
+		resolvedCacheInstance.maxResidentBytes = int64FromEnv(
+			envResolvedCacheMaxResidentBytes, defaultResolvedCacheMaxResidentBytes)
 		// 0.30.8: wire the cache into the dep tracker so OnDelete can
 		// evict and so any eviction path (LRU/TTL/DELETE) calls
 		// Deps().RemoveL1Key to keep dep records and L1 entries
@@ -438,6 +553,12 @@ func newResolvedCache(maxEntries int, maxBytes int64, ttl time.Duration) *Resolv
 		maxEntries: maxEntries,
 		maxBytes:   maxBytes,
 		ttl:        ttl,
+		// Ship 4a (0.30.198) — default the resident budget so test
+		// construction has pinning available. The production singleton path
+		// OVERWRITES this from RESOLVED_CACHE_MAX_RESIDENT_BYTES (where an
+		// explicit 0 disables pinning). Tests that exercise pin behaviour set
+		// the field directly.
+		maxResidentBytes: defaultResolvedCacheMaxResidentBytes,
 	}
 }
 
@@ -619,22 +740,61 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 
 	apistage := isApistageEntry(entry)
 	widgetContent := isWidgetContentEntry(entry)
+	raFullList := isRAFullListEntry(entry)
 
-	// Replace-in-place semantics if key already present.
+	// Ship 4a (0.30.198) — resolve the entry's FINAL pin status. A pin is
+	// requested via entry.Pinned (set by an expensive prewarm/refresher
+	// Put). It is HONOURED only when the resident region is enabled
+	// (maxResidentBytes > 0) AND the new resident weight fits under the
+	// resident budget. Otherwise the entry is DEMOTED to transient
+	// (Pinned=false) — the kill-switch (budget 0) and the overflow-guard
+	// both degrade to LRU rather than evicting another pinned cell or
+	// OOMing. The decision is taken HERE, under mu, after subtracting any
+	// prior resident weight for this key (replace-in-place may flip status).
+	priorResident := int64(0)
 	if el, ok := c.index[key]; ok {
 		old := el.Value.(*lruItem)
-		c.curBytes -= old.bytes
+		if old.entry != nil && old.entry.Pinned {
+			priorResident = old.bytes
+		}
+	}
+	if entry.Pinned {
+		if c.maxResidentBytes <= 0 {
+			// Kill-switch: pinning disabled. Store transient.
+			entry.Pinned = false
+			c.residentDemoteTotal.Add(1)
+		} else if c.curResidentBytes-priorResident+bytes > c.maxResidentBytes {
+			// Resident budget would overflow. Degrade to transient rather
+			// than evict another pinned cell (the prewarm-coverage contract
+			// — a pinned cell is never sacrificed for another pin).
+			entry.Pinned = false
+			c.residentDemoteTotal.Add(1)
+		}
+	}
+
+	// Replace-in-place semantics if key already present. The prior entry's
+	// status (transient vs resident) may differ from the new one, so adjust
+	// BOTH budgets symmetrically.
+	if el, ok := c.index[key]; ok {
+		old := el.Value.(*lruItem)
+		if old.entry != nil && old.entry.Pinned {
+			c.curResidentBytes -= old.bytes
+			c.residentEntries--
+		} else {
+			c.curBytes -= old.bytes
+		}
 		old.entry = entry
 		old.bytes = bytes
-		c.curBytes += bytes
+		if entry.Pinned {
+			c.curResidentBytes += bytes
+			c.residentEntries++
+			c.residentPinTotal.Add(1)
+		} else {
+			c.curBytes += bytes
+		}
 		c.order.MoveToFront(el)
 		c.storeTotal.Add(1)
-		if apistage {
-			c.apistageStoreTotal.Add(1)
-		}
-		if widgetContent {
-			c.widgetContentStoreTotal.Add(1)
-		}
+		c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
 		c.evictUntilUnderCapsLocked()
 		return
 	}
@@ -642,16 +802,33 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	item := &lruItem{key: key, entry: entry, bytes: bytes}
 	el := c.order.PushFront(item)
 	c.index[key] = el
-	c.curBytes += bytes
+	if entry.Pinned {
+		c.curResidentBytes += bytes
+		c.residentEntries++
+		c.residentPinTotal.Add(1)
+	} else {
+		c.curBytes += bytes
+	}
 	c.storeTotal.Add(1)
+	c.bumpClassStoreLocked(apistage, widgetContent, raFullList)
+
+	c.evictUntilUnderCapsLocked()
+}
+
+// bumpClassStoreLocked increments the per-class store counters. Must be
+// called with mu held (or from a context where atomic adds are fine — the
+// counters are atomic, but keeping the call under mu groups it with the
+// byte accounting). Ship 4a factored this out of Put's two branches.
+func (c *ResolvedCacheStore) bumpClassStoreLocked(apistage, widgetContent, raFullList bool) {
 	if apistage {
 		c.apistageStoreTotal.Add(1)
 	}
 	if widgetContent {
 		c.widgetContentStoreTotal.Add(1)
 	}
-
-	c.evictUntilUnderCapsLocked()
+	if raFullList {
+		c.raFullListStoreTotal.Add(1)
+	}
 }
 
 // isApistageEntry reports whether entry is a Ship E api-stage L1 entry —
@@ -666,6 +843,13 @@ func isApistageEntry(entry *ResolvedEntry) bool {
 func isWidgetContentEntry(entry *ResolvedEntry) bool {
 	return entry != nil && entry.Inputs != nil &&
 		entry.Inputs.CacheEntryClass == CacheEntryClassWidgetContent
+}
+
+// isRAFullListEntry reports whether entry is a Ship 4a raFullList L1
+// entry — classified by its Inputs.CacheEntryClass. Nil-safe.
+func isRAFullListEntry(entry *ResolvedEntry) bool {
+	return entry != nil && entry.Inputs != nil &&
+		entry.Inputs.CacheEntryClass == CacheEntryClassRAFullList
 }
 
 // itemsTreeOverheadFactor estimates the in-memory footprint of a parsed
@@ -741,6 +925,15 @@ type ResolvedCacheStats struct {
 	// Ship G (0.30.16x) widget-content counters.
 	WidgetContentStoreTotal uint64
 	WidgetContentEvictTotal uint64
+
+	// Ship 4a (0.30.198) raFullList + resident-region counters.
+	RAFullListStoreTotal uint64
+	RAFullListEvictTotal uint64
+	ResidentEntries      int
+	ResidentBytes        int64
+	MaxResidentBytes     int64
+	ResidentPinTotal     uint64
+	ResidentDemoteTotal  uint64
 }
 
 func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
@@ -750,6 +943,9 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 	c.mu.Lock()
 	entries := c.order.Len()
 	bytes := c.curBytes
+	residentEntries := c.residentEntries
+	residentBytes := c.curResidentBytes
+	maxResidentBytes := c.maxResidentBytes
 	c.mu.Unlock()
 	return ResolvedCacheStats{
 		Entries:                 entries,
@@ -766,6 +962,13 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		ApistageEvictTotal:      c.apistageEvictTotal.Load(),
 		WidgetContentStoreTotal: c.widgetContentStoreTotal.Load(),
 		WidgetContentEvictTotal: c.widgetContentEvictTotal.Load(),
+		RAFullListStoreTotal:    c.raFullListStoreTotal.Load(),
+		RAFullListEvictTotal:    c.raFullListEvictTotal.Load(),
+		ResidentEntries:         residentEntries,
+		ResidentBytes:           residentBytes,
+		MaxResidentBytes:        maxResidentBytes,
+		ResidentPinTotal:        c.residentPinTotal.Load(),
+		ResidentDemoteTotal:     c.residentDemoteTotal.Load(),
 	}
 }
 
@@ -808,14 +1011,41 @@ func (s ResolvedCacheStats) HitRate() float64 {
 
 // evictUntilUnderCapsLocked drops tail entries (least recently used)
 // until BOTH caps are satisfied. Must be called with mu held.
+//
+// Ship 4a (0.30.198) — PINNED (resident) entries are SKIPPED: the
+// transient entry-count cap (maxEntries) and the transient byte cap
+// (maxBytes) apply to TRANSIENT entries only, and the sweep walks from the
+// LRU tail toward the front, skipping any pinned element, evicting the
+// first TRANSIENT element it finds. Resident bytes/count have their OWN
+// budget (maxResidentBytes), enforced at Put time by demote-to-transient —
+// the sweep never evicts a pinned cell (the prewarm-coverage contract,
+// feedback_zero_cold_navigations_hard_requirement). If EVERY remaining
+// entry is pinned the sweep terminates (no transient victim) — bounded, no
+// spin.
 func (c *ResolvedCacheStore) evictUntilUnderCapsLocked() {
-	for c.order.Len() > c.maxEntries || c.curBytes > c.maxBytes {
-		tail := c.order.Back()
-		if tail == nil {
+	transientEntries := c.order.Len() - c.residentEntries
+	for transientEntries > c.maxEntries || c.curBytes > c.maxBytes {
+		// Walk from the LRU tail toward the front to find the first
+		// non-pinned victim. A pinned entry is skipped (it lives in the
+		// resident region; LRU pressure must not touch it).
+		var victim *list.Element
+		for el := c.order.Back(); el != nil; el = el.Prev() {
+			item := el.Value.(*lruItem)
+			if item.entry != nil && item.entry.Pinned {
+				continue
+			}
+			victim = el
+			break
+		}
+		if victim == nil {
+			// No transient victim left — every entry is pinned. Stop; the
+			// transient caps cannot be satisfied further without touching
+			// resident cells, which is forbidden.
 			return
 		}
-		c.removeElementLocked(tail)
+		c.removeElementLocked(victim)
 		c.evictLRUTotal.Add(1)
+		transientEntries--
 	}
 }
 
@@ -830,10 +1060,23 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
-	c.curBytes -= item.bytes
-	if c.curBytes < 0 {
-		// Defensive — should never happen with non-negative bytes.
-		c.curBytes = 0
+	// Ship 4a (0.30.198) — debit the correct budget. A pinned entry's bytes
+	// live in the resident region; a transient entry's in curBytes.
+	if item.entry != nil && item.entry.Pinned {
+		c.curResidentBytes -= item.bytes
+		if c.curResidentBytes < 0 {
+			c.curResidentBytes = 0
+		}
+		c.residentEntries--
+		if c.residentEntries < 0 {
+			c.residentEntries = 0
+		}
+	} else {
+		c.curBytes -= item.bytes
+		if c.curBytes < 0 {
+			// Defensive — should never happen with non-negative bytes.
+			c.curBytes = 0
+		}
 	}
 	// Ship E (0.30.116): count an api-stage eviction for the O6 pressure
 	// metric. Classified off the dropped entry's CacheEntryClass.
@@ -844,6 +1087,12 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	// per-class pressure signal.
 	if isWidgetContentEntry(item.entry) {
 		c.widgetContentEvictTotal.Add(1)
+	}
+	// Ship 4a (0.30.198): count a raFullList eviction (TTL/DELETE — a pinned
+	// raFullList is skipped by the LRU sweep; an un-pinned one can be
+	// LRU-evicted here).
+	if isRAFullListEntry(item.entry) {
+		c.raFullListEvictTotal.Add(1)
 	}
 	// Dep-tracker cleanup. Safe even when L1 is the only consumer
 	// (Deps() is always non-nil); a no-op when no edges were ever
@@ -881,9 +1130,23 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	item := el.Value.(*lruItem)
 	delete(c.index, item.key)
 	c.order.Remove(el)
-	c.curBytes -= item.bytes
-	if c.curBytes < 0 {
-		c.curBytes = 0
+	// Ship 4a (0.30.198) — debit the correct budget (a DELETE can evict a
+	// pinned cell; the resident region is TTL/DELETE-evictable, only LRU-
+	// pressure spares it).
+	if item.entry != nil && item.entry.Pinned {
+		c.curResidentBytes -= item.bytes
+		if c.curResidentBytes < 0 {
+			c.curResidentBytes = 0
+		}
+		c.residentEntries--
+		if c.residentEntries < 0 {
+			c.residentEntries = 0
+		}
+	} else {
+		c.curBytes -= item.bytes
+		if c.curBytes < 0 {
+			c.curBytes = 0
+		}
 	}
 	// Ship E (0.30.116): count an api-stage DELETE-eviction for the O6
 	// pressure metric — same classification as removeElementLocked.
@@ -891,6 +1154,8 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	// Ship G (0.30.16x): same per-class DELETE classification for the
 	// widget-content layer.
 	widgetContent := isWidgetContentEntry(item.entry)
+	// Ship 4a (0.30.198): same per-class DELETE classification for raFullList.
+	raFullList := isRAFullListEntry(item.entry)
 	c.mu.Unlock()
 	c.evictDeleteTotal.Add(1)
 	if apistage {
@@ -898,6 +1163,9 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	}
 	if widgetContent {
 		c.widgetContentEvictTotal.Add(1)
+	}
+	if raFullList {
+		c.raFullListEvictTotal.Add(1)
 	}
 	return true
 }
@@ -966,6 +1234,18 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Uint64("widget_content_evict_total", s.WidgetContentEvictTotal),
 				slog.Float64("widget_content_evict_pressure", s.WidgetContentEvictPressure()),
 				slog.Bool("widget_content_enabled", WidgetContentL1Enabled()),
+				// Ship 4a (0.30.198) — raFullList + resident-region surface
+				// (per feedback_measurement_use_expvar_not_log_tails — also
+				// in /debug/vars via the same Stats snapshot). resident_entries
+				// is the prewarm-coverage signal; resident_demote_total > 0
+				// means the resident budget overflowed or pinning is disabled.
+				slog.Uint64("ra_full_list_store_total", s.RAFullListStoreTotal),
+				slog.Uint64("ra_full_list_evict_total", s.RAFullListEvictTotal),
+				slog.Int("resident_entries", s.ResidentEntries),
+				slog.Int64("resident_bytes", s.ResidentBytes),
+				slog.Int64("max_resident_bytes", s.MaxResidentBytes),
+				slog.Uint64("resident_pin_total", s.ResidentPinTotal),
+				slog.Uint64("resident_demote_total", s.ResidentDemoteTotal),
 			)
 		}
 	}()

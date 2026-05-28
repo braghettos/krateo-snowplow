@@ -38,6 +38,7 @@ package dispatchers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -97,6 +98,18 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	}
 
 	key := cache.ComputeKey(inputs)
+
+	// Ship 4a (0.30.198) — capture the prior entry's pin status so a
+	// RAFullList refresh RE-PINS rather than demoting a resident cell to
+	// transient on a dirty-mark (the prewarm-protection contract:
+	// feedback_zero_cold_navigations_hard_requirement). For every other
+	// class prePinned stays false and the re-Put is unchanged.
+	prePinned := false
+	if inputs.CacheEntryClass == cache.CacheEntryClassRAFullList {
+		if prior, ok := c.Get(key); ok && prior != nil {
+			prePinned = prior.Pinned
+		}
+	}
 
 	// AC-C7: re-resolve under the entry's OWN identity. Ship A.3 /
 	// 0.30.179 — the entry is per-COHORT (keyed by BindingSetHash); the
@@ -200,12 +213,18 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	c.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &inputs,
+		// Ship 4a (0.30.198) — preserve the resident pin on a RAFullList
+		// refresh so a dirty-mark re-resolve never demotes a prewarmed
+		// expensive cell to the transient LRU. Put honours the pin subject
+		// to the resident budget (else demotes — the safe degrade).
+		Pinned: prePinned,
 	})
 	log.Debug("resolveAndPopulateL1: re-resolved + stored",
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
 		slog.String("handler", inputs.CacheEntryClass),
 		slog.String("user", inputs.RepresentativeUsername),
+		slog.Bool("pinned", prePinned),
 	)
 	return nil
 }
@@ -251,6 +270,17 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 	switch inputs.CacheEntryClass {
 	case "restactions":
 		return resolveRestActionForRefresh(ctx, got, inputs, authnNS)
+	case cache.CacheEntryClassRAFullList:
+		// Ship 4a (0.30.198) — refresh the page-independent RA full-list
+		// cell. The cell holds the RA's STATUS MAP (the resolved result,
+		// e.g. {compositionspanels:[...]}) resolved UNPAGINATED — NOT the
+		// whole RESTAction CR. resolveRAFullListForRefresh re-resolves the
+		// RA at PerPage=0/Page=0 (no `.slice` injected → full sorted set) and
+		// returns json.Marshal(ra.Status-map) so the bytes are byte-identical
+		// to the apiref serve path's PutRAFullList (which marshals the same
+		// map). Using resolveRestActionForRefresh here would store the whole
+		// CR — a SHAPE MISMATCH the Go-slice serve could not consume.
+		return resolveRAFullListForRefresh(ctx, got, inputs, authnNS)
 	case "widgets":
 		return resolveWidgetForRefresh(ctx, got, inputs, authnNS)
 	case cache.CacheEntryClassWidgetContent:
@@ -332,6 +362,50 @@ func resolveRestActionForRefresh(ctx context.Context, got objects.Result, inputs
 		return nil, fmt.Errorf("resolve RESTAction: %w", err)
 	}
 	return encodeResolvedJSON(res)
+}
+
+// resolveRAFullListForRefresh re-resolves a RAFullList cell — Ship 4a
+// (0.30.198). The cell holds the RA's resolved STATUS MAP (the full sorted
+// result) resolved UNPAGINATED. It converts the re-fetched CR to a typed
+// RESTAction, resolves it at PerPage=0/Page=0 (no `.slice` → the RA's output
+// jq returns the full sorted set), and returns json.Marshal of the Status
+// map — byte-identical to the apiref serve path's PutRAFullList (which
+// marshals the same map via cache.PutRAFullList). Returns (nil, nil) when the
+// resolve produced no Status (skip-to-TTL).
+func resolveRAFullListForRefresh(ctx context.Context, got objects.Result, inputs cache.ResolvedKeyInputs, authnNS string) ([]byte, error) {
+	scheme := runtime.NewScheme()
+	if err := apis.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("add apis to scheme: %w", err)
+	}
+	var cr templatesv1.RESTAction
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
+		return nil, fmt.Errorf("unstructured -> RESTAction (raFullList): %w", err)
+	}
+	// UNPAGINATED — Inputs already carry PerPage=0/Page=0 (RAFullListKeyInputs),
+	// but pass 0/0 explicitly so the contract is local + obvious.
+	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
+		In:      &cr,
+		AuthnNS: authnNS,
+		PerPage: 0,
+		Page:    0,
+		Extras:  inputs.Extras,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve RAFullList: %w", err)
+	}
+	if res.Status == nil || res.Status.Raw == nil {
+		// No status produced — skip-to-TTL (not an error).
+		return nil, nil
+	}
+	// The cell stores the Status MAP (decoded then re-marshaled canonically),
+	// matching cache.PutRAFullList(json.Marshal(full)). Round-trip through a
+	// map so the bytes are canonical (sorted keys) and byte-identical to the
+	// serve-path Put regardless of the jq emitter's key order.
+	var full map[string]any
+	if err := json.Unmarshal(res.Status.Raw, &full); err != nil {
+		return nil, fmt.Errorf("RAFullList status not a JSON object: %w", err)
+	}
+	return json.Marshal(full)
 }
 
 // resolveWidgetForRefresh dispatches widgets.Resolve on the re-fetched

@@ -100,6 +100,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/apiref"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -955,7 +956,68 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	// the informer for every recorded GVR is wired (AC-PIP.5 / falsifier
 	// #5).
 	recordWidgetDeps(slog.Default(), key, e.GVR, res)
+
+	// Ship 4a (0.30.198) — prewarm + PIN the page-independent RAFullList
+	// cell for this (widget→RESTAction × cohort). The cell survives LRU
+	// thrash (resident region) so the cohort's FIRST paginated /call hits a
+	// warm full-list and is served as a cheap Go-slice — the zero-cold-nav
+	// requirement (feedback_zero_cold_navigations_hard_requirement). Best-
+	// effort: a prewarm error is log-only and never fails the widget seed
+	// (the cohort's per-user widget cell above already seeded; RAFullList is
+	// an accelerator). NON-FATAL by design.
+	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName())
 	return nil
+}
+
+// seedRAFullListForWidget prewarms + pins the page-independent RAFullList
+// cell for a widget's underlying RESTAction, under the cohort ctx — Ship 4a
+// (0.30.198). It resolves the widget's apiRef at a PAGINATED tuple
+// (prewarmPageLimit, page 1) so apiref.Resolve engages raFullListServe,
+// which: resolves the RA UNPAGINATED, byte-verifies sliceability for the
+// apiRef shape, Puts the full cell (pinned when the cost predicate fires —
+// envelope bytes ≥ threshold), and records the verdict. Reusing the serve
+// path means ZERO duplicated slice/verify/pin logic and guarantees the
+// prewarmed cell is byte-identical to what the first /call would build.
+//
+// Best-effort: the function swallows errors (log-only). A widget with no
+// apiRef (e.g. a static-data widget) is a no-op. CACHE off → apiref.Resolve's
+// raFullListServe nil-checks the cache and returns served=false → the resolve
+// is a harmless extra read (only reached when ResolvedCacheEnabled, see the
+// guard below). The whole block is gated under cache.ResolvedCacheEnabled()
+// so a cache-off process never runs the extra resolve.
+func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, authnNS, ns, name string) {
+	if !cache.ResolvedCacheEnabled() {
+		return
+	}
+	apiRef, err := widgets.GetApiRef(w.Object)
+	if err != nil || apiRef.Name == "" || apiRef.Namespace == "" {
+		// No apiRef (static widget) or unparseable — nothing to prewarm.
+		return
+	}
+	// Resolve at a paginated tuple so raFullListServe engages (it requires
+	// perPage>0 && page>0). page 1 + prewarmPageLimit is sufficient: the
+	// byte-verify + pin are per-(RA × shape), NOT per-page, so this single
+	// prewarm populates+verifies+pins the cell for EVERY subsequent (page,
+	// perPage) /call by this cohort. The result is discarded (we only want
+	// the cell-populating side-effect).
+	pp := prewarmPageLimit()
+	if pp <= 0 {
+		pp = 1
+	}
+	if _, rerr := apiref.Resolve(ctx, apiref.ResolveOptions{
+		ApiRef:  apiRef,
+		AuthnNS: authnNS,
+		PerPage: pp,
+		Page:    1,
+	}); rerr != nil {
+		slog.Default().Warn("phase1.seed.rafulllist.skipped",
+			slog.String("subsystem", "cache"),
+			slog.String("widget", ns+"/"+name),
+			slog.String("apiref", apiRef.Namespace+"/"+apiRef.Name),
+			slog.Any("err", rerr),
+			slog.String("effect", "RAFullList prewarm skipped for this (widget,cohort); first /call cold-resolves + pins lazily"),
+		)
+	}
 }
 
 // cohortLogLabel renders a cohort into a stable log/metric label. The

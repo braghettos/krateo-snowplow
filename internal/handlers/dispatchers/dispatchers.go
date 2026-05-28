@@ -100,4 +100,14 @@ func RegisterRefreshHandlers(saRC *rest.Config) {
 	// composition lives in ComputeKey, so the re-Put lands under the
 	// content key correctly.
 	cache.RegisterRefreshFunc(cache.CacheEntryClassWidgetContent, refreshFunc)
+	// Ship 4a (0.30.198) — register the refresher for the page-independent
+	// RAFullList cell. The SAME refreshFunc closure serves it: resolveOnceFn
+	// routes CacheEntryClassRAFullList to resolveRAFullListForRefresh (an
+	// UNPAGINATED RA re-resolve returning the Status map, byte-identical to
+	// the apiref serve-path Put). resolveAndPopulateL1 PRESERVES the
+	// resident pin on the re-Put so a dirty-mark never demotes a prewarmed
+	// expensive cell to the transient LRU. Without this registration a
+	// RAFullList entry off the queue would hit a nil handler → skippedNoHandler
+	// → silently TTL-only (the 0.30.116 AC-E3 defect class).
+	cache.RegisterRefreshFunc(cache.CacheEntryClassRAFullList, refreshFunc)
 }
