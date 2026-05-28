@@ -686,7 +686,16 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	// carries no slice params so the dispatcher's paginationInfo returns
 	// (-1, -1); the seed Put must use the same tuple. Resolution tuple
 	// stays = prewarmPageLimit() (the 0.30.127 storm guard).
-	return w.walk(rctx, root, gvr, 0, prewarmPageLimit(), prewarmPageLimit(), -1, -1)
+	//
+	// Ship 0.30.199 (Change A): the page NUMBER must be 1, NOT
+	// prewarmPageLimit(). injectSlice (widgets/resolve.go:268) computes the
+	// list-windowing `offset = (page-1)*perPage`. Passing page == perPage ==
+	// prewarmPageLimit() (=5) windowed the children at offset (5-1)*5 = 20,
+	// so a small nav root (e.g. the 3-item sidebar-nav-menu) sliced at
+	// offset 20 yielded ZERO children and the walk never descended below the
+	// roots. The page SIZE stays prewarmPageLimit() — the 0.30.127 bounded
+	// fan-out guard is untouched; only the page-NUMBER overshoot is fixed.
+	return w.walk(rctx, root, gvr, 0, 1, prewarmPageLimit(), -1, -1)
 }
 
 // Ship 0.30.127: the per-(parent,GVR) sample cap — phase1PerGVRSampleLimit,
@@ -924,7 +933,16 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// when absent, fall back to the bounded PREWARM_PAGE_LIMIT default
 		// — NEVER the unbounded -1 (which, with the iterator cap removed,
 		// is the 49K-row storm).
-		childPage, childPerPage := prewarmPageLimit(), prewarmPageLimit()
+		//
+		// Ship 0.30.199 (Change A): the no-declared-slice default page
+		// NUMBER is 1, NOT prewarmPageLimit(). Same overshoot as the root
+		// site: injectSlice's `offset = (page-1)*perPage` windowed a child
+		// nav list at offset (5-1)*5 = 20, dropping every child of a small
+		// list to ZERO so the recursion never descended. The page SIZE
+		// stays prewarmPageLimit() (the 0.30.127 bounded fan-out guard). A
+		// child whose /call Path DOES declare a slice still overrides both
+		// values below.
+		childPage, childPerPage := 1, prewarmPageLimit()
 		if p, pp, hasPg := util.ParseCallPathPagination(child.Path); hasPg {
 			childPage, childPerPage = p, pp
 		}

@@ -227,6 +227,118 @@ func TestDashboardTable_ColdPath_Slices_To_50(t *testing.T) {
 		"sliced envelope must be at least ~1000× smaller than unsliced (48,999/50 = 980×)")
 }
 
+// navRootOffsetWindowExpression mirrors the .slice.offset-shaped child
+// windowing the navigation widgets use (the same Shape-2 family as
+// restaction.compositions-panels.yaml:37-38 — `.slice.offset // 0` paired
+// with `.slice.perPage // (.list | length)`). It windows the source list
+// at `.list[offset : offset + perPage]`. A small nav list (e.g. the 3-item
+// sidebar-nav-menu) sliced at offset 20 yields ZERO children; sliced at
+// offset 0 yields the children. This is the EXACT mechanism that decided
+// whether the Phase-1 walk discovered children below the nav roots.
+const navRootOffsetWindowExpression = `${
+  (
+    (.slice.offset // 0) as $off
+    | (.slice.perPage // (.list | length)) as $pp
+    | .list[$off : ($off + $pp)]
+  )
+}`
+
+// TestNavRootWindow_Page1_Yields_Children_Overshoot_Yields_Zero is the
+// Ship 0.30.199 (Change A) falsifier. It captures the page-NUMBER
+// overshoot bug at the load-bearing resolution layer: the slice tuple the
+// Phase-1 walk passes to injectSlice windows a small nav-root child list.
+//
+//   - BUGGY tuple  page == perPage == prewarmPageLimit() (=5):
+//     offset = (5-1)*5 = 20 → a 3-item list[20:25] = ZERO children →
+//     walk never descends → everything below the nav roots is undiscovered.
+//   - FIXED tuple  page == 1, perPage == prewarmPageLimit() (=5):
+//     offset = (1-1)*5 = 0 → list[0:5] = all 3 children → walk descends.
+//
+// The page SIZE (perPage) is IDENTICAL in both cases — this isolates the
+// page-NUMBER overshoot and proves the 0.30.127 bounded fan-out guard
+// (perPage) is preserved. The test FAILS against the pre-fix tuple
+// (overshoot returns children, contradicting the live byte-proof that it
+// returns zero) and PASSES with the fix.
+func TestNavRootWindow_Page1_Yields_Children_Overshoot_Yields_Zero(t *testing.T) {
+	// prewarmPageLimit() default — kept in sync with
+	// dispatchers/phase1_content_prewarm.go defaultPrewarmPageLimit (=5).
+	// The walk uses this as the page SIZE (perPage) at both root and
+	// no-declared-slice child sites.
+	const perPage = 5
+
+	// A small nav-root child list — mirrors the live sidebar-nav-menu's
+	// 3 resolved children (architect byte-proof: 0 items at no-params /
+	// page=perPage=5, 3 items at page=1,perPage=5).
+	makeList := func() []any {
+		return []any{
+			map[string]any{"id": "child-0"},
+			map[string]any{"id": "child-1"},
+			map[string]any{"id": "child-2"},
+		}
+	}
+
+	items := []templatesv1.WidgetDataTemplate{
+		{
+			ForPath:    "children",
+			Expression: navRootOffsetWindowExpression,
+		},
+	}
+
+	resolveWindow := func(t *testing.T, page int) []any {
+		t.Helper()
+		ds := map[string]any{"list": makeList()}
+		// injectSlice is the production helper that turns the walk's
+		// (perPage, page) tuple into ds["slice"]{page, perPage, offset}.
+		injectSlice(ds, perPage, page)
+		evals, err := widgetdatatemplate.Resolve(context.Background(), widgetdatatemplate.ResolveOptions{
+			Items:      items,
+			DataSource: ds,
+		})
+		require.NoError(t, err)
+		require.Len(t, evals, 1)
+		rows, ok := evals[0].Value.([]any)
+		require.True(t, ok, "windowing jq must return []any (got %T)", evals[0].Value)
+		return rows
+	}
+
+	// (a) BUGGY tuple — page == perPage. This is what the pre-0.30.199
+	// root site (phase1_walk.go:689) and no-declared-slice child default
+	// (phase1_walk.go:927) passed. offset = (perPage-1)*perPage = 20 on a
+	// 3-item list → ZERO children → recursion never descends.
+	overshootRows := resolveWindow(t, perPage)
+	assert.Equal(t, 0, len(overshootRows),
+		"BUGGY page-number overshoot (page==perPage==%d → offset (%d-1)*%d=%d) windows a small nav list to ZERO children — this is why the walk discovered nothing below the roots",
+		perPage, perPage, perPage, (perPage-1)*perPage)
+
+	// (b) FIXED tuple — page == 1, perPage unchanged. offset = 0 → the
+	// full child list passes → recursion descends the nav tree.
+	page1Rows := resolveWindow(t, 1)
+	assert.Equal(t, 3, len(page1Rows),
+		"FIXED page NUMBER = 1 (offset 0) windows the full child list — the walk now descends below the nav roots")
+
+	// (c) The page SIZE (perPage) is identical in both cases: this fix is
+	// PURELY a page-number correction, not a relaxation of the 0.30.127
+	// bounded fan-out guard. A list larger than perPage is still capped.
+	bigDS := map[string]any{"list": func() []any {
+		out := make([]any, 12)
+		for i := range out {
+			out[i] = map[string]any{"id": i}
+		}
+		return out
+	}()}
+	injectSlice(bigDS, perPage, 1)
+	evalsBig, err := widgetdatatemplate.Resolve(context.Background(), widgetdatatemplate.ResolveOptions{
+		Items:      items,
+		DataSource: bigDS,
+	})
+	require.NoError(t, err)
+	require.Len(t, evalsBig, 1)
+	bigRows, ok := evalsBig[0].Value.([]any)
+	require.True(t, ok)
+	assert.Equal(t, perPage, len(bigRows),
+		"page SIZE (perPage=%d) still bounds the window at page 1 — the 0.30.127 fan-out guard is preserved", perPage)
+}
+
 // TestDashboardTable_NonSlicedWidget_ByteIdenticalAcrossPagination — design
 // §7.1 row 5: a widget whose jq does NOT reference .slice produces
 // byte-identical output regardless of injection. Confirms the fix is
