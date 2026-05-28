@@ -13,25 +13,30 @@
 // every cohort then returns dispatcher.call.complete l1_hit:"hit" with
 // zero resolve.
 //
-// COHORT ENUMERATION (architect's PM gate #392). The cohort set is
-// derived from cache.EnumerateRBACCohorts() — see
-// internal/cache/rbac_cohorts.go for the canonical-dedupe contract
-// (two identities are the same cohort iff their union of matched
-// binding-pointer-sets is equal). The architect's expected
-// production-scale cohort count is ≤ 50 (admin + a handful of
-// least-privilege team cohorts). Above 50 PIP FAIL-CLOSES — phase1Done
-// stays false, pod stays not-ready, the operator MUST inspect the log
-// line phase1.seed.cohort_cap_exceeded. This is the storage-bound
-// guard: each cohort × (N_restactions+N_widgets) is an L1 entry, so
-// 50 × ~35 ≈ 1750 entries is the upper bound on PIP-seeded L1.
+// COHORT ENUMERATION. The cohort set is derived from
+// cache.EnumerateBindingSetClasses() — see
+// internal/cache/binding_set_enumeration.go for the canonical-dedupe
+// contract (two identities are the same cohort iff their union of matched
+// binding-pointer-sets is equal).
 //
-// FOREGROUND + FAIL-CLOSED (Diego OQ-1 + OQ-2, ratified for PIP).
-// phase1WarmupWith calls runPIPSeed as Step 7.6 — AFTER contentWarm
-// (7.5) and BEFORE MarkPhase1Done (8). Any cohort-level error
-// (per-cohort seed timeout, resolver error, Put error) propagates up
-// and causes phase1WarmupWith to RETURN WITHOUT calling MarkPhase1Done.
-// /readyz stays 503; the pod stays not-ready. The operator must
-// inspect the per-cohort error log line and redeploy/restart.
+// Ship 2 / 0.30.196 — COHORT-COUNT-INDEPENDENT. The old cohort cap (50)
+// + the cohort_cap_exceeded fail-closed branch are DELETED. The product
+// owner's invariant: the cache architecture must NOT depend on cohort
+// count — a future customer with per-user User-kind bindings could push
+// cohort count to O(users), and that must never wedge the pod. Each
+// cohort × (N_restactions+N_widgets) is still an L1 entry, but the seed
+// is now a BACKGROUND best-effort warm: a large cohort set simply takes
+// longer to warm in the background; it never withholds readiness.
+//
+// BACKGROUND + BEST-EFFORT (Ship 2 / 0.30.196 — supersedes the prior
+// FOREGROUND + FAIL-CLOSED contract). phase1WarmupWith launches runPIPSeed
+// as Step 7.6 on a bounded background goroutine AFTER MarkPhase1Done
+// (Step 8) — readiness is already 200. Any cohort-level error is log-only;
+// it NEVER withholds readiness and NEVER fail-closes. The background seed
+// is bounded by pipGlobalTimeout and dies with the process. The first
+// /call by a not-yet-seeded cohort falls back to a per-user resolve — the
+// correct degraded posture, since the architecture gate proved the cold
+// nav is served from the informer substrate regardless of the seed.
 //
 // CONCURRENCY (architect's design §3). The cohort loop runs under a
 // bounded errgroup with limit = runtime.GOMAXPROCS(0) — matches the F2
@@ -111,14 +116,17 @@ const (
 	// either is off, PIP stays inert regardless of this knob.
 	envPrewarmPIPEnabled = "PREWARM_PIP_ENABLED"
 
-	// pipCohortCapDefault is the architect's expected production-scale
-	// cohort ceiling (PM gate #392 / OQ-2). EnumerateRBACCohorts returning
-	// more than this triggers FAIL-CLOSED: phase1Done stays false.
-	pipCohortCapDefault = 50
-
-	// envPrewarmPIPCohortCap allows ops to raise/lower the ceiling
-	// without a code change — emergency lever only.
-	envPrewarmPIPCohortCap = "PREWARM_PIP_COHORT_CAP"
+	// Ship 2 / 0.30.196 — the PER-COHORT CAP IS DELETED. pipCohortCapDefault
+	// (50), envPrewarmPIPCohortCap ("PREWARM_PIP_COHORT_CAP"), and
+	// pipCohortCap() are GONE. The cap was the not-Ready-forever landmine:
+	// at cohort #51 runPIPSeed returned a fatal `cohort_cap_exceeded` error
+	// and phase1WarmupWith fail-closed (/readyz 503 FOREVER). With readiness
+	// now decoupled from the per-cohort seed (the seed runs as a background
+	// best-effort warm AFTER MarkPhase1Done — see phase1_walk.go Step 7.6),
+	// there is NO storage rationale to fail closed on cohort count, and an
+	// O(users)-cohort topology (per-user User-kind bindings) must not wedge
+	// the pod. The cap is the forbidden unbounded-cohort landmine and is
+	// removed entirely.
 
 	// pipCohortTimeout is the per-cohort hard ceiling. A stuck cohort
 	// cannot wedge Phase 1 past Step 7.6's global budget.
@@ -154,17 +162,6 @@ const (
 func PrewarmPIPEnabled() bool {
 	v := env.String(envPrewarmPIPEnabled, "false")
 	return v == "true"
-}
-
-// pipCohortCap returns the operator-overridable cohort ceiling. A
-// non-positive env value falls back to the default; ops can never set
-// it to zero (which would FAIL-CLOSE every Phase 1).
-func pipCohortCap() int {
-	n := env.Int(envPrewarmPIPCohortCap, pipCohortCapDefault)
-	if n <= 0 {
-		return pipCohortCapDefault
-	}
-	return n
 }
 
 // navWidgetEntry is one navigation widget CR captured during the
@@ -324,9 +321,13 @@ func (h *navWidgetHarvester) snapshot() []navWidgetEntry {
 
 // runPIPSeed is the Ship PIP Step 7.6 entry point invoked by
 // phase1WarmupWith. Enumerates RBAC cohorts and seeds the per-user
-// resolved-output L1 (restactions + widgets) for every cohort. Returns
-// a non-nil error on cap-exceeded OR cohort-level seed failure;
-// phase1WarmupWith treats that as FAIL-CLOSED and skips MarkPhase1Done.
+// resolved-output L1 (restactions + widgets) for every cohort.
+//
+// Ship 2 / 0.30.196 — runPIPSeed is invoked on a BACKGROUND goroutine
+// AFTER MarkPhase1Done; its return value is log-only. There is no longer
+// a cohort cap and no fail-closed path: per-cohort errors are swallowed
+// (each cohort goroutine returns nil), so a non-nil return here is now
+// vacuously rare. Readiness is NEVER affected by this function's outcome.
 //
 // h is the F2 content-prewarm harvester (apiRefHarvester) — drained
 // for the restactions seed loop. nh is the new navWidgetHarvester —
@@ -353,20 +354,12 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 		return nil
 	}
 
-	cap := pipCohortCap()
-	if len(cohorts) > cap {
-		// FAIL-CLOSED (architect's storage-bound guard, PM gate #392 /
-		// OQ-2). Emit a loud structured log line; the operator must
-		// inspect why the cohort count blew past the ceiling.
-		log.Error("phase1.seed.cohort_cap_exceeded",
-			slog.String("subsystem", "cache"),
-			slog.Int("cohorts", len(cohorts)),
-			slog.Int("cap", cap),
-			slog.String("effect", "phase1Done stays false; pod stays not-ready until the cap is raised "+
-				"(PREWARM_PIP_COHORT_CAP) or the RBAC topology is reduced"),
-		)
-		return fmt.Errorf("PIP cohort cap exceeded: enumerated=%d cap=%d", len(cohorts), cap)
-	}
+	// Ship 2 / 0.30.196 — the cohort cap check is DELETED. There is no
+	// fail-closed-on-cohort-count branch: runPIPSeed runs as a background
+	// best-effort warm (phase1_walk.go Step 7.6) AFTER readiness is already
+	// 200, so a high cohort count can never withhold readiness. An
+	// O(users)-cohort topology simply takes longer to warm in the
+	// background, bounded by pipGlobalTimeout — it never wedges the pod.
 
 	restactionRefs := h.snapshot()
 	widgetEntries := nh.snapshot()
@@ -374,7 +367,6 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	log.Info("phase1.seed.started",
 		slog.String("subsystem", "cache"),
 		slog.Int("cohorts", len(cohorts)),
-		slog.Int("cap", cap),
 		slog.Int("restactions", len(restactionRefs)),
 		slog.Int("widgets", len(widgetEntries)),
 	)
