@@ -34,9 +34,11 @@
 //     - rule.ResourceNames is EMPTY (a resourceNames-scoped rule never
 //       grants a collection verb such as list — rbac/evaluate.go:500-507)
 //   No subject re-check at this layer — the caller already filtered
-//   bindings by cohort membership via collectCohortBindingPtrs, which is
-//   the same pointer-set the rest of the cohort code uses (correctness
-//   barrier preserved).
+//   bindings by cohort membership via collectCohortClusterBindings /
+//   collectCohortBindingIDs, the same matched-binding set the rest of the
+//   cohort code uses (correctness barrier preserved). Ship 1 / 0.30.195
+//   moved the cohort-KEY encoding from pointer address to metadata.uid;
+//   the matched-binding MEMBERSHIP this ACL layer reads is unchanged.
 //
 // SAFETY (binding contracts)
 //   - feedback_l1_per_user_keyed_never_cohort.md — this helper computes
@@ -163,7 +165,7 @@ func CohortNSACL(
 //
 // SA-kind / catch-all are NOT collected here — the GMC memo's caller is
 // always a User+Groups identity (jwtutil.UserInfo on the resolver path,
-// apistage_cohort_memo.go:127). collectCohortBindingPtrs (rbac_cohort_gen.go:205-268)
+// apistage_cohort_memo.go:127). collectCohortBindingIDs (rbac_cohort_gen.go)
 // makes the same choice. Future SA cohort support is additive (one more
 // snap landing + one more matcher branch).
 func collectCohortClusterBindings(

@@ -256,7 +256,15 @@ type ResolvedKeyInputs struct {
 // pre-0.30.179 key is structurally different from a fresh key for
 // the SAME cohort. The salt rotation forces a clean break across the
 // rolling restart: pre-v2 entries never serve as v2 hits (AC-178.3).
-const resolvedKeyVersion = "v2"
+//
+// Ship 1 / 0.30.195 — BUMPED v2 → v3. BindingSetHash now hashes the
+// binding's immutable metadata.uid instead of its pointer address
+// (rbac_cohort_gen.go — collectCohortBindingIDs / fnv64aIdentities). The
+// hash VALUE for the same logical cohort differs from the v2 pointer-set
+// value, so a pre-0.30.195 (pointer-keyed) L1 entry MUST NOT be served as
+// the new UID-keyed entry for the same cohort. The salt rotation forces a
+// clean rolling key break: pre-v3 entries never serve as v3 hits.
+const resolvedKeyVersion = "v3"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed

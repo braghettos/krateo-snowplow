@@ -57,10 +57,11 @@
 //   time.
 //
 // HG-178.2 invariant: BindingSetHash matches CohortRBACGen's
-// `fnv64aPointers(collectCohortBindingPtrs(...))` byte-for-byte — same
-// helpers, same snapshot, same code path. By construction the L1 cell
-// the seed populates is the SAME cell the request-time
-// dispatchCacheLookupKey hashes for any cohort member.
+// `fnv64aIdentities(collectCohortBindingIDs(...))` byte-for-byte — same
+// helpers, same snapshot, same code path (Ship 1 / 0.30.195 — UID-based
+// identity, not pointer address). By construction the L1 cell the seed
+// populates is the SAME cell the request-time dispatchCacheLookupKey
+// hashes for any cohort member.
 //
 // AC-178.8: re-enumeration fires on RBAC informer rebuild via existing
 // `rbacRebuildDirty` — callers of EnumerateBindingSetClasses are

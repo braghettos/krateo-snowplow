@@ -8,18 +8,22 @@
 // of binding-pointer-sets it matches.
 //
 // CANONICAL DEDUPE — TWO USERS ARE THE SAME COHORT IFF THEIR UNION OF
-// BINDING-POINTER-SETS IS EQUAL. This is the architect's brief: an
+// BINDING-IDENTITY-SETS IS EQUAL. This is the architect's brief: an
 // identity sees, in the RBAC evaluator, exactly the bindings whose
 // Subjects.Kind=="User" + Subjects.Name==<username>. Two usernames that
 // reach the SAME binding set yield byte-identical resolved output for
-// every dispatcher key — they are one cohort. Pointer comparison is
-// load-bearing: the typed indexes share object identity per
-// rbac_snapshot.go:108-112 (the values in CRBsByUser / RBsByUserByNS
-// point into the SAME ClusterRoleBindings / RoleBindings slices held
-// elsewhere in the snapshot). Two cohorts whose binding *contents*
-// happen to be equal but whose Subject.Name differs intentionally stay
-// distinct — group membership flows through the binding identity, not
-// the name.
+// every dispatcher key — they are one cohort.
+//
+// Ship 1 / 0.30.195 — binding identity is the binding's IMMUTABLE
+// `metadata.uid` (empty-UID fallback = a stable content tuple), NOT the
+// pointer address. The pre-0.30.195 pointer comparison drifted on every
+// snapshot republish (~4.6/s), making the seed key diverge from the
+// dispatch key; UID is stable across relist so the two agree across
+// generations. The dedupe MEMBERSHIP is unchanged (UID-set == pointer-set
+// membership); only the encoding moved from address to UID. Two cohorts
+// whose binding *contents* happen to be equal but whose Subject.Name
+// differs intentionally stay distinct — group membership flows through
+// the matched binding set, not the name.
 //
 // GROUPS — the architect's brief defines a cohort as {Username, Groups}.
 // The snapshot's CRBsByUser maps Subject.Kind=="User" Name. The user's
@@ -74,7 +78,6 @@ package cache
 
 import (
 	"sort"
-	"unsafe"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 )
@@ -193,56 +196,60 @@ func EnumerateRBACCohorts() []Cohort {
 	return out
 }
 
-// canonicalCohortKey builds a deterministic key from the sorted pointer
-// addresses of every binding in the cohort's union. Pointer comparison
-// is the architect's dedupe contract — two cohorts whose binding-sets
-// are pointer-equal MUST collapse into one. uintptr is stable for the
-// lifetime of the snapshot (snapshot is immutable post-publish,
-// rbac_snapshot.go:36-51).
+// canonicalCohortKey builds a deterministic key from the sorted STABLE
+// identities of every binding in the cohort's union. Ship 1 / 0.30.195
+// switched the identity from the binding's pointer ADDRESS to its
+// immutable `metadata.uid` (with an empty-UID content-tuple fallback) —
+// the SAME identity the L1-cache-key consumers BindingSetHash /
+// CohortRBACGen use (collectCohortBindingIDs / crbIdentity / rbIdentity).
+// Routing all three consumers through the same identity is what keeps the
+// seed-time key (this enumerator) byte-identical to the dispatch-time key
+// ACROSS snapshot republishes; the pre-0.30.195 pointer addresses drifted
+// every rebuild (~4.6/s) and made the prewarmed cell unreachable.
 //
-// The key encodes ALL matched pointer addresses, sorted ascending, so
-// {a,b} and {b,a} hash identically. An empty cohort (no CRBs, no RBs)
-// yields the empty key — multiple "no bindings" identities would
-// collapse, which is the architect's invariant (they all resolve to
-// identical EvaluateRBAC verdicts and would produce byte-identical
-// resolved output).
+// The key encodes ALL matched identities, sorted ascending, so {a,b} and
+// {b,a} hash identically. An empty cohort (no CRBs, no RBs) yields the
+// empty key — multiple "no bindings" identities collapse, which is the
+// architect's invariant (they all resolve to identical EvaluateRBAC
+// verdicts and would produce byte-identical resolved output).
+//
+// EMPTY-UID FALLBACK — crbIdentity / rbIdentity fall back to a stable
+// per-binding content tuple (Kind tag + ns/name + roleRef) when
+// metadata.uid is empty, so two distinct empty-UID bindings stay distinct
+// rather than collapsing into a shared zero-bucket. See
+// collectCohortBindingIDs (rbac_cohort_gen.go) for the full CLAIM-5 note.
 func canonicalCohortKey(crbs []*rbacv1.ClusterRoleBinding, rbs []*rbacv1.RoleBinding) string {
-	// Capacity: 18 chars per uintptr (max uint64 hex) + 1 separator.
-	capHint := (len(crbs) + len(rbs)) * 20
-	if capHint == 0 {
+	if len(crbs)+len(rbs) == 0 {
 		return ""
 	}
-	addrs := make([]uintptr, 0, len(crbs)+len(rbs))
+	ids := make([]string, 0, len(crbs)+len(rbs))
 	for _, p := range crbs {
 		if p == nil {
 			continue
 		}
-		addrs = append(addrs, uintptr(unsafe.Pointer(p)))
+		ids = append(ids, crbIdentity(p))
 	}
 	for _, p := range rbs {
 		if p == nil {
 			continue
 		}
-		addrs = append(addrs, uintptr(unsafe.Pointer(p)))
+		ids = append(ids, rbIdentity(p))
 	}
-	sort.Slice(addrs, func(i, j int) bool { return addrs[i] < addrs[j] })
+	if len(ids) == 0 {
+		return ""
+	}
+	sort.Strings(ids)
 
-	// Build the key as a fixed-base-16 encoding separated by '|'. We use
-	// a manual builder rather than fmt.Sprintf to keep the hot path
-	// allocation-cheap (this runs once per Phase-1 startup but staying
-	// within the per-rebuild budget is courteous).
-	buf := make([]byte, 0, capHint)
-	const hex = "0123456789abcdef"
-	for i, a := range addrs {
+	// Build the key by joining the sorted identities with a 0x1e record
+	// separator (distinct from the 0x1f field separator the identity
+	// tuples use internally) so a single concatenation can never alias a
+	// different set partition.
+	buf := make([]byte, 0, len(ids)*40)
+	for i, id := range ids {
 		if i > 0 {
-			buf = append(buf, '|')
+			buf = append(buf, 0x1e)
 		}
-		// uint64 -> hex, little-endian-friendly: print high nibble
-		// first.
-		for shift := 60; shift >= 0; shift -= 4 {
-			b := hex[(a>>shift)&0xf]
-			buf = append(buf, b)
-		}
+		buf = append(buf, id...)
 	}
 	return string(buf)
 }

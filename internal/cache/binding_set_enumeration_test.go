@@ -58,10 +58,14 @@ func TestBindingSetHash_StableUnderEquivalentInput(t *testing.T) {
 
 // TestBindingSetHash_MatchesCohortRBACGenMechanism — AC-178.2. The hash
 // returned by BindingSetHash MUST equal the value
-// fnv64aPointers(collectCohortBindingPtrs(snap, u, gs+implicit-auth)) —
+// fnv64aIdentities(collectCohortBindingIDs(snap, u, gs+implicit-auth)) —
 // same helpers, same snapshot. By construction the L1 cell the seed
 // populates is the SAME cell the request-time dispatchCacheLookupKey
 // hashes for a cohort member.
+//
+// Ship 1 / 0.30.195 — the identity helpers hash metadata.uid (with an
+// empty-UID content-tuple fallback), NOT the pointer address; the
+// byte-equality invariant is unchanged in shape.
 //
 // BindingSetHash injects "system:authenticated" for authenticated users
 // (mirrors evaluate.go), so the reference must inject it too.
@@ -75,7 +79,7 @@ func TestBindingSetHash_MatchesCohortRBACGenMechanism(t *testing.T) {
 		nil,
 	)
 
-	want := fnv64aPointers(collectCohortBindingPtrs(snap, "admin",
+	want := fnv64aIdentities(collectCohortBindingIDs(snap, "admin",
 		[]string{"devs", "system:authenticated"}))
 	got := BindingSetHash("admin", []string{"devs"})
 	if got != want {

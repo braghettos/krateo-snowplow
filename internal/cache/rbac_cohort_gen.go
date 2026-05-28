@@ -1,4 +1,27 @@
-// rbac_cohort_gen.go — Ship GMC.1 / 0.30.175.
+// rbac_cohort_gen.go — Ship GMC.1 / 0.30.175;
+//   Ship 1 / 0.30.195 — UID-stable cohort identity (root-cause fix for
+//   cohort-key drift).
+//
+// SHIP 1 / 0.30.195 — POINTER-ADDRESS → metadata.uid
+//   The pre-0.30.195 identity hashed raw pointer ADDRESSES of the matched
+//   bindings (`ptrAddr` → `fnv64aPointers`). The informer rebuilds those
+//   pointers fresh on EVERY RBAC snapshot republish (~4.6/s churn,
+//   `rebuildRBACSnapshot`), so the pointer-set hash drifted across
+//   generations even when the LOGICAL binding membership was byte-
+//   identical. A prewarm-seed key computed in one generation then
+//   diverged from the dispatch key computed in a later generation, and
+//   the prewarmed L1 cell was unreachable.
+//   FIX: hash the binding's IMMUTABLE `metadata.uid` (the SORTED SET of
+//   UIDs of the matched bindings) instead of the pointer address. UIDs
+//   survive relist, so seed-time and dispatch-time hashes are byte-
+//   identical across generations. The three identity consumers
+//   (BindingSetHash, CohortRBACGen, canonicalCohortKey in
+//   rbac_cohorts.go) all route through the UID-based identity helpers
+//   (collectCohortBindingIDs / crbIdentity / rbIdentity / fnv64aIdentities)
+//   so seed and dispatch never disagree. The membership SET is unchanged
+//   (UID-set == pointer-set membership; only the encoding changes), so
+//   the cohort is not widened — RBAC correctness is preserved and the
+//   per-request content gate (apistage.go) is untouched.
 //
 // Per-cohort RBAC generation. Replaces the global cache.RBACGen() stamp
 // the Ship GMC (0.30.174) gate memo used: any single RBAC mutation
@@ -81,7 +104,7 @@
 // SANITY CHECK (AC-GMC1.3):
 //   - Hash function MUST NOT appear in pprof top-10, OR if it does,
 //     cumulative self-time MUST be <1%. Tester samples 30s CPU profile
-//     under admin burst; if `fnv64aPointers` or `collectCohortBindingPtrs`
+//     under admin burst; if `fnv64aIdentities` or `collectCohortBindingIDs`
 //     break that ceiling, follow-up ship adds hash caching keyed on
 //     snapshot publish-seq.
 
@@ -94,7 +117,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 )
@@ -153,8 +175,8 @@ func CohortRBACGen(username string, groups []string) uint64 {
 		return s.gen.Load()
 	}
 
-	ptrs := collectCohortBindingPtrs(snap, username, groups)
-	h := fnv64aPointers(ptrs)
+	ids := collectCohortBindingIDs(snap, username, groups)
+	h := fnv64aIdentities(ids)
 
 	if s.bindingsHash.Swap(h) != h {
 		s.gen.Add(1)
@@ -177,10 +199,11 @@ func CohortRBACGen(username string, groups []string) uint64 {
 //     contains it. BindingSetHash MUST mirror that behaviour or the
 //     seed-time hash (which enumerates the implicit group) would
 //     diverge from the request-time hash (where the JWT may omit it).
-//   - Collect the cohort's matched binding-pointer-set via
-//     collectCohortBindingPtrs.
-//   - Hash the union pointer-set via fnv64aPointers (FNV-64a;
-//     pointer-SET semantics).
+//   - Collect the cohort's matched binding-identity set via
+//     collectCohortBindingIDs (Ship 1 / 0.30.195 — metadata.uid, not
+//     pointer address).
+//   - Hash the union identity-set via fnv64aIdentities (FNV-64a;
+//     SET semantics, order-independent).
 //
 // EMPTY SNAPSHOT — returns 0 when no snapshot has been published
 // (degrade-to-deny posture; the cache-key caller sees zero identity-
@@ -203,8 +226,8 @@ func CohortRBACGen(username string, groups []string) uint64 {
 // reseed populates the new cell.
 //
 // CONCURRENCY — lock-free. rbacSnap.Load is atomic; the snapshot is
-// immutable post-publish (rbac_snapshot.go:36-51); collectCohortBindingPtrs
-// + fnv64aPointers are pure functions.
+// immutable post-publish (rbac_snapshot.go:36-51); collectCohortBindingIDs
+// + fnv64aIdentities are pure functions.
 func BindingSetHash(username string, groups []string) uint64 {
 	snap := rbacSnap.Load()
 	if snap == nil {
@@ -248,8 +271,8 @@ func BindingSetHash(username string, groups []string) uint64 {
 			effective = append(effective, systemAuthenticatedGroup)
 		}
 	}
-	ptrs := collectCohortBindingPtrs(snap, username, effective)
-	return fnv64aPointers(ptrs)
+	ids := collectCohortBindingIDs(snap, username, effective)
+	return fnv64aIdentities(ids)
 }
 
 // CohortKeyHash hashes (sorted(groups), username) into a stable cohort
@@ -284,8 +307,8 @@ func CohortKeyHash(username string, groups []string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// collectCohortBindingPtrs gathers the union of pointer-addresses of
-// every (Cluster)RoleBinding this cohort matches in the published
+// collectCohortBindingIDs gathers the union of STABLE binding identities
+// of every (Cluster)RoleBinding this cohort matches in the published
 // snapshot. The union is:
 //
 //   CRBsByUser[username] ∪
@@ -293,24 +316,47 @@ func CohortKeyHash(username string, groups []string) string {
 //     ∪_ns RBsByUserByNS[ns][username] ∪
 //     ∪_ns ∪_g RBsByGroupByNS[ns][g]
 //
-// Returns uintptr values (stable for the lifetime of an immutable
-// snapshot) — sortable and hashable by raw address. Pointer-set semantics
-// align with EnumerateRBACCohorts' canonicalCohortKey.
+// Returns a slice of stable identity strings — sortable and hashable as a
+// SET. Identity is the binding's `metadata.uid`, which is IMMUTABLE across
+// relist / snapshot republish (Ship 1 / 0.30.195). This is the root-cause
+// fix for cohort-key drift: the pre-0.30.195 code hashed raw pointer
+// ADDRESSES (`ptrAddr`), which the informer rebuilds fresh on every RBAC
+// snapshot republish (~4.6/s churn). The pointer-set hash therefore
+// drifted across generations even when the logical binding membership was
+// byte-identical, so a prewarm-seed key diverged from the dispatch key and
+// the prewarmed cell was unreachable. Hashing the UID makes the seed-time
+// and dispatch-time hashes byte-identical ACROSS generations.
+//
+// EMPTY-UID FALLBACK (review-required, CLAIM 5):
+//   Synthetic / hand-built bindings (e.g. fakes, some test fixtures, and
+//   theoretically a control-plane object before the apiserver stamps a
+//   UID) can have an empty `metadata.uid`. We MUST NOT collapse all
+//   empty-UID bindings to a single shared zero-bucket — that would make
+//   two DISTINCT empty-UID bindings hash-collide into one cohort identity,
+//   which is an RBAC over-collapse (cross-binding leak). Instead, for a
+//   binding with empty UID we fall back to a stable per-binding identifier
+//   built from its content tuple: a Kind tag + namespace + name +
+//   roleRef(apiGroup/kind/name). This tuple is stable across republishes
+//   (it is derived from the binding's own immutable spec fields, not its
+//   address) and distinguishes two empty-UID bindings whose name or
+//   roleRef differs. Two empty-UID bindings that are genuinely identical
+//   in every tuple field DO collapse — but that is correct: they are
+//   indistinguishable to the RBAC evaluator and produce the same verdict.
 //
 // SA-kind bindings are NOT collected — the GMC gate memo runs on the
 // resolver path where Identity is User+Groups (jwtutil.UserInfo). A user
 // holding both a user-binding and a group-binding union both; SA
 // identity is a separate code path (and a separate cohort).
-func collectCohortBindingPtrs(
+func collectCohortBindingIDs(
 	snap *RBACSnapshot, username string, groups []string,
-) []uintptr {
+) []string {
 	if snap == nil {
 		return nil
 	}
 
 	// Estimate: typical admin matches a handful of CRBs + a handful per
 	// namespace of RBs. Allocate generously; the slice is throwaway.
-	out := make([]uintptr, 0, 32)
+	out := make([]string, 0, 32)
 
 	// User-kind cluster-wide bindings.
 	if username != "" {
@@ -318,7 +364,7 @@ func collectCohortBindingPtrs(
 			if p == nil {
 				continue
 			}
-			out = append(out, ptrAddr(p))
+			out = append(out, crbIdentity(p))
 		}
 	}
 
@@ -331,7 +377,7 @@ func collectCohortBindingPtrs(
 			if p == nil {
 				continue
 			}
-			out = append(out, ptrAddr(p))
+			out = append(out, crbIdentity(p))
 		}
 	}
 
@@ -343,7 +389,7 @@ func collectCohortBindingPtrs(
 				if p == nil {
 					continue
 				}
-				out = append(out, ptrAddr(p))
+				out = append(out, rbIdentity(p))
 			}
 		}
 	}
@@ -358,7 +404,7 @@ func collectCohortBindingPtrs(
 				if p == nil {
 					continue
 				}
-				out = append(out, ptrAddr(p))
+				out = append(out, rbIdentity(p))
 			}
 		}
 	}
@@ -366,48 +412,59 @@ func collectCohortBindingPtrs(
 	return out
 }
 
-// ptrAddr is a tiny generic helper that returns a comparable uintptr from
-// any pointer. The cast through unsafe.Pointer is the canonical pattern
-// (same as rbac_cohorts.go:220).
-//
-// Inlinable; the snapshot's pointed-to objects are not relocated by the
-// GC (they are reachable via the snapshot's strong references for the
-// snapshot's lifetime), so the uintptr is stable until the next snapshot
-// publishes and the old one becomes unreachable.
-func ptrAddr[T any](p *T) uintptr {
-	return uintptr(unsafe.Pointer(p))
+// crbIdentity returns the stable cohort-identity string for a
+// ClusterRoleBinding: its `metadata.uid` when present, else the empty-UID
+// fallback tuple (see collectCohortBindingIDs CLAIM-5 note). The "C:"
+// Kind tag namespaces ClusterRoleBinding identities away from RoleBinding
+// identities so a CRB and an RB can never alias on an identical tuple.
+func crbIdentity(p *rbacv1.ClusterRoleBinding) string {
+	if uid := string(p.UID); uid != "" {
+		return "u:" + uid
+	}
+	// Empty-UID fallback: stable per-binding tuple (no namespace for
+	// cluster-scoped CRBs). roleRef is part of the binding's effective
+	// grant, so two CRBs with the same name but different roleRef stay
+	// distinct.
+	return "C:" + p.Name +
+		"\x1f" + p.RoleRef.APIGroup + "/" + p.RoleRef.Kind + "/" + p.RoleRef.Name
 }
 
-// fnv64aPointers hashes a slice of pointer addresses into a single uint64
-// via FNV-64a. The slice is sorted in place first so {a,b} and {b,a}
-// hash to the same value — pointer-SET semantics, order-independent.
+// rbIdentity returns the stable cohort-identity string for a RoleBinding:
+// its `metadata.uid` when present, else the empty-UID fallback tuple. The
+// "R:" Kind tag + namespace keep RoleBinding identities distinct from
+// ClusterRoleBindings and from same-name RoleBindings in other namespaces.
+func rbIdentity(p *rbacv1.RoleBinding) string {
+	if uid := string(p.UID); uid != "" {
+		return "u:" + uid
+	}
+	return "R:" + p.Namespace + "/" + p.Name +
+		"\x1f" + p.RoleRef.APIGroup + "/" + p.RoleRef.Kind + "/" + p.RoleRef.Name
+}
+
+// fnv64aIdentities hashes a slice of stable binding-identity strings into
+// a single uint64 via FNV-64a. The slice is sorted first so {a,b} and
+// {b,a} hash to the same value — SET semantics, order-independent. A
+// 0-byte separator is written between identities so a single
+// concatenation can never alias a different multi-set partition (e.g.
+// {"ab","c"} vs {"a","bc"}).
 //
-// Allocation profile: sort.Slice in place (no allocation); the 8-byte
-// scratch buffer is stack-allocated. AC-GMC1.3 (hash cost <1%) is the
-// gate; if pprof flags this in admin-cohort runs, follow-up ship adds
-// snapshot-seq-keyed caching.
-func fnv64aPointers(ptrs []uintptr) uint64 {
-	if len(ptrs) == 0 {
+// Allocation profile: sort.Strings in place (no allocation beyond the
+// sort's internal handling); the FNV hasher is a stack-friendly struct.
+// AC-GMC1.3 (hash cost <1%) carries over from the pointer-set hash; if
+// pprof flags this in admin-cohort runs, a follow-up ship caches the
+// result keyed on snapshot publish-seq.
+func fnv64aIdentities(ids []string) uint64 {
+	if len(ids) == 0 {
 		return fnv.New64a().Sum64()
 	}
-	sort.Slice(ptrs, func(i, j int) bool { return ptrs[i] < ptrs[j] })
+	sort.Strings(ids)
 
 	h := fnv.New64a()
-	var buf [8]byte
-	for _, a := range ptrs {
-		// Encode uintptr as 8 little-endian bytes. uintptr is 8 bytes on
-		// all supported platforms (linux/amd64, linux/arm64, darwin/arm64);
-		// keep the encoding explicit for portability.
-		u := uint64(a)
-		buf[0] = byte(u)
-		buf[1] = byte(u >> 8)
-		buf[2] = byte(u >> 16)
-		buf[3] = byte(u >> 24)
-		buf[4] = byte(u >> 32)
-		buf[5] = byte(u >> 40)
-		buf[6] = byte(u >> 48)
-		buf[7] = byte(u >> 56)
-		_, _ = h.Write(buf[:])
+	for _, id := range ids {
+		_, _ = h.Write([]byte(id))
+		// Field separator — guards against concatenation aliasing across
+		// different set partitions.
+		_, _ = h.Write([]byte{0})
 	}
 	return h.Sum64()
 }
