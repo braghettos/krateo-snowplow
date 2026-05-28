@@ -70,6 +70,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	pcs, pcEmit := beginPerCall(req, "restactions")
 	defer pcEmit()
 
+	// Ship 1 — customer-priority signal. Mark this /call as in-flight so
+	// the prewarm engine yields its background re-seed work for the
+	// duration of the dispatch (feedback_customer_priority_over_refresher).
+	// Cheap atomic; deferred decrement covers every return path.
+	defer markCustomerInFlight()()
+
 	extras, err := util.ParseExtras(req)
 	if err != nil {
 		response.BadRequest(wri, err)

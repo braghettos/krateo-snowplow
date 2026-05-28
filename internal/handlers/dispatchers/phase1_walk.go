@@ -85,6 +85,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -308,7 +309,59 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester, navHarvester)
 	}
 
-	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm, pipSeed)
+	// Ship 1 — the unified dynamic cohort-prewarm engine. When ON (and the
+	// PIP harvesters exist — the engine shares them), the background seed
+	// goroutine routes through the engine: it runs the post-sync re-walk
+	// (the boot-race fix), builds the BindingsByGVR index over the
+	// navigated GVRs, and seeds per-target-GVR-scoped cohorts — instead of
+	// the legacy global runPIPSeed. engineSeed is the background callback
+	// phase1WarmupWith invokes at Step 7.6 in place of pipSeed when set.
+	var engineSeed pipSeedFn
+	if PrewarmEngineEnabled() && navHarvester != nil {
+		deps := rePrewarmDeps{
+			rw:        rw,
+			lister:    lister,
+			harvester: harvester,
+			navHarv:   navHarvester,
+			saEP:      *saEP,
+			saRC:      rc,
+			authnNS:   authnNS,
+		}
+		engineSeed = func(pctx context.Context) error {
+			// bootDone is closed by the engine's scopeDone callback the
+			// instant the BOOT scope finishes — so this goroutine returns at
+			// ACTUAL completion (S2), not after the full pipGlobalTimeout.
+			bootDone := make(chan struct{})
+			var bootErr error
+			var closeOnce sync.Once
+			StartPrewarmEngine(pctx, makeBootScopeHandler(deps), func(s prewarmScope, err error) {
+				if s.kind == scopeKindBoot {
+					bootErr = err
+					closeOnce.Do(func() { close(bootDone) })
+				}
+			})
+			// Ship 1 enqueues only the BOOT scope. Ship 2 wires runtime
+			// triggers (widget/RESTAction CR + RBAC shift) to enqueueScope.
+			prewarmEngineSingleton().enqueueScope(prewarmScope{kind: scopeKindBoot})
+			// Wait for boot completion OR pctx cancel — whichever first. The
+			// engine worker keeps running for any future (Ship 2) enqueues;
+			// this background goroutine's job is done once boot is.
+			select {
+			case <-bootDone:
+				return bootErr
+			case <-pctx.Done():
+				return pctx.Err()
+			}
+		}
+	}
+
+	// Prefer the engine when enabled; else the legacy PIP seed.
+	seedFn := pipSeed
+	if engineSeed != nil {
+		seedFn = engineSeed
+	}
+
+	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm, seedFn)
 }
 
 // phase1WarmupWith is the testable core: it takes the watcher, the

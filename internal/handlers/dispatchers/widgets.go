@@ -56,6 +56,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	pcs, pcEmit := beginPerCall(req, "widgets")
 	defer pcEmit()
 
+	// Ship 1 — customer-priority signal (see restactions.go). Marks this
+	// /call as in-flight so the prewarm engine yields its background
+	// re-seed work for the dispatch's duration.
+	defer markCustomerInFlight()()
+
 	extras, err := util.ParseExtras(req)
 	if err != nil {
 		response.BadRequest(wri, err)

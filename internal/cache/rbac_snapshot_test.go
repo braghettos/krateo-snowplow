@@ -245,7 +245,7 @@ func TestRBACSnapshot_EventDriven_Updates(t *testing.T) {
 	if err := store.Add(added); err != nil {
 		t.Fatalf("indexer.Add: %v", err)
 	}
-	handlers := rw.rbacSnapshotEventHandlers()
+	handlers := rw.rbacSnapshotEventHandlers(clusterRoleBindingsTypedGVR)
 	handlers.AddFunc(added)
 
 	awaitSnapshotContains(t, func(s *RBACSnapshot) bool {
@@ -321,7 +321,7 @@ func TestRBACSnapshot_Race_ReaderWriter(t *testing.T) {
 	seed = append(seed, mkCR("crb-0-role"), mkR("ns-a", "viewer-bind-role"))
 	rw := newSnapshotTestWatcher(t, seed...)
 
-	handlers := rw.rbacSnapshotEventHandlers()
+	handlers := rw.rbacSnapshotEventHandlers(clusterRoleBindingsTypedGVR)
 	rw.mu.RLock()
 	gi := rw.informers[clusterRoleBindingsTypedGVR]
 	rw.mu.RUnlock()

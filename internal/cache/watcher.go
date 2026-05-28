@@ -772,7 +772,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// wiring. isTypedRBACGVR is false for every non-RBAC GVR — no
 	// overhead on the steady-state metadata-only path.
 	if isTypedRBACGVR(gvr) {
-		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers()); regErr != nil {
+		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers(gvr)); regErr != nil {
 			slog.Warn("cache.rbac.snapshot.add_event_handler_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("resource_type", resourceType),
@@ -1131,7 +1131,7 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// the same processor goroutine as depEventHandlers — neither
 	// handler blocks.
 	if isTypedRBACGVR(gvr) {
-		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers()); regErr != nil {
+		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers(gvr)); regErr != nil {
 			slog.Warn("cache.rbac.snapshot.add_event_handler_failed",
 				slog.String("subsystem", "cache"),
 				slog.String("resource_type", resourceType),

@@ -797,15 +797,46 @@ func isTypedRBACGVR(gvr schema.GroupVersionResource) bool {
 // addResourceTypeLocked for each of the 4 typed-RBAC GVRs alongside the
 // existing `depEventHandlers` (deps_watch.go).
 //
-// All three callbacks call scheduleRBACRebuild(rw); they do not need
-// to read the event object's content. The new indexer state is read
-// inside the detached rebuild goroutine — the handler bodies stay
-// O(1) atomics and never block the informer's processor goroutine.
-func (rw *ResourceWatcher) rbacSnapshotEventHandlers() clientcache.ResourceEventHandlerFuncs {
+// All three callbacks call scheduleRBACRebuild(rw) (the wholesale snapshot
+// used by EvaluateRBAC) AND, for Ship 1's incremental BindingsByGVR index,
+// the per-event index delta hooks (bindings_by_gvr_delta.go). The two are
+// independent: the wholesale rebuild stays the authz boundary; the index
+// delta is seed-targeting only.
+//
+// gvr discriminates a binding event (CRB/RB → onBinding{Add,Update,Delete})
+// from a role-rule event (ClusterRole/Role → onRoleRulesChanged). The
+// index hooks no-op until the index is built (deltaActive gate) so a
+// pre-build replay event is free; the wholesale rebuild scheduling is
+// unchanged. The handler bodies stay non-blocking: scheduleRBACRebuild is
+// a few atomics, and the index delta is O(navigatedGVRs) map ops under the
+// index lock (Gate-2: ~5.8 µs/event).
+func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
+	isBinding := gvr == clusterRoleBindingsTypedGVR || gvr == roleBindingsTypedGVR
 	return clientcache.ResourceEventHandlerFuncs{
-		AddFunc:    func(_ interface{}) { scheduleRBACRebuild(rw) },
-		UpdateFunc: func(_, _ interface{}) { scheduleRBACRebuild(rw) },
-		DeleteFunc: func(_ interface{}) { scheduleRBACRebuild(rw) },
+		AddFunc: func(obj interface{}) {
+			scheduleRBACRebuild(rw)
+			if isBinding {
+				onBindingAdd(obj)
+			} else {
+				onRoleObjectChanged(obj)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			scheduleRBACRebuild(rw)
+			if isBinding {
+				onBindingUpdate(oldObj, newObj)
+			} else {
+				onRoleObjectChanged(newObj)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			scheduleRBACRebuild(rw)
+			if isBinding {
+				onBindingDelete(obj)
+			} else {
+				onRoleObjectChanged(obj)
+			}
+		},
 	}
 }
 
