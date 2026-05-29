@@ -224,18 +224,29 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 // JQ-eval errors and RBAC errors both fail closed. An EMPTY `resources`
 // set denies (no resource to grant against) — never allow-all.
 func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any) bool {
-	namespace := ""
-	if uaf.NamespaceFrom != "" {
-		ns, err := evalJQString(ctx, uaf.NamespaceFrom, item)
-		if err != nil {
-			log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
-				slog.String("expr", uaf.NamespaceFrom),
-				slog.Any("err", err),
-			)
-			return false
-		}
-		namespace = ns
+	// Ship S.1 — an absent/empty NamespaceFrom defaults to
+	// ".metadata.namespace" (the dominant namespaced-object shape) rather
+	// than a cluster-scope (namespace=="") RBAC check. The cluster-scope
+	// default was a SEMANTICS BUG: it denied narrow devs who hold the grant
+	// only in their own namespace. The CRD-level +kubebuilder:default makes
+	// the apiserver fill this for stored RESTAction CRs; this in-code
+	// default is the belt-and-suspenders for pre-default CRs and any caller
+	// that passes a UAF with an empty NamespaceFrom directly. An explicit
+	// "." or ".metadata.name" still overrides verbatim. Fail-closed on JQ
+	// error is preserved on every branch.
+	nsExpr := uaf.NamespaceFrom
+	if nsExpr == "" {
+		nsExpr = ".metadata.namespace"
 	}
+	ns, err := evalJQString(ctx, nsExpr, item)
+	if err != nil {
+		log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
+			slog.String("expr", nsExpr),
+			slog.Any("err", err),
+		)
+		return false
+	}
+	namespace := ns
 
 	// OR semantics: keep the item iff the user is permitted on ANY
 	// resource in the set. An empty set yields no iterations -> false

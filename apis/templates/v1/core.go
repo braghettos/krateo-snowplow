@@ -17,6 +17,19 @@ type Dependency struct {
 }
 
 // API represents a request to an HTTP service
+//
+// Stage-level admission guards (Ship S.1 hoist) — the Go markers are the
+// SINGLE SOURCE OF TRUTH for ALL CEL on this CRD. These three security
+// guards were historically hand-authored in the snowplow CHART CRD; they
+// are hoisted here verbatim so a future `scripts/gen.sh` regen can never
+// silently drop them. They sit on the API (stage) struct because each
+// rule reads sibling stage fields (self.verb / self.exportJwt) alongside
+// self.userAccessFilter — placement the UserAccessFilterSpec-level XOR
+// rule cannot reach.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || !has(self.verb) || self.verb == '' || self.verb in ['GET', 'HEAD', 'get', 'head']",message="userAccessFilter is only allowed on read-verb HTTP stages (GET/HEAD, case-insensitive); CRUD verbs would expose mutation under filter scope."
+// +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || !has(self.exportJwt) || !self.exportJwt",message="userAccessFilter stages MUST NOT have exportJwt: true; would leak the raw JWT through the user-facing filtered response."
+// +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || ((has(self.userAccessFilter.resource) && size(self.userAccessFilter.resource) > 0) || (has(self.userAccessFilter.resourcesFrom) && size(self.userAccessFilter.resourcesFrom) > 0)) && self.userAccessFilter.verb != ''",message="userAccessFilter must specify a non-empty verb and exactly one of resource or resourcesFrom; a degenerate filter would collapse the SubjectAccessReview check to a wildcard."
 type API struct {
 	// Name is a (unique) identifier
 	Name string `json:"name"`
@@ -57,53 +70,6 @@ type API struct {
 	// whether the outer dispatch is RBAC-gated. The refilter step
 	// also calls EvaluateRBAC per object returned by the SA call.
 	UserAccessFilter *UserAccessFilterSpec `json:"userAccessFilter,omitempty"`
-
-	// ClusterListWhenAllowed declares that this API call is eligible
-	// to dispatch as a SINGLE cluster-scoped LIST against
-	// /apis/<g>/<v>/<resource> (instead of a per-namespace iterator
-	// fan-out) when the requesting identity holds cluster-scope
-	// `list` permission on the target GVR. Added at Tag 0.30.152
-	// Ship D.5.
-	//
-	// Permission is checked against the Ship B typed RBAC snapshot
-	// (cache.RBACSnapshot) via rbac.EvaluateRBAC(ctx, opts) with
-	// opts.Namespace=="" — the existing cluster-list semantics at
-	// internal/rbac/evaluate.go:198-211. On a deny verdict the call
-	// falls through to the existing iterator path verbatim (no
-	// behavioral change for non-cluster-list users e.g. cyberjoker).
-	//
-	// Additionally gated on !cache.Disabled() at the resolver entry
-	// (AC-D5.13) and on Ship B snapshot readiness — the
-	// `useClusterList` decision must NOT execute against a nil
-	// snapshot. When the cache is "removed" (CACHE_ENABLED=false),
-	// the cluster-list collapse is disabled entirely; dispatch falls
-	// through to the existing per-NS iterator UNCHANGED. This
-	// preserves the removable-cache invariant
-	// (project_caching_is_provisional).
-	//
-	// Default false (nil): existing RestActions are byte-identical
-	// to pre-D.5. Setting true is an OPT-IN by the RA author who
-	// has verified that:
-	//
-	//   1. The target GVR is namespace-scoped (cluster-scoped GVRs
-	//      have no iterator pattern to collapse).
-	//   2. A cluster-list dispatch returns the SAME object set the
-	//      iterator fan-out would have aggregated. For
-	//      namespace-scoped resources, the apiserver cluster-scoped
-	//      LIST endpoint /apis/<g>/<v>/<resource> returns objects
-	//      across all namespaces; the iterator's per-NS LIST returns
-	//      the same objects partitioned by namespace.
-	//   3. The widget consuming the RA's output applies any
-	//      per-object narrowing through the existing serve-time
-	//      RBAC gate (gateContentEnvelope at
-	//      internal/resolvers/restactions/api/apistage.go:94-145),
-	//      NOT through the RA's iterator shape.
-	//
-	// When this field is true but DependsOn.Iterator is empty, the
-	// field is a no-op (there is nothing to collapse). When both
-	// are set, the resolver runs §2.3's permission check and
-	// selects the dispatch path.
-	ClusterListWhenAllowed *bool `json:"clusterListWhenAllowed,omitempty"`
 }
 
 // UserAccessFilterSpec declares the per-object refilter contract.
@@ -133,6 +99,16 @@ type API struct {
 //   3. The filtered result set is returned + cached under a key that
 //      includes user_identity (so admin and cyberjoker get distinct
 //      L1 entries).
+//
+// Exactly-one-of(resource, resourcesFrom): the refilter checks EITHER a
+// single static plural (Resource) OR a runtime-discovered plural set
+// (ResourcesFrom) — never both, never neither. The XOR is enforced at
+// admission via the CEL rule below (CEL needs apiextensions/v1 +
+// k8s>=1.25 — GKE satisfies this). `resource` is therefore
+// conditionally-required THROUGH this rule, NOT via the struct-level
+// `required` list (which stays [group, verb]).
+//
+// +kubebuilder:validation:XValidation:rule="has(self.resource) != has(self.resourcesFrom)",message="exactly one of resource or resourcesFrom must be set"
 type UserAccessFilterSpec struct {
 	// Verb is the Kubernetes RBAC verb checked per object.
 	// Required. Lower-case ("get", "list", "watch", etc.).
@@ -170,8 +146,21 @@ type UserAccessFilterSpec struct {
 	//   - ".metadata.namespace" when the returned objects live IN
 	//     namespaces (e.g. CustomResourceDefinitions don't, but
 	//     compositions do).
-	//   - "" / unset when the resource is cluster-scoped and the
-	//     RBAC check is also cluster-scoped (namespace="").
+	//   - "." when the items are bare namespace-name strings (the
+	//     namespaces-stage post-filter shape).
+	//
+	// Optional with a default of ".metadata.namespace": when the field
+	// is ABSENT the refilter evaluates ".metadata.namespace" against
+	// each object — the common namespaced-object shape — rather than
+	// falling back to a cluster-scope (namespace="") RBAC check. The
+	// cluster-scope check is the WRONG default for the dominant
+	// namespaced-object case: it would deny a narrow dev who holds the
+	// grant only in their own namespace. An explicit "." or
+	// ".metadata.name" still overrides the default verbatim; the default
+	// only fires when the field is omitted.
+	//
+	// +optional
+	// +kubebuilder:default=".metadata.namespace"
 	NamespaceFrom string `json:"namespaceFrom,omitempty"`
 }
 

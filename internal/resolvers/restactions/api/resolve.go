@@ -397,10 +397,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		//
 		// Ship 0.30.192 — capture cluster_list outcome + deny gate for
 		// per-stage timing instrumentation. The third return value is
-		// the deny-gate number (0 = no deny, 1-7 = which gate); see
+		// the deny-gate number (0 = no deny, 2-7 = which gate); see
 		// cache/pip_stage_timing.go PIPStageTiming.ClusterListDenyGate
 		// for the value table.
-		stageTiming.ClusterListAttempted = ptr.Deref(apiCall.ClusterListWhenAllowed, false)
+		//
+		// Ship S.1 — the per-RA opt-in field (ClusterListWhenAllowed) was
+		// removed. attemptClusterListCollapse is now reached for every
+		// iterator stage (its own gates 2-5 decide servability), so
+		// ClusterListAttempted is true whenever the resolver evaluates the
+		// gate. The old `ptr.Deref(apiCall.ClusterListWhenAllowed, false)`
+		// gate-attempt signal is gone with the field.
+		stageTiming.ClusterListAttempted = true
 		if newTmp, useClusterList, denyGate := attemptClusterListCollapse(
 			ctx, log, apiCall, dict, ep, apistageStore, apistageEnabled); useClusterList {
 			tmp = newTmp

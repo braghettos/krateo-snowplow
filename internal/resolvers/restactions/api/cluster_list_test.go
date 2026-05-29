@@ -388,7 +388,6 @@ func TestBuildClusterListCall_PathAndVerb(t *testing.T) {
 		DependsOn: &templates.Dependency{
 			Iterator: ptr.To(".compositions[]"),
 		},
-		ClusterListWhenAllowed: ptr.To(true),
 	}
 	gvr := schema.GroupVersionResource{
 		Group:    "composition.krateo.io",
@@ -415,49 +414,52 @@ func TestBuildClusterListCall_PathAndVerb(t *testing.T) {
 
 // ---------- attemptClusterListCollapse — structural gates ----------
 
-func TestAttemptClusterListCollapse_OptInOff(t *testing.T) {
+// TestAttemptClusterListCollapse_NoGlobalCacheDenies — Ship S.1 removed
+// the per-RA opt-in (formerly gate 1). The cache-off / snapshot gate
+// (gate 2) is now the FIRST gate. With no cache.Global() published
+// (rw==nil) the helper must deny at gate 2 regardless of iterator
+// presence. This replaces the old opt-in-OFF test (the field is gone).
+func TestAttemptClusterListCollapse_NoGlobalCacheDenies(t *testing.T) {
+	cache.SetGlobal(nil)
 	apiCall := &templates.API{
-		Name:                   "compositions-list",
-		Path:                   `${ "/apis/g/v/namespaces/" + .ns + "/r" }`,
-		DependsOn:              &templates.Dependency{Iterator: ptr.To(`["a","b"]`)},
-		ClusterListWhenAllowed: nil, // opt-in OFF
+		Name:      "compositions-list",
+		Path:      `${ "/apis/g/v/namespaces/" + .ns + "/r" }`,
+		DependsOn: &templates.Dependency{Iterator: ptr.To(`["a","b"]`)},
 	}
-	tmp, ok, _ := attemptClusterListCollapse(
+	tmp, ok, gate := attemptClusterListCollapse(
 		context.Background(), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
-		t.Fatalf("opt-in OFF must short-circuit; got ok=%v tmp=%v", ok, tmp)
+		t.Fatalf("no global cache must deny; got ok=%v tmp=%v", ok, tmp)
 	}
-}
-
-func TestAttemptClusterListCollapse_CacheDisabledShortCircuits(t *testing.T) {
-	// cache.Disabled() is the FIRST gate after opt-in (AC-D5.13). The
-	// test harness can't easily flip Disabled() without a process-wide
-	// env, so this test ASSERTS the structural ordering: when opt-in
-	// is ON but no iterator is present, the helper short-circuits
-	// BEFORE touching the snapshot. Indirect coverage of the
-	// cache-disabled branch is via the integration falsifier
-	// (TestFalsifierF1_* runs in CACHE_ENABLED=true; the
-	// CACHE_ENABLED=false validation is HG-5 post-deploy).
-	apiCall := &templates.API{
-		Name:                   "x",
-		ClusterListWhenAllowed: ptr.To(true),
-		DependsOn:              nil, // no iterator
-	}
-	tmp, ok, _ := attemptClusterListCollapse(
-		context.Background(), clusterListLogger(t), apiCall,
-		map[string]any{}, endpointStub(), nil, true)
-	if ok || tmp != nil {
-		t.Fatalf("opt-in ON but no iterator must short-circuit; got ok=%v tmp=%v", ok, tmp)
+	if gate != 2 {
+		t.Fatalf("no global cache must deny at gate 2 (cache-off/snapshot); got gate=%d", gate)
 	}
 }
 
 func TestAttemptClusterListCollapse_NoIterator(t *testing.T) {
+	// Post-S.1 there is no opt-in field. A no-iterator stage still has
+	// nothing to collapse; the helper short-circuits. With no global
+	// cache published the cache-off gate (gate 2) fires before the
+	// iterator gate — either deny is acceptable here, the contract is
+	// "must short-circuit".
 	apiCall := &templates.API{
-		Name:                   "compositions-list",
-		Path:                   "/apis/g/v/r",
-		ClusterListWhenAllowed: ptr.To(true),
-		DependsOn:              &templates.Dependency{Iterator: ptr.To("")},
+		Name:      "x",
+		DependsOn: nil, // no iterator
+	}
+	tmp, ok, _ := attemptClusterListCollapse(
+		context.Background(), clusterListLogger(t), apiCall,
+		map[string]any{}, endpointStub(), nil, true)
+	if ok || tmp != nil {
+		t.Fatalf("no iterator must short-circuit; got ok=%v tmp=%v", ok, tmp)
+	}
+}
+
+func TestAttemptClusterListCollapse_EmptyIterator(t *testing.T) {
+	apiCall := &templates.API{
+		Name:      "compositions-list",
+		Path:      "/apis/g/v/r",
+		DependsOn: &templates.Dependency{Iterator: ptr.To("")},
 	}
 	tmp, ok, _ := attemptClusterListCollapse(
 		context.Background(), clusterListLogger(t), apiCall,
@@ -469,10 +471,9 @@ func TestAttemptClusterListCollapse_NoIterator(t *testing.T) {
 
 func TestAttemptClusterListCollapse_ApistageStoreNil(t *testing.T) {
 	apiCall := &templates.API{
-		Name:                   "compositions-list",
-		Path:                   `${ "/apis/g/v/namespaces/" + .ns + "/r" }`,
-		ClusterListWhenAllowed: ptr.To(true),
-		DependsOn:              &templates.Dependency{Iterator: ptr.To(`[{"ns":"a"}]`)},
+		Name:      "compositions-list",
+		Path:      `${ "/apis/g/v/namespaces/" + .ns + "/r" }`,
+		DependsOn: &templates.Dependency{Iterator: ptr.To(`[{"ns":"a"}]`)},
 	}
 	tmp, ok, _ := attemptClusterListCollapse(
 		context.Background(), clusterListLogger(t), apiCall,

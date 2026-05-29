@@ -231,6 +231,85 @@ func TestApplyUserAccessFilter_AdminSeesAll(t *testing.T) {
 	}
 }
 
+// TestApplyUserAccessFilter_NamespaceFromDefaultsToMetadataNamespace is
+// the Ship S.1 semantics-fix regression: when NamespaceFrom is ABSENT,
+// evalSingle defaults to ".metadata.namespace" (the dominant
+// namespaced-object shape), NOT a cluster-scope (namespace=="") RBAC
+// check. The pre-S.1 empty-NamespaceFrom path issued a cluster-scope
+// check, which DENIED a narrow dev who only holds the grant in their own
+// namespace.
+//
+// Fixture: "devs" may get compositions in bench-ns-01 only (a Role +
+// RoleBinding). The SA-dispatched list contains three composition
+// objects each carrying .metadata.namespace. With the absent-default,
+// only the bench-ns-01 object survives — proving the default resolved
+// .metadata.namespace per object. A cluster-scope check (the buggy
+// pre-S.1 behaviour) would have denied ALL three (devs has no
+// cluster-wide grant).
+func TestApplyUserAccessFilter_NamespaceFromDefaultsToMetadataNamespace(t *testing.T) {
+	role := &rbacv1.Role{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ns01-comp-reader", Namespace: "bench-ns-01"},
+		Rules: []rbacv1.PolicyRule{
+			{
+				Verbs:     []string{"get", "list", "watch"},
+				APIGroups: []string{"composition.krateo.io"},
+				Resources: []string{"compositions"},
+			},
+		},
+	}
+	binding := &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ns01-comp-reader-binding", Namespace: "bench-ns-01"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "Group", APIGroup: "rbac.authorization.k8s.io", Name: "devs"},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "ns01-comp-reader",
+		},
+	}
+	newRefilterTestWatcher(t, role, binding)
+
+	apiCall := &templates.API{
+		Name: "compositions",
+		UserAccessFilter: &templates.UserAccessFilterSpec{
+			Verb:     "get",
+			Group:    "composition.krateo.io",
+			Resource: "compositions",
+			// NamespaceFrom intentionally ABSENT — exercises the S.1
+			// default of ".metadata.namespace".
+		},
+	}
+	dict := map[string]any{
+		"compositions": map[string]any{
+			"kind":       "CompositionList",
+			"apiVersion": "composition.krateo.io/v1",
+			"items": []any{
+				map[string]any{"metadata": map[string]any{"name": "c1", "namespace": "bench-ns-01"}},
+				map[string]any{"metadata": map[string]any{"name": "c2", "namespace": "bench-ns-02"}},
+				map[string]any{"metadata": map[string]any{"name": "c3", "namespace": "bench-ns-03"}},
+			},
+		},
+	}
+
+	res := applyUserAccessFilter(ctxWithUser("cyberjoker", "devs"), dict, apiCall)
+	if res.Kept != 1 {
+		t.Errorf("absent-NamespaceFrom kept = %d; want 1 (bench-ns-01 only — default resolved .metadata.namespace)", res.Kept)
+	}
+	if res.Dropped != 2 {
+		t.Errorf("absent-NamespaceFrom dropped = %d; want 2", res.Dropped)
+	}
+	wrapper := dict["compositions"].(map[string]any)
+	items := wrapper["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items length = %d; want 1", len(items))
+	}
+	meta := items[0].(map[string]any)["metadata"].(map[string]any)
+	if meta["namespace"] != "bench-ns-01" {
+		t.Errorf("retained item namespace = %v; want bench-ns-01", meta["namespace"])
+	}
+}
+
 // TestApplyUserAccessFilter_NoUserInfoFailsClosed asserts the
 // fail-closed semantic: missing UserInfo in context produces an empty
 // result set (not the full SA-dispatched response).

@@ -86,15 +86,17 @@ const shapeCheckSlowThreshold = 10 * time.Millisecond
 //
 // denyGate is the 0.30.192 instrumentation seam (purely additive, no
 // behaviour change): 0 means the gate passed (useClusterList==true);
-// 1-7 means the corresponding gate triggered the false return — see the
+// 2-7 means the corresponding gate triggered the false return — see the
 // PIPStageTiming.ClusterListDenyGate doc on cache/pip_stage_timing.go for
-// the value table.
+// the value table. Value 1 (the old opt-in deny) is unused since Ship
+// S.1 removed the per-RA opt-in gate.
 //
-// The helper performs FIVE structural gates in order, short-circuiting
-// on the first failure (no wasted work):
+// The helper performs FOUR structural gates in order, short-circuiting
+// on the first failure (no wasted work). The Ship-S.1 removal of the
+// per-RA opt-in gate (formerly gate 1) means every iterator stage is
+// eligible for the collapse; the cache-off / snapshot / iterator / GVR /
+// RBAC gates below remain the load-bearing guards:
 //
-//  1. Opt-in: apiCall.ClusterListWhenAllowed == true.
-//     Default-false (nil) RAs are byte-identical to pre-D.5.
 //  2. Cache-off + snapshot gate (AC-D5.13): !cache.Disabled() AND the
 //     Ship B typed-RBAC snapshot is published.
 //  3. Iterator present: apiCall.DependsOn.Iterator is non-empty (a
@@ -105,7 +107,7 @@ const shapeCheckSlowThreshold = 10 * time.Millisecond
 //  5. RBAC permission: rbac.EvaluateRBAC with Verb="list", Namespace=""
 //     against the derived (group, resource) tuple returns permit==true.
 //
-// On ALL FIVE gates passing the helper runs the AC-D5.14 defensive
+// On ALL gates passing the helper runs the AC-D5.14 defensive
 // dispatch: dispatchViaInformer un-gated → shape check → on success,
 // Put under the identity-free apistage key → return the cluster-scope
 // call slice. On any defensive failure the helper records the matching
@@ -119,10 +121,13 @@ func attemptClusterListCollapse(
 	apistageStore *cache.ResolvedCacheStore,
 	apistageEnabled bool,
 ) ([]httpcall.RequestOptions, bool, int) {
-	// Gate 1: opt-in.
-	if !ptr.Deref(apiCall.ClusterListWhenAllowed, false) {
-		return nil, false, 1
-	}
+	// Gate 1 (opt-in via apiCall.ClusterListWhenAllowed) was REMOVED at
+	// Ship S.1 — the field is gone and the collapse is no longer per-RA
+	// opt-in. The gate-number contract is preserved for S.2 reuse: the
+	// deny-gate values 2-7 retain their meaning; value 1 is now unused
+	// (no path returns it). attemptClusterListCollapse therefore begins at
+	// the cache-off + snapshot gate.
+	//
 	// Gate 2: cache-off + Servable. AC-D5.13.
 	if cache.Disabled() {
 		return nil, false, 2

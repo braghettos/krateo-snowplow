@@ -57,11 +57,11 @@ type PIPStageTiming struct {
 	// + apistage-content serve.
 	ElapsedMs int64 `json:"elapsed_ms"`
 
-	// ClusterListAttempted is true when attemptClusterListCollapse
-	// was reached (the stage had ClusterListWhenAllowed=true and the
-	// resolver decided to evaluate the gate). When false, the stage
-	// did NOT opt in (apiCall.ClusterListWhenAllowed nil/false) and
-	// went straight to the iterator path.
+	// ClusterListAttempted is true when attemptClusterListCollapse was
+	// reached for the stage. Since Ship S.1 removed the per-RA opt-in
+	// (formerly ClusterListWhenAllowed), the resolver evaluates the gate
+	// for EVERY iterator stage, so this is true whenever the stage had an
+	// iterator the resolver could attempt to collapse.
 	ClusterListAttempted bool `json:"cl_attempt"`
 
 	// ClusterListUsed reports the outcome of the gate: true means the
@@ -70,12 +70,12 @@ type PIPStageTiming struct {
 	// ClusterListDenyGate.
 	ClusterListUsed bool `json:"cl_used"`
 
-	// ClusterListDenyGate is the gate number (1-7) that triggered the
-	// false return from attemptClusterListCollapse — see cluster_list.go
-	// :86-104. 0 means no deny (gate passed, ClusterListUsed=true) OR
-	// the helper was not attempted. Values:
-	//   1 — opt-in deny (ClusterListWhenAllowed false/nil)
-	//   2 — cache-off / snapshot pre-readiness
+	// ClusterListDenyGate is the gate number (2-7) that triggered the
+	// false return from attemptClusterListCollapse — see cluster_list.go.
+	// 0 means no deny (gate passed, ClusterListUsed=true) OR the helper
+	// was not attempted. Values:
+	//   1 — UNUSED since Ship S.1 (was: opt-in deny ClusterListWhenAllowed)
+	//   2 — cache-off / snapshot pre-readiness / apistage substrate absent
 	//   3 — no iterator on the stage
 	//   4 — GVR derivation failed (iterator path not namespace-scoped)
 	//   5 — RBAC permission deny
