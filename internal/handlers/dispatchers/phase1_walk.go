@@ -552,6 +552,14 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 			}()
 			seedCtx, seedCancel := context.WithTimeout(context.Background(), pipGlobalTimeout)
 			defer seedCancel()
+			// 0.30.207 — seedCtx is a bare context.Background() derivative
+			// (it must outlive Phase1Warmup's ctx). Like cacheCtx it carries
+			// no logger, so the cohort-seed resolves underneath would hit
+			// xcontext.Logger's hardcoded slog.LevelDebug fallback and emit
+			// full-dict DEBUG lines regardless of DEBUG=false. Inject the
+			// level-configured default logger so the seed resolve obeys the
+			// flag (level gating only — log content unchanged).
+			seedCtx = xcontext.BuildContext(seedCtx, xcontext.WithLogger(slog.Default()))
 			seedStart := time.Now()
 			if err := pipSeed(seedCtx); err != nil {
 				log.Warn("phase1.seed.background_incomplete",

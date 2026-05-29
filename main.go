@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/kubeutil"
 	"github.com/krateoplatformops/plumbing/server/use"
@@ -168,6 +169,20 @@ func main() {
 	// /call dispatched at startup does not race informer LISTs.
 	cacheCtx, cacheCancel := context.WithCancel(context.Background())
 	defer cacheCancel()
+	// 0.30.207 — honor DEBUG on the background path. cacheCtx is a bare
+	// context.Background() derivative; unlike the HTTP request path (which
+	// runs use.Logger(log) → xcontext.WithLogger), it carries NO logger.
+	// Every background-resolve site (refresher → resolveAndPopulateL1 →
+	// resolver, prewarm walk, discovery refresher) calls
+	// xcontext.Logger(ctx), which on a logger-less context falls back to a
+	// HARDCODED slog.LevelDebug handler (plumbing/context.Logger) that
+	// ignores the DEBUG env var entirely — so the hot L1-refresher loop
+	// emits full-dict DEBUG lines even with DEBUG=false. Inject the
+	// already-level-configured logger (Info when DEBUG=false, Debug when
+	// DEBUG=true) so the background path obeys the flag. WithLogger wraps a
+	// non-nil root verbatim (preserving its level), so this changes log
+	// LEVEL gating only — never log content.
+	cacheCtx = xcontext.BuildContext(cacheCtx, xcontext.WithLogger(log))
 
 	var cacheWatcher *cache.ResourceWatcher
 	if !cache.Disabled() {
