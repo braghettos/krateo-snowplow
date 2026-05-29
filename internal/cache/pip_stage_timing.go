@@ -70,11 +70,11 @@ type PIPStageTiming struct {
 	// ClusterListDenyGate.
 	ClusterListUsed bool `json:"cl_used"`
 
-	// ClusterListDenyGate is the gate number (2-7) that triggered the
+	// ClusterListDenyGate is the gate number (1-7) that triggered the
 	// false return from attemptClusterListCollapse — see cluster_list.go.
 	// 0 means no deny (gate passed, ClusterListUsed=true) OR the helper
 	// was not attempted. Values:
-	//   1 — UNUSED since Ship S.1 (was: opt-in deny ClusterListWhenAllowed)
+	//   1 — collapse INERT (Ship S.1-re sequencing gate; S.2 flips clusterListCollapseEnabled)
 	//   2 — cache-off / snapshot pre-readiness / apistage substrate absent
 	//   3 — no iterator on the stage
 	//   4 — GVR derivation failed (iterator path not namespace-scoped)

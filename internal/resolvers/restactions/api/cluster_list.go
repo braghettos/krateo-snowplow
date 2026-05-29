@@ -66,6 +66,16 @@ import (
 // map[string]any — well inside the 10ms budget.
 const shapeCheckSlowThreshold = 10 * time.Millisecond
 
+// clusterListCollapseEnabled is the Ship S.1-re sequencing gate. The cluster-list
+// iterator collapse is CORRECT but NOT yet refresher-safe: activated unconditionally
+// (0.30.205) it ran the full-payload dispatch+unmarshal under the L1 refresher every
+// cycle × entry-count → admin warm /call 11-22s, CPU 7.4/8. Held INERT here,
+// behaviour-identical to 0.30.204 (the removed per-RA opt-in denied for all 167,111
+// prod stages). S.2 flips this true AFTER landing the refresher-decoupling
+// (cohort-memo reuse + skip-on-unchanged populate + customer-priority yield).
+// Compile-time const, NOT an env flag (single-flag direction: end state is one CACHE_ENABLED).
+const clusterListCollapseEnabled = false
+
 // attemptClusterListCollapse decides whether the per-stage iterator
 // fan-out can be collapsed to a single cluster-scope LIST and, when so,
 // returns the replacement []httpcall.RequestOptions slice — a single
@@ -86,16 +96,20 @@ const shapeCheckSlowThreshold = 10 * time.Millisecond
 //
 // denyGate is the 0.30.192 instrumentation seam (purely additive, no
 // behaviour change): 0 means the gate passed (useClusterList==true);
-// 2-7 means the corresponding gate triggered the false return — see the
+// 1-7 means the corresponding gate triggered the false return — see the
 // PIPStageTiming.ClusterListDenyGate doc on cache/pip_stage_timing.go for
-// the value table. Value 1 (the old opt-in deny) is unused since Ship
-// S.1 removed the per-RA opt-in gate.
+// the value table.
 //
-// The helper performs FOUR structural gates in order, short-circuiting
-// on the first failure (no wasted work). The Ship-S.1 removal of the
-// per-RA opt-in gate (formerly gate 1) means every iterator stage is
-// eligible for the collapse; the cache-off / snapshot / iterator / GVR /
-// RBAC gates below remain the load-bearing guards:
+// SEQUENCING (Ship S.1-re): the collapse is held INERT behind the
+// compile-time clusterListCollapseEnabled const (false). While inert,
+// the FIRST statement returns deny-gate 1 and NO later gate runs — the
+// helper is byte-identical-behaviour to healthy 0.30.204 (where the
+// removed per-RA opt-in denied for every prod stage). The gates 2-5
+// below + all helper machinery stay VERBATIM for S.2, just unreachable
+// until S.2 flips the const true after landing refresher-decoupling.
+//
+// When enabled, the helper performs FOUR structural gates in order,
+// short-circuiting on the first failure (no wasted work):
 //
 //  2. Cache-off + snapshot gate (AC-D5.13): !cache.Disabled() AND the
 //     Ship B typed-RBAC snapshot is published.
@@ -121,13 +135,14 @@ func attemptClusterListCollapse(
 	apistageStore *cache.ResolvedCacheStore,
 	apistageEnabled bool,
 ) ([]httpcall.RequestOptions, bool, int) {
-	// Gate 1 (opt-in via apiCall.ClusterListWhenAllowed) was REMOVED at
-	// Ship S.1 — the field is gone and the collapse is no longer per-RA
-	// opt-in. The gate-number contract is preserved for S.2 reuse: the
-	// deny-gate values 2-7 retain their meaning; value 1 is now unused
-	// (no path returns it). attemptClusterListCollapse therefore begins at
-	// the cache-off + snapshot gate.
-	//
+	// Ship S.1-re INERT gate (was the per-RA opt-in, removed with the field).
+	// Held off until S.2 lands refresher-decoupling. Returns deny-gate 1
+	// (freed by the opt-in removal) so PIP timing self-documents "collapse
+	// disabled, S.2-pending".
+	if !clusterListCollapseEnabled {
+		return nil, false, 1
+	}
+
 	// Gate 2: cache-off + Servable. AC-D5.13.
 	if cache.Disabled() {
 		return nil, false, 2

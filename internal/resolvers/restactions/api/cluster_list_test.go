@@ -414,12 +414,16 @@ func TestBuildClusterListCall_PathAndVerb(t *testing.T) {
 
 // ---------- attemptClusterListCollapse — structural gates ----------
 
-// TestAttemptClusterListCollapse_NoGlobalCacheDenies — Ship S.1 removed
-// the per-RA opt-in (formerly gate 1). The cache-off / snapshot gate
-// (gate 2) is now the FIRST gate. With no cache.Global() published
-// (rw==nil) the helper must deny at gate 2 regardless of iterator
-// presence. This replaces the old opt-in-OFF test (the field is gone).
-func TestAttemptClusterListCollapse_NoGlobalCacheDenies(t *testing.T) {
+// TestAttemptClusterListCollapse_InertGateDenies — Ship S.1-re holds the
+// cluster-list collapse INERT behind the compile-time
+// clusterListCollapseEnabled const (false). The FIRST statement of
+// attemptClusterListCollapse returns deny-gate 1 and NO later gate runs,
+// so the helper is behaviour-identical to healthy 0.30.204. Even with a
+// fully-eligible-looking stage (iterator present), the inert gate must
+// deny at gate 1 before the cache-off / snapshot / GVR / RBAC gates.
+// When S.2 flips the const true this test should be re-pointed at the
+// gate-2 (cache-off) contract.
+func TestAttemptClusterListCollapse_InertGateDenies(t *testing.T) {
 	cache.SetGlobal(nil)
 	apiCall := &templates.API{
 		Name:      "compositions-list",
@@ -430,19 +434,18 @@ func TestAttemptClusterListCollapse_NoGlobalCacheDenies(t *testing.T) {
 		context.Background(), clusterListLogger(t), apiCall,
 		map[string]any{}, endpointStub(), nil, true)
 	if ok || tmp != nil {
-		t.Fatalf("no global cache must deny; got ok=%v tmp=%v", ok, tmp)
+		t.Fatalf("inert collapse must deny; got ok=%v tmp=%v", ok, tmp)
 	}
-	if gate != 2 {
-		t.Fatalf("no global cache must deny at gate 2 (cache-off/snapshot); got gate=%d", gate)
+	if gate != 1 {
+		t.Fatalf("inert collapse must deny at gate 1 (S.1-re sequencing gate); got gate=%d", gate)
 	}
 }
 
 func TestAttemptClusterListCollapse_NoIterator(t *testing.T) {
-	// Post-S.1 there is no opt-in field. A no-iterator stage still has
-	// nothing to collapse; the helper short-circuits. With no global
-	// cache published the cache-off gate (gate 2) fires before the
-	// iterator gate — either deny is acceptable here, the contract is
-	// "must short-circuit".
+	// A no-iterator stage has nothing to collapse; the helper
+	// short-circuits. While the S.1-re inert gate is active the deny
+	// happens at gate 1 before the iterator gate is reached — either way
+	// the contract here is "must short-circuit" (ok==false, tmp==nil).
 	apiCall := &templates.API{
 		Name:      "x",
 		DependsOn: nil, // no iterator
