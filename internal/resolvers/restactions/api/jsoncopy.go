@@ -1,5 +1,21 @@
 // jsoncopy.go — Ship C (resolver-path rebuild, 0.30.139).
 //
+// HISTORICAL — NO LONGER ON THE SERVE PATH (Ship 2a, 0.30.209). The
+// `listEnvelopeValue` deep copy this helper was written to make cheaper
+// has been REMOVED: Ship 2a serves a SHALLOW envelope aliasing the shared
+// items, made safe by an allocator-aware `deleteEmpty` in the gojq fork
+// (gojq/func.go). `CopyJSONValue`/`CopyJSONMap` have no serve-path caller
+// anymore. They are retained as a tested, upstream-byte-equivalent
+// deep-copy utility (TestCopyJSONValue_UpstreamEquivalence remains the
+// gate) for any future isolation need; they are NOT a correctness
+// dependency of the serve path. NOTE the original rationale below cited
+// gojq's `normalizeNumbers` (gojq@v0.12.17) as a reason the copy "cannot
+// be removed" — that is OBSOLETE: upstream removed normalizeNumbers in
+// v0.12.18 (the fork is v0.12.19), and the remaining `deleteEmpty`
+// in-place writer was the one this ship eliminated via copy-on-write.
+//
+// ---- Original Ship C rationale (preserved for provenance) ----
+//
 // **Ship C — bounded-headroom ship, projected 0.7–1.3 GB / 60-call,
 // hard-gate ≥0.6 GB at the migrated site, small-win-or-revert posture
 // per PM ratification 2026-05-20.** (AC-C.12 — design doc + commit
@@ -14,16 +30,6 @@
 // 0.30.138@sha256:a36072a7…, artifacts at
 // /tmp/snowplow-runs/0.30.138/heap_alloc_pre_b.pprof +
 // .../heap_alloc_post_b.pprof.) ~61 MB / `/call` in deep-copy alone.
-//
-// The deep copy itself cannot be removed. Three cross-ship invariants
-// depend on it (task #200): (a) gojq's `Code.RunWithContext` calls
-// `normalizeNumbers(input)` which mutates maps/slices in place
-// (gojq@v0.12.17/normalize.go:71-80; the 0.30.128/0.30.129 deploy crash
-// is the historical evidence); (b) gojq's result CAN alias sub-trees of
-// its input (Ship A AC-A.6); (c) Ship B's `convertUnstructured*` runs at
-// snapshot-rebuild time, NOT on values flowing through
-// `listEnvelopeValue` — orthogonal but documented. Ship C only makes
-// the copy cheaper.
 //
 // What this ship actually buys.
 //

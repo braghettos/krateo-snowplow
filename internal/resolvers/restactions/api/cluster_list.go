@@ -563,6 +563,11 @@ func validateClusterListShape(gvr schema.GroupVersionResource, raw []byte) (pars
 	// byte-identical to parseListEnvelope's output at apistage.go:149-161.
 	items := make([]*unstructured.Unstructured, 0, len(envelope.Items))
 	for _, it := range envelope.Items {
+		// Ship 2a (0.30.209) — strip managedFields at this
+		// item-materialisation site too (mirrors parseListEnvelope), so
+		// every shared entry.Items map is stripped once at load and the
+		// serve path needs no per-serve removeManagedFields walk.
+		stripManagedFields(it)
 		items = append(items, &unstructured.Unstructured{Object: it})
 	}
 	apiVersion := envelope.APIVersion

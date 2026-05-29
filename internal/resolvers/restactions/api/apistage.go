@@ -148,6 +148,14 @@ func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListE
 	}
 	items := make([]*unstructured.Unstructured, 0, len(envelope.Items))
 	for _, it := range envelope.Items {
+		// Ship 2a (0.30.209) — strip managedFields ONCE here, at the
+		// item-materialisation site where `it` is still PRIVATE (freshly
+		// json.Unmarshal'd, not yet aliased by any serve). After this the
+		// shared entry.Items carry no managedFields, so the serve path
+		// needs no per-serve removeManagedFields walk (dropped in
+		// resolve.go) — that walk wrote the SHARED item maps once the
+		// envelope went shallow, racing concurrent reads.
+		stripManagedFields(it)
 		items = append(items, &unstructured.Unstructured{Object: it})
 	}
 	apiVersion := envelope.APIVersion
@@ -159,6 +167,31 @@ func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListE
 		kind = listKindForResource(gvr.Resource)
 	}
 	return parsedListEnvelope{items: items, apiVersion: apiVersion, kind: kind}, true
+}
+
+// stripManagedFields removes metadata.managedFields from a single item
+// map IN PLACE. It MUST be called only at item-materialisation sites
+// (parseListEnvelope, validateClusterListShape, gateGetEnvelope,
+// gateListEnvelope), where the item map is freshly json.Unmarshal'd and
+// still private — never on a map already aliased by a serve. After this,
+// the shared entry.Items maps carry no managedFields, which is the
+// invariant the Ship 2a shallow envelope relies on to drop the per-serve
+// removeManagedFields walk (resolve.go).
+//
+// managedFields is a wire field on every apiserver object's metadata; it
+// is large, server-managed, and never consumed by widgets/RESTActions, so
+// snowplow has always stripped it before serving. Pre-Ship-2a the strip
+// happened per-serve on a private deep copy (removeManagedFields(dict));
+// Ship 2a moves it to load-time so the shared items are stripped once.
+func stripManagedFields(obj map[string]any) {
+	if obj == nil {
+		return
+	}
+	md, ok := obj["metadata"].(map[string]any)
+	if !ok {
+		return
+	}
+	delete(md, "managedFields")
 }
 
 // gateListItems runs filterListByRBAC over an ALREADY-PARSED item slice
@@ -189,48 +222,45 @@ func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed 
 // map are irrelevant to the served body: the stage filter / jsonHandler
 // operate on the decoded value and re-encode canonically downstream.
 //
-// Ship 0.30.130 — corrected P-CORE-2 (per-call value isolation). The
-// `items` here is the cached content entry's R3 pre-parsed Items, whose
-// it.Object map[string]any are OWNED by entry.Items and SHARED across
-// every content-Get-hit. Returning those maps directly aliased the
-// served value tree to the cache: jsonHandlerCore feeds the tree into
-// jqutil.Eval, and gojq mutates every map in place (normalizeNumbers
-// iterate-and-write, deleteEmpty/delpaths delete-and-write). Two
-// concurrent Resolve workers Get-hitting the same entry then ran gojq
-// over the same maps -> `fatal error: concurrent map iteration and map
-// write` (the 0.30.128/0.30.129 deploy crash).
+// Ship 2a (0.30.209) — SHALLOW envelope. Background: the `items` here is
+// the cached content entry's R3 pre-parsed Items, whose it.Object
+// map[string]any are OWNED by entry.Items and SHARED across every
+// content-Get-hit. From 0.30.130 to 0.30.208 this site deep-copied the
+// assembled envelope (maps.DeepCopyJSON, then CopyJSONMap) so each serve
+// got a PRIVATE tree gojq could mutate freely — the per-call isolation
+// the pre-0.30.128 marshal+unmarshal round-trip provided. That deep copy
+// was 45.9% of serve-path allocations / ~20% GC at scale (155 MB/serve),
+// and existed ONLY to absorb gojq's in-place writers of the input:
+// normalizeNumbers (gone — upstream removed it in v0.12.18; the fork is
+// v0.12.19) and deleteEmpty (delpaths/del), whose copy-on-write left
+// ALIASED sibling sub-trees and recursed-and-wrote them in place.
 //
-// The fix: deep-copy the assembled envelope via maps.DeepCopyJSON so
-// every caller receives a PRIVATE value tree — no map shared with
-// entry.Items. This restores the per-call isolation the pre-0.30.128
-// marshal+unmarshal round-trip provided, without that redundant
-// round-trip (the deep copy is structurally cheaper — it never
-// re-serialises). DeepCopyJSON recursively copies every json.Unmarshal
-// value type (map/slice/scalars/json.Number); the items come straight
-// from parseListEnvelope's json.Unmarshal so no non-JSON type can reach
-// its panic-on-unknown default. P-CORE-1 (decode-once-at-entry-load) is
-// untouched — only the per-hit aliasing is removed.
+// Ship 2a removes that last writer: the gojq fork's deleteEmpty is now
+// allocator-aware (gojq/func.go) — it CoW-copies any non-gojq-allocated
+// node instead of writing it, exactly like the update* family. With NO
+// gojq path able to write the input, this site hands back a SHALLOW
+// envelope: a fresh outer map + a fresh []any whose elements ALIAS the
+// shared it.Object. The served tree is read-only and per-request (it
+// flows to the HTTP response; it is never Put into a shared cache), so
+// aliasing the shared items is safe. The -race destructive-serve
+// falsifier is the hard gate (ship2a CoW falsifier +
+// apistage_concurrent_isolation_test). P-CORE-1 (decode-once-at-entry-
+// load) is untouched.
 func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstructured) map[string]any {
 	itemList := make([]any, 0, len(items))
 	for _, it := range items {
 		if it != nil {
+			// SHALLOW: alias the shared it.Object (read-only). gojq cannot
+			// mutate it — its only input-writer (deleteEmpty) is now
+			// allocator-aware (CoW for non-allocated nodes).
 			itemList = append(itemList, it.Object)
 		}
 	}
-	envelope := map[string]any{
+	return map[string]any{
 		"apiVersion": apiVersion,
 		"kind":       listKind,
 		"items":      itemList,
 	}
-	// Per-call isolation: hand the caller a private deep copy so the
-	// downstream in-place gojq mutation never touches the cached maps.
-	//
-	// Ship C (0.30.139): migrated from `plumbing/maps.DeepCopyJSON` to
-	// the snowplow-local monomorphic `CopyJSONMap` (jsoncopy.go) — same
-	// byte-shape, leaf-fast-path case ordering + in-package call-frame
-	// elision, projected 0.7–1.3 GB / 60-call reduction on this site
-	// (gated ≥0.6 GB, small-win-or-revert).
-	return CopyJSONMap(envelope)
 }
 
 // gateListEnvelope unmarshals a LIST envelope, runs filterListByRBAC over
@@ -260,6 +290,12 @@ func gateGetEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw [
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, false
 	}
+	// Ship 2a (0.30.209) — the GET-by-name path does NOT flow through the
+	// LIST item-strip; strip managedFields here too so dropping the
+	// per-serve removeManagedFields walk (resolve.go) does not change the
+	// served wire shape for a managedFields-bearing GET. `obj` is freshly
+	// json.Unmarshal'd and private at this point.
+	stripManagedFields(obj)
 	u := &unstructured.Unstructured{Object: obj}
 	if !filterGetByRBAC(ctx, gvr, u) {
 		return nil, false

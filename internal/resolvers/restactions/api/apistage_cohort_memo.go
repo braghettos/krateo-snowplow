@@ -367,7 +367,12 @@ func populateMemoFromCanonicalFilter(
 //     memo.keptNames.
 //
 // Returns the same map[string]any shape listEnvelopeValue produces on
-// the canonical path, with the same deep-copy isolation invariant.
+// the canonical path. Ship 2a (0.30.209): listEnvelopeValue now returns a
+// SHALLOW envelope (items alias the shared entry.Items[i].Object); the
+// per-serve deep copy is gone. The served tree is read-only — gojq cannot
+// write the shared input now that the gojq fork's deleteEmpty is
+// allocator-aware (CoW for non-allocated nodes). Both the permitAll and
+// the !permitAll branch return this shallow shape.
 func cohortGateMemoServe(
 	ctx context.Context,
 	gvr schema.GroupVersionResource,

@@ -901,7 +901,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		recordStageTiming()
 	}
 
-	removeManagedFields(dict)
+	// Ship 2a (0.30.209) — the per-serve removeManagedFields(dict) walk is
+	// GONE. managedFields is now stripped ONCE at the four item-
+	// materialisation sites (parseListEnvelope, validateClusterListShape,
+	// gateGetEnvelope, gateListEnvelope→parseListEnvelope), where the item
+	// map is still private. With the Ship 2a SHALLOW envelope, this walk
+	// `delete(v, "managedFields")`'d the SHARED entry.Items maps in place,
+	// racing concurrent serves' reads (the -race in
+	// TestResolve_ConcurrentRequestsDoNotCrossPollinate). Stripping at
+	// load means dict's only maps here are the fresh per-serve outer
+	// envelope + jq-constructed objects (never carry managedFields), so
+	// the walk is both unsafe (shared write) and unnecessary. Dropping it
+	// also removes a per-serve O(nodes) full-tree traversal (perf win).
 	//delete(dict, "slice")
 
 	return dict
@@ -990,20 +1001,10 @@ func lazyRegisterInnerCallPaths(log *slog.Logger, opts []httpcall.RequestOptions
 	}
 }
 
-func removeManagedFields(data any) {
-	switch v := data.(type) {
-	case map[string]any:
-		delete(v, "managedFields")
-		// scansiona tutte le altre chiavi
-		for _, val := range v {
-			removeManagedFields(val)
-		}
-	case []any:
-		for _, elem := range v {
-			removeManagedFields(elem)
-		}
-	// other types (string, int, ecc.) -> do nothing
-	default:
-		return
-	}
-}
+// removeManagedFields was the per-serve recursive managedFields stripper
+// called at the end of Resolve. Ship 2a (0.30.209) removed it: with the
+// shallow envelope it wrote the shared entry.Items in place (a data
+// race), and managedFields is now stripped once at the item-
+// materialisation sites (stripManagedFields in apistage.go /
+// cluster_list.go). The function is intentionally deleted rather than
+// parked — feedback_no_park_broken_behind_flag.
