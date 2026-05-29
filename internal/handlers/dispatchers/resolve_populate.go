@@ -460,6 +460,18 @@ func resolveRAFullListForRefresh(ctx context.Context, got objects.Result, inputs
 	if err := json.Unmarshal(res.Status.Raw, &full); err != nil {
 		return nil, fmt.Errorf("RAFullList status not a JSON object: %w", err)
 	}
+	// EMPTY-FULL GUARD twin (0.30.208) — symmetric to the apiref serve-path
+	// guard. If a refresh re-resolves to an EMPTY full (single array key,
+	// length 0), it is INDISTINGUISHABLE from a not-yet-synced /
+	// continueOnError-degraded resolve, so refuse to overwrite the existing
+	// (possibly good, non-empty) cell with empty. Treat it as skip-to-TTL
+	// (return nil,nil — the same no-status sentinel) so the cell is left
+	// untouched and re-resolved on the next cycle once the informer is
+	// synced. Mechanism-uniform: keyed off "the full is empty", NO
+	// resource/name/GVR literal.
+	if cache.FullListIsEmpty(full) {
+		return nil, nil
+	}
 	return json.Marshal(full)
 }
 

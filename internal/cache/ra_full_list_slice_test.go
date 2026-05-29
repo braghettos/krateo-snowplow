@@ -17,6 +17,34 @@ import (
 	"github.com/krateoplatformops/plumbing/jqutil"
 )
 
+// HG-4a.empty — FullListIsEmpty: the mechanism-uniform emptiness probe that
+// the serve/refresher empty-full guard (0.30.208) keys off. A clean single-
+// array map with a zero-length list is "empty" (→ true). A non-empty list,
+// nil, a zero-array map, and a multi-array map are NOT (→ false). NO
+// resource/name/GVR literal — keyed purely on the single-array shape contract.
+func TestFullListIsEmpty(t *testing.T) {
+	cases := []struct {
+		name string
+		full map[string]any
+		want bool
+	}{
+		{"single empty array", map[string]any{"compositionspanels": []any{}}, true},
+		{"single empty array generic", map[string]any{"items": []any{}}, true},
+		{"single non-empty array", map[string]any{"compositionspanels": []any{map[string]any{"x": 1}}}, false},
+		{"nil map", nil, false},
+		{"no array key (aggregation shape)", map[string]any{"count": float64(0)}, false},
+		{"multi array map", map[string]any{"a": []any{}, "b": []any{}}, false},
+		{"empty array plus scalar sibling", map[string]any{"items": []any{}, "total": float64(0)}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FullListIsEmpty(tc.full); got != tc.want {
+				t.Fatalf("FullListIsEmpty(%v) = %v, want %v", tc.full, got, tc.want)
+			}
+		})
+	}
+}
+
 // HG-4a.1 — page-independent key. Two ResolvedKeyInputs differing ONLY in
 // Page/PerPage produce the IDENTICAL RAFullList key; differing in a non-slice
 // input (resource/ns/name/cohort/non-slice extra) produces a DIFFERENT key.

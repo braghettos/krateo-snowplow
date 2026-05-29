@@ -153,6 +153,35 @@ func raFullListServe(
 	if err != nil {
 		return nil, false, err
 	}
+
+	// EMPTY-FULL GUARD (0.30.208) — self-healing refusal to freeze on empty.
+	//
+	// When the freshly-resolved full list's single array-valued key has
+	// length 0, an empty Go-slice byte-equals an empty page-keyed S_ra, so
+	// the byte-verify below would (wrongly) record verdict=sliceable and Put
+	// the EMPTY cell — freezing the fast path on an empty result FOREVER (it
+	// never re-verifies). But an empty full is INDISTINGUISHABLE from a
+	// not-yet-synced / continueOnError-degraded resolve (panels informer not
+	// synced at boot → panel LISTs degrade to []), so it is NOT an
+	// authoritative sliceable verdict. Refuse to record OR Put: leave the
+	// verdict UNKNOWN so the NEXT request re-runs first-sight once the
+	// informer is synced (self-healing), and serve the (correct, empty)
+	// page-keyed S_ra meanwhile.
+	//
+	// PERF: this guard adds ZERO resolves — `full` is ALREADY resolved on
+	// this first-sight path for the byte-verify, so the emptiness check is
+	// free. We never RecordSliceability on empty, so the cheap fast path
+	// (known&&sliceable → Get → GoSlice) is never entered for an empty cell;
+	// every request stays on first-sight only while the full resolves EMPTY
+	// (cheap — a not-synced fan-out yields []), NOT a 48s/163MB full. The
+	// one-time expensive full resolve happens exactly once, AFTER sync, when
+	// the full is non-empty and the verdict is correctly recorded → cheap
+	// hits thereafter. Mechanism-uniform: keyed off "the full is empty"
+	// (FullListIsEmpty), NO resource/name/GVR literal.
+	if cache.FullListIsEmpty(full) {
+		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+		return sRA, true, nil
+	}
 	// 3. Go-slice the full F -> S_go.
 	sGo, sok := cache.GoSliceFullList(full, offset, perPage)
 

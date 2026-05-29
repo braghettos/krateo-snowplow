@@ -245,6 +245,131 @@ func TestRAServe_CacheOffDeclines(t *testing.T) {
 	}
 }
 
+// HG-4a.serve.5 — EMPTY-FULL self-healing guard (0.30.208 defect fix).
+//
+// Models the panels-not-synced-at-boot state: the RA resolves to an EMPTY
+// full ({compositionspanels: []}). The byte-verify would otherwise see
+// empty-Go-slice == empty-page-keyed → record verdict=sliceable + Put the
+// empty cell → freeze the fast path on empty FOREVER. The guard MUST instead:
+//   (a) record NO sliceable verdict (verdict stays UNKNOWN / re-verifiable),
+//   (b) Put NO cell (no empty cell cached),
+//   (c) serve the correct (empty) page-keyed result this /call.
+// Then, after the informer syncs (the stub starts returning real panels), the
+// NEXT /call must re-run first-sight, record a real verdict, and serve
+// non-empty data — proving self-healing.
+func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	cache.ResetResolvedCacheForTest()
+
+	// `synced` flips the stub from the not-synced (empty) state to the
+	// synced (real panels) state, modelling the informer catching up.
+	var synced atomic.Bool
+	full := panelDict(40)
+	var calls atomic.Int64
+	resolve := func(ctx context.Context, perPage, page int) (map[string]any, error) {
+		calls.Add(1)
+		if !synced.Load() {
+			// Not-synced / continueOnError-degraded: empty list at EVERY
+			// pagination (both the unpaginated full and the page-keyed ref).
+			return map[string]any{"compositionspanels": []any{}}, nil
+		}
+		dict := map[string]any{}
+		for k, v := range full {
+			dict[k] = v
+		}
+		if perPage > 0 && page > 0 {
+			dict["slice"] = map[string]any{
+				"perPage": float64(perPage),
+				"page":    float64(page),
+				"offset":  float64((page - 1) * perPage),
+			}
+		}
+		s, err := jqutil.Eval(t.Context(), jqutil.EvalOptions{Query: raSliceJQ, Data: dict})
+		if err != nil {
+			return nil, err
+		}
+		var out map[string]any
+		if err := json.Unmarshal([]byte(s), &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+	ctx := ctxWithUser(t)
+
+	// Unique RA name so this test is self-isolating from the PROCESS-GLOBAL
+	// sliceability memo (not reset by ResetResolvedCacheForTest) — a verdict
+	// recorded by another test for "compositions-panels" must never leak here.
+	const raName = "compositions-panels-empty-guard"
+
+	// --- Not-synced: first /call resolves EMPTY. ---
+	got1, ok, err := raFullListServe(ctx, gvr(), "krateo-system", raName,
+		ra(raSliceJQ), 5, 1, nil, resolve)
+	if err != nil || !ok {
+		t.Fatalf("empty-state serve failed: ok=%v err=%v", ok, err)
+	}
+	// Served the (empty) page-keyed result — correct for the moment.
+	if items, _ := got1["compositionspanels"].([]any); len(items) != 0 {
+		t.Fatalf("not-synced serve should be empty, got %d items", len(items))
+	}
+
+	// (a) verdict MUST stay UNKNOWN — NOT recorded as sliceable.
+	shape := cache.SliceShapeHash(raFullListCallerClass, gvr().Group, gvr().Version,
+		gvr().Resource, "krateo-system", raName, raSliceJQ)
+	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
+		"krateo-system", raName,
+		cache.BindingSetHash("admin", []string{"system:masters"}), nil)
+	raKey := cache.ComputeKey(keyInputs)
+	if _, known := cache.SliceabilityLookup(raKey, shape); known {
+		t.Fatalf("empty full MUST NOT record a sliceability verdict (must stay UNKNOWN/re-verifiable)")
+	}
+
+	// (b) NO empty cell cached.
+	if _, ok := cache.ResolvedCache().Get(raKey); ok {
+		t.Fatalf("empty full MUST NOT Put a cell (no empty cell cached)")
+	}
+
+	// A second not-synced /call must AGAIN re-run first-sight (still empty,
+	// still no freeze) — it must not have been short-circuited by a recorded
+	// verdict. (2 resolves per first-sight = unpaginated + page-keyed.)
+	callsBefore := calls.Load()
+	_, ok, err = raFullListServe(ctx, gvr(), "krateo-system", raName,
+		ra(raSliceJQ), 5, 1, nil, resolve)
+	if err != nil || !ok {
+		t.Fatalf("second empty-state serve failed: ok=%v err=%v", ok, err)
+	}
+	if calls.Load()-callsBefore != 2 {
+		t.Fatalf("not-synced /call must re-run first-sight (2 resolves), got %d", calls.Load()-callsBefore)
+	}
+	if _, known := cache.SliceabilityLookup(raKey, shape); known {
+		t.Fatalf("still empty: verdict MUST remain UNKNOWN")
+	}
+
+	// --- Informer syncs: panels now present. Self-heal on next /call. ---
+	synced.Store(true)
+	got2, ok, err := raFullListServe(ctx, gvr(), "krateo-system", raName,
+		ra(raSliceJQ), 5, 1, nil, resolve)
+	if err != nil || !ok {
+		t.Fatalf("post-sync serve failed: ok=%v err=%v", ok, err)
+	}
+	// Non-empty now: 5 items (perPage=5, page=1).
+	items, _ := got2["compositionspanels"].([]any)
+	if len(items) != 5 {
+		t.Fatalf("post-sync serve must return 5 items (perPage=5), got %d", len(items))
+	}
+	// Self-healed: verdict now recorded (sliceable) + cell cached.
+	if sliceable, known := cache.SliceabilityLookup(raKey, shape); !known || !sliceable {
+		t.Fatalf("post-sync first-sight MUST record sliceable verdict: known=%v sliceable=%v", known, sliceable)
+	}
+	if _, ok := cache.ResolvedCache().Get(raKey); !ok {
+		t.Fatalf("post-sync non-empty full MUST Put the cell")
+	}
+	// Served bytes match the RA jq page-1 reference exactly (no regression).
+	synced.Store(true)
+	ref, _ := resolve(ctx, 5, 1)
+	assertCanonEqual(t, got2, ref, "post-sync-page1")
+}
+
 func assertCanonEqual(t *testing.T, a, b map[string]any, label string) {
 	t.Helper()
 	ab, _ := json.Marshal(a)

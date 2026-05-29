@@ -169,6 +169,35 @@ func GoSliceFullList(full map[string]any, offset, perPage int) (map[string]any, 
 	return out, true
 }
 
+// FullListIsEmpty reports whether a freshly-resolved RA full-result map is
+// "empty" — i.e. its SINGLE array-valued key has length 0. It is the
+// mechanism-uniform emptiness probe used by the serve path to refuse to
+// freeze a sliceability verdict on an empty full (the "cache empty at the
+// prewarm tuple → permanent stale hit" foot-gun): an empty full under a
+// continueOnError stage is INDISTINGUISHABLE from a not-yet-synced / degraded
+// resolve, so it must never be recorded as an authoritative sliceable verdict.
+//
+// Keyed off the SAME single-array shape contract as GoSliceFullList (NO
+// resource/name/GVR literal — feedback_no_special_cases): a clean single-list
+// map whose list is empty → true. A nil map, a zero-array-key map, or a
+// multi-array map → false (NOT "empty" in the sliceable sense — those shapes
+// are handled by GoSliceFullList's ok=false fail-safe and never reach a
+// "freeze the empty verdict" decision). A non-empty single list → false.
+func FullListIsEmpty(full map[string]any) bool {
+	if full == nil {
+		return false
+	}
+	arrCount := 0
+	emptyArr := false
+	for _, v := range full {
+		if a, isArr := v.([]any); isArr {
+			arrCount++
+			emptyArr = len(a) == 0
+		}
+	}
+	return arrCount == 1 && emptyArr
+}
+
 // --- Sliceability memo --------------------------------------------------
 //
 // Per the design §3: the verdict "is this RAFullList cell safely sliceable
