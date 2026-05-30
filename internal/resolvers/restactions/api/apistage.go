@@ -492,6 +492,16 @@ func apistageContentServe(
 			}
 			haveParsed = true
 		}
+		// Ship 0.30.212 — idempotent re-record on HIT. Required to converge
+		// after rollout for entries Put under an earlier binary (no dep
+		// edge) OR via the cluster_list collapse path. sync.Map.LoadOrStore
+		// semantics make this a no-op for already-present edges — sub-µs
+		// hot-path cost per Deps.Record/RecordList doc.
+		if isList {
+			cache.Deps().RecordList(contentKey, gvr, ns)
+		} else {
+			cache.Deps().Record(contentKey, gvr, ns, name)
+		}
 		log.Debug("apistage.content_hit",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
@@ -527,6 +537,19 @@ func apistageContentServe(
 			}
 		}
 		store.Put(contentKey, newEntry)
+		// Ship 0.30.212 — wire informer-event invalidation for this content
+		// entry. Without a dep edge an informer ADD/UPDATE/DELETE on the
+		// underlying objects can never dirty-mark this cell, leaving it
+		// TTL-stale-forever (F-4 defect). Symmetric with dispatcher L1
+		// dep-record at resolve.go:546-562 and widget_content.go:267
+		// recordWidgetDeps (AC-G.5 pattern). `isList` was computed above
+		// on the same `name == ""` predicate the content layer keys on.
+		// Idempotent (sync.Map.LoadOrStore) and sub-µs (two atomic.Add).
+		if isList {
+			cache.Deps().RecordList(contentKey, gvr, ns)
+		} else {
+			cache.Deps().Record(contentKey, gvr, ns, name)
+		}
 		entryRef = newEntry
 		log.Debug("apistage.content_store",
 			slog.String("subsystem", "cache"),

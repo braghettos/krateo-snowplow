@@ -73,8 +73,16 @@ const shapeCheckSlowThreshold = 10 * time.Millisecond
 // behaviour-identical to 0.30.204 (the removed per-RA opt-in denied for all 167,111
 // prod stages). S.2 flips this true AFTER landing the refresher-decoupling
 // (cohort-memo reuse + skip-on-unchanged populate + customer-priority yield).
-// Compile-time const, NOT an env flag (single-flag direction: end state is one CACHE_ENABLED).
-const clusterListCollapseEnabled = false
+// Not an env flag (single-flag direction: end state is one CACHE_ENABLED).
+//
+// Ship 0.30.212 — the package-level clusterListCollapseEnabled var (default
+// false, NEVER assigned by production) so tests can flip it to exercise the
+// post-gate Put + dep-record path that proves F-4 freshness wiring for the
+// cluster-list collapse cell. Test-only override is via the
+// withClusterListCollapseEnabledForTest helper in cluster_list_dep_record_test.go.
+// Do NOT restore `const` — that would break the test by making the var
+// non-addressable; the doc above intentionally reflects the var declaration.
+var clusterListCollapseEnabled = false
 
 // attemptClusterListCollapse decides whether the per-stage iterator
 // fan-out can be collapsed to a single cluster-scope LIST and, when so,
@@ -101,12 +109,13 @@ const clusterListCollapseEnabled = false
 // the value table.
 //
 // SEQUENCING (Ship S.1-re): the collapse is held INERT behind the
-// compile-time clusterListCollapseEnabled const (false). While inert,
-// the FIRST statement returns deny-gate 1 and NO later gate runs — the
-// helper is byte-identical-behaviour to healthy 0.30.204 (where the
-// removed per-RA opt-in denied for every prod stage). The gates 2-5
-// below + all helper machinery stay VERBATIM for S.2, just unreachable
-// until S.2 flips the const true after landing refresher-decoupling.
+// package-level clusterListCollapseEnabled var (NEVER assigned by
+// production). While inert, the FIRST statement returns deny-gate 1
+// and NO later gate runs — the helper is byte-identical-behaviour to
+// healthy 0.30.204 (where the removed per-RA opt-in denied for every
+// prod stage). The gates 2-5 below + all helper machinery stay
+// VERBATIM for S.2, just unreachable until S.2 flips the var true
+// after landing refresher-decoupling.
 //
 // When enabled, the helper performs FOUR structural gates in order,
 // short-circuiting on the first failure (no wasted work):
@@ -318,6 +327,15 @@ func attemptClusterListCollapse(
 
 	putStart := time.Now()
 	apistageStore.Put(contentKey, newEntry)
+	// Ship 0.30.212 — wire informer-event invalidation for the collapsed
+	// cluster-scope LIST cell. Without a dep edge an informer ADD/UPDATE/
+	// DELETE on any object of (gvr, *) can never dirty-mark this cell,
+	// leaving it TTL-stale-forever (F-4 defect). Always LIST with name=""
+	// by construction (contentKey is built with empty ns + empty name on
+	// the line above), so no isList branch needed; cluster-scope → empty
+	// namespace argument matches dispatcher resolve.go:550 RecordList.
+	// Idempotent + sub-µs.
+	cache.Deps().RecordList(contentKey, gvr, "")
 	defensivePutMs := time.Since(putStart).Milliseconds()
 
 	// Ship 0.30.193 — accumulate the defensive prefetch breakdown into
