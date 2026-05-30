@@ -189,12 +189,24 @@ func raFullListServe(
 	//    `full`, so identity holds by construction — re-encode both to
 	//    canonical JSON to be safe) AND S_go must byte-equal S_ra.
 	verdict := sok && canonicalJSONEqual(sGo, sRA)
+
+	// Ship #91 / 0.30.211 — Class C heuristic. When the byte-verify FAILED
+	// AND `full` is shape-identical to S_ra modulo length-vs-perPage, this
+	// is an aggregation RA (or otherwise structurally non-sliceable RA)
+	// whose verdict will never flip. Mark it permanent so the retry cap
+	// drops from 3 to 1. Mechanism-uniform: derived from (full, sRA, perPage),
+	// no resource/name/GVR literal (feedback_no_special_cases).
+	permanent := false
+	if !verdict {
+		permanent = cache.IsStructurallyNonSliceable(full, sRA, perPage)
+	}
+
 	// Record the verdict + the caller-CR identity labels so the
 	// snowplow_ra_full_list_memo expvar can describe the entry by its caller
 	// (e.g. compositions-page-datagrid) instead of by the raKey/sliceShape
 	// sha256 hashes alone. The labels are READ-SIDE ONLY (they do not change
 	// the memo key) — see RecordSliceabilityWithLabels.
-	cache.RecordSliceabilityWithLabels(raKey, shape, verdict, cache.SliceabilityLabels{
+	cache.RecordSliceabilityClassified(raKey, shape, verdict, permanent, cache.SliceabilityLabels{
 		CallerClass:     raFullListCallerClass,
 		CallerGroup:     gvr.Group,
 		CallerVersion:   gvr.Version,
@@ -203,18 +215,29 @@ func raFullListServe(
 		CallerName:      name,
 	})
 
+	// Ship #91 / 0.30.211 — Lever C symmetric dep-record at BOTH verdict
+	// branches. Pre-Ship-#91 the RA-CR self-dep was recorded ONLY on the
+	// verdict=true branch (line 217), so a verdict=false entry got no dep
+	// edge — meaning a panels-informer event on the underlying objects
+	// could not invalidate a stuck-false memo entry via the refresher hook.
+	// Symmetric record() at this site lets the refresher's RAFullList
+	// class-prefix hook (Lever C) call InvalidateSliceabilityForKey(raKey)
+	// when the dep-tuple fires, clearing the memo and letting the next
+	// /call re-enter first-sight. THIS IS THE WIRING THE ARCHITECT GUARDS.
+	cache.Deps().Record(raKey, gvr, namespace, name)
+
 	if !verdict {
 		// NOT cleanly sliceable for this shape — serve the page-keyed S_ra
-		// (already resolved) and never try the Go-slice for this shape again.
+		// (already resolved) and never try the Go-slice for this shape until
+		// Lever A's TTL expires + retryCount permits OR Lever C invalidates.
 		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
 		return sRA, true, nil
 	}
 
 	// Sliceable — Put the full cell (possibly pinned by cost predicate),
-	// then serve the verified Go-slice. Record the RA-CR self-dep so a
-	// DELETE of the RESTAction evicts the cell.
+	// then serve the verified Go-slice. The RA-CR self-dep was already
+	// recorded above (symmetric with the false branch — Ship #91).
 	c.PutRAFullList(raKey, keyInputs, full)
-	cache.Deps().Record(raKey, gvr, namespace, name)
 	cache.RecordRAFullListServe(cache.RAFullListServeVerifiedSlice)
 	return sGo, true, nil
 }

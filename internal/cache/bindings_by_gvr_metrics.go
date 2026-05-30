@@ -71,6 +71,13 @@ func registerBindingsByGVRMetrics() {
 		expvar.Publish("snowplow_ra_full_list_memo", expvar.Func(func() any {
 			return SliceabilityMemoSnapshot()
 		}))
+		// Ship #91 / 0.30.211 — async invalidator worker counters. F-7
+		// (informer event triggers re-verify on stuck-false within ≤ 60s)
+		// + F-9 (pod-restart proof) + F-12 (8 Class D raKeys converge)
+		// validate via these counters from the bench harness.
+		expvar.Publish("snowplow_sliceability_reverify", expvar.Func(func() any {
+			return SliceabilityReverifyStatsSnapshot()
+		}))
 	})
 }
 

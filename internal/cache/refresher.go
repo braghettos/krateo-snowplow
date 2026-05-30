@@ -186,8 +186,21 @@ func StartRefresher(ctx context.Context) {
 		// Wire the dep tracker's dirty-mark hook to the queue. Add is
 		// idempotent — repeat marks of one key coalesce; the queue is
 		// unbounded — a mark is never dropped.
+		//
+		// Ship #91 / 0.30.211 — Lever C: for EVERY dirty-marked L1 key
+		// also submit the key to the bounded async invalidator worker.
+		// The worker's invalidate() walks the sliceability memo and
+		// removes entries whose raKey matches; for non-RAFullList keys
+		// the walk is a fast O(memo-size, ≤4096) scan that finds zero
+		// matches — a no-op. We cannot gate on the L1 class here because
+		// a stuck-false (Mode-3) RAFullList raKey has NO L1 entry by
+		// construction (PutRAFullList is only called on the verdict=true
+		// branch); the memo holds the entry, so we MUST consult the memo
+		// directly, not the L1 store. The invalidator is non-blocking
+		// (drop-on-full) so this never delays the refresher enqueue path.
 		Deps().SetRefreshHook(func(l1Key string) {
 			r.enqueue(l1Key)
+			SubmitSliceabilityInvalidate(l1Key)
 		})
 
 		for i := 0; i < r.parallelism; i++ {
@@ -240,6 +253,40 @@ func (r *refresher) enqueue(l1Key string) {
 	}
 	r.queue.Add(l1Key)
 	r.enqueueTotal.Add(1)
+}
+
+// EnqueueRefresh is the package-level enqueue entry point for callers
+// OUTSIDE the deps/refresher wiring that want to schedule a re-resolve on
+// the refresher's workqueue. Used by Ship #91 / 0.30.211 Lever A's TTL
+// gate: when SliceabilityLookup observes a stuck-false memo entry that has
+// aged past T_unverify, it asks the refresher to schedule an L1 re-resolve
+// on the refresher's workqueue.
+//
+// For an EXISTING L1 entry this warms the cell ahead of the next /call
+// (≈50-100ms hot re-resolve). For a stuck-false RAFullList raKey with NO
+// L1 entry (PutRAFullList never fired on the verdict=false branch), the
+// workqueue is a no-op: processOne does c.Get → ok=false →
+// skippedNoEntryTotal++ → return. The next /call after worker-invalidate
+// pays the cold first-sight cost on first reach. This is CORRECT:
+// customer-priority preserved (the TTL-expired /call is fast on the
+// cached false verdict); cold cost is bounded to ≤ retryCap × one unlucky
+// /call per (raKey, cohort) per pod life.
+//
+// Idempotent (the workqueue coalesces) and non-blocking (Add is a no-op
+// when the queue has shut down). Empty l1Key is a no-op.
+//
+// Cache-off: when ResolvedCacheEnabled() is false the refresher singleton
+// is constructed but its worker pool is never started; Add still buffers
+// keys in the unbounded queue but no worker will process them. Production
+// only reaches this code from inside the cache package, which itself is
+// gated on cache-on at the same Start* call site as the refresher — so
+// the buffer-up-but-never-drain case does not arise in practice.
+//
+// Future ship hook: if Phase-6 data shows post-worker /call cold-tail is
+// painful, consider reconstructing ResolvedKeyInputs from memo labels to
+// enable refresher-driven L1 warm. Out of scope for #91.
+func EnqueueRefresh(l1Key string) {
+	refresherSingleton().enqueue(l1Key)
 }
 
 // processNext pulls one key, processes it, and reports whether the
@@ -404,6 +451,16 @@ func resetRefresherForTest() {
 // falsifier). Production code MUST NOT call it.
 func ResetRefresherForTest() {
 	resetRefresherForTest()
+}
+
+// refresherEnqueueTotalForTest is the test-only accessor for the
+// refresher singleton's enqueueTotal counter. Used by Ship #91 / 0.30.211
+// Lever A tests to assert that lookup() at TTL expiry calls
+// EnqueueRefresh(raFullListKey) — i.e. schedules an L1 warm — exactly
+// once. TEST-ONLY; lives in refresher.go (not _test.go) so the package
+// cache test file in another _test.go can reach it.
+func refresherEnqueueTotalForTest() uint64 {
+	return refresherSingleton().enqueueTotal.Load()
 }
 
 // RefreshFuncForTest returns the RefreshFunc registered for handlerKind,

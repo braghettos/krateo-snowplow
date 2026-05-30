@@ -23,6 +23,7 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -171,6 +172,65 @@ func GoSliceFullList(full map[string]any, offset, perPage int) (map[string]any, 
 	return out, true
 }
 
+// IsStructurallyNonSliceable is the Ship #91 / 0.30.211 Class C heuristic.
+// It reports whether the byte-verify just established a SHAPE-IDENTITY
+// between the freshly-resolved unpaginated full result and the page-keyed
+// fall-back reference S_ra — i.e. the RA's slice-jq did NOT actually narrow
+// the result on the page-keyed resolve. That is exactly the shape of an
+// aggregation RA (a sum/count/groupBy/etc. that emits the SAME shape per
+// /call regardless of pagination): paginating it cannot ever produce a
+// proper slice over the underlying array, because the underlying array is
+// not the wire shape — the aggregation IS the wire shape.
+//
+// Trigger condition (both required):
+//   - canonicalJSONEqual(full, sRA) == true   — full and S_ra are byte-
+//     identical to canonical JSON. NB: the caller establishes this by
+//     re-encoding to canonical JSON; cheap given both are already in hand.
+//   - arrLen(full) > perPage                  — the underlying single-array
+//     value carries more rows than one page; a correct slice would have to
+//     differ from the un-paginated full. perPage==0 is excluded (the
+//     unpaginated case can't be permanent — the page-keyed reference IS
+//     the full by construction).
+//
+// SHAPE CONTRACT: full must be a single-array map (the SAME contract
+// GoSliceFullList honours). When `full` is not a single-array map this
+// returns FALSE — the entry is NOT Class C, and the standard Class
+// A/D retry cap (3) applies. Mechanism-uniform: NO resource/name/GVR
+// literal — keyed off (canonicalJSONEqual(full,sRA), arrLen(full),
+// perPage).
+//
+// Co-located with GoSliceFullList because it shares the same "single
+// array-valued key" probe.
+func IsStructurallyNonSliceable(full, sRA map[string]any, perPage int) bool {
+	if perPage <= 0 || full == nil || sRA == nil {
+		return false
+	}
+	// Re-encode + compare. canonicalJSONEqual is defined in the apiref
+	// package (ra_full_list.go); we re-do the equivalent here so the cache
+	// package needs no dependency on apiref. encoding/json sorts map keys
+	// by default → canonical.
+	ab, err1 := jsonMarshalCanonical(full)
+	bb, err2 := jsonMarshalCanonical(sRA)
+	if err1 != nil || err2 != nil || string(ab) != string(bb) {
+		return false
+	}
+	// arrLen(full): probe the single array-valued key. If full has zero or
+	// multiple array-valued keys, the shape contract is broken and we
+	// refuse Class C classification.
+	arrCount := 0
+	arrLen := 0
+	for _, v := range full {
+		if a, isArr := v.([]any); isArr {
+			arrCount++
+			arrLen = len(a)
+		}
+	}
+	if arrCount != 1 {
+		return false
+	}
+	return arrLen > perPage
+}
+
 // FullListIsEmpty reports whether a freshly-resolved RA full-result map is
 // "empty" — i.e. its SINGLE array-valued key has length 0. It is the
 // mechanism-uniform emptiness probe used by the serve path to refuse to
@@ -246,6 +306,16 @@ type SliceabilityLabels struct {
 // recordedAt. The hot lookup() path still does one sync.Map.Load + one
 // pointer-deref of an immutable struct (no extra locks, no allocations on
 // the read path).
+//
+// Ship #91 / 0.30.211: added `permanent` + `retryCount` to support the
+// Lever A re-verify gate. `permanent` is set by the Class C heuristic (the
+// full result is shape-identical to the page-keyed S_ra modulo length —
+// see IsStructurallyNonSliceable) and bounds the retry cap to 1: once a
+// shape is proven STRUCTURALLY non-sliceable (e.g. an aggregation RA whose
+// output is the SAME shape regardless of pagination) no number of re-
+// verifies will change that, so we stop. `retryCount` increments on every
+// record() AFTER the first; the lookup-gate at expiry uses it to bound
+// re-verify attempts to N attempts per (raKey, sliceShape) per pod life.
 type sliceabilityMemoEntry struct {
 	verdict bool
 	// RAKey/SliceShape are the SAME strings the caller passed to record() —
@@ -266,6 +336,17 @@ type sliceabilityMemoEntry struct {
 	// failing (verdict=false, lastUpdated ≈ now) — the two need different
 	// next ships. Architect REQ-2 (0.30.210).
 	lastUpdatedAtUnix int64
+	// permanent is set TRUE when the Class C heuristic
+	// (IsStructurallyNonSliceable) fires at byte-verify time: the FULL result
+	// is shape-identical to the page-keyed S_ra (an aggregation that does
+	// not paginate) AND has more rows than perPage. Such an entry's verdict
+	// will NEVER flip on re-verify, so the retry cap is effectively 1.
+	// Mechanism-uniform: derived from the SHAPE of (full, sRA, perPage), no
+	// resource/name/GVR literal (feedback_no_special_cases).
+	permanent bool
+	// retryCount is the number of record() calls AFTER the first. Used by
+	// the lookup-gate to refuse re-verify once it crosses the cap.
+	retryCount int8
 }
 
 // sliceabilityMemo is the process-wide bounded map of
@@ -305,6 +386,55 @@ func currentNowUnix() int64 {
 // guard, not a tuning knob.
 const defaultSliceabilityMemoCap = 4096
 
+// Ship #91 / 0.30.211 — Lever A + Lever C tunables.
+//
+// SLICEABILITY_REVERIFY_RATE_FLOOR_SECONDS — the minimum interval, in
+// seconds, between re-verify attempts for any one (raKey × sliceShape).
+// The same floor is reused by Lever C's dep-event invalidate: a noisy
+// informer stream against a depended-on object cannot churn the memo
+// faster than this floor. Default 60s; design-time falsifier expects 60s.
+// The PM brief calls out a conditional bump to 300s if Phase 6 observes
+// per-RA cohort count > 12 (vs PF-1's 7) — re-tune via this env knob, no
+// code change.
+const envSliceabilityReverifyRateFloorSeconds = "SLICEABILITY_REVERIFY_RATE_FLOOR_SECONDS"
+
+// defaultSliceabilityReverifyRateFloorSeconds is the design-time default.
+const defaultSliceabilityReverifyRateFloorSeconds int64 = 60
+
+// SLICEABILITY_RETRY_CAP — the max retryCount the lookup-gate enforces for
+// NON-permanent entries (Class A/D). Permanent (Class C) entries are
+// capped at 1 regardless of this knob. Default 3. Lowering to 1 effectively
+// disables Lever A (one retry total, after which stuck-false stays stuck);
+// raising past int8-saturate (127) is a no-op.
+const envSliceabilityRetryCap = "SLICEABILITY_RETRY_CAP"
+
+const defaultSliceabilityRetryCap = 3
+
+// sliceabilityReverifyRateFloorSeconds returns the active rate-floor
+// (in seconds) for Lever A re-verify + Lever C dep-event invalidate.
+// Read on every lookup/invalidate; environment-driven so deployers can
+// re-tune at pod start without a code change.
+func sliceabilityReverifyRateFloorSeconds() int64 {
+	return int64FromEnv(envSliceabilityReverifyRateFloorSeconds, defaultSliceabilityReverifyRateFloorSeconds)
+}
+
+// sliceabilityRetryCap returns the effective retry cap for an entry:
+// 1 when permanent==true (Class C — never retry beyond once), the env
+// override / default otherwise.
+func sliceabilityRetryCap(permanent bool) int {
+	if permanent {
+		return 1
+	}
+	return intFromEnv(envSliceabilityRetryCap, defaultSliceabilityRetryCap)
+}
+
+// jsonMarshalCanonical is the canonical-JSON encoder used by
+// IsStructurallyNonSliceable's shape-equality probe. encoding/json sorts
+// map keys by default → byte-stable for equality comparison.
+func jsonMarshalCanonical(m map[string]any) ([]byte, error) {
+	return json.Marshal(m)
+}
+
 // sliceShapeHash fingerprints HOW a caller slices a RAFullList cell:
 // (callerClass, caller gvr/ns/name, hash of the RA's output slice jq). Two
 // callers with the same shape share a verdict; different shapes get
@@ -343,6 +473,43 @@ func memoKey(raFullListKey, sliceShape string) string {
 // SliceabilityVerdict returns (sliceable, known) for the given
 // (RAFullListKey × sliceShape). known=false means no verdict has been
 // recorded yet — the caller must run the byte-verify and RecordSliceability.
+//
+// Ship #91 / 0.30.211 — Lever A async-worker TTL gate (PM-ratified
+// 2026-05-30, supersedes the architect-brief "return known=false" wording).
+// When an entry's verdict is FALSE and the entry has aged past T_unverify
+// AND retryCount is below its cap, lookup STILL returns (false, true) —
+// the cached false verdict is served, the customer /call falls through to
+// the page-keyed fallback and returns IMMEDIATELY. No synchronous re-
+// verify burden on the customer. The lookup also schedules two off-/call
+// async actions:
+//
+//  1. SubmitSliceabilityInvalidate(raFullListKey) — the bounded async
+//     invalidator worker will Delete() the memo entry (after the rate-
+//     floor check) so the NEXT /call after the worker runs sees
+//     known=false and enters first-sight under its own /call ctx.
+//  2. EnqueueRefresh(raFullListKey) — schedules an L1 re-resolve on the
+//     refresher's workqueue, so by the time that "next /call" hits the
+//     first-sight path the unpaginated full is warm in L1 (≈50-100ms
+//     hot re-resolve, not the cold ~50s fan-out).
+//
+// Permanent entries (Class C heuristic — IsStructurallyNonSliceable) are
+// short-circuited: lookup returns the cached false verdict but does NOT
+// submit or enqueue. A structurally non-sliceable shape will never flip,
+// so burning worker + refresher cycles on it is pure waste.
+//
+// Customer-priority preserved (feedback_customer_priority_over_refresher):
+// the customer /call NEVER blocks on a re-verify. The verdict flips on a
+// LATER /call after the worker has invalidated AND the refresher has
+// warmed the L1 cell. retryCount climbs only when the eventual first-
+// sight path runs record() with a fresh verdict; the cap (3 normal, 1
+// permanent) bounds the total re-verify cycles per pod life.
+//
+// Mechanism-uniform: keyed off (lastUpdatedAtUnix, retryCount, permanent)
+// on EVERY raFullList entry — no resource/name/GVR literal
+// (feedback_no_special_cases).
+//
+// The TTL gate does NOT mutate the entry — invalidate (via the async
+// worker) Delete()s it, and the next /call's record() repopulates it.
 func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, known bool) {
 	v, ok := m.verdicts.Load(memoKey(raFullListKey, sliceShape))
 	if !ok {
@@ -351,6 +518,21 @@ func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, 
 	e, ok := v.(*sliceabilityMemoEntry)
 	if !ok || e == nil {
 		return false, false
+	}
+	if !e.verdict && !e.permanent {
+		// Lever A: stuck-false TTL gate. If the entry has aged past
+		// T_unverify AND retryCount is below its cap, schedule the async
+		// re-verify path off the customer /call. The cached false verdict
+		// is STILL returned (caller falls back fast); flipping happens on
+		// the next /call AFTER the worker has invalidated + the refresher
+		// has warmed L1.
+		now := currentNowUnix()
+		ttl := sliceabilityReverifyRateFloorSeconds()
+		cap := sliceabilityRetryCap(false)
+		if (now-e.lastUpdatedAtUnix) > ttl && int(e.retryCount) < cap {
+			SubmitSliceabilityInvalidate(raFullListKey)
+			EnqueueRefresh(raFullListKey)
+		}
 	}
 	return e.verdict, true
 }
@@ -367,16 +549,31 @@ func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, 
 //     Answers "when was the verdict last (re-)written". Discriminates
 //     Mode-3 stuck-since-boot from Mode-3 refreshing-still-failing.
 //
+// RETRY / PERMANENT SEMANTICS (Ship #91 / 0.30.211, Lever A):
+//   - retryCount:        incremented on every refresh-in-place; the lookup-
+//     gate uses it (with the cap) to bound re-verify attempts.
+//   - permanent:         STICKY-once-true (Class C heuristic). Once a /call
+//     observes a structurally non-sliceable shape and passes permanent=true,
+//     the field stays true across all subsequent record()s — a later /call
+//     never silently un-permanents a verdict it could not authoritatively
+//     re-classify (the cleanest read of "structurally non-sliceable" is
+//     monotonic: if it ever was, it forever is for this pod's run).
+//
 // Labels and raKey/sliceShape are preserved across refresh-in-place (a
 // refresh-without-labels never overwrites real labels with empty).
-func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable bool, labels SliceabilityLabels) {
+func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable, permanent bool, labels SliceabilityLabels) {
 	mk := memoKey(raFullListKey, sliceShape)
 	now := currentNowUnix()
 	if prev, exists := m.verdicts.Load(mk); exists {
 		// Refresh in place: build a NEW entry (entries are immutable post-Store)
-		// preserving recordedAt + labels, updating verdict + lastUpdatedAt.
+		// preserving recordedAt + labels, updating verdict + lastUpdatedAt +
+		// retryCount + permanent (sticky-once-true).
 		pe, _ := prev.(*sliceabilityMemoEntry)
 		if pe != nil {
+			next := pe.retryCount
+			if int(next) < 127 { // saturate to avoid int8 overflow
+				next++
+			}
 			m.verdicts.Store(mk, &sliceabilityMemoEntry{
 				verdict:           sliceable,
 				raKey:             pe.raKey,
@@ -384,6 +581,8 @@ func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable bo
 				labels:            pe.labels,
 				recordedAtUnix:    pe.recordedAtUnix,
 				lastUpdatedAtUnix: now,
+				permanent:         pe.permanent || permanent,
+				retryCount:        next,
 			})
 		} else {
 			// Defensive: a pre-0.30.210 raw bool snuck in somehow — replace it
@@ -395,6 +594,8 @@ func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable bo
 				labels:            labels,
 				recordedAtUnix:    now,
 				lastUpdatedAtUnix: now,
+				permanent:         permanent,
+				retryCount:        0,
 			})
 		}
 		return
@@ -413,7 +614,66 @@ func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable bo
 		labels:            labels,
 		recordedAtUnix:    now,
 		lastUpdatedAtUnix: now,
+		permanent:         permanent,
+		retryCount:        0,
 	})
+}
+
+// invalidate removes EVERY memo entry whose raKey matches raFullListKey.
+// Used by Lever C (dep-event invalidate) — when an informer event fires
+// against an object that an RAFullList cell depends on, the verdicts keyed
+// by that raFullListKey are stale and must be re-verified on next /call.
+// Rate-limited to one invalidation per (raFullListKey, sliceShape) per
+// T_unverify (matches Lever A's gate so a noisy informer event stream
+// cannot churn the memo). Returns the number of entries that were
+// invalidated for observability.
+//
+// Mechanism-uniform: keyed off raFullListKey only (no resource/name
+// literal); rate-limit floor read from
+// sliceabilityReverifyRateFloorSeconds() (the same knob Lever A uses).
+//
+// Walks the memo's sync.Map — O(entries). The memo is capped at
+// defaultSliceabilityMemoCap (4096) so even a worst-case walk is trivial
+// at the dep-event cadence.
+func (m *sliceabilityMemo) invalidate(raFullListKey string) int {
+	if raFullListKey == "" {
+		return 0
+	}
+	now := currentNowUnix()
+	ttl := sliceabilityReverifyRateFloorSeconds()
+	removed := 0
+	m.verdicts.Range(func(k, v any) bool {
+		e, ok := v.(*sliceabilityMemoEntry)
+		if !ok || e == nil {
+			return true
+		}
+		if e.raKey != raFullListKey {
+			return true
+		}
+		// Rate-floor: refuse to invalidate if the entry was last updated
+		// within T_unverify (Lever C floor shared with Lever A).
+		if (now - e.lastUpdatedAtUnix) < ttl {
+			return true
+		}
+		m.verdicts.Delete(k)
+		m.mu.Lock()
+		if m.count > 0 {
+			m.count--
+		}
+		m.mu.Unlock()
+		removed++
+		return true
+	})
+	return removed
+}
+
+// InvalidateSliceabilityForKey is the package-level entry point for Lever
+// C dep-event invalidation. The refresher's dep-event hook calls this for
+// every RAFullList L1 entry whose dep tuple matched. Rate-limited inside
+// invalidate(); safe to call from the refresher hook goroutine without
+// further synchronisation. Returns the number of memo entries invalidated.
+func InvalidateSliceabilityForKey(raFullListKey string) int {
+	return raSliceabilityMemo.invalidate(raFullListKey)
 }
 
 // SliceabilityLookup is the package-level lookup against the process memo.
@@ -424,9 +684,9 @@ func SliceabilityLookup(raFullListKey, sliceShape string) (sliceable, known bool
 // RecordSliceability records a byte-verify verdict in the process memo with
 // EMPTY labels. Test/back-compat entry point — production callers SHOULD use
 // RecordSliceabilityWithLabels so the read-side snapshot can describe the
-// entry's caller-CR identity.
+// entry's caller-CR identity. permanent=false (the test-default).
 func RecordSliceability(raFullListKey, sliceShape string, sliceable bool) {
-	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, SliceabilityLabels{})
+	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, false, SliceabilityLabels{})
 }
 
 // RecordSliceabilityWithLabels records a byte-verify verdict + the caller-CR
@@ -437,24 +697,48 @@ func RecordSliceability(raFullListKey, sliceShape string, sliceable bool) {
 // given sliceShapeHash folds caller ns/name) would share one verdict and the
 // labels of WHICHEVER recorded first; in practice sliceShape is unique per
 // caller-CR so labels are 1:1 with entries.
+//
+// permanent=false. The /call site that wants to mark a verdict as
+// structurally non-sliceable (Class C heuristic — see
+// IsStructurallyNonSliceable) MUST call RecordSliceabilityClassified.
 func RecordSliceabilityWithLabels(raFullListKey, sliceShape string, sliceable bool, labels SliceabilityLabels) {
-	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, labels)
+	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, false, labels)
+}
+
+// RecordSliceabilityClassified records a byte-verify verdict + labels + the
+// `permanent` flag from the Class C heuristic (IsStructurallyNonSliceable).
+// When permanent is true the retry cap is effectively 1 (architectural
+// invariant: a shape proven non-sliceable BY STRUCTURE — full-shape ==
+// page-shape modulo length — will never start slicing cleanly on re-verify;
+// continuing to retry would just thrash the cache).
+//
+// `permanent` is monotonic on refresh-in-place: once an entry has been
+// recorded permanent=true, a later record() with permanent=false does NOT
+// un-permanent it (see record()).
+func RecordSliceabilityClassified(raFullListKey, sliceShape string, sliceable, permanent bool, labels SliceabilityLabels) {
+	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, permanent, labels)
 }
 
 // SliceabilityMemoEntry is the public, snapshot-friendly view of one memo
 // entry. Field names map directly to the snowplow_ra_full_list_memo JSON keys.
 //
-// RecordedAtUnixSeconds / LastUpdatedAtUnixSeconds are deliberately NOT
-// omitempty — operators reading /debug/vars shouldn't have to guess "field
-// not in this build" vs "value zero" (architect REQ-2 callout). Caller
-// labels keep omitempty because zero-label entries (legacy
-// RecordSliceability tests) shouldn't crowd the snapshot.
+// RecordedAtUnixSeconds / LastUpdatedAtUnixSeconds / Permanent / RetryCount
+// are deliberately NOT omitempty — operators reading /debug/vars shouldn't
+// have to guess "field not in this build" vs "value zero" (architect REQ-2
+// callout, reaffirmed for Ship #91 Permanent + RetryCount). Caller labels
+// keep omitempty because zero-label entries (legacy RecordSliceability
+// tests) shouldn't crowd the snapshot.
 type SliceabilityMemoEntry struct {
 	RAKey                    string `json:"raKey"`
 	SliceShape               string `json:"sliceShape"`
 	Verdict                  bool   `json:"verdict"`
 	RecordedAtUnixSeconds    int64  `json:"recordedAtUnixSeconds"`
 	LastUpdatedAtUnixSeconds int64  `json:"lastUpdatedAtUnixSeconds"`
+	// Permanent — TRUE when the Class C heuristic
+	// (IsStructurallyNonSliceable) fired; gates retry cap to 1. Ship #91.
+	Permanent bool `json:"permanent"`
+	// RetryCount — number of record() refreshes for this entry. Ship #91.
+	RetryCount int8 `json:"retryCount"`
 	CallerClass              string `json:"callerClass,omitempty"`
 	CallerGroup              string `json:"callerGroup,omitempty"`
 	CallerVersion            string `json:"callerVersion,omitempty"`
@@ -502,6 +786,8 @@ func (m *sliceabilityMemo) snapshot() []SliceabilityMemoEntry {
 			Verdict:                  e.verdict,
 			RecordedAtUnixSeconds:    e.recordedAtUnix,
 			LastUpdatedAtUnixSeconds: e.lastUpdatedAtUnix,
+			Permanent:                e.permanent,
+			RetryCount:               e.retryCount,
 			CallerClass:              e.labels.CallerClass,
 			CallerGroup:              e.labels.CallerGroup,
 			CallerVersion:            e.labels.CallerVersion,

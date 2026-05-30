@@ -294,6 +294,13 @@ func main() {
 					// apiserver client-config on the context.
 					dispatchers.RegisterRefreshHandlers(rc)
 					cache.StartRefresher(cacheCtx)
+					// Ship #91 / 0.30.211 — Lever C async invalidator worker.
+					// Bounded queue, drop-on-full. Receives raKey enqueues
+					// from the deps refresh hook for stuck-false memo
+					// invalidation. NOT on the refresher workqueue
+					// (feedback_refresher_populate_amplification). Cache-off
+					// is a no-op inside the Start fn.
+					cache.StartSliceabilityReverifier(cacheCtx)
 
 					// Block until RBAC informer LISTs complete so the
 					// first dispatch is not racing the initial sync.
