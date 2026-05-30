@@ -196,6 +196,228 @@ func TestBindingsByGVRIndex_DeltaNonTypedBumpsCanary(t *testing.T) {
 	}
 }
 
+// TestRAFullListMemoExpvarPublished (0.30.210) asserts the
+// snowplow_ra_full_list_memo expvar:
+//   - is published under CACHE_ENABLED=true,
+//   - returns a snapshot whose shape includes raKey + sliceShape + verdict
+//     + recordedAtUnixSeconds + caller-CR labels per entry,
+//   - reflects EVERY recorded (RA × sliceShape) entry (true + false verdicts)
+//     with labels populated from RecordSliceabilityWithLabels,
+//   - is safe under -race against concurrent record() writers (the race
+//     coverage lives in TestRAFullList_ResidentAndMemoRace; this test adds
+//     a concurrent walk-while-write check specifically against the snapshot
+//     reader).
+func TestRAFullListMemoExpvarPublished(t *testing.T) {
+	resetSliceabilityMemoForTest()
+	RegisterBindingsByGVRMetricsForTest()
+
+	v := expvar.Get("snowplow_ra_full_list_memo")
+	if v == nil {
+		t.Fatal("snowplow_ra_full_list_memo not published")
+	}
+
+	// Seed two entries: one TRUE verdict + labels, one FALSE verdict + labels.
+	raKeyA := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
+		"krateo-system", "compositions-panels", 0x1234, nil))
+	shapeA := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
+		"tables", "krateo-system", "compositions-page-datagrid", "{}")
+	labelsA := SliceabilityLabels{
+		CallerClass:     "apiref",
+		CallerGroup:     "widgets.templates.krateo.io",
+		CallerVersion:   "v1beta1",
+		CallerResource:  "tables",
+		CallerNamespace: "krateo-system",
+		CallerName:      "compositions-page-datagrid",
+	}
+	RecordSliceabilityWithLabels(raKeyA, shapeA, true, labelsA)
+
+	raKeyB := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
+		"OTHER-NS", "compositions-panels", 0xC0FFEE, nil))
+	shapeB := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
+		"charts", "krateo-system", "compositions-chart", "{ sum: 0 }")
+	labelsB := SliceabilityLabels{
+		CallerClass:     "apiref",
+		CallerGroup:     "widgets.templates.krateo.io",
+		CallerVersion:   "v1beta1",
+		CallerResource:  "charts",
+		CallerNamespace: "krateo-system",
+		CallerName:      "compositions-chart",
+	}
+	RecordSliceabilityWithLabels(raKeyB, shapeB, false, labelsB)
+
+	// Scrape via the expvar.Func interface — must return []SliceabilityMemoEntry.
+	raw := v.(expvar.Func).Value()
+	snap, ok := raw.([]SliceabilityMemoEntry)
+	if !ok {
+		t.Fatalf("expvar value wrong type: %T (want []SliceabilityMemoEntry)", raw)
+	}
+	if len(snap) == 0 {
+		t.Fatal("snapshot empty after two RecordSliceabilityWithLabels calls")
+	}
+
+	findByName := func(callerName string) *SliceabilityMemoEntry {
+		for i := range snap {
+			if snap[i].CallerName == callerName {
+				return &snap[i]
+			}
+		}
+		return nil
+	}
+
+	gridEntry := findByName("compositions-page-datagrid")
+	if gridEntry == nil {
+		t.Fatalf("compositions-page-datagrid entry missing from snapshot: %+v", snap)
+	}
+	if !gridEntry.Verdict {
+		t.Fatalf("compositions-page-datagrid verdict = %v, want true", gridEntry.Verdict)
+	}
+	if gridEntry.RAKey != raKeyA {
+		t.Fatalf("compositions-page-datagrid raKey = %q, want %q", gridEntry.RAKey, raKeyA)
+	}
+	if gridEntry.SliceShape != shapeA {
+		t.Fatalf("compositions-page-datagrid sliceShape = %q, want %q", gridEntry.SliceShape, shapeA)
+	}
+	if gridEntry.RecordedAtUnixSeconds == 0 {
+		t.Fatalf("compositions-page-datagrid recordedAtUnixSeconds = 0, want non-zero")
+	}
+	// REQ-2 (0.30.210): on INSERT, recordedAt == lastUpdatedAt (same clock
+	// read for both). The consumer cares about monotonicity, not byte-equality.
+	if gridEntry.LastUpdatedAtUnixSeconds != gridEntry.RecordedAtUnixSeconds {
+		t.Fatalf("on insert lastUpdatedAt (%d) should equal recordedAt (%d)",
+			gridEntry.LastUpdatedAtUnixSeconds, gridEntry.RecordedAtUnixSeconds)
+	}
+	if gridEntry.CallerClass != labelsA.CallerClass ||
+		gridEntry.CallerGroup != labelsA.CallerGroup ||
+		gridEntry.CallerVersion != labelsA.CallerVersion ||
+		gridEntry.CallerResource != labelsA.CallerResource ||
+		gridEntry.CallerNamespace != labelsA.CallerNamespace {
+		t.Fatalf("compositions-page-datagrid labels mismatch: got %+v want %+v", gridEntry, labelsA)
+	}
+
+	chartEntry := findByName("compositions-chart")
+	if chartEntry == nil {
+		t.Fatalf("compositions-chart entry missing from snapshot: %+v", snap)
+	}
+	if chartEntry.Verdict {
+		t.Fatalf("compositions-chart verdict = %v, want false", chartEntry.Verdict)
+	}
+	if chartEntry.CallerName != "compositions-chart" || chartEntry.CallerResource != "charts" {
+		t.Fatalf("compositions-chart labels mismatch: %+v", chartEntry)
+	}
+
+	// Refresh-in-place preserves recordedAt (first-freeze semantics) BUT
+	// updates lastUpdatedAt to "now" (REQ-2 — Mode-3 stuck-vs-refreshing
+	// discriminator).
+	firstRecordedAt := gridEntry.RecordedAtUnixSeconds
+	// Bump the simulated clock so a NEW lastUpdatedAt is observable.
+	bumped := firstRecordedAt + 100
+	f := func() int64 { return bumped }
+	prev := nowUnix.Load()
+	nowUnix.Store(&f)
+	t.Cleanup(func() { nowUnix.Store(prev) })
+
+	// Re-record FLIPPING the verdict for the SAME (raKey, shape) — labels arg
+	// here is empty to assert that refresh-in-place preserves the ORIGINAL
+	// labels (does not overwrite them with empty).
+	RecordSliceabilityWithLabels(raKeyA, shapeA, false, SliceabilityLabels{})
+	snap2 := v.(expvar.Func).Value().([]SliceabilityMemoEntry)
+	grid2 := func() *SliceabilityMemoEntry {
+		for i := range snap2 {
+			if snap2[i].CallerName == "compositions-page-datagrid" {
+				return &snap2[i]
+			}
+		}
+		return nil
+	}()
+	if grid2 == nil {
+		t.Fatal("compositions-page-datagrid entry lost after refresh")
+	}
+	if grid2.Verdict {
+		t.Fatalf("verdict refresh did not flip: %+v", grid2)
+	}
+	if grid2.RecordedAtUnixSeconds != firstRecordedAt {
+		t.Fatalf("recordedAt mutated on refresh: was %d now %d",
+			firstRecordedAt, grid2.RecordedAtUnixSeconds)
+	}
+	// REQ-2: lastUpdatedAt tracks last-write, not first-freeze.
+	if grid2.LastUpdatedAtUnixSeconds != bumped {
+		t.Fatalf("lastUpdatedAt did not advance on refresh: got %d, want %d",
+			grid2.LastUpdatedAtUnixSeconds, bumped)
+	}
+	if grid2.LastUpdatedAtUnixSeconds <= grid2.RecordedAtUnixSeconds {
+		t.Fatalf("after refresh lastUpdatedAt (%d) must be > recordedAt (%d)",
+			grid2.LastUpdatedAtUnixSeconds, grid2.RecordedAtUnixSeconds)
+	}
+	if grid2.CallerName != "compositions-page-datagrid" {
+		t.Fatalf("refresh-in-place LOST labels: %+v", grid2)
+	}
+}
+
+// TestRAFullListMemoSnapshotConcurrentWriters (0.30.210) — race coverage for
+// the snapshot reader running concurrently with record() writers. The
+// existing TestRAFullList_ResidentAndMemoRace exercises lookup/record but not
+// the snapshot walk. Run under -race; passes when no race report fires and
+// the snapshot is never observed with a nil entry.
+func TestRAFullListMemoSnapshotConcurrentWriters(t *testing.T) {
+	resetSliceabilityMemoForTest()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 4 writers churning distinct (raKey, shape) pairs.
+	for w := 0; w < 4; w++ {
+		w := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rk := "rakey-" + itoa(w) + "-" + itoa(i%17)
+				sh := SliceShapeHash("apiref", "g", "v", "r", "ns",
+					"name-"+itoa(w)+"-"+itoa(i%13), "{}")
+				RecordSliceabilityWithLabels(rk, sh, (i%2) == 0, SliceabilityLabels{
+					CallerClass:    "apiref",
+					CallerResource: "r",
+					CallerName:     "name-" + itoa(w),
+				})
+			}
+		}()
+	}
+
+	// 2 snapshot readers.
+	for r := 0; r < 2; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snap := SliceabilityMemoSnapshot()
+				for _, e := range snap {
+					// Defensive: an entry's raKey/sliceShape must not be empty
+					// (we never record with empty strings, and the snapshot
+					// must not invent any). Catches an interleaving where the
+					// reader sees a half-initialised entry.
+					if e.RAKey == "" || e.SliceShape == "" {
+						panic("snapshot returned entry with empty raKey/sliceShape: " + e.RAKey + "/" + e.SliceShape)
+					}
+				}
+			}
+		}()
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
 // TestRAFullListServeExpvarPublished (clause-5) asserts the
 // snowplow_ra_full_list_serve expvar is published and reflects a recorded
 // Hit — so the tester can assert the cheap raFullList serve path over the

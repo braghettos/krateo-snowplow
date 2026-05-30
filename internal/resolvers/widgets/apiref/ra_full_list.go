@@ -189,7 +189,19 @@ func raFullListServe(
 	//    `full`, so identity holds by construction — re-encode both to
 	//    canonical JSON to be safe) AND S_go must byte-equal S_ra.
 	verdict := sok && canonicalJSONEqual(sGo, sRA)
-	cache.RecordSliceability(raKey, shape, verdict)
+	// Record the verdict + the caller-CR identity labels so the
+	// snowplow_ra_full_list_memo expvar can describe the entry by its caller
+	// (e.g. compositions-page-datagrid) instead of by the raKey/sliceShape
+	// sha256 hashes alone. The labels are READ-SIDE ONLY (they do not change
+	// the memo key) — see RecordSliceabilityWithLabels.
+	cache.RecordSliceabilityWithLabels(raKey, shape, verdict, cache.SliceabilityLabels{
+		CallerClass:     raFullListCallerClass,
+		CallerGroup:     gvr.Group,
+		CallerVersion:   gvr.Version,
+		CallerResource:  gvr.Resource,
+		CallerNamespace: namespace,
+		CallerName:      name,
+	})
 
 	if !verdict {
 		// NOT cleanly sliceable for this shape — serve the page-keyed S_ra

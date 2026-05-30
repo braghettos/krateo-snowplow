@@ -60,6 +60,17 @@ func registerBindingsByGVRMetrics() {
 		expvar.Publish("snowplow_bindings_by_gvr_delta_skipped_non_typed", expvar.Func(func() any {
 			return BindingsIndexDeltaSkippedNonTyped()
 		}))
+		// 0.30.210 — RAFullList sliceability memo state. Snapshots every
+		// recorded (RA × sliceShape) verdict for operator-side diagnosis of
+		// the RAFullList serve path's three failure modes (boot empty-full
+		// self-heal, prewarm not reaching widget, first-sight byte mismatch).
+		// READ-ONLY: walks the process-local sync.Map at scrape time; the
+		// serve-path lookup/record paths are unchanged on the hot path.
+		// Mechanism-uniform (feedback_no_special_cases): generic over every
+		// (RA × sliceShape) — no widget/cohort/path literal in the publisher.
+		expvar.Publish("snowplow_ra_full_list_memo", expvar.Func(func() any {
+			return SliceabilityMemoSnapshot()
+		}))
 	})
 }
 

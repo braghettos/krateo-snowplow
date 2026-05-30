@@ -24,6 +24,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // sliceExtrasKeys is the set of Extras keys that carry PAGINATION/slice
@@ -208,18 +210,94 @@ func FullListIsEmpty(full map[string]any) bool {
 // verdict is computed on FIRST sight (the byte-verify) and reused after;
 // re-evaluated per new shape + on pod restart (the memo is process-local).
 
+// SliceabilityLabels carry the HUMAN-READABLE caller-CR identity for a memo
+// entry. Captured at record time so the read-side snapshot (used by
+// snowplow_ra_full_list_memo) can describe each entry by its callerNamespace
+// / callerName / callerResource — without those, every entry is a sha256
+// hash and the operator cannot pick out a specific widget's verdict.
+//
+// Mechanism-uniform (feedback_no_special_cases): the labels are GENERIC
+// caller-identity fields populated for EVERY caller, not a per-widget literal.
+// The same struct describes apiref's "compositions-page-datagrid" and any
+// future caller class identically.
+//
+// Optional (zero-value safe): when the labels are unset (e.g. tests calling
+// the legacy RecordSliceability) the snapshot emits empty strings — verdicts
+// are still recorded, just less describable. Production callers MUST pass
+// real labels.
+type SliceabilityLabels struct {
+	// CallerClass mirrors sliceShapeHash's callerClass argument (e.g.
+	// "apiref" / "restactions") — distinguishes serve-path families.
+	CallerClass string
+	// CallerGroup/Version/Resource is the caller CR's GVR (e.g. the apiRef
+	// widget's GVR).
+	CallerGroup    string
+	CallerVersion  string
+	CallerResource string
+	// CallerNamespace/Name is the caller CR's ns/name (e.g. the apiRef
+	// widget's ns/name — what the operator greps for in the snapshot).
+	CallerNamespace string
+	CallerName      string
+}
+
+// sliceabilityMemoEntry is the in-memory value stored in the memo's sync.Map.
+// Pre-0.30.210 this was a bare `bool`; we widened it so the read-side
+// snapshot can describe each entry by raKey + sliceShape + labels +
+// recordedAt. The hot lookup() path still does one sync.Map.Load + one
+// pointer-deref of an immutable struct (no extra locks, no allocations on
+// the read path).
+type sliceabilityMemoEntry struct {
+	verdict bool
+	// RAKey/SliceShape are the SAME strings the caller passed to record() —
+	// kept here only so the snapshot can emit them without a reverse lookup.
+	// Reading them is read-only (immutable post-Store), no mutex needed.
+	raKey      string
+	sliceShape string
+	labels     SliceabilityLabels
+	// recordedAtUnix is the Unix-seconds timestamp captured at first record().
+	// Re-record (refresh in place) does NOT update it — the snapshot field
+	// answers "when was this verdict first frozen", which is what the
+	// operator needs to distinguish "recorded long ago" from "just now".
+	recordedAtUnix int64
+	// lastUpdatedAtUnix is the Unix-seconds timestamp of the MOST RECENT
+	// record() call for this (raKey, sliceShape) — updated on every record()
+	// call (insert AND refresh-in-place). Discriminates Mode-3 stuck-since-boot
+	// (verdict=false, lastUpdated ≈ pod-start) from Mode-3 refreshing-still-
+	// failing (verdict=false, lastUpdated ≈ now) — the two need different
+	// next ships. Architect REQ-2 (0.30.210).
+	lastUpdatedAtUnix int64
+}
+
 // sliceabilityMemo is the process-wide bounded map of
-// hash(RAFullListKey × sliceShape) -> sliceable bool. sync.Map for lock-free
-// Load on the hot serve path; the insertion-order cap is enforced only on the
-// Store-miss path (rare — once per distinct (key, shape)).
+// hash(RAFullListKey × sliceShape) -> *sliceabilityMemoEntry. sync.Map for
+// lock-free Load on the hot serve path; the insertion-order cap is enforced
+// only on the Store-miss path (rare — once per distinct (key, shape)).
 type sliceabilityMemo struct {
-	verdicts sync.Map // string(hash) -> bool
+	verdicts sync.Map // string(hash) -> *sliceabilityMemoEntry
 	count    int64    // approximate entry count (atomic via mu)
 	mu       sync.Mutex
 	cap      int
 }
 
 var raSliceabilityMemo = &sliceabilityMemo{cap: defaultSliceabilityMemoCap}
+
+// nowUnix is the clock used to stamp recordedAtUnix. Indirected via atomic
+// so tests can replace it without a race; production reads time.Now().Unix().
+var nowUnix atomic.Pointer[func() int64]
+
+func init() {
+	def := func() int64 { return time.Now().Unix() }
+	nowUnix.Store(&def)
+}
+
+// currentNowUnix returns the active clock function.
+func currentNowUnix() int64 {
+	f := nowUnix.Load()
+	if f == nil {
+		return time.Now().Unix()
+	}
+	return (*f)()
+}
 
 // defaultSliceabilityMemoCap bounds the sliceability memo. It is small:
 // the distinct (RA × sliceShape) population is O(num_slicing_RAs ×
@@ -270,17 +348,55 @@ func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, 
 	if !ok {
 		return false, false
 	}
-	return v.(bool), true
+	e, ok := v.(*sliceabilityMemoEntry)
+	if !ok || e == nil {
+		return false, false
+	}
+	return e.verdict, true
 }
 
 // record stores the verdict for (RAFullListKey × sliceShape). Idempotent;
 // the bounded cap is enforced on the miss path only — once full, new
 // verdicts are dropped (the caller then re-verifies per /call, which is the
 // fail-safe page-keyed path, never a wrong result).
-func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable bool) {
+//
+// TIMESTAMP SEMANTICS (architect REQ-2, 0.30.210):
+//   - recordedAtUnix:    set on INSERT only, preserved on refresh-in-place.
+//     Answers "when was this verdict first frozen".
+//   - lastUpdatedAtUnix: set on EVERY record() (insert AND refresh-in-place).
+//     Answers "when was the verdict last (re-)written". Discriminates
+//     Mode-3 stuck-since-boot from Mode-3 refreshing-still-failing.
+//
+// Labels and raKey/sliceShape are preserved across refresh-in-place (a
+// refresh-without-labels never overwrites real labels with empty).
+func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable bool, labels SliceabilityLabels) {
 	mk := memoKey(raFullListKey, sliceShape)
-	if _, exists := m.verdicts.Load(mk); exists {
-		m.verdicts.Store(mk, sliceable) // refresh in place; no count change
+	now := currentNowUnix()
+	if prev, exists := m.verdicts.Load(mk); exists {
+		// Refresh in place: build a NEW entry (entries are immutable post-Store)
+		// preserving recordedAt + labels, updating verdict + lastUpdatedAt.
+		pe, _ := prev.(*sliceabilityMemoEntry)
+		if pe != nil {
+			m.verdicts.Store(mk, &sliceabilityMemoEntry{
+				verdict:           sliceable,
+				raKey:             pe.raKey,
+				sliceShape:        pe.sliceShape,
+				labels:            pe.labels,
+				recordedAtUnix:    pe.recordedAtUnix,
+				lastUpdatedAtUnix: now,
+			})
+		} else {
+			// Defensive: a pre-0.30.210 raw bool snuck in somehow — replace it
+			// with a fresh entry. No correctness impact.
+			m.verdicts.Store(mk, &sliceabilityMemoEntry{
+				verdict:           sliceable,
+				raKey:             raFullListKey,
+				sliceShape:        sliceShape,
+				labels:            labels,
+				recordedAtUnix:    now,
+				lastUpdatedAtUnix: now,
+			})
+		}
 		return
 	}
 	m.mu.Lock()
@@ -290,7 +406,14 @@ func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable bo
 	}
 	m.count++
 	m.mu.Unlock()
-	m.verdicts.Store(mk, sliceable)
+	m.verdicts.Store(mk, &sliceabilityMemoEntry{
+		verdict:           sliceable,
+		raKey:             raFullListKey,
+		sliceShape:        sliceShape,
+		labels:            labels,
+		recordedAtUnix:    now,
+		lastUpdatedAtUnix: now,
+	})
 }
 
 // SliceabilityLookup is the package-level lookup against the process memo.
@@ -298,9 +421,97 @@ func SliceabilityLookup(raFullListKey, sliceShape string) (sliceable, known bool
 	return raSliceabilityMemo.lookup(raFullListKey, sliceShape)
 }
 
-// RecordSliceability records a byte-verify verdict in the process memo.
+// RecordSliceability records a byte-verify verdict in the process memo with
+// EMPTY labels. Test/back-compat entry point — production callers SHOULD use
+// RecordSliceabilityWithLabels so the read-side snapshot can describe the
+// entry's caller-CR identity.
 func RecordSliceability(raFullListKey, sliceShape string, sliceable bool) {
-	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable)
+	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, SliceabilityLabels{})
+}
+
+// RecordSliceabilityWithLabels records a byte-verify verdict + the caller-CR
+// identity labels. The labels are READ-SIDE ONLY (the snowplow_ra_full_list_memo
+// expvar snapshot) — they DO NOT participate in the verdict key (memoKey is
+// built from raKey + sliceShape only, byte-identical to pre-0.30.210). So two
+// callers that hash to the SAME sliceShape (an architectural impossibility
+// given sliceShapeHash folds caller ns/name) would share one verdict and the
+// labels of WHICHEVER recorded first; in practice sliceShape is unique per
+// caller-CR so labels are 1:1 with entries.
+func RecordSliceabilityWithLabels(raFullListKey, sliceShape string, sliceable bool, labels SliceabilityLabels) {
+	raSliceabilityMemo.record(raFullListKey, sliceShape, sliceable, labels)
+}
+
+// SliceabilityMemoEntry is the public, snapshot-friendly view of one memo
+// entry. Field names map directly to the snowplow_ra_full_list_memo JSON keys.
+//
+// RecordedAtUnixSeconds / LastUpdatedAtUnixSeconds are deliberately NOT
+// omitempty — operators reading /debug/vars shouldn't have to guess "field
+// not in this build" vs "value zero" (architect REQ-2 callout). Caller
+// labels keep omitempty because zero-label entries (legacy
+// RecordSliceability tests) shouldn't crowd the snapshot.
+type SliceabilityMemoEntry struct {
+	RAKey                    string `json:"raKey"`
+	SliceShape               string `json:"sliceShape"`
+	Verdict                  bool   `json:"verdict"`
+	RecordedAtUnixSeconds    int64  `json:"recordedAtUnixSeconds"`
+	LastUpdatedAtUnixSeconds int64  `json:"lastUpdatedAtUnixSeconds"`
+	CallerClass              string `json:"callerClass,omitempty"`
+	CallerGroup              string `json:"callerGroup,omitempty"`
+	CallerVersion            string `json:"callerVersion,omitempty"`
+	CallerResource           string `json:"callerResource,omitempty"`
+	CallerNamespace          string `json:"callerNamespace,omitempty"`
+	CallerName               string `json:"callerName,omitempty"`
+}
+
+// SliceabilityMemoSnapshot returns a flat list of every recorded entry in the
+// process memo. The walk is sync.Map.Range — concurrent record/lookup callers
+// race-free; the result is a point-in-time view (entries added during the walk
+// may or may not appear). Order is unspecified.
+//
+// Cost: O(entries). The memo is capped at defaultSliceabilityMemoCap (4096)
+// so worst case is a 4096-element slice — trivial at the typical
+// expvar-scrape cadence (10-60s).
+//
+// READ-ONLY: this function never mutates the memo. It is intended for
+// /debug/vars consumption only; nothing on the serve path calls it.
+func SliceabilityMemoSnapshot() []SliceabilityMemoEntry {
+	return raSliceabilityMemo.snapshot()
+}
+
+// snapshot walks the memo's sync.Map and returns a flat slice of public
+// entries.
+func (m *sliceabilityMemo) snapshot() []SliceabilityMemoEntry {
+	// Pre-size from the approximate count under the cap mutex; sync.Map.Range
+	// may add/remove during iteration but the cap is small so over/under by
+	// a few is fine.
+	m.mu.Lock()
+	n := m.count
+	m.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	out := make([]SliceabilityMemoEntry, 0, n)
+	m.verdicts.Range(func(_, v any) bool {
+		e, ok := v.(*sliceabilityMemoEntry)
+		if !ok || e == nil {
+			return true
+		}
+		out = append(out, SliceabilityMemoEntry{
+			RAKey:                    e.raKey,
+			SliceShape:               e.sliceShape,
+			Verdict:                  e.verdict,
+			RecordedAtUnixSeconds:    e.recordedAtUnix,
+			LastUpdatedAtUnixSeconds: e.lastUpdatedAtUnix,
+			CallerClass:              e.labels.CallerClass,
+			CallerGroup:              e.labels.CallerGroup,
+			CallerVersion:            e.labels.CallerVersion,
+			CallerResource:           e.labels.CallerResource,
+			CallerNamespace:          e.labels.CallerNamespace,
+			CallerName:               e.labels.CallerName,
+		})
+		return true
+	})
+	return out
 }
 
 // SliceShapeHash is the exported sliceShape fingerprint (see sliceShapeHash).
