@@ -60,6 +60,25 @@ const (
 	defaultRefresherBaseDelayMS = 500
 	defaultRefresherMaxDelayMS  = 60_000
 
+	// Ship #98 / 0.30.215 — customer-priority cooperative yield. The
+	// refresher worker parks while a customer /call is in flight, mirroring
+	// the prewarm engine's pattern at prewarm_engine.go:295-322. The poll
+	// cadence is the same constant the prewarm engine uses
+	// (defaultEngineYieldPoll = 25ms) so a customer burst clearing fast is
+	// observed promptly without busy-spinning the refresher worker.
+	refresherYieldPoll = 25 * time.Millisecond
+
+	// refresherYieldMaxParked caps how long a single yieldToCustomer() call
+	// can park before it proceeds anyway. Tightened from the architect's
+	// initial 10s to 5s per PM verdict C2: this leaves ~5s headroom under
+	// the 10s convergence SLA for the actual resolve+populate work, so a
+	// sustained customer burst can delay a CRUD-triggered refresh by at
+	// MOST refresherYieldMaxParked + one resolve = 5s + ≤3s ≈ 8s under the
+	// 10s budget. Also acts as a defense-in-depth bound against a buggy
+	// never-decrementing customer-inflight counter (the refresher proceeds
+	// regardless after the cap).
+	refresherYieldMaxParked = 5 * time.Second
+
 	// maxRefreshRequeues caps how many times a single key may be
 	// re-enqueued via AddRateLimited before the refresher gives up on it
 	// (Ship 0.30.113 Part A — the poison-pill bound). This is the standard
@@ -73,6 +92,53 @@ const (
 	// against ANY future deterministic refresh failure.
 	maxRefreshRequeues = 5
 )
+
+// customerInflightHook is a process-global predicate the dispatchers
+// subsystem injects at start-up. The refresher reads it at every
+// processNext to decide whether to yield to a customer /call.
+//
+// Nil-default behaviour: when no hook is set (unit tests, cache-off
+// production) the refresher proceeds without yielding — byte-identical
+// to the pre-Ship-#98 path. The hook is the ONE seam between cache and
+// dispatchers; the cache package cannot import dispatchers (cycle), so
+// the dispatcher subsystem injects its predicate via SetCustomerInflightHook.
+//
+// Concurrency: the load + store run under customerInflightHookMu (a
+// sync.RWMutex). Reads are hot (per yield-poll); writes happen ONCE at
+// process start. The RWMutex serves the contract — never gives the
+// caller a stale pointer mid-flight.
+var (
+	customerInflightHookMu sync.RWMutex
+	customerInflightHook   func() bool
+)
+
+// SetCustomerInflightHook injects the customer-inflight predicate from
+// the dispatchers subsystem. Wired once during main.go's
+// dispatchers.RegisterRefreshHandlers + cache.StartRefresher pair. Safe
+// to call multiple times (the latest wins); production wires it BEFORE
+// StartRefresher so the worker pool sees a populated hook on its first
+// processNext.
+//
+// Passing nil clears the hook (the refresher reverts to never-yield).
+// Tests do this between runs to keep the singleton clean.
+func SetCustomerInflightHook(fn func() bool) {
+	customerInflightHookMu.Lock()
+	customerInflightHook = fn
+	customerInflightHookMu.Unlock()
+}
+
+// customerInFlightLocked reads the current hook under the RWMutex and
+// returns the predicate's result (false when no hook is set). Called by
+// the refresher worker at yield-poll cadence (25ms × N workers).
+func customerInFlightLocked() bool {
+	customerInflightHookMu.RLock()
+	fn := customerInflightHook
+	customerInflightHookMu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	return fn()
+}
 
 // RefreshFunc is the callback the cache package invokes on a refresh.
 // It MUST re-resolve the entry described by inputs and Put the fresh
@@ -118,6 +184,19 @@ type refresher struct {
 	// an exportJwt loopback stage correctly, so the layer-(a) skip-to-TTL
 	// net is obsolete. Layer (b) stays as the general backstop.)
 	refresherSkippedStageError atomic.Uint64
+
+	// Ship #98 / 0.30.215 — customer-priority yield falsifier counter.
+	// yieldedTotal ticks every time a worker spent at least one yield-poll
+	// parked in yieldToCustomer waiting for the customer-inflight signal
+	// to clear. cappedTotal ticks when yieldToCustomer hit
+	// refresherYieldMaxParked and proceeded anyway (the defense-in-depth
+	// bound). These two counters are the post-deploy mechanism-gate
+	// evidence: if yieldedTotal stays 0 under burst the hook is broken; if
+	// cappedTotal climbs the customer-inflight signal is leaking
+	// (never-decrementing counter or a true sustained-burst pathological
+	// case).
+	yieldedTotal atomic.Uint64
+	cappedTotal  atomic.Uint64
 
 	startedOnce sync.Once
 	stopOnce    sync.Once
@@ -289,6 +368,54 @@ func EnqueueRefresh(l1Key string) {
 	refresherSingleton().enqueue(l1Key)
 }
 
+// yieldToCustomer parks the worker while any customer /call is in flight,
+// re-checking every refresherYieldPoll. Returns promptly once no customer
+// call is in flight, OR after refresherYieldMaxParked (defense-in-depth
+// cap so a buggy counter cannot stall refresh forever), OR on ctx cancel.
+//
+// Mirrors the prewarm engine's cooperative yield at
+// prewarm_engine.go:295-322 (Ship #98 prior art). The yield is BEFORE the
+// handler call; processOne / completedTotal++ / Forget(key) all happen
+// AFTER the yield releases. Cache settle-time after a CRUD informer event
+// is bounded by refresherYieldMaxParked + the actual resolve time (see
+// AC-98.12).
+//
+// Cooperative customer-priority discipline (feedback_customer_priority_over_refresher):
+// the refresher does NOT preempt customer /call work; it steps aside for
+// the duration of the burst. The customer-tax surface is one
+// atomic-int64 Load per yield tick — negligible (4 workers × 40 Hz = 160
+// reads/s steady-state; no cache-line bouncing on the read side because
+// each worker reads on its own poll cycle without serializing).
+func (r *refresher) yieldToCustomer(ctx context.Context) {
+	if !customerInFlightLocked() {
+		return
+	}
+	t := time.NewTicker(refresherYieldPoll)
+	defer t.Stop()
+	cap := time.NewTimer(refresherYieldMaxParked)
+	defer cap.Stop()
+	parked := false
+	for customerInFlightLocked() {
+		if !parked {
+			// First park — count it ONCE per yield call (mirrors the
+			// prewarm engine's per-call yieldTotal semantics).
+			r.yieldedTotal.Add(1)
+			parked = true
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-cap.C:
+			// Max-parked cap fired — proceed regardless. Counts toward
+			// cappedTotal so a leaking customer-inflight counter is
+			// observable in the falsifier suite + post-deploy ledger.
+			r.cappedTotal.Add(1)
+			return
+		case <-t.C:
+		}
+	}
+}
+
 // processNext pulls one key, processes it, and reports whether the
 // worker loop should continue (false once the queue has ShutDown).
 //
@@ -303,12 +430,25 @@ func EnqueueRefresh(l1Key string) {
 //
 // Done(key) is always called (deferred) so the queue can release the
 // key for re-add; Forget/AddRateLimited only touch the rate limiter.
+//
+// Ship #98 / 0.30.215 — CUSTOMER PRIORITY YIELD. Before invoking the
+// handler we cooperatively yield to any in-flight customer /call. The
+// yield is bounded by refresherYieldMaxParked (5s) so a never-decrementing
+// inflight counter cannot stall refresh forever. AC-98.12 (CRUD-to-
+// completed Δt ≤ 10s under quiescent load) is the convergence falsifier.
 func (r *refresher) processNext(ctx context.Context) bool {
 	key, shutdown := r.queue.Get()
 	if shutdown {
 		return false
 	}
 	defer r.queue.Done(key)
+
+	// Customer-priority cooperative yield (Ship #98). Mirrors prewarm
+	// engine's yield-before-scope pattern (prewarm_engine.go:275). The
+	// yield reads the dispatcher-injected customer-inflight hook; with
+	// no hook (unit tests, cache-off) it is a single zero-cost read +
+	// immediate return.
+	r.yieldToCustomer(ctx)
 
 	if err := r.processOne(ctx, key); err != nil {
 		r.failedTotal.Add(1)
@@ -399,6 +539,8 @@ type refresherStats struct {
 	skippedNoEntry    uint64
 	skippedNoHandler  uint64
 	skippedStageError uint64 // Ship 0.30.120 layer (b)
+	yielded           uint64 // Ship #98 — customer-priority yields
+	capped            uint64 // Ship #98 — max-parked cap hits
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -415,6 +557,8 @@ func refresherStatsSnapshot() refresherStats {
 		skippedNoEntry:    r.skippedNoEntryTotal.Load(),
 		skippedNoHandler:  r.skippedNoHandler.Load(),
 		skippedStageError: r.refresherSkippedStageError.Load(),
+		yielded:           r.yieldedTotal.Load(),
+		capped:            r.cappedTotal.Load(),
 	}
 }
 
@@ -444,6 +588,12 @@ func resetRefresherForTest() {
 	}
 	refresherInstance = nil
 	refresherInit = sync.Once{}
+	// Ship #98 — also reset the customer-inflight hook so a previous
+	// test's hook does not leak into the next refresher singleton's
+	// yield decisions.
+	customerInflightHookMu.Lock()
+	customerInflightHook = nil
+	customerInflightHookMu.Unlock()
 }
 
 // ResetRefresherForTest is the exported variant of resetRefresherForTest

@@ -99,6 +99,21 @@ func registerRefresherMetrics() {
 			}
 			return r.queue.Len()
 		}))
+		// Ship #98 / 0.30.215 — customer-priority yield observability.
+		// _yielded_total ticks every time a worker spent at least one
+		// yield-poll parked because a customer /call was in flight.
+		// _capped_total ticks every time refresherYieldMaxParked fired —
+		// proceeded-anyway count. Both are POST-DEPLOY falsifier evidence
+		// (AC-98.3, AC-98.8): _yielded_total MUST be > 0 under a customer
+		// burst (if 0 the hook is broken); _capped_total MUST stay near 0
+		// (if it climbs steadily the customer-inflight counter is leaking
+		// or a sustained-pressure pathological case is unfolding).
+		expvar.Publish("snowplow_refresher_yielded_total", expvar.Func(func() any {
+			return refresherStatsSnapshot().yielded
+		}))
+		expvar.Publish("snowplow_refresher_capped_total", expvar.Func(func() any {
+			return refresherStatsSnapshot().capped
+		}))
 	})
 }
 

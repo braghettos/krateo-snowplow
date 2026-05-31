@@ -293,6 +293,17 @@ func main() {
 					// no live per-user token; the widget resolver needs an
 					// apiserver client-config on the context.
 					dispatchers.RegisterRefreshHandlers(rc)
+					// Ship #98 / 0.30.215 — wire the customer-priority
+					// yield hook BEFORE StartRefresher so the worker pool
+					// sees a populated hook on its first processNext.
+					// Mirrors the prewarm engine's customer-inflight signal
+					// (prewarm_engine.go:88-105) — one atomic-int64 read per
+					// refresher yield-poll tick. Cache-off is a no-op
+					// (StartRefresher returns early). The hook is the ONE
+					// seam between cache and dispatchers; cache cannot
+					// import dispatchers (cycle), so dispatchers injects
+					// its predicate via cache.SetCustomerInflightHook.
+					cache.SetCustomerInflightHook(dispatchers.CustomerInFlight)
 					cache.StartRefresher(cacheCtx)
 					// Ship #91 / 0.30.211 — Lever C async invalidator worker.
 					// Bounded queue, drop-on-full. Receives raKey enqueues

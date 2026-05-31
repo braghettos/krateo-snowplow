@@ -104,6 +104,19 @@ func customerInFlight() bool {
 	return customerInFlightCount.Load() > 0
 }
 
+// CustomerInFlight is the exported predicate the refresher subsystem
+// injects via cache.SetCustomerInflightHook (Ship #98 / 0.30.215). It
+// shares the same atomic counter as the prewarm engine's yield — a
+// customer /call's ServeHTTP increment/decrement bracket
+// (restactions.go:77, widgets.go:62) is now observed by BOTH the prewarm
+// engine (boot re-seed scopes) AND the steady-state L1 refresher worker
+// pool. One atomic-int64 Load per refresher yield tick (4 workers × 40
+// Hz = 160 reads/s steady-state) — negligible cost, no cache-line
+// contention on the read side.
+func CustomerInFlight() bool {
+	return customerInFlight()
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // prewarmScope — the unit of engine work. Declares what to (re-)walk and
 // the cohort source for the seed. Ship 1 uses only scopeKindBoot; Ship 2
