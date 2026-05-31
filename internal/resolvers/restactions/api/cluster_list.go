@@ -75,14 +75,28 @@ const shapeCheckSlowThreshold = 10 * time.Millisecond
 // (cohort-memo reuse + skip-on-unchanged populate + customer-priority yield).
 // Not an env flag (single-flag direction: end state is one CACHE_ENABLED).
 //
-// Ship 0.30.212 — the package-level clusterListCollapseEnabled var (default
-// false, NEVER assigned by production) so tests can flip it to exercise the
-// post-gate Put + dep-record path that proves F-4 freshness wiring for the
-// cluster-list collapse cell. Test-only override is via the
-// withClusterListCollapseEnabledForTest helper in cluster_list_dep_record_test.go.
-// Do NOT restore `const` — that would break the test by making the var
-// non-addressable; the doc above intentionally reflects the var declaration.
-var clusterListCollapseEnabled = false
+// Ship 0.30.216 — Path 3 Phase 2'. The cluster-list collapse mechanism
+// (held INERT since 0.30.212 and reverted in S.2 / 0.30.213 for wall-clock
+// regression) is activated in lockstep with portal-chart 0.30.176, which
+// tightens the per-stage filter on compositions-panels + blueprints-panels
+// to an SPA-minimal projection (no `.spec.*` fields). Empirical post-jq
+// envelope is 10.9 MiB (2.3× under 25 MB cap) per dev Phase 0 probe
+// 2026-05-31. This avoids the S.2 failure mode: S.2 flipped this flag
+// against the loose `del(managedFields)` per-stage filter → 56.9 MiB
+// post-trim envelope → in-process scan cost dominated per-call latency.
+// Phase 1' deployed portal-chart 0.30.176 FIRST against this flag still
+// OFF (byte-equivalent on SPA-rendered fields), so the YAML-tight state
+// is already live; this flag flip activates cluster-LIST collapse on the
+// already-tight per-stage filter.
+//
+// Test-only override stays available via the
+// withClusterListCollapseEnabledForTest helper in
+// cluster_list_dep_record_test.go (the helper preserves the prior var
+// value across nested invocations).
+//
+// Per project_single_cache_flag_direction: NOT an env flag (end state is
+// one CACHE_ENABLED). The package-level var stays.
+var clusterListCollapseEnabled = true
 
 // attemptClusterListCollapse decides whether the per-stage iterator
 // fan-out can be collapsed to a single cluster-scope LIST and, when so,

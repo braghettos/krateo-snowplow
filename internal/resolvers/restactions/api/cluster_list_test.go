@@ -414,16 +414,45 @@ func TestBuildClusterListCall_PathAndVerb(t *testing.T) {
 
 // ---------- attemptClusterListCollapse — structural gates ----------
 
-// TestAttemptClusterListCollapse_InertGateDenies — Ship S.1-re holds the
-// cluster-list collapse INERT behind the compile-time
-// clusterListCollapseEnabled const (false). The FIRST statement of
-// attemptClusterListCollapse returns deny-gate 1 and NO later gate runs,
-// so the helper is behaviour-identical to healthy 0.30.204. Even with a
-// fully-eligible-looking stage (iterator present), the inert gate must
-// deny at gate 1 before the cache-off / snapshot / GVR / RBAC gates.
-// When S.2 flips the const true this test should be re-pointed at the
-// gate-2 (cache-off) contract.
-func TestAttemptClusterListCollapse_InertGateDenies(t *testing.T) {
+// TestAttemptClusterListCollapse_FlagOnCacheOffDenies — Path 3 / 0.30.216
+// flips clusterListCollapseEnabled to true. Gate 1 (the inert gate) no
+// longer denies; the next sequencing gate is gate 2 (cache-off + Servable).
+// With `cache.SetGlobal(nil)` the global is nil, so gate 2 denies. This
+// pins the new ordering: gate 1 is open (flag on), the helper falls through
+// to gate 2 and denies because no cache global is published.
+//
+// Prior contract (S.1-re INERT, gate-1 deny) is preserved via
+// withClusterListCollapseEnabledForTest in cluster_list_dep_record_test.go
+// (used by the dep-record tests that need to exercise the post-gate Put
+// path) and via the explicit test below.
+func TestAttemptClusterListCollapse_FlagOnCacheOffDenies(t *testing.T) {
+	cache.SetGlobal(nil)
+	apiCall := &templates.API{
+		Name:      "compositions-list",
+		Path:      `${ "/apis/g/v/namespaces/" + .ns + "/r" }`,
+		DependsOn: &templates.Dependency{Iterator: ptr.To(`["a","b"]`)},
+	}
+	tmp, ok, gate := attemptClusterListCollapse(
+		context.Background(), clusterListLogger(t), apiCall,
+		map[string]any{}, endpointStub(), nil, true)
+	if ok || tmp != nil {
+		t.Fatalf("cache-off must deny; got ok=%v tmp=%v", ok, tmp)
+	}
+	if gate != 2 {
+		t.Fatalf("cache-off must deny at gate 2 (cache-off + Servable); got gate=%d", gate)
+	}
+}
+
+// TestAttemptClusterListCollapse_InertGateDeniesUnderTestOverride — exercises
+// the prior S.1-re inert-gate contract via the test-only override helper.
+// This preserves the regression coverage that a flag-off state denies at
+// gate 1 BEFORE the cache-off / snapshot / GVR / RBAC gates run, in case
+// a future ship temporarily re-flips the var to false.
+func TestAttemptClusterListCollapse_InertGateDeniesUnderTestOverride(t *testing.T) {
+	prev := clusterListCollapseEnabled
+	clusterListCollapseEnabled = false
+	t.Cleanup(func() { clusterListCollapseEnabled = prev })
+
 	cache.SetGlobal(nil)
 	apiCall := &templates.API{
 		Name:      "compositions-list",
