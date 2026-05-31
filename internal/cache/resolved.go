@@ -249,6 +249,47 @@ type ResolvedEntry struct {
 	// before Put; Put reads it under mu to decide resident vs transient
 	// accounting.
 	Pinned bool
+
+	// lastRefreshedAt — Ship S.2 / 0.30.213. UnixNano timestamp of the
+	// most recent refresher-driven re-resolve completion (NOT the original
+	// Put). Read/written atomically so the refresher's pre-dispatch
+	// byte-budget gate can rate-limit big cluster-LIST cells without
+	// acquiring the L1 mu. Zero on initial Put; the refresher stamps it
+	// post-Put via MarkRefreshedNow. The refresh-bound gate compares
+	// time.Since(LastRefreshedAt()) against defaultClusterListMinRefreshInterval
+	// for entries whose len(RawJSON) > defaultClusterListRefreshByteBudget.
+	//
+	// Why atomic (not mu-protected): the gate read happens inside the
+	// refresher worker's processOne BEFORE the L1 store dispatch; no
+	// store mu is held at that point. atomic.Int64 lets the read be
+	// lock-free and contention-free.
+	lastRefreshedAt atomic.Int64
+}
+
+// LastRefreshedAt returns the UnixNano timestamp of the most recent
+// refresher-driven re-resolve completion, or zero when the entry has
+// never been refreshed. Lock-free; safe to call from any goroutine.
+// Ship S.2 / 0.30.213.
+func (e *ResolvedEntry) LastRefreshedAt() time.Time {
+	if e == nil {
+		return time.Time{}
+	}
+	v := e.lastRefreshedAt.Load()
+	if v == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, v)
+}
+
+// MarkRefreshedNow stamps the entry's lastRefreshedAt to time.Now().
+// Lock-free; called by the refresher AFTER a successful re-resolve so
+// the next refresh cycle's byte-budget gate can rate-limit. Idempotent;
+// callers may stamp repeatedly. Ship S.2 / 0.30.213.
+func (e *ResolvedEntry) MarkRefreshedNow() {
+	if e == nil {
+		return
+	}
+	e.lastRefreshedAt.Store(time.Now().UnixNano())
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set

@@ -408,8 +408,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// gate. The old `ptr.Deref(apiCall.ClusterListWhenAllowed, false)`
 		// gate-attempt signal is gone with the field.
 		stageTiming.ClusterListAttempted = true
+		// Ship S.2 / 0.30.213 — thread the RA's sibling stages into
+		// attemptClusterListCollapse so the UAF-derivation fallback can
+		// inspect a sibling stage's userAccessFilter when the
+		// iterator-element derivation path fails (the compositions-panels
+		// shape: bare-namespace-string iterator). opts.Items is the full
+		// RA stage slice in declaration order; the helper filters out the
+		// current stage via identity check.
 		if newTmp, useClusterList, denyGate := attemptClusterListCollapse(
-			ctx, log, apiCall, dict, ep, apistageStore, apistageEnabled); useClusterList {
+			ctx, log, apiCall, opts.Items, dict, ep, apistageStore, apistageEnabled); useClusterList {
 			tmp = newTmp
 			stageTiming.ClusterListUsed = true
 			stageTiming.ClusterListDenyGate = denyGate // 0 on success

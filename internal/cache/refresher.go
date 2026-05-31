@@ -54,6 +54,40 @@ const (
 	envRefresherBaseDelayMS = "RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS"
 	envRefresherMaxDelayMS  = "RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS"
 
+	// Ship S.2 / 0.30.213 — cluster-LIST refresh-bound (AC-S2.refresh-bound,
+	// design §7.2). Apistage entries whose RawJSON exceeds the byte budget
+	// (i.e. the cluster-LIST collapse cells) are rate-limited to at most
+	// one refresh per defaultClusterListMinRefreshInterval regardless of
+	// informer-event storm intensity. The workqueue dedup is the in-burst
+	// safety net; this is the steady-state amplification gate.
+	//
+	// Per project_single_cache_flag_direction: these are CODE-SIDE constants
+	// (NOT chart-exposed, NOT operator-visible). The env-var override paths
+	// below exist exclusively for SRE bench/diagnostics — they MUST NOT be
+	// surfaced in chart/values.yaml/configmap. End-state remains one
+	// customer-visible flag: CACHE_ENABLED.
+	envClusterListRefreshByteBudget   = "CLUSTER_LIST_REFRESH_BYTE_BUDGET"
+	envClusterListMinRefreshIntervalS = "CLUSTER_LIST_MIN_REFRESH_INTERVAL_S"
+
+	// defaultClusterListRefreshByteBudget — set from the empirical envelope
+	// size captured on the 50K production cluster per PM Condition 1
+	// (docs/ship-s2-byte-budget-probe-2026-05-31.md):
+	//   - empirical worst-case = 96,636,785 bytes (~92.2 MiB), 33,758
+	//     panels items, GVR widgets.templates.krateo.io/v1beta1/panels.
+	//   - PM formula: min(empirical × 0.75, 100 MiB) = 72,477,588 bytes.
+	//   - Rounded to clean Go literal: 72 MiB = 75,497,472 bytes.
+	//   - Per-NS apistage entries (the FALSE-POSITIVE concern) are ~2 MB,
+	//     leaving ~35-50× separation from the gate threshold.
+	// Per memory feedback_capacity_caps_empirical_per_entry_cost.
+	defaultClusterListRefreshByteBudget = 72 * 1024 * 1024 // 72 MiB
+
+	// defaultClusterListMinRefreshInterval — 30s rate-limit window.
+	// Burst dedup is the workqueue's job; this gate addresses the
+	// steady-state amplification pattern Phase B 0.30.185 HARD-REVERT'd
+	// (5.9× wall-clock regression from a new populate layer × refresher
+	// cycles × entry-count).
+	defaultClusterListMinRefreshInterval = 30 * time.Second
+
 	defaultRefresherParallelism = 4
 	// Exponential-failure backoff: first retry after baseDelay, doubling
 	// each requeue, capped at maxDelay. 500ms -> 1s -> 2s -> ... -> 60s.
@@ -118,6 +152,17 @@ type refresher struct {
 	// an exportJwt loopback stage correctly, so the layer-(a) skip-to-TTL
 	// net is obsolete. Layer (b) stays as the general backstop.)
 	refresherSkippedStageError atomic.Uint64
+
+	// Ship S.2 / 0.30.213 — cluster-LIST refresh-bound counter.
+	// refresherSkippedClusterListBudget counts apistage refreshes the
+	// pre-dispatch byte-budget gate declined because the entry exceeds
+	// defaultClusterListRefreshByteBudget AND it was refreshed less than
+	// defaultClusterListMinRefreshInterval ago. The key is re-enqueued
+	// with a fixed delay so it fires once the rate-limit window opens
+	// (not exponential backoff — this is steady-state rate-limiting, not
+	// failure backoff). Mitigates the Phase B 0.30.185 amplification
+	// regression class for the cluster-LIST collapse cells.
+	refresherSkippedClusterListBudget atomic.Uint64
 
 	startedOnce sync.Once
 	stopOnce    sync.Once
@@ -344,6 +389,31 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	return true
 }
 
+// clusterListRefreshByteBudget returns the effective byte budget at
+// which the refresher rate-limits apistage entries' re-dispatch. Reads
+// the SRE-only env override (CLUSTER_LIST_REFRESH_BYTE_BUDGET, int
+// bytes) if set; otherwise falls back to the code-side constant
+// defaultClusterListRefreshByteBudget. NOT a chart-exposed knob.
+// Ship S.2 / 0.30.213.
+func clusterListRefreshByteBudget() int64 {
+	return int64FromEnv(envClusterListRefreshByteBudget, defaultClusterListRefreshByteBudget)
+}
+
+// clusterListMinRefreshInterval returns the effective min interval
+// between two refreshes of the same big apistage entry. Reads the
+// SRE-only env override (CLUSTER_LIST_MIN_REFRESH_INTERVAL_S, int
+// seconds) if set; otherwise falls back to the code-side constant
+// defaultClusterListMinRefreshInterval. NOT a chart-exposed knob.
+// Ship S.2 / 0.30.213.
+func clusterListMinRefreshInterval() time.Duration {
+	s := int64FromEnv(envClusterListMinRefreshIntervalS,
+		int64(defaultClusterListMinRefreshInterval/time.Second))
+	if s <= 0 {
+		return defaultClusterListMinRefreshInterval
+	}
+	return time.Duration(s) * time.Second
+}
+
 // processOne handles a single refresh: load the entry from L1, dispatch
 // the registered handler for its kind. Returns the handler's error
 // (drives the requeue decision). A missing entry / missing handler /
@@ -369,6 +439,40 @@ func (r *refresher) processOne(ctx context.Context, key string) error {
 		r.skippedNoHandler.Add(1)
 		return nil
 	}
+
+	// Ship S.2 / 0.30.213 — cluster-LIST refresh-bound (AC-S2.refresh-bound,
+	// design §7.2). Rate-limit re-dispatch on big apistage entries (the
+	// cluster-LIST collapse cells, empirical 92 MiB envelope at 50K
+	// production scale — docs/ship-s2-byte-budget-probe-2026-05-31.md).
+	// Workqueue dedup handles in-burst storms; this gate addresses the
+	// steady-state amplification pattern Phase B 0.30.185 HARD-REVERT'd.
+	//
+	// Predicate: apistage class + envelope > defaultClusterListRefreshByteBudget
+	// (72 MiB) + last refresh < defaultClusterListMinRefreshInterval (30s) ago.
+	// On a hit: bump skip counter + re-enqueue with FIXED delay
+	// (window-remaining), NOT exponential backoff — this is rate-limiting,
+	// not failure backoff.
+	if entry.Inputs.CacheEntryClass == CacheEntryClassApistage {
+		budget := clusterListRefreshByteBudget()
+		if budget > 0 && int64(len(entry.RawJSON)) > budget {
+			minInterval := clusterListMinRefreshInterval()
+			last := entry.LastRefreshedAt()
+			if !last.IsZero() {
+				since := time.Since(last)
+				if since < minInterval {
+					r.refresherSkippedClusterListBudget.Add(1)
+					// Re-enqueue with the remaining window so the gate
+					// re-evaluates exactly when the rate-limit opens.
+					// Forget() clears any prior failure-backoff state so
+					// AddAfter's delay is honoured verbatim.
+					r.queue.Forget(key)
+					r.queue.AddAfter(key, minInterval-since)
+					return nil
+				}
+			}
+		}
+	}
+
 	r.handlersMu.RLock()
 	fn := r.handlers[entry.Inputs.CacheEntryClass]
 	r.handlersMu.RUnlock()
@@ -386,19 +490,30 @@ func (r *refresher) processOne(ctx context.Context, key string) error {
 		)
 		return err
 	}
+	// Ship S.2 / 0.30.213 — stamp the entry's lastRefreshedAt so the
+	// next refresh cycle can apply the byte-budget gate above. The
+	// re-resolve handler Put'd a fresh entry over the SAME key, so we
+	// must re-load to mark the NEW *ResolvedEntry (the captured `entry`
+	// pointer above may be the prior, now-replaced entry). A miss here
+	// is benign — the entry was evicted between handler success and
+	// re-Get; the next refresh starts clean.
+	if fresh, freshOK := c.Get(key); freshOK && fresh != nil {
+		fresh.MarkRefreshedNow()
+	}
 	return nil
 }
 
 // refresherStats is the read-only snapshot the summary log consumes.
 type refresherStats struct {
-	enqueued          uint64
-	completed         uint64
-	failed            uint64
-	retried           uint64
-	dropped           uint64
-	skippedNoEntry    uint64
-	skippedNoHandler  uint64
-	skippedStageError uint64 // Ship 0.30.120 layer (b)
+	enqueued                 uint64
+	completed                uint64
+	failed                   uint64
+	retried                  uint64
+	dropped                  uint64
+	skippedNoEntry           uint64
+	skippedNoHandler         uint64
+	skippedStageError        uint64 // Ship 0.30.120 layer (b)
+	skippedClusterListBudget uint64 // Ship S.2 / 0.30.213
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -407,14 +522,15 @@ func refresherStatsSnapshot() refresherStats {
 		return refresherStats{}
 	}
 	return refresherStats{
-		enqueued:          r.enqueueTotal.Load(),
-		completed:         r.completedTotal.Load(),
-		failed:            r.failedTotal.Load(),
-		retried:           r.retriedTotal.Load(),
-		dropped:           r.droppedTotal.Load(),
-		skippedNoEntry:    r.skippedNoEntryTotal.Load(),
-		skippedNoHandler:  r.skippedNoHandler.Load(),
-		skippedStageError: r.refresherSkippedStageError.Load(),
+		enqueued:                 r.enqueueTotal.Load(),
+		completed:                r.completedTotal.Load(),
+		failed:                   r.failedTotal.Load(),
+		retried:                  r.retriedTotal.Load(),
+		dropped:                  r.droppedTotal.Load(),
+		skippedNoEntry:           r.skippedNoEntryTotal.Load(),
+		skippedNoHandler:         r.skippedNoHandler.Load(),
+		skippedStageError:        r.refresherSkippedStageError.Load(),
+		skippedClusterListBudget: r.refresherSkippedClusterListBudget.Load(),
 	}
 }
 

@@ -82,7 +82,18 @@ const shapeCheckSlowThreshold = 10 * time.Millisecond
 // withClusterListCollapseEnabledForTest helper in cluster_list_dep_record_test.go.
 // Do NOT restore `const` — that would break the test by making the var
 // non-addressable; the doc above intentionally reflects the var declaration.
-var clusterListCollapseEnabled = false
+//
+// Ship S.2 / 0.30.213 — FLIPPED TRUE. The refresher-decoupling landed:
+// per-cohort memo reuse + cluster-LIST refresh-bound gate (refresher.go's
+// defaultClusterListRefreshByteBudget / defaultClusterListMinRefreshInterval)
+// + UAF-derivation second path for the compositions-panels shape (see
+// deriveTargetGVRForClusterListFromUAFStage below). The package-level
+// `var` shape is preserved so test-injection (withClusterListCollapseEnabledForTest)
+// continues to work, and the rollback path (design §9.4) is a single-line
+// flip-back to false in a 0.30.214 commit. Per memory:
+// feedback_no_park_broken_behind_flag — if AC-S2 falsifiers fail, the
+// defect is reverted, NOT parked behind a default-off flag.
+var clusterListCollapseEnabled = true
 
 // attemptClusterListCollapse decides whether the per-stage iterator
 // fan-out can be collapsed to a single cluster-scope LIST and, when so,
@@ -135,10 +146,19 @@ var clusterListCollapseEnabled = false
 // Put under the identity-free apistage key → return the cluster-scope
 // call slice. On any defensive failure the helper records the matching
 // fall-through counter and returns useClusterList=false.
+// Ship S.2 / 0.30.213 — siblings is the slice of sibling stages from the
+// owning RESTAction (the resolver's apiMap values, in declaration order)
+// — used by the UAF-derivation fallback path so we can find a sibling
+// stage whose userAccessFilter.resource matches the iterator's path
+// template. Nil/empty siblings disables the fallback (the helper behaves
+// identically to pre-S.2, only the iterator-element derivation path runs).
+// Callers (resolve.go) thread the full apiMap values; tests can pass nil
+// for the iterator-element-only path.
 func attemptClusterListCollapse(
 	ctx context.Context,
 	log *slog.Logger,
 	apiCall *templates.API,
+	siblings []*templates.API,
 	dict map[string]any,
 	ep endpoints.Endpoint,
 	apistageStore *cache.ResolvedCacheStore,
@@ -188,7 +208,31 @@ func attemptClusterListCollapse(
 	}
 
 	// Gate 4: derive the target GVR from the first iterator element.
+	// Ship S.2 / 0.30.213 — TWO derivation paths, evaluated in order:
+	//   (a) deriveTargetGVRForClusterList — the original 0.30.152 path
+	//       that resolves the iterator's path template against the FIRST
+	//       iterator element. Succeeds when the element carries enough
+	//       fields to fully substitute the template (e.g. an object with
+	//       {"ns": "...", "plural": "..."}).
+	//   (b) deriveTargetGVRForClusterListFromUAFStage — the S.2
+	//       SECOND derivation path: when (a) returns false because the
+	//       iterator element is a BARE namespace string (the shape
+	//       compositions-panels' UAF-driven `namespaces` stage emits via
+	//       `[.namespaces.items[] | .metadata.name]`), this fallback
+	//       reads from the RA spec ONLY (the stage's path template + a
+	//       sibling stage's userAccessFilter resource) to derive the
+	//       (group, resource) tuple without resolving the iterator. This
+	//       is the load-bearing piece that makes compositions-panels
+	//       qualify (PM gate question #1 audit).
+	//
+	// On (b)'s success the derived GVR is used by Gate 5 (RBAC permit)
+	// + the un-gated dispatch verbatim — no other code path differs.
+	// Per memory feedback_no_special_cases: helper is data-driven from
+	// the RA spec, no hardcoded path/resource/user allowlist.
 	gvr, derivedOK := deriveTargetGVRForClusterList(ctx, log, apiCall, dict)
+	if !derivedOK {
+		gvr, derivedOK = deriveTargetGVRForClusterListFromUAFStage(ctx, log, apiCall, siblings)
+	}
 	if !derivedOK {
 		log.Debug("cluster_list.gate_deny.gvr_derivation_failed",
 			slog.String("subsystem", "cache"),
@@ -364,6 +408,239 @@ func attemptClusterListCollapse(
 		slog.Int64("defensive_put_ms", defensivePutMs),
 	)
 	return []httpcall.RequestOptions{clusterCall}, true, 0
+}
+
+// deriveTargetGVRForClusterListFromUAFStage is the Ship S.2 / 0.30.213
+// SECOND derivation path (~80 LOC). The original
+// deriveTargetGVRForClusterList resolves the iterator's path template
+// against the FIRST iterator element; that path FAILS when the iterator
+// element is a BARE namespace string (e.g. the compositions-panels RA's
+// stage 2, whose `dependsOn.iterator = .namespaces` enumerates a stage 1
+// output of `[.namespaces.items[] | .metadata.name]` — bare strings).
+//
+// This fallback derives the (group, version, resource) tuple WITHOUT
+// resolving the iterator: it parses the path template's STATIC literal
+// segments (the prefix before any `${...}` substitution and the suffix
+// after the last substitution), then cross-checks against a sibling
+// stage's userAccessFilter to confirm intent.
+//
+// Wire shape of the compositions-panels iterator-over-namespaces stage:
+//
+//	path: ${ "/apis/widgets.templates.krateo.io/v1beta1/namespaces/" + (.) + "/panels" }
+//
+// Strategy:
+//
+//  1. Extract the literal head from the path template — strip outer
+//     `${ ... }`, walk the JQ string-concat expression to find the
+//     leading string literal that contains the apiserver prefix.
+//  2. Look for the `namespaces/` segment in that literal — it marks a
+//     namespace-scoped path (cluster-scope iterators do not collapse).
+//  3. Find the resource segment in the literal SUFFIX after the
+//     namespace placeholder (the trailing literal in the JQ expr).
+//  4. Validate: a SIBLING stage carries a UAF with `verb=list` AND
+//     `resource=<our extracted resource>` AND `group=<our extracted
+//     group OR empty>`. If multiple siblings match identically, we pick
+//     the FIRST in declaration order — the data is unambiguous. If two
+//     siblings match the same resource on DIFFERENT groups, FAIL-CLOSED
+//     (return false) — ambiguity must not silently mis-target the
+//     cluster-LIST cell to a wrong GVR.
+//
+// Returns (gvr, false) on ANY failure (no UAF sibling, ambiguous match,
+// no namespaces segment, no extractable resource). Per memory
+// feedback_no_special_cases: no hardcoded GVR/resource allowlist; the
+// helper reads only from RA spec and template literals.
+//
+// Ship S.2 / 0.30.213 — load-bearing NEW CODE (R7 in design risk
+// register). Adversarial two-siblings tie-break: identical
+// (verb,resource,group) wins on declaration order; non-identical group
+// on identical resource fails-closed.
+func deriveTargetGVRForClusterListFromUAFStage(
+	ctx context.Context,
+	log *slog.Logger,
+	apiCall *templates.API,
+	siblings []*templates.API,
+) (schema.GroupVersionResource, bool) {
+	_ = ctx
+	if apiCall == nil || apiCall.Path == "" {
+		return schema.GroupVersionResource{}, false
+	}
+	if len(siblings) == 0 {
+		return schema.GroupVersionResource{}, false
+	}
+
+	// Step 1+2+3: extract (group, version, resource) from the path
+	// template's literal segments. The template shape is
+	//   ${ "<literal-head>" + <expr> + "<literal-tail>" }
+	// We just need to find the apiserver prefix + a `namespaces/`
+	// marker + the resource segment. parsePathTemplateLiterals walks
+	// every string literal in the template and joins them with a
+	// single space (the JQ substitution sites become whitespace),
+	// then we apply the same path-shape recogniser ParseAPIServerPathToGVR
+	// uses on a fully-resolved path. The whitespace-as-placeholder
+	// trick works because the apiserver path grammar tokenises on `/`
+	// and the substitution positions sit between `/` segments — the
+	// joined string contains the apiserver prefix verbatim followed
+	// by the resource segment.
+	gvr, namespacedOK := extractGVRFromNamespacedPathTemplate(apiCall.Path)
+	if !namespacedOK {
+		return schema.GroupVersionResource{}, false
+	}
+
+	// Step 4: find a sibling stage whose UAF confirms intent. Verb
+	// MUST be "list" (case-insensitive — UAF spec allows both cases
+	// per core.go CEL rule). Resource MUST equal our extracted
+	// resource. Group MUST match (or be empty for core group).
+	var match *templates.UserAccessFilterSpec
+	for _, s := range siblings {
+		if s == nil || s == apiCall {
+			continue
+		}
+		if s.UserAccessFilter == nil {
+			continue
+		}
+		uaf := s.UserAccessFilter
+		if !strings.EqualFold(uaf.Verb, "list") {
+			continue
+		}
+		if uaf.Resource != gvr.Resource {
+			continue
+		}
+		// Group symmetry — core group is "". An empty UAF group on a
+		// non-core extracted GVR is an ambiguous data-driven hint, so
+		// require exact match (including both-empty).
+		if uaf.Group != gvr.Group {
+			// Ambiguity: same resource on different groups. Fail-closed
+			// to avoid mis-targeting (R7 adversarial two-siblings).
+			if match != nil && uaf.Resource == match.Resource {
+				log.Debug("cluster_list.uaf_derive.ambiguous_group",
+					slog.String("subsystem", "cache"),
+					slog.String("ra_stage", apiCall.Name),
+					slog.String("resource", uaf.Resource),
+					slog.String("group_a", match.Group),
+					slog.String("group_b", uaf.Group),
+				)
+				return schema.GroupVersionResource{}, false
+			}
+			continue
+		}
+		// Adversarial tie-break: identical match on a later sibling.
+		// Since (verb,resource,group) all already matched on `match`,
+		// the second hit is identical-intent — first-in-declaration
+		// wins, no fail-closed needed (data is unambiguous).
+		if match == nil {
+			match = uaf
+		}
+	}
+	if match == nil {
+		log.Debug("cluster_list.uaf_derive.no_sibling",
+			slog.String("subsystem", "cache"),
+			slog.String("ra_stage", apiCall.Name),
+			slog.String("extracted_gvr", gvr.String()),
+		)
+		return schema.GroupVersionResource{}, false
+	}
+	return gvr, true
+}
+
+// extractGVRFromNamespacedPathTemplate parses an apiserver path template
+// (JQ-substituted form) and returns the (group, version, resource) tuple
+// when the template is a NAMESPACE-SCOPED path. Returns (zero, false) for
+// cluster-scope templates (no namespaces/ segment), unparseable templates,
+// or non-apiserver prefixes.
+//
+// The template's literal segments are concatenated with a SPACE between
+// substitution sites; the joined string is then matched against the
+// apiserver grammar /api/<v>/namespaces/<X>/<resource>... or
+// /apis/<g>/<v>/namespaces/<X>/<resource>... — the substitution-site
+// space lands where the namespace name would go, so the grammar's slash
+// tokenisation finds the resource segment in the expected position.
+//
+// Ship S.2 / 0.30.213 helper.
+func extractGVRFromNamespacedPathTemplate(template string) (schema.GroupVersionResource, bool) {
+	literals := collectJQStringLiterals(template)
+	if len(literals) == 0 {
+		return schema.GroupVersionResource{}, false
+	}
+	// Join with a single placeholder character so the slash tokenisation
+	// finds the resource segment. We use "X" so the joined string is
+	// path-valid (no slashes injected).
+	joined := strings.Join(literals, "X")
+	// The joined string must contain the namespaces/ marker — cluster-
+	// scope templates don't collapse via this helper.
+	if !strings.Contains(joined, "/namespaces/") {
+		return schema.GroupVersionResource{}, false
+	}
+	// Strip query string + trailing slash, then apply path-shape recogniser.
+	if i := strings.IndexByte(joined, '?'); i >= 0 {
+		joined = joined[:i]
+	}
+	joined = strings.TrimRight(joined, "/")
+	// Walk the path shape. The resource segment sits immediately after
+	// /namespaces/<ns-placeholder>/. ParseAPIServerPathToGVR is the
+	// canonical recogniser but it rejects templates containing "${" —
+	// our joined string has the ${...} sites already replaced by "X",
+	// so the rejection does not fire.
+	gvr, ok := cache.ParseAPIServerPathToGVR(joined)
+	if !ok {
+		return schema.GroupVersionResource{}, false
+	}
+	if gvr.Resource == "" || gvr.Version == "" {
+		return schema.GroupVersionResource{}, false
+	}
+	// Reject placeholder leakage: if the substituted "X" landed in a
+	// position that became the resource or version segment, the result
+	// is junk. The string literal in the template that yielded the
+	// resource must be a contiguous segment ending the URL (or followed
+	// by another literal slash); our joined-with-X heuristic preserves
+	// segment boundaries unless a substitution site falls INSIDE a
+	// resource/version literal (which would be malformed RA spec).
+	if strings.Contains(gvr.Resource, "X") && strings.Contains(template, "X") == false {
+		return schema.GroupVersionResource{}, false
+	}
+	return gvr, true
+}
+
+// collectJQStringLiterals walks a JQ template string of the shape
+//
+//	${ "literal1" + expr + "literal2" + ... }
+//
+// and returns the literal substrings in declaration order. A template
+// with no outer `${ ... }` (a fully-literal path) returns one element:
+// the path itself. A template missing balanced quotes returns nil.
+//
+// This is intentionally a simple character-level scanner — not a full
+// JQ parser — because we only consume the string-literal grammar of JQ
+// path templates as defined by createRequestOption. JQ strings are
+// double-quoted; backslash-escapes are passed through verbatim (the
+// snowplow path templates never contain escape sequences in the
+// apiserver-prefix literals, so this is correct).
+func collectJQStringLiterals(template string) []string {
+	t := strings.TrimSpace(template)
+	if !strings.HasPrefix(t, "${") || !strings.HasSuffix(t, "}") {
+		// Pure-literal path: return verbatim.
+		return []string{template}
+	}
+	inner := t[2 : len(t)-1]
+	var out []string
+	i := 0
+	for i < len(inner) {
+		// Skip until the next `"`.
+		j := strings.IndexByte(inner[i:], '"')
+		if j < 0 {
+			break
+		}
+		start := i + j + 1
+		// Find the closing quote (no escape handling — apiserver prefix
+		// literals are escape-free).
+		k := strings.IndexByte(inner[start:], '"')
+		if k < 0 {
+			// Unbalanced quotes → bail.
+			return nil
+		}
+		out = append(out, inner[start:start+k])
+		i = start + k + 1
+	}
+	return out
 }
 
 // deriveTargetGVRForClusterList runs ONE jq evaluation of the

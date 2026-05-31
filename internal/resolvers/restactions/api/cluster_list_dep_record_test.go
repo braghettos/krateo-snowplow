@@ -188,7 +188,7 @@ func TestClusterListCollapsePut_RecordsDepEdges(t *testing.T) {
 	)
 
 	newTmp, useCluster, gate := attemptClusterListCollapse(
-		ctx, clusterListLogger(t), apiCall,
+		ctx, clusterListLogger(t), apiCall, nil,
 		map[string]any{}, endpoints.Endpoint{}, store, true,
 	)
 	if !useCluster {
