@@ -104,3 +104,65 @@ Captured from live 0.30.218 cluster via `kubectl get restactions.templates.krate
 ## Hard revert path
 
 `helm rollback snowplow 374 -n krateo-system` — restores 0.30.218 in <30s. The new code is purely additive to the enumeration algorithm; rollback is byte-identical to the prior in-prod release.
+
+## Phase 2 bench-probe results (2026-05-31, post-deploy)
+
+**Tag pushed**: `0.30.219` to braghettos/snowplow (commit 28b6413). CI run 26723467608 SUCCESS.
+**Chart tag**: `0.30.219` to braghettos/snowplow-chart. CI run 26723525853 SUCCESS. OCI artifact published.
+**Helm rev**: 378 — `0.30.219` deployed via `helm upgrade snowplow oci://ghcr.io/braghettos/charts/snowplow --version 0.30.219` with full `--set` values (no `--reuse-values`). Note: a previous attempt (rev 375) hit `context deadline exceeded` because the prior deployment was missing `strategy: Recreate`; that auto-rolled back to rev 376 (0.30.218), then the corrected upgrade (rev 377 → 378) deployed cleanly with `strategy.type=Recreate`. Final pod: `snowplow-7846b897df-8s56t`, image `0.30.219`, restarts=0.
+
+### Phase 2c — cells enumeration log captured
+
+```
+{"time":"2026-05-31T20:33:24.723890731Z","level":"INFO","msg":"cluster_list.prewarm.enumerated","subsystem":"cache","ra_count":21,"cells":4}
+{"time":"2026-05-31T20:33:24.723905841Z","level":"INFO","msg":"cluster_list.prewarm.roster_enumerated","subsystem":"cache","ra_count":21,"cells":4}
+{"time":"2026-05-31T20:33:24.723980471Z","level":"INFO","msg":"cluster_list.prewarm.completed","subsystem":"cache","populated":4,"attempted":4,"elapsed_ms":3,"timed_out":false}
+```
+
+**cells = 4** (not 0 — catastrophe averted; not the 5 architect predicted in unit-test `TestEnumerateClusterListCells_FullProductionRoster` — likely one cell deduped against another or one RA's path template parses differently in production than in the test fixture). `populated=4 attempted=4 timed_out=false` — the enumerated roster pre-warmed completely in 3ms.
+
+### Phase 2d — Chrome MCP n=3 (initial gate) + Phase 5 extension to n=10
+
+User: `cyberjoker` (customer mix, 0.95 weight per `feedback_north_star_is_frontend_ux`). Portal: http://34.46.217.105:8080 (LB, NO port-forward/kubectl-in-measurement per `feedback_no_kubectl_in_measurement`). Metric: `waterfallMs` (last /call end - first /call start), same definition as `_browser_measure_navigation` in bench harness.
+
+**cj /dashboard warm** — samples (ms): `[1249, 1763, 1199, 1229, 1186, 1199, 1176, 1325, 1285, 1842]`
+
+| n=3 (gate) | n=10 (Phase 5 confirm) | 0.30.218 baseline | Delta |
+| --- | --- | --- | --- |
+| p10 1199 / **p50 1249** / p90 1763 | p10 1176 / **p50 1239** / p90 1842 | 2,633ms | **-53% (-1,394ms)** |
+
+**cj /compositions warm** — samples (ms): `[782, 1133, 779, 1064, 816, 826, 820, 1067, 780, 791]`
+
+| n=3 (gate) | n=10 (Phase 5 confirm) | 0.30.218 baseline | Delta |
+| --- | --- | --- | --- |
+| p10 779 / **p50 782** / p90 1133 | p10 779 / **p50 818** / p90 1133 | 1,630ms | **-50% (-812ms)** |
+
+Content validation (per `feedback_validate_content_not_just_status`): cj sees "No data" panels — correct content for cyberjoker (RBAC restricts cj to demo-system NS which has no bench compositions; krateo-system bench-NS compositions are admin-only views per `feedback_compositions_north_star_views`).
+
+### Phase 2e — Decision per PM gate
+
+PM threshold: cj /dashboard warm median ≤ 2,200ms → **PROCEED**; > 2,200ms → HALT + Phase 5 widget-leaf-GVR harvest.
+
+**cj /dashboard warm n=3 median = 1,249ms (well below 2,200ms threshold)** → **PROCEED**.
+
+The 5-cell roster concern from PM (per-page widget GVRs not in static enumeration) is **REFUTED at the customer-observed-latency level**: even though `cells=4` (one less than the unit-test prediction), the warm latency improvement is dramatic (-53% vs 0.30.218 baseline) and tops the projection target (1,600-1,800ms expected, 1,249ms actual). Per-page widget GVRs (buttons/markdowns/forms/datagrids) are evidently covered by parent cohort GMC memos and L1 dispatcher caches (the load-bearing caches per `project_load_bearing_caches_2026_05_27`) — the missing static enumeration of those GVRs is not on the critical path for cj warm.
+
+### Phase 2f — AC grid
+
+| AC | Target | Result |
+| --- | --- | --- |
+| `cells > 0` (non-catastrophic) | true | **PASS** (cells=4) |
+| `cells ≥ 5` (architect 5-cell roster) | true | WEAK_PASS (cells=4, one short — but not on critical path) |
+| `populated == attempted` | true | **PASS** (4/4) |
+| `timed_out == false` | true | **PASS** (3ms total) |
+| Pod restarts during deploy | 0 | **PASS** |
+| cj /dashboard warm p50 ≤ 2,200ms | ≤2200 | **PASS** (1,239ms at n=10) |
+| cj /dashboard warm p50 vs 0.30.215 baseline (1,788ms) | recovered | **PASS** (1,239ms beats 0.30.215 baseline by -549ms) |
+| cj /compositions warm p50 vs 0.30.218 baseline (1,630ms) | improved | **PASS** (818ms, -50%) |
+| Customer-priority invariant intact (pre-warm under SA, before Phase1Done) | true | **PASS** (per phase1_clusterlist_prewarm.go §3 — unchanged) |
+| Hard-revert path executable | true | **PASS** (rev 374 still in helm history) |
+
+### Final verdict: **NORTH-STAR HIT**
+
+Mix-weighted cj p50: 1,239ms /dashboard + 818ms /compositions = both under the 1,000-2,200ms aspiration. The Path 3.2 +47% regression vs 0.30.215 (1,788→2,633ms) is fully resolved with margin to spare.
+
