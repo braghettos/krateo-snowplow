@@ -281,19 +281,26 @@ func attemptClusterListCollapse(
 		return nil, false, 6
 	}
 
-	// AC-D5.14 — multi-element shape check. ≤10ms budget. Ship 0.30.194
-	// Fix B — validateClusterListShape now also returns the
-	// parsedListEnvelope from its single decode (it was previously
-	// followed by a second parseListEnvelope of the same bytes — ~11s
-	// wasted on 363 MB envelopes at admin-cohort scale).
+	// AC-D5.14 — multi-element shape check. ≤10ms budget.
+	//
+	// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction):
+	// validateClusterListShape is now O(envelope-fields + first-K-items
+	// sample). The full per-item materialisation
+	// (decodeClusterListItems) has been HOISTED OUT to its own
+	// separately-timed step below — it is fresh-populate cost paid
+	// once per cell, NOT a recurring per-call cost. The shape check's
+	// `envelope_ok_elapsed` log field reflects honest, cheap shape
+	// verification; the materialisation's cost surfaces under its own
+	// `materialise_elapsed` field. Restores honest telemetry split per
+	// architect ack of 2026-05-31.
 	shapeStart := time.Now()
-	parsed, shapeOK, shapeReason := validateClusterListShape(gvr, rawEnvelope)
-	shapeElapsed := time.Since(shapeStart)
-	if shapeElapsed > shapeCheckSlowThreshold {
+	shape, shapeOK, shapeReason := validateClusterListShape(gvr, rawEnvelope)
+	envelopeOKElapsed := time.Since(shapeStart)
+	if envelopeOKElapsed > shapeCheckSlowThreshold {
 		log.Warn("cluster_list.shape_check.slow",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
-			slog.Duration("elapsed", shapeElapsed),
+			slog.Duration("elapsed", envelopeOKElapsed),
 			slog.Duration("threshold", shapeCheckSlowThreshold),
 			slog.String("hint", "AC-D5.14 budget exceeded — surface to PM"),
 		)
@@ -311,18 +318,48 @@ func attemptClusterListCollapse(
 		return nil, false, 7
 	}
 
+	// Path 3.1 Bug 1 (architect-mandated correction) — materialise items
+	// OUTSIDE the shape-check budget so its cost is attributed honestly
+	// to its own `materialise_elapsed` log field. This is the
+	// fresh-populate path; subsequent reads of the cell skip this work
+	// via the stored ResolvedEntry.Items slice (the
+	// apistageContentServe Get-hit path consumes parsedListEnvelope
+	// without re-materialisation).
+	//
+	// Decode failure here is treated as a shape fallback (same
+	// counter+log marker pre-correction): the envelope passed the
+	// header check but a per-item byte was malformed — the iterator
+	// path remains the safe fallback.
+	materialiseStart := time.Now()
+	parsed, decodeErr := decodeClusterListItems(shape)
+	materialiseElapsed := time.Since(materialiseStart)
+	if decodeErr != "" {
+		cache.RecordApiserverFallthrough(ctx,
+			cache.ReasonClusterListShapeFallback, gvr.String())
+		log.Warn("cluster_list.shape_fallback",
+			slog.String("subsystem", "cache"),
+			slog.String("ra_stage", apiCall.Name),
+			slog.String("gvr", gvr.String()),
+			slog.String("shape_reason", decodeErr),
+			slog.Int("envelope_bytes", len(rawEnvelope)),
+			slog.Duration("materialise_elapsed", materialiseElapsed),
+		)
+		return nil, false, 7
+	}
+
 	// Store the validated envelope under the identity-free apistage key
 	// BEFORE returning the cluster-scope call. The worker loop's
 	// apistageContentServe will then Get-hit on this entry and skip the
 	// redundant dispatchViaInformer call.
 	//
-	// Ship 0.30.194 Fix B — populate Items / ItemsAPIVersion / ItemsKind
-	// from the parsedListEnvelope validateClusterListShape returned. The
-	// shape-check decode is byte-identical to parseListEnvelope's decode
-	// (same struct tags, same []map[string]any item shape, same
-	// []*unstructured.Unstructured{Object: it} wrap), so the resulting
-	// entry observed by apistageContentServe is byte-identical to the
-	// pre-Fix-B path.
+	// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction) —
+	// Items / ItemsAPIVersion / ItemsKind come from decodeClusterListItems
+	// above; populating them at the Put site keeps Ship 0.30.194 Fix B's
+	// no-double-decode dedup property (apistageContentServe does NOT
+	// re-run parseListEnvelope on the Get-hit). Output is byte-identical
+	// to pre-correction Ship 0.30.216 because decodeClusterListItems and
+	// the prior in-validate per-item loop run the SAME json.Unmarshal +
+	// stripManagedFields + unstructured.Unstructured wrap.
 	contentKey := cache.ComputeKey(contentKeyInputs(gvr, "", ""))
 	newEntry := &cache.ResolvedEntry{
 		RawJSON:         rawEnvelope,
@@ -331,13 +368,15 @@ func attemptClusterListCollapse(
 		ItemsAPIVersion: parsed.apiVersion,
 		ItemsKind:       parsed.kind,
 	}
-	// defensiveParseMs is retained at zero — Fix B folded the second
-	// unmarshal into the shape check, so there is no separate parse
-	// stage to time. The PIPStageTiming.AccumulateDefensive signature
-	// stays unchanged (additive instrumentation) so seed/diff dashboards
-	// keep their existing columns; the column now legitimately reads 0
-	// after Fix B.
-	const defensiveParseMs int64 = 0
+	// defensiveParseMs now reflects the materialisation step (the
+	// per-item decode + stripManagedFields + Unstructured wrap that the
+	// architect correction moved out of validateClusterListShape). The
+	// PIPStageTiming.AccumulateDefensive signature stays unchanged
+	// (additive instrumentation) so seed/diff dashboards keep their
+	// existing columns; the column now correctly attributes the
+	// materialisation cost to the parse stage instead of leaving it
+	// folded into shape_check_elapsed.
+	defensiveParseMs := materialiseElapsed.Milliseconds()
 
 	putStart := time.Now()
 	apistageStore.Put(contentKey, newEntry)
@@ -373,7 +412,15 @@ func attemptClusterListCollapse(
 		slog.String("user", user.Username),
 		slog.Int("envelope_bytes", len(rawEnvelope)),
 		slog.Duration("dispatch_elapsed", time.Since(dispatchStart)),
-		slog.Duration("shape_check_elapsed", shapeElapsed),
+		// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction) —
+		// `envelope_ok_elapsed` replaces `shape_check_elapsed`: the
+		// envelope-only shape check is the actual cheap path now (no
+		// per-item materialisation folded in). Field rename matches the
+		// architect's "restore honest telemetry split" instruction.
+		// `materialise_elapsed` is the new field for the per-item decode
+		// cost — paid here on fresh-populate, NOT on cache hits.
+		slog.Duration("envelope_ok_elapsed", envelopeOKElapsed),
+		slog.Duration("materialise_elapsed", materialiseElapsed),
 		slog.Int64("defensive_parse_ms", defensiveParseMs),
 		slog.Int64("defensive_put_ms", defensivePutMs),
 	)
@@ -517,91 +564,146 @@ func clusterScopePathFor(gvr schema.GroupVersionResource) string {
 	return string(b)
 }
 
-// validateClusterListShape enforces AC-D5.14's defensive multi-element
-// shape check on the raw cluster-scope LIST envelope. Returns
-// (parsed, true, "") on a well-formed envelope; (zero, false, reason)
-// otherwise. The reason string is for the WARN log line — it never
-// reaches the fall-through counter (only the closed-enum
-// FallthroughReason does).
+// shapeCheckItemSampleSize bounds the number of items the defensive
+// shape check materially walks. Path 3.1 Bug 1 — the previous
+// implementation iterated EVERY item in the cluster-LIST envelope (~44K
+// at cyberjoker scale) which dominated per-/call latency (1.3-1.5s
+// observed in 0.30.216 canonical Chrome MCP). At apiserver wire shape
+// uniformity (the apiserver does not emit per-item shape drift inside
+// a single LIST response — items decode through one schema), inspecting
+// the first k items is sufficient to detect a malformed envelope while
+// keeping the check O(1) in items.
+const shapeCheckItemSampleSize = 8
+
+// isJSONNull reports whether a json.RawMessage is the literal JSON
+// `null` value, ignoring surrounding whitespace. Used by the
+// sample-bounded item check: a null item slot must NOT be cached, so
+// we reject at shape-check time without paying the per-item decode.
+func isJSONNull(raw []byte) bool {
+	// Strip ASCII whitespace (matches encoding/json's space-stripping).
+	i, j := 0, len(raw)
+	for i < j {
+		switch raw[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+			continue
+		}
+		break
+	}
+	for j > i {
+		switch raw[j-1] {
+		case ' ', '\t', '\n', '\r':
+			j--
+			continue
+		}
+		break
+	}
+	return j-i == 4 &&
+		raw[i] == 'n' && raw[i+1] == 'u' && raw[i+2] == 'l' && raw[i+3] == 'l'
+}
+
+// envelopeShape is the Path 3.1 Bug 1 (architect-mandated correction)
+// intermediate form produced by validateClusterListShape: just enough
+// shape evidence to (a) confirm the envelope is a well-formed LIST and
+// (b) hand off to materialisation WITHOUT having done the per-item
+// decode. The rawItems slice carries the deferred per-item bytes so
+// decodeClusterListItems can complete materialisation OUT of the
+// latency-critical shape-check budget — the architect's exact fix
+// instruction: "move decodeClusterListItems OUT of
+// validateClusterListShape to the call site".
+type envelopeShape struct {
+	apiVersion string
+	kind       string
+	rawItems   []json.RawMessage
+}
+
+// validateClusterListShape enforces AC-D5.14's defensive shape check
+// on the raw cluster-scope LIST envelope. Returns (shape, true, "")
+// on a well-formed envelope; (zero, false, reason) otherwise.
 //
-// Definition (PM-ratified, §AC-D5.14):
+// Ship 0.30.217 Path 3.1 Bug 1 + Bug 3 — surgical fixes
+// (Bug 1 reflects the architect-mandated correction: materialisation
+// is HOISTED out; this function is now O(envelope-fields + first-K-items
+// nil-check) and never touches per-item field maps):
 //
-//   - kind ends with "List"
+//   Bug 1 (slow shape check, 1.3-1.5s observed): the function previously
+//   iterated EVERY item in the envelope with 4 map ops + per-item
+//   stripManagedFields + unstructured.Unstructured allocation. At
+//   cyberjoker scale (~44K items, ~10.9 MiB envelope) this dominated
+//   per-/call latency. Item materialisation is redundant work in the
+//   shape budget — `parseListEnvelope` runs the SAME decode at the Put
+//   site (apistage.go:140-170). Fix: the shape check itself is O(1) at
+//   the envelope level + sample-bounded at the item level (first k=8
+//   items for nil-check only). It now returns the deferred
+//   []json.RawMessage so the caller can pay the per-item decode under
+//   its OWN separately-named/separately-timed step
+//   (`materialise_elapsed`) — see the call site near cluster_list.go:312.
+//
+//   Bug 3 (per-item TypeMeta false-negative): the previous check
+//   asserted `it["apiVersion"]` and `it["kind"]` are non-empty strings.
+//   The apiserver does NOT emit per-item apiVersion/kind on a typed
+//   LIST endpoint (those live only on the envelope; k8s API convention)
+//   — and the dynamic-informer-served path (`marshalAsList` at
+//   informer_dispatch.go:209-222) stores items AS DECODED with no
+//   per-item TypeMeta injection. Result: EVERY informer-served
+//   cluster-LIST tripped this assertion, paying both the dispatch cost
+//   AND the shape-check cost for ZERO collapse benefit. Fix: drop the
+//   per-item TypeMeta assertion. `parseListEnvelope` already tolerates
+//   this — envelope-level TypeMeta (apiVersion/kind) is the source of
+//   truth and is synthesized from the GVR if missing.
+//
+// Definition (post-Path-3.1):
+//
+//   - kind ends with "List" (envelope-level only)
 //   - .items is a non-empty array of objects
-//   - each item has non-nil apiVersion AND non-nil kind strings
-//
-// Ship 0.30.194 Fix B — dedup with parseListEnvelope. The previous
-// signature returned only (ok, reason) and the caller subsequently
-// called parseListEnvelope(gvr, rawEnvelope) to obtain the items —
-// a SECOND json.Unmarshal of the same 363 MB envelope. Both decodes
-// produced byte-identical output (same struct shape, same item-wrap
-// pattern). The dedup widens the local envelope shape to match
-// parseListEnvelope's APIVersion + Items contract and threads the
-// parsed slice back through the return value; the caller drops its
-// second parseListEnvelope call and consumes parsed.items directly.
-//
-// Item-wrap contract: items are wrapped as
-// []*unstructured.Unstructured{Object: it} where `it` is the
-// json.Unmarshal'd map[string]any. This matches parseListEnvelope
-// (apistage.go:149-152) exactly — the wrapping is structurally
-// identical, the items decode from the SAME raw bytes via the SAME
-// json package contract, so downstream consumers (gateListItems,
-// cohortGateMemoServe, apistageContentServe) observe byte-identical
-// values whether the entry was populated via parseListEnvelope or
-// via this defensive prefetch path.
+//   - sampled items (first k) have non-empty raw bytes
 //
 // gvr is consulted ONLY when envelope.APIVersion / envelope.Kind are
-// empty — the apiserver always emits both on a real cluster-scope
-// LIST, so the fallback is for the defensive-tests path only.
-func validateClusterListShape(gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool, string) {
+// empty — synthesized from GVR per parseListEnvelope's contract.
+func validateClusterListShape(gvr schema.GroupVersionResource, raw []byte) (envelopeShape, bool, string) {
+	// Path 3.1 Bug 1 — envelope-only decode. We need just enough shape
+	// to (a) verify the kind ends in "List", and (b) verify .items is a
+	// non-empty array. json.RawMessage on Items defers the per-item
+	// decode out of the latency-critical shape check; the caller picks
+	// up the deferred slice via the returned envelopeShape.rawItems.
 	var envelope struct {
-		APIVersion string           `json:"apiVersion"`
-		Kind       string           `json:"kind"`
-		Items      []map[string]any `json:"items"`
+		APIVersion string            `json:"apiVersion"`
+		Kind       string            `json:"kind"`
+		Items      []json.RawMessage `json:"items"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return parsedListEnvelope{}, false, "envelope-unmarshal-failed"
+		return envelopeShape{}, false, "envelope-unmarshal-failed"
 	}
 	if !strings.HasSuffix(envelope.Kind, "List") {
-		return parsedListEnvelope{}, false, "envelope-kind-not-list"
+		return envelopeShape{}, false, "envelope-kind-not-list"
 	}
 	if len(envelope.Items) == 0 {
 		// AC-D5.14 says non-empty items. A genuinely-empty cluster also
 		// hits this — but the iterator path's empty-result handling is
 		// safer than a cached zero-item entry that could mask later
 		// populations until TTL eviction. Fall back to the iterator.
-		return parsedListEnvelope{}, false, "envelope-items-empty"
-	}
-	for i, it := range envelope.Items {
-		if it == nil {
-			return parsedListEnvelope{}, false, "envelope-item-nil"
-		}
-		// Non-nil string check: present AND of type string AND non-empty
-		// would be stricter than AC-D5.14, which only requires "non-nil
-		// apiVersion and kind strings". A present-but-empty-string
-		// passes the spec; a missing/null key fails (untyped nil).
-		apiV, apiOK := it["apiVersion"].(string)
-		kind, kindOK := it["kind"].(string)
-		if !apiOK || apiV == "" {
-			return parsedListEnvelope{}, false, "envelope-item-missing-apiVersion"
-		}
-		if !kindOK || kind == "" {
-			return parsedListEnvelope{}, false, "envelope-item-missing-kind"
-		}
-		_ = i
+		return envelopeShape{}, false, "envelope-items-empty"
 	}
 
-	// Build the parsedListEnvelope from the single decoded envelope —
-	// byte-identical to parseListEnvelope's output at apistage.go:149-161.
-	items := make([]*unstructured.Unstructured, 0, len(envelope.Items))
-	for _, it := range envelope.Items {
-		// Ship 2a (0.30.209) — strip managedFields at this
-		// item-materialisation site too (mirrors parseListEnvelope), so
-		// every shared entry.Items map is stripped once at load and the
-		// serve path needs no per-serve removeManagedFields walk.
-		stripManagedFields(it)
-		items = append(items, &unstructured.Unstructured{Object: it})
+	// Path 3.1 Bug 1 — sample-bounded per-item nil check. The apiserver
+	// emits structurally-uniform items inside a single LIST response;
+	// a sample of the first k items detects malformed-envelope cases
+	// (genuine nil/empty items at the byte level) without the O(N) walk.
+	// "null" raw bytes are also rejected — that is the wire form of a
+	// json-null item slot, which decodes to a nil map and would fail at
+	// materialisation; rejecting at the sample stage keeps the budget
+	// honest without inviting a cached zero-map item.
+	sampleN := shapeCheckItemSampleSize
+	if sampleN > len(envelope.Items) {
+		sampleN = len(envelope.Items)
 	}
+	for i := 0; i < sampleN; i++ {
+		raw := envelope.Items[i]
+		if len(raw) == 0 || isJSONNull(raw) {
+			return envelopeShape{}, false, "envelope-item-nil"
+		}
+	}
+
 	apiVersion := envelope.APIVersion
 	if apiVersion == "" {
 		apiVersion = apiVersionForGVR(gvr)
@@ -610,5 +712,50 @@ func validateClusterListShape(gvr schema.GroupVersionResource, raw []byte) (pars
 	if kind == "" {
 		kind = listKindForResource(gvr.Resource)
 	}
-	return parsedListEnvelope{items: items, apiVersion: apiVersion, kind: kind}, true, ""
+	return envelopeShape{
+		apiVersion: apiVersion,
+		kind:       kind,
+		rawItems:   envelope.Items,
+	}, true, ""
+}
+
+// decodeClusterListItems materialises the deferred per-item bytes from a
+// validated envelopeShape into the parsedListEnvelope form that
+// apistage's content-gate / ResolvedEntry consumes. Per-item decode +
+// stripManagedFields run here so the latency-critical
+// `validateClusterListShape` envelope check stays O(1) in items —
+// Path 3.1 Bug 1 architect-mandated correction.
+//
+// Output is byte-identical to parseListEnvelope's output for the same
+// raw input bytes (same struct tags, same stripManagedFields call, same
+// []*unstructured.Unstructured{Object: it} wrap).
+//
+// Returns (parsedListEnvelope{}, "envelope-item-decode-failed") on any
+// item-level decode failure — the caller falls back to the iterator
+// path AND records cache.ReasonClusterListShapeFallback exactly as for
+// a shape-check failure. Item materialisation is the cell-fresh-populate
+// path; subsequent reads of the cell skip this work via the stored
+// ResolvedEntry.Items slice.
+func decodeClusterListItems(shape envelopeShape) (parsedListEnvelope, string) {
+	items := make([]*unstructured.Unstructured, 0, len(shape.rawItems))
+	for _, rawIt := range shape.rawItems {
+		var it map[string]any
+		if err := json.Unmarshal(rawIt, &it); err != nil {
+			return parsedListEnvelope{}, "envelope-item-decode-failed"
+		}
+		if it == nil {
+			return parsedListEnvelope{}, "envelope-item-nil"
+		}
+		// Ship 2a (0.30.209) — strip managedFields at the item-
+		// materialisation site (mirrors parseListEnvelope), so every
+		// shared entry.Items map is stripped once at load and the serve
+		// path needs no per-serve removeManagedFields walk.
+		stripManagedFields(it)
+		items = append(items, &unstructured.Unstructured{Object: it})
+	}
+	return parsedListEnvelope{
+		items:      items,
+		apiVersion: shape.apiVersion,
+		kind:       shape.kind,
+	}, ""
 }

@@ -559,6 +559,21 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 // per-Resource if-elif in the routing code path.
 //
 // Safe for concurrent use.
+//
+// Ship 0.30.217 Path 3.1 Bug 2 — RLock fast-path on the hit path. The
+// pre-Path-3.1 implementation took `rw.mu.Lock()` UNCONDITIONALLY even
+// when the GVR was already registered. At cluster-list-collapse
+// activation EVERY /call drives the inner-call path through this lock
+// (resolve.go:444 `lazyRegisterInnerCallPaths` + deps_extract.go:155
+// `ensureWatcherInformerForGVR`), serialising all concurrent /call
+// workers on a single writer mutex (2,988ms blocking observed in
+// 0.30.216 canonical Chrome MCP). The fix mirrors the RLock fast-path
+// pattern already used by `IsMetadataOnly` (line 893) and `IsSynced`/
+// `IsServable` (servable.go:216). Correctness: the locked path's
+// `addResourceTypeLocked` / `addResourceTypeMetadataOnlyLocked` already
+// have idempotent re-check guards (`if _, exists := rw.informers[gvr];
+// exists { return }`) so the classic check-then-act race window between
+// RUnlock and Lock is benign.
 func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (added bool, sync <-chan struct{}) {
 	if rw == nil {
 		return false, nil
@@ -567,13 +582,38 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 		return false, nil
 	}
 
+	// Path 3.1 Bug 2 — fast-path hit lookup under RLock. The hit path
+	// is the dominant code path under cluster-list-collapse (every
+	// /call worker checks the same handful of GVRs); doing it under
+	// RLock allows concurrent readers and eliminates the writer-stack
+	// contention that motivated this fix.
+	rw.mu.RLock()
+	if _, exists := rw.informers[gvr]; exists {
+		ch, ok := rw.syncCh[gvr]
+		rw.mu.RUnlock()
+		if ok {
+			return false, ch
+		}
+		// Defensive: invariant broken. Return a pre-closed channel
+		// so callers don't deadlock.
+		closed := make(chan struct{})
+		close(closed)
+		return false, closed
+	}
+	rw.mu.RUnlock()
+
+	// Miss confirmed under RLock — upgrade to writer Lock. The
+	// addResourceType*Locked helpers re-check the informers map (line
+	// 694 + line 580-ish equivalents), so a peer that registered the
+	// GVR while we were re-acquiring is handled idempotently.
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
 	if _, exists := rw.informers[gvr]; exists {
-		// Hit: return the existing sync channel. Defensive nil-check
-		// — the constructor's RBAC registrations always allocate a
-		// channel, but a future refactor could break this invariant.
+		// Hit (peer registered between RUnlock + Lock): return the
+		// existing sync channel. Defensive nil-check — the
+		// constructor's RBAC registrations always allocate a channel,
+		// but a future refactor could break this invariant.
 		if ch, ok := rw.syncCh[gvr]; ok {
 			return false, ch
 		}

@@ -675,3 +675,81 @@ func TestEnsureResourceType_NilReceiverIsNoOp(t *testing.T) {
 		t.Fatalf("nil-receiver EnsureResourceType: want nil channel")
 	}
 }
+
+// TestEnsureResourceType_ConcurrentHitPathScales is the Path 3.1 Bug 2
+// falsifier: under HIGH concurrent hit-path load on the same registered
+// GVR, the hot path MUST NOT serialise on the writer mutex. Before the
+// RLock fast-path fix, every /call worker took rw.mu.Lock() — even on
+// the hit path — which produced 2,988ms blocking in 0.30.216 canonical
+// Chrome MCP. With the fix in place, the hit path is RLock-only and
+// concurrent readers must proceed in parallel.
+//
+// The test runs N goroutines doing K iterations each over a single
+// pre-registered GVR, all returning hit. Pure correctness assertions:
+// (a) added=false on every call (no duplicate registration); (b) the
+// same sync channel for every call (singleflight preserved); (c) -race
+// is clean (no data races on rw.mu or rw.syncCh under the new RLock
+// path). The scaling property itself (throughput vs goroutines) is
+// validated empirically at Phase 1 candidate falsifier under load —
+// this unit test guarantees correctness; the prod marker rate proves
+// the contention is gone.
+func TestEnsureResourceType_ConcurrentHitPathScales(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		newTestScheme(), secretsListKinds())
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	if rw == nil {
+		t.Fatalf("expected non-nil watcher")
+	}
+	defer rw.Stop()
+
+	// Pre-register the GVR so all subsequent calls take the hit path.
+	added, ch0 := rw.EnsureResourceType(secretGVR)
+	if !added {
+		t.Fatalf("pre-register: want added=true")
+	}
+	if ch0 == nil {
+		t.Fatalf("pre-register: want non-nil sync channel")
+	}
+
+	const (
+		goroutines = 64
+		perGo      = 256
+	)
+	var (
+		wg          sync.WaitGroup
+		added2Count int32
+		distinctCh  sync.Map // distinct sync channels seen (must be 1)
+		start       = make(chan struct{})
+	)
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			for k := 0; k < perGo; k++ {
+				a, ch := rw.EnsureResourceType(secretGVR)
+				if a {
+					atomic.AddInt32(&added2Count, 1)
+				}
+				distinctCh.Store(ch, struct{}{})
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&added2Count); got != 0 {
+		t.Fatalf("Path 3.1 Bug 2: %d concurrent hit-path calls saw added=true; want 0 (GVR was already registered)", got)
+	}
+	unique := 0
+	distinctCh.Range(func(_, _ any) bool { unique++; return true })
+	if unique != 1 {
+		t.Fatalf("Path 3.1 Bug 2: %d distinct sync channels handed out under concurrent hit-path load; want 1", unique)
+	}
+}

@@ -83,12 +83,15 @@ func TestApistageContentKey_ClusterScopeDistinctFromNamespaced(t *testing.T) {
 
 // ---------- AC-D5.14 — defensive multi-element shape check ----------
 //
-// Ship 0.30.194 Fix B — validateClusterListShape now also returns the
-// parsedListEnvelope from its single decode (the call site previously
-// did a SECOND parseListEnvelope of the same bytes). The tests assert
-// (ok, reason) the same way; the happy-path test additionally asserts
-// the returned parsedListEnvelope's items/apiVersion/kind match what
-// parseListEnvelope would produce.
+// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction):
+// validateClusterListShape now returns an envelopeShape (apiVersion,
+// kind, deferred []json.RawMessage items) — no per-item materialisation.
+// The materialisation moved to a separate `decodeClusterListItems`
+// helper invoked at the call site so its cost surfaces under its own
+// telemetry field (`materialise_elapsed`), not folded into the shape
+// budget. The test surface mirrors this split: shape-check tests assert
+// envelopeShape; per-item structural tests call decodeClusterListItems
+// against the shape and assert against parsedListEnvelope.
 
 // testShapeGVR is a stable GVR used across the shape-check tests; the
 // gvr is consulted ONLY when envelope.APIVersion / envelope.Kind are
@@ -117,37 +120,45 @@ func TestValidateClusterListShape_HappyPath(t *testing.T) {
 			},
 		},
 	})
-	parsed, ok, reason := validateClusterListShape(testShapeGVR, raw)
+	shape, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if !ok {
 		t.Fatalf("validateClusterListShape: expected ok=true on well-formed envelope; reason=%q", reason)
 	}
+	if len(shape.rawItems) != 2 {
+		t.Fatalf("validateClusterListShape: expected 2 deferred raw items; got %d", len(shape.rawItems))
+	}
+	if shape.apiVersion != "composition.krateo.io/v1-2-2" {
+		t.Fatalf("validateClusterListShape: apiVersion=%q want composition.krateo.io/v1-2-2", shape.apiVersion)
+	}
+	if shape.kind != "GithubScaffoldingWithCompositionPagesList" {
+		t.Fatalf("validateClusterListShape: kind=%q want GithubScaffoldingWithCompositionPagesList", shape.kind)
+	}
+	// Path 3.1 Bug 1 (architect-mandated correction) — materialisation
+	// is now a separate, separately-timed step. Verify the per-item
+	// round-trip via the decodeClusterListItems helper that the call
+	// site invokes immediately after validateClusterListShape.
+	parsed, decodeErr := decodeClusterListItems(shape)
+	if decodeErr != "" {
+		t.Fatalf("decodeClusterListItems: unexpected error=%q", decodeErr)
+	}
 	if len(parsed.items) != 2 {
-		t.Fatalf("validateClusterListShape: expected 2 items in parsed envelope; got %d", len(parsed.items))
+		t.Fatalf("decodeClusterListItems: expected 2 materialised items; got %d", len(parsed.items))
 	}
-	if parsed.apiVersion != "composition.krateo.io/v1-2-2" {
-		t.Fatalf("validateClusterListShape: apiVersion=%q want composition.krateo.io/v1-2-2", parsed.apiVersion)
-	}
-	if parsed.kind != "GithubScaffoldingWithCompositionPagesList" {
-		t.Fatalf("validateClusterListShape: kind=%q want GithubScaffoldingWithCompositionPagesList", parsed.kind)
-	}
-	// Byte-compat with parseListEnvelope — the items unwrap pattern is
-	// []*unstructured.Unstructured{Object: it} where it is the
-	// json.Unmarshal'd map[string]any. Spot-check that the first item's
-	// metadata.name round-trips through the wrap.
 	if got := parsed.items[0].GetName(); got != "a" {
-		t.Fatalf("validateClusterListShape: items[0].GetName()=%q want \"a\"", got)
+		t.Fatalf("materialised items[0].GetName()=%q want \"a\"", got)
 	}
 	if got := parsed.items[1].GetNamespace(); got != "ns-2" {
-		t.Fatalf("validateClusterListShape: items[1].GetNamespace()=%q want \"ns-2\"", got)
+		t.Fatalf("materialised items[1].GetNamespace()=%q want \"ns-2\"", got)
 	}
 }
 
 // TestValidateClusterListShape_ParseListEnvelopeEquivalence — Ship
-// 0.30.194 Fix B byte-compat gate. The architect's dedup design relies
-// on validateClusterListShape producing a parsedListEnvelope that is
-// structurally identical to parseListEnvelope's output for the same
-// raw bytes + gvr. This test runs both functions on the same input
-// and asserts items count, apiVersion, kind, and per-item ns/name
+// 0.30.194 Fix B byte-compat gate (kept under Ship 0.30.217 Path 3.1
+// Bug 1 architect-mandated correction). The dedup design relies on the
+// validate-then-materialise pipeline producing a parsedListEnvelope
+// that is structurally identical to parseListEnvelope's output for the
+// same raw bytes + gvr. This test runs both pipelines on the same
+// input and asserts items count, apiVersion, kind, and per-item ns/name
 // round-trip equivalence.
 func TestValidateClusterListShape_ParseListEnvelopeEquivalence(t *testing.T) {
 	raw := mustJSON(t, map[string]any{
@@ -171,9 +182,13 @@ func TestValidateClusterListShape_ParseListEnvelopeEquivalence(t *testing.T) {
 			},
 		},
 	})
-	vParsed, ok, reason := validateClusterListShape(testShapeGVR, raw)
+	vShape, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if !ok {
 		t.Fatalf("validateClusterListShape: ok=false on well-formed envelope; reason=%q", reason)
+	}
+	vParsed, decodeErr := decodeClusterListItems(vShape)
+	if decodeErr != "" {
+		t.Fatalf("decodeClusterListItems: unexpected error=%q", decodeErr)
 	}
 	pParsed, ok := parseListEnvelope(testShapeGVR, raw)
 	if !ok {
@@ -233,39 +248,111 @@ func TestValidateClusterListShape_EmptyItems(t *testing.T) {
 	}
 }
 
-func TestValidateClusterListShape_ItemMissingApiVersion(t *testing.T) {
+// Path 3.1 Bug 3 — informer-served LIST has no per-item TypeMeta.
+// validateClusterListShape MUST accept envelopes whose items lack
+// apiVersion/kind (the apiserver typed-LIST + dynamic-informer-served
+// wire shape — see informer_dispatch.go:209-222). Pre-Path-3.1 this
+// was a false-negative that tripped EVERY informer-served cluster-LIST
+// and fell back to the iterator path for ZERO collapse benefit.
+func TestValidateClusterListShape_AcceptsInformerWireShape_NoPerItemTypeMeta(t *testing.T) {
 	raw := mustJSON(t, map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ConfigMapList",
 		"items": []any{
-			// apiVersion absent → Go nil from absent map key.
-			map[string]any{"kind": "ConfigMap"},
+			// Per-item apiVersion/kind ABSENT — this is the informer-
+			// served path's wire shape. Path 3.1 Bug 3 fix: accept it.
+			map[string]any{
+				"metadata": map[string]any{"name": "a", "namespace": "ns-1"},
+				"data":     map[string]any{"k": "v"},
+			},
+			map[string]any{
+				"metadata": map[string]any{"name": "b", "namespace": "ns-2"},
+			},
 		},
 	})
-	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
-	if ok {
-		t.Fatalf("validateClusterListShape: expected ok=false when an item lacks apiVersion; reason=%q", reason)
+	shape, ok, reason := validateClusterListShape(testShapeGVR, raw)
+	if !ok {
+		t.Fatalf("validateClusterListShape: Path 3.1 Bug 3 — expected ok=true on informer-served envelope (no per-item TypeMeta); reason=%q", reason)
 	}
-	if !strings.Contains(reason, "missing-apiVersion") {
-		t.Fatalf("expected reason to flag missing-apiVersion; got %q", reason)
+	if len(shape.rawItems) != 2 {
+		t.Fatalf("expected 2 deferred raw items; got %d", len(shape.rawItems))
+	}
+	// Materialise via the helper the call site uses — Path 3.1 Bug 1
+	// architect-mandated correction split. Per-item TypeMeta is still
+	// absent at the materialise layer; only metadata.name carries through.
+	parsed, decodeErr := decodeClusterListItems(shape)
+	if decodeErr != "" {
+		t.Fatalf("decodeClusterListItems: unexpected error=%q on informer-served envelope", decodeErr)
+	}
+	if len(parsed.items) != 2 {
+		t.Fatalf("expected 2 materialised items; got %d", len(parsed.items))
+	}
+	if parsed.items[0].GetName() != "a" {
+		t.Fatalf("items[0].GetName()=%q want \"a\"", parsed.items[0].GetName())
 	}
 }
 
-func TestValidateClusterListShape_ItemMissingKind(t *testing.T) {
-	raw := mustJSON(t, map[string]any{
+// Path 3.1 Bug 1 — sample-bounded item check should still detect a
+// genuinely-malformed envelope (nil item bytes). Empty item is a
+// degenerate case not seen on the wire but documented for the assertion.
+func TestValidateClusterListShape_DetectsNilItemInSample(t *testing.T) {
+	// Construct an envelope where the first item decodes to nil (raw
+	// `null` bytes). The shape check's sample-bounded loop must catch
+	// it as "envelope-item-nil".
+	raw := []byte(`{
 		"apiVersion": "v1",
 		"kind":       "ConfigMapList",
-		"items": []any{
-			map[string]any{"apiVersion": "v1"},
-		},
-	})
+		"items": [null, {"metadata":{"name":"b"}}]
+	}`)
 	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
 	if ok {
-		t.Fatalf("validateClusterListShape: expected ok=false when an item lacks kind; reason=%q", reason)
+		t.Fatalf("expected ok=false on nil-item envelope; reason=%q", reason)
 	}
-	if !strings.Contains(reason, "missing-kind") {
-		t.Fatalf("expected reason to flag missing-kind; got %q", reason)
+	if !strings.Contains(reason, "envelope-item-nil") {
+		t.Fatalf("expected reason to flag envelope-item-nil; got %q", reason)
 	}
+}
+
+// Path 3.1 Bug 1 (architect-mandated correction) — verify the
+// shape-check fast path is O(envelope-fields + sample-K) and stays far
+// inside the AC-D5.14 10ms budget. Pre-Path-3.1 a 44K-item input took
+// 1.3-1.5s; the partial 0.30.217 fix (deferred RawMessage) still
+// materialised every item inside validateClusterListShape and so kept
+// the per-call cost folded into the shape-check budget. The architect
+// correction (this ship) hoists materialisation out — the shape check
+// now skips per-item decode entirely.
+func TestValidateClusterListShape_FastEnvelopeReject(t *testing.T) {
+	// Build a 10K-item envelope where the ENVELOPE kind does not end in
+	// "List" — the function MUST reject at the envelope check without
+	// walking items. This is the cheapest rejection path.
+	items := make([]any, 0, 10000)
+	for i := 0; i < 10000; i++ {
+		items = append(items, map[string]any{
+			"metadata": map[string]any{"name": "obj", "namespace": "ns"},
+		})
+	}
+	raw := mustJSON(t, map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap", // does NOT end in List
+		"items":      items,
+	})
+	start := time.Now()
+	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatalf("expected envelope-level reject on kind=ConfigMap")
+	}
+	if !strings.Contains(reason, "kind-not-list") {
+		t.Fatalf("expected kind-not-list reason; got %q", reason)
+	}
+	// Envelope-level reject must be FAR under the 10ms budget — even on
+	// a 10K-item envelope, json.RawMessage defers per-item decode so we
+	// only pay the slice-index walk. 50ms hard guard so CI noise on
+	// busy machines doesn't false-positive.
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("Path 3.1 Bug 1 envelope-reject path took %v (>50ms); fast-path regressed", elapsed)
+	}
+	t.Logf("Path 3.1 Bug 1 envelope-reject path: 10K items, %v elapsed", elapsed)
 }
 
 func TestValidateClusterListShape_MalformedJSON(t *testing.T) {
@@ -282,9 +369,15 @@ func TestValidateClusterListShape_MalformedJSON(t *testing.T) {
 // ≤10ms. The check runs on a structurally-large envelope (2,000 items
 // each carrying a small object) so the median measurement reflects the
 // production envelope shape; the spec calls for ≤10ms per invocation,
-// not per-item. This test records the per-call overhead so the
-// diff-review gate sees the empirical number; it FAILS only on a
-// gross budget breach (>50ms) to avoid CI noise on busy machines.
+// not per-item.
+//
+// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction):
+// validateClusterListShape no longer pays per-item decode — items
+// remain as deferred []json.RawMessage. The envelope decode is still
+// O(N) on the slice index (RawMessage bookkeeping) but is far cheaper
+// than the per-item map decode + field-walk that the pre-correction
+// path ran. The 50ms hard guard is preserved to surface gross
+// regressions while not false-positiving on busy CI.
 func TestValidateClusterListShape_Overhead(t *testing.T) {
 	items := make([]any, 0, 2000)
 	for i := 0; i < 2000; i++ {
@@ -324,6 +417,63 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 	if avg > 50*time.Millisecond {
 		t.Fatalf("AC-D5.14 overhead budget breach: avg=%v > 50ms (5× the 10ms PM-ratified budget)", avg)
 	}
+}
+
+// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction) — the
+// shape check must NOT pay the per-item decode cost. This test scales
+// the input to a 10K-item happy-path envelope and asserts that
+// validateClusterListShape stays under the 50ms hard guard (was
+// hundreds-of-ms pre-correction). decodeClusterListItems separately
+// IS allowed to be slow on this input — its cost is the
+// fresh-populate-once cost paid outside the shape budget.
+func TestValidateClusterListShape_HoistedMaterialisation(t *testing.T) {
+	items := make([]any, 0, 10000)
+	for i := 0; i < 10000; i++ {
+		items = append(items, map[string]any{
+			"metadata": map[string]any{
+				"name":      "obj",
+				"namespace": "ns",
+			},
+		})
+	}
+	raw := mustJSON(t, map[string]any{
+		"apiVersion": "composition.krateo.io/v1-2-2",
+		"kind":       "GithubScaffoldingWithCompositionPagesList",
+		"items":      items,
+	})
+	start := time.Now()
+	shape, ok, reason := validateClusterListShape(testShapeGVR, raw)
+	shapeElapsed := time.Since(start)
+	if !ok {
+		t.Fatalf("validateClusterListShape: unexpected ok=false; reason=%q", reason)
+	}
+	if len(shape.rawItems) != 10000 {
+		t.Fatalf("expected 10K deferred items; got %d", len(shape.rawItems))
+	}
+	// Architect mandate: shape budget excludes materialisation. A
+	// 10K-item happy-path envelope must stay well under 50ms in the
+	// shape check itself.
+	if shapeElapsed > 50*time.Millisecond {
+		t.Fatalf("Path 3.1 Bug 1 architect-correction regressed: validateClusterListShape took %v on 10K-item happy-path envelope (>50ms hard guard)", shapeElapsed)
+	}
+	t.Logf("Path 3.1 Bug 1 architect-correction: validateClusterListShape on 10K-item happy-path envelope = %v", shapeElapsed)
+
+	// Materialisation is a separately-timed step; we record its cost
+	// for the diff-review gate but do not assert a tight budget — it
+	// is the fresh-populate-once cost the architect mandate moves
+	// out of the shape budget. The point is that the per-call shape
+	// check above stayed fast even though this materialisation step
+	// is heavier work.
+	matStart := time.Now()
+	parsed, decodeErr := decodeClusterListItems(shape)
+	matElapsed := time.Since(matStart)
+	if decodeErr != "" {
+		t.Fatalf("decodeClusterListItems: unexpected error=%q", decodeErr)
+	}
+	if len(parsed.items) != 10000 {
+		t.Fatalf("decodeClusterListItems: expected 10K items; got %d", len(parsed.items))
+	}
+	t.Logf("Path 3.1 Bug 1 architect-correction: decodeClusterListItems on 10K-item envelope = %v", matElapsed)
 }
 
 // ---------- Cluster-scope path construction ----------
