@@ -639,6 +639,54 @@ func RefreshContentEntry(ctx context.Context, inputs cache.ResolvedKeyInputs) ([
 	return raw, nil
 }
 
+// ParseListEnvelopeForRefresh — Ship #97 (0.30.214). Pure helper the
+// refresher's Put site at resolve_populate.go:255 calls when the entry
+// being Put is an apistage-class LIST so it can populate
+// ResolvedEntry.Items + ItemsAPIVersion + ItemsKind. Without this, the
+// refresher writes RawJSON-only entries, the R3 fast-path predicate at
+// apistage.go:487 (`len(entry.Items) > 0`) evaluates false on every
+// subsequent content-Get-hit, and the gate falls through to
+// gateListEnvelope → parseListEnvelope on the customer request goroutine
+// — the 45% cum CPU long-pole captured in the 0.30.212 pre-fix profile
+// (ship-97-prefix-falsifier-2026-05-31).
+//
+// Returns (nil, "", "", false) for:
+//   - GET-by-name (inputs.Name != ""), where Items is not the right shape;
+//   - a LIST whose envelope fails to parse (e.g. a non-LIST shape that
+//     leaked into the apistage class — caller stores RawJSON only and
+//     the gate then takes the unmarshal fallback, byte-identical to the
+//     pre-fix path).
+//
+// Pure function over (inputs, raw) — no context. The refresher's
+// WithUserInfo / SA-transport identity is unchanged (the parse runs
+// inside the refresher goroutine; the resulting Items slice is the
+// same Items the MISS branch at apistage.go:530-538 populates). The
+// parse cost moves from "per Get-hit on request goroutines" to "per
+// Put on refresher goroutines" — strictly lower rate by construction
+// (Puts << Gets in steady-state) and consistent with the customer-
+// priority invariant (`feedback_customer_priority_over_refresher`).
+func ParseListEnvelopeForRefresh(inputs cache.ResolvedKeyInputs, raw []byte) (
+	items []*unstructured.Unstructured, apiVersion, kind string, ok bool,
+) {
+	if inputs.Name != "" {
+		// GET-by-name — not a LIST. R3 fast-path keys on LIST envelopes only.
+		return nil, "", "", false
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    inputs.Group,
+		Version:  inputs.Version,
+		Resource: inputs.Resource,
+	}
+	parsed, parseOK := parseListEnvelope(gvr, raw)
+	if !parseOK {
+		// Malformed-at-Put envelope. Caller stores RawJSON only — the
+		// content gate then takes the unmarshal fallback at hit time,
+		// byte-identical to pre-fix behaviour.
+		return nil, "", "", false
+	}
+	return parsed.items, parsed.apiVersion, parsed.kind, true
+}
+
 // apiserverPathFor reconstructs the apiserver REST path for a K8s call.
 // name=="" yields a collection (LIST) path; a non-empty name yields the
 // object (GET-by-name) path. Core group ("") uses the /api/v1 prefix;

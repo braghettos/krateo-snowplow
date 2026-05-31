@@ -252,7 +252,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		return nil
 	}
 
-	c.Put(key, &cache.ResolvedEntry{
+	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &inputs,
 		// Ship 4a (0.30.198) — preserve the resident pin on a RAFullList
@@ -260,7 +260,28 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// expensive cell to the transient LRU. Put honours the pin subject
 		// to the resident budget (else demotes — the safe degrade).
 		Pinned: prePinned,
-	})
+	}
+	// Ship #97 (0.30.214) — restore the R3 fast-path on refresher Puts
+	// of apistage-class LIST entries. Pre-fix the refresher Put wrote
+	// RawJSON only (Items: nil); the apistage read path at apistage.go:487
+	// then evaluated `len(entry.Items) > 0 == false` on every content-Get-hit,
+	// falling through to gateListEnvelope → parseListEnvelope on the
+	// customer request goroutine (45% cum CPU at 0.30.212 production scale
+	// per ship-97-prefix-falsifier-2026-05-31). Populating Items here
+	// pushes the parse cost ONCE onto the refresher goroutine (per cycle)
+	// and lets every subsequent Get-hit short-circuit through
+	// gateListItemsWithMemo.
+	//
+	// GET-by-name (Name != "") and malformed-at-Put envelopes return ok=false
+	// and the entry keeps Items=nil — byte-identical fallback to today.
+	if inputs.CacheEntryClass == cache.CacheEntryClassApistage {
+		if items, apiVer, kind, ok := restactionsapi.ParseListEnvelopeForRefresh(inputs, encoded); ok {
+			entry.Items = items
+			entry.ItemsAPIVersion = apiVer
+			entry.ItemsKind = kind
+		}
+	}
+	c.Put(key, entry)
 	log.Debug("resolveAndPopulateL1: re-resolved + stored",
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
