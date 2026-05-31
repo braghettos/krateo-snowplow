@@ -988,6 +988,18 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// (which composes its key from paginationInfo's URL-derived tuple).
 	populateWidgetContentL1(ctx, gvr, in, keyPerPage, keyPage, res)
 
+	// Path 3.2.2 (0.30.220) — apiRef pagination. If `in` is an
+	// apiRef+resourcesRefsTemplate-driven widget AND the resolver's
+	// `status.resourcesRefs.slice.continue` signal is true on the
+	// page-1 envelope, iterateApiRefPages walks pages 2..MaxPages,
+	// populating each page's identity-free `widgetContent` cell and
+	// recursing into the per-page children. A no-op when the predicate
+	// is false or .slice.continue is false — byte-identical to pre-
+	// 3.2.2 behaviour for non-paginated widgets. See
+	// phase1_walk_pagination.go for the full rationale, bounds, and
+	// data-driven predicate.
+	iterateApiRefPages(ctx, w, in, gvr, res, depth, perPage, keyPerPage, w.authnNS)
+
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
 	children := extractResourcesRefsItems(res.Object)
 
