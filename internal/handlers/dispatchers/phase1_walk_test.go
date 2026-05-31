@@ -140,7 +140,7 @@ func TestPhase1_NoHardcode_OrphanExcluded(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil); err != nil {
+	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, nil); err != nil {
 		t.Fatalf("phase1WarmupWith returned error: %v", err)
 	}
 
@@ -189,7 +189,7 @@ func TestPhase1_NoRoots_StillSignalsDone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil); err != nil {
+	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, nil); err != nil {
 		t.Fatalf("phase1WarmupWith (no roots) returned error: %v", err)
 	}
 	if !cache.IsPhase1Done() {
@@ -227,7 +227,7 @@ func TestPhase1_PrematureReady(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		done <- phase1WarmupWith(ctx, rw, lister, resolver, nil, nil)
+		done <- phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, nil)
 	}()
 
 	// Wait until the walk is mid-resolve.

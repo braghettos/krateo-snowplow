@@ -141,16 +141,20 @@ func newClusterListWatcher(t *testing.T) *cache.ResourceWatcher {
 }
 
 // TestClusterListCollapsePut_RecordsDepEdges drives the cluster-list
-// collapse success path to completion (gate-permit → un-gated dispatch
-// via dispatchViaInformer → shape check → apistageStore.Put) and
-// asserts the new Ship 0.30.212 Site 3 dep-record block at
-// cluster_list.go:321's neighbourhood fired with the LIST bucket
-// (gvr, ns="").
+// collapse success path to completion and asserts the Ship 0.30.212
+// Site 3 dep-record block fires with the LIST bucket (gvr, ns="").
 //
-// Pre-fix this test FAILS because the collapse Put has no dep-record
-// companion → CollectMatchesForTest finds NO entry under the
-// cluster-scope LIST bucket → the refresh hook is never called on
-// subsequent OnAdd events for the GVR. Post-fix both invariants PASS.
+// Path 3.2 / 0.30.218 — attemptClusterListCollapse no longer Puts on the
+// customer goroutine; the customer's FIRST call now returns deny-gate 8
+// (cold-miss) and spawns an async populate goroutine. To drive the
+// SYNCHRONOUS Put path the test now calls populateClusterListCellSync
+// directly (the helper extracted from the pre-Path-3.2 customer-path
+// body), then calls attemptClusterListCollapse a SECOND time to verify
+// the cell-warm fast-path returns useCluster=true + gate=0.
+//
+// Pre-Ship-0.30.212 fix this test FAILS because the collapse Put has no
+// dep-record companion → CollectMatchesForTest finds NO entry under the
+// cluster-scope LIST bucket. Post-fix both invariants PASS.
 func TestClusterListCollapsePut_RecordsDepEdges(t *testing.T) {
 	rw := newClusterListWatcher(t)
 	_ = rw
@@ -166,14 +170,6 @@ func TestClusterListCollapsePut_RecordsDepEdges(t *testing.T) {
 		t.Fatalf("resolved cache nil under RESOLVED_CACHE_ENABLED=true")
 	}
 
-	// Stage shape: iterator yields ONE element with ns="team-a" (a
-	// seeded namespace from newClusterListWatcher) so the Path
-	// template resolves to a namespace-scoped widgets path.
-	// deriveTargetGVRForClusterList then derives (widgets.krateo.io/v1/
-	// widgets) and (ns="team-a"), returns ok=true (namespace-scoped).
-	// The RBAC gate then evaluates cluster-scope `list widgets` for
-	// clusterListBroadUser — admitted because the ClusterRoleBinding
-	// grants cluster-wide list.
 	apiCall := &templates.API{
 		Name: "widgets-cluster-collapse",
 		Path: `${ "/apis/widgets.krateo.io/v1/namespaces/" + .ns + "/widgets" }`,
@@ -186,16 +182,35 @@ func TestClusterListCollapsePut_RecordsDepEdges(t *testing.T) {
 	ctx := xcontext.BuildContext(context.Background(),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: clusterListBroadUser}),
 	)
+	log := clusterListLogger(t)
 
+	// Phase 1 — drive the synchronous populate directly (the path
+	// PIP boot pre-warm + the async populate goroutine both call).
+	// This is the cell-fresh-populate code path under test. We
+	// skip attempting the cold-miss path via attemptClusterListCollapse
+	// here because the cold-miss spawns an async goroutine whose
+	// lifetime extends past the test return and would interfere with
+	// subsequent tests under -race. Phase-A cold-miss assertion is
+	// done by the dedicated TestClusterListCollapse_ColdMissReturnsGate8
+	// test in cluster_list_warm_fallback_test.go which resets the
+	// async state on Cleanup.
+	contentKey := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "", ""))
+	clusterCall := buildClusterListCall(apiCall, endpoints.Endpoint{}, f1WidgetsGVR)
+	if !populateClusterListCellSync(ctx, log, apiCall, f1WidgetsGVR, contentKey, clusterCall, store) {
+		t.Fatalf("populateClusterListCellSync: expected ok=true (synchronous populate "+
+			"under cluster_list collapse enabled flag + populated cluster-scope LIST envelope); "+
+			"got ok=false. Cell warmth + Site 3 dep-record both depend on this path.")
+	}
+
+	// Phase 2 — the cell is now warm. attemptClusterListCollapse must
+	// return useCluster=true + gate=0 via the cell-warm fast-path.
 	newTmp, useCluster, gate := attemptClusterListCollapse(
-		ctx, clusterListLogger(t), apiCall,
+		ctx, log, apiCall,
 		map[string]any{}, endpoints.Endpoint{}, store, true,
 	)
 	if !useCluster {
-		t.Fatalf("attemptClusterListCollapse: expected success path (useClusterList=true); "+
-			"got useCluster=%v gate=%d tmp=%v. Setup broken — newClusterListWatcher's "+
-			"ClusterRoleBinding grants cluster-scope `list widgets`; "+
-			"clusterListCollapseEnabled is flipped.",
+		t.Fatalf("Path 3.2 cell-warm fast-path: expected useCluster=true after populate; "+
+			"got useCluster=%v gate=%d tmp=%v.",
 			useCluster, gate, newTmp)
 	}
 	if len(newTmp) != 1 {

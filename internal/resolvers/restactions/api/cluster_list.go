@@ -42,7 +42,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -56,6 +58,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+func goMaxProcs() int { return runtime.GOMAXPROCS(0) }
 
 // shapeCheckSlowThreshold is the AC-D5.14 conditional ratification
 // budget: the defensive shape check must complete within 10ms. A slow
@@ -242,57 +246,127 @@ func attemptClusterListCollapse(
 	// All five gates passed. Build the cluster-scope call.
 	clusterCall := buildClusterListCall(apiCall, ep, gvr)
 
-	// AC-D5.14 defensive shape check — dispatch un-gated through the
-	// informer pivot to obtain the raw cluster-scope envelope, then
-	// verify its multi-element shape BEFORE storing in apistage L1.
+	// Path 3.2 / 0.30.218 — CELL-WARM FAST-PATH.
 	//
-	// Why this prefetch + shape-check happens here (and not inside the
-	// worker loop): a malformed cluster-scope envelope must NOT be
-	// cached. If the shape check fired AFTER apistageContentServe's
-	// Put, the bad envelope would be in L1 already and subsequent
-	// requests would re-read it. Prefetching lets us reject before
-	// caching, and on the success path we Put the validated envelope
-	// directly so the worker loop hits the cache (no double-dispatch).
+	// Before paying the synchronous defensive prefetch (which decodes the
+	// multi-MB envelope ON THE CUSTOMER GOROUTINE at ~10-12 ms/MB —
+	// 2,024ms for compositions at 50K production scale per the empirical
+	// 0.30.217 marker probe), check whether the apistage cell for this
+	// (gvr, "", "") tuple is already warm. If so, return the cluster-scope
+	// call and let the worker loop's apistageContentServe consume the
+	// cached, decoded envelope (cheap per-user UAF prune — ~ms).
 	//
-	// Ship 0.30.193 Defensive prefetch breakdown — capture the
-	// dispatch / parse / put sub-stage timings + envelope bytes on the
-	// success path (the only path that does work whose cost matters for
-	// the cohort allCompositions 91s gap). Fail-paths (unservable
-	// dispatch, shape fallback) leave the accumulator at zero — the
-	// sink-side AccumulateDefensive is gated on the success return
-	// below at line 286.
+	// The cell-warm check is a sync.Map.Load (ns-scale, zero alloc) — IT
+	// IS the customer-priority property that lets cluster_list collapse
+	// safely activate at production scale. Without it, every cold customer
+	// /call pays the 2-second decode tax (`feedback_cluster_list_decode_irreducibility`).
+	//
+	// COLD-MISS POLICY: the cell is unpopulated. DO NOT decode
+	// synchronously on the customer goroutine. Schedule an async populate
+	// via the refresher's HIGH-PRIORITY cluster_list tier, return
+	// useClusterList=false (deny-gate 8 — "cell-cold-async-populate-
+	// scheduled"), and let the caller fall back to the per-NS iterator
+	// path for THIS request. The per-NS path is small per call (1-2 NS
+	// for narrow-RBAC users at ~50-200ms aggregate) — well inside the
+	// 500ms AC-P3.2.1 decode-attribution gate.
+	//
+	// The next customer of the same cell hits the populated cell from
+	// the refresher's async work — warmth improves monotonically without
+	// any customer ever paying raw decode.
+	contentKey := cache.ComputeKey(contentKeyInputs(gvr, "", ""))
+	if entry, hit := apistageStore.Get(contentKey); hit && entry != nil {
+		// CELL WARM. Customer keeps the cluster-scope call; the worker
+		// loop's apistageContentServe will Get-hit on this entry and
+		// skip the redundant dispatchViaInformer call. NO decode on the
+		// customer goroutine.
+		cache.RecordApiserverFallthrough(ctx,
+			cache.ReasonClusterListDispatch, gvr.String())
+		cache.RecordClusterListCellWarm()
+		log.Debug("cluster_list.cell.warm",
+			slog.String("subsystem", "cache"),
+			slog.String("ra_stage", apiCall.Name),
+			slog.String("gvr", gvr.String()),
+			slog.String("user", user.Username),
+		)
+		return []httpcall.RequestOptions{clusterCall}, true, 0
+	}
+
+	// CELL COLD. Schedule async populate via a bounded background
+	// goroutine that runs the SAME synchronous populate body the
+	// pre-Path-3.2 code path ran on the customer goroutine — only NOT
+	// on the customer goroutine. Return useClusterList=false so the
+	// caller falls back to per-NS iterator for THIS request.
+	//
+	// The next customer of the same cell hits warm. PIP boot pre-warm
+	// (phase1_clusterlist_prewarm.go) populates every cluster_list
+	// cell at boot so this cold-miss path fires ONLY for runtime
+	// new-RA / cell-eviction edge cases.
+	populateClusterListCellAsync(ctx, log, apiCall, ep, gvr, contentKey, clusterCall, apistageStore)
+	cache.RecordClusterListCellColdFallback()
+	log.Info("cluster_list.cell.cold_fallback",
+		slog.String("subsystem", "cache"),
+		slog.String("ra_stage", apiCall.Name),
+		slog.String("gvr", gvr.String()),
+		slog.String("user", user.Username),
+		slog.String("effect", "per-NS fallback for this request; async populate scheduled — next request warm"),
+	)
+	return nil, false, 8
+}
+
+// populateClusterListCellSync runs the synchronous defensive prefetch +
+// shape check + materialise + Put for the cluster_list cell identified
+// by (gvr, contentKey). This is the pre-Path-3.2 customer-path body,
+// extracted so it can run from THREE call sites without duplication:
+//
+//   1. PIP boot pre-warm (phase1_clusterlist_prewarm.go) — invoked at
+//      Step 7.5 BEFORE MarkPhase1Done, populates the cell roster under
+//      SA identity in parallel.
+//   2. populateClusterListCellAsync — the cold-miss async populate goroutine
+//      spawned from attemptClusterListCollapse when a customer /call hits
+//      an unpopulated cell. Runs OFF the customer goroutine.
+//   3. The refresher handler (registered indirectly via the RestActions
+//      refresh path) — invoked when the dep-tracker dirty-marks the
+//      cluster_list cell on an informer event.
+//
+// Returns ok=true when the cell was successfully populated; false on any
+// failure (dispatch unservable, shape fallback, materialise error). The
+// caller decides what to do on failure (per-NS fallback at customer
+// path; log-only at PIP boot path).
+//
+// ctx MUST be set up so dispatchViaInformer can serve the cluster-scope
+// call (cache.WithApistageContentResolve at the customer path; SA
+// identity context at the PIP path).
+func populateClusterListCellSync(
+	ctx context.Context,
+	log *slog.Logger,
+	apiCall *templates.API,
+	gvr schema.GroupVersionResource,
+	contentKey string,
+	clusterCall httpcall.RequestOptions,
+	apistageStore *cache.ResolvedCacheStore,
+) bool {
+	// Belt-and-braces: re-check warmth under the lock-equivalent
+	// sync.Map.Load. Two cold-miss goroutines for the same cell may
+	// have raced past attemptClusterListCollapse's fast-path check;
+	// the second one Puts identical bytes — harmless but wasteful.
+	if entry, hit := apistageStore.Get(contentKey); hit && entry != nil {
+		return true
+	}
+
 	pipSink := cache.PIPStageTimingSinkFrom(ctx)
 	dispatchStart := time.Now()
 	rawEnvelope, dispatchedOK := dispatchViaInformer(
 		cache.WithApistageContentResolve(ctx), clusterCall)
 	defensiveDispatchMs := time.Since(dispatchStart).Milliseconds()
 	if !dispatchedOK {
-		// Pre-sync informer / metadata-only GVR / passthrough mode —
-		// the pivot cannot serve this call. The iterator path can
-		// still proceed (it dispatches per-NS through the apiserver
-		// branch); fall back without recording a shape fallback (this
-		// is not a malformed envelope, just a "not pivot-servable"
-		// signal).
 		log.Debug("cluster_list.dispatch_unservable",
 			slog.String("subsystem", "cache"),
 			slog.String("ra_stage", apiCall.Name),
 			slog.String("gvr", gvr.String()),
 		)
-		return nil, false, 6
+		return false
 	}
 
-	// AC-D5.14 — multi-element shape check. ≤10ms budget.
-	//
-	// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction):
-	// validateClusterListShape is now O(envelope-fields + first-K-items
-	// sample). The full per-item materialisation
-	// (decodeClusterListItems) has been HOISTED OUT to its own
-	// separately-timed step below — it is fresh-populate cost paid
-	// once per cell, NOT a recurring per-call cost. The shape check's
-	// `envelope_ok_elapsed` log field reflects honest, cheap shape
-	// verification; the materialisation's cost surfaces under its own
-	// `materialise_elapsed` field. Restores honest telemetry split per
-	// architect ack of 2026-05-31.
 	shapeStart := time.Now()
 	shape, shapeOK, shapeReason := validateClusterListShape(gvr, rawEnvelope)
 	envelopeOKElapsed := time.Since(shapeStart)
@@ -315,21 +389,9 @@ func attemptClusterListCollapse(
 			slog.String("shape_reason", shapeReason),
 			slog.Int("envelope_bytes", len(rawEnvelope)),
 		)
-		return nil, false, 7
+		return false
 	}
 
-	// Path 3.1 Bug 1 (architect-mandated correction) — materialise items
-	// OUTSIDE the shape-check budget so its cost is attributed honestly
-	// to its own `materialise_elapsed` log field. This is the
-	// fresh-populate path; subsequent reads of the cell skip this work
-	// via the stored ResolvedEntry.Items slice (the
-	// apistageContentServe Get-hit path consumes parsedListEnvelope
-	// without re-materialisation).
-	//
-	// Decode failure here is treated as a shape fallback (same
-	// counter+log marker pre-correction): the envelope passed the
-	// header check but a per-item byte was malformed — the iterator
-	// path remains the safe fallback.
 	materialiseStart := time.Now()
 	parsed, decodeErr := decodeClusterListItems(shape)
 	materialiseElapsed := time.Since(materialiseStart)
@@ -344,23 +406,9 @@ func attemptClusterListCollapse(
 			slog.Int("envelope_bytes", len(rawEnvelope)),
 			slog.Duration("materialise_elapsed", materialiseElapsed),
 		)
-		return nil, false, 7
+		return false
 	}
 
-	// Store the validated envelope under the identity-free apistage key
-	// BEFORE returning the cluster-scope call. The worker loop's
-	// apistageContentServe will then Get-hit on this entry and skip the
-	// redundant dispatchViaInformer call.
-	//
-	// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction) —
-	// Items / ItemsAPIVersion / ItemsKind come from decodeClusterListItems
-	// above; populating them at the Put site keeps Ship 0.30.194 Fix B's
-	// no-double-decode dedup property (apistageContentServe does NOT
-	// re-run parseListEnvelope on the Get-hit). Output is byte-identical
-	// to pre-correction Ship 0.30.216 because decodeClusterListItems and
-	// the prior in-validate per-item loop run the SAME json.Unmarshal +
-	// stripManagedFields + unstructured.Unstructured wrap.
-	contentKey := cache.ComputeKey(contentKeyInputs(gvr, "", ""))
 	newEntry := &cache.ResolvedEntry{
 		RawJSON:         rawEnvelope,
 		Inputs:          ptrTo(contentKeyInputs(gvr, "", "")),
@@ -368,34 +416,19 @@ func attemptClusterListCollapse(
 		ItemsAPIVersion: parsed.apiVersion,
 		ItemsKind:       parsed.kind,
 	}
-	// defensiveParseMs now reflects the materialisation step (the
-	// per-item decode + stripManagedFields + Unstructured wrap that the
-	// architect correction moved out of validateClusterListShape). The
-	// PIPStageTiming.AccumulateDefensive signature stays unchanged
-	// (additive instrumentation) so seed/diff dashboards keep their
-	// existing columns; the column now correctly attributes the
-	// materialisation cost to the parse stage instead of leaving it
-	// folded into shape_check_elapsed.
 	defensiveParseMs := materialiseElapsed.Milliseconds()
 
 	putStart := time.Now()
 	apistageStore.Put(contentKey, newEntry)
-	// Ship 0.30.212 — wire informer-event invalidation for the collapsed
-	// cluster-scope LIST cell. Without a dep edge an informer ADD/UPDATE/
-	// DELETE on any object of (gvr, *) can never dirty-mark this cell,
-	// leaving it TTL-stale-forever (F-4 defect). Always LIST with name=""
-	// by construction (contentKey is built with empty ns + empty name on
-	// the line above), so no isList branch needed; cluster-scope → empty
-	// namespace argument matches dispatcher resolve.go:550 RecordList.
-	// Idempotent + sub-µs.
 	cache.Deps().RecordList(contentKey, gvr, "")
 	defensivePutMs := time.Since(putStart).Milliseconds()
 
-	// Ship 0.30.193 — accumulate the defensive prefetch breakdown into
-	// the in-flight PIP stage. Nil-safe sink: production /call has no
-	// sink → no-op. The parent goroutine of the resolver stage loop
-	// owns sink.current at this point (BeginStage has fired, no g.Go
-	// has been launched yet) — no mu contention from worker writes.
+	// Path 3.2 / 0.30.218 — register the populated cell as a
+	// cluster_list tier key so the dep-tracker dirty-mark hook routes
+	// future informer-event refreshes to the HIGH-PRIORITY tier.
+	// Idempotent.
+	cache.RegisterClusterListKey(contentKey)
+
 	pipSink.AccumulateDefensive(
 		int64(len(rawEnvelope)),
 		defensiveDispatchMs,
@@ -409,22 +442,165 @@ func attemptClusterListCollapse(
 		slog.String("subsystem", "cache"),
 		slog.String("ra_stage", apiCall.Name),
 		slog.String("gvr", gvr.String()),
-		slog.String("user", user.Username),
 		slog.Int("envelope_bytes", len(rawEnvelope)),
 		slog.Duration("dispatch_elapsed", time.Since(dispatchStart)),
-		// Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction) —
-		// `envelope_ok_elapsed` replaces `shape_check_elapsed`: the
-		// envelope-only shape check is the actual cheap path now (no
-		// per-item materialisation folded in). Field rename matches the
-		// architect's "restore honest telemetry split" instruction.
-		// `materialise_elapsed` is the new field for the per-item decode
-		// cost — paid here on fresh-populate, NOT on cache hits.
 		slog.Duration("envelope_ok_elapsed", envelopeOKElapsed),
 		slog.Duration("materialise_elapsed", materialiseElapsed),
 		slog.Int64("defensive_parse_ms", defensiveParseMs),
 		slog.Int64("defensive_put_ms", defensivePutMs),
 	)
-	return []httpcall.RequestOptions{clusterCall}, true, 0
+	return true
+}
+
+// populateClusterListCellAsync spawns a bounded background goroutine
+// that calls populateClusterListCellSync. Used by
+// attemptClusterListCollapse's cold-miss path to populate the cell
+// off the customer goroutine.
+//
+// Concurrency bound: each call spawns ONE goroutine bounded by
+// clusterListAsyncSemaphore (size = GOMAXPROCS). Excess concurrent
+// cold-misses on DIFFERENT cells either block until a slot frees up
+// OR drop the populate (TryAcquire pattern — drop is safe because the
+// next customer will retry).
+//
+// We use a non-blocking TrySend semaphore so the customer goroutine is
+// NEVER blocked on an inflight populate — the customer keeps the
+// per-NS fallback regardless. The customer-priority invariant is
+// preserved: at WORST the cold-miss path is amplified by another
+// customer hitting the same cell while the populate is still in
+// flight; at best the populate completes before the next request
+// arrives.
+//
+// inflightCells tracks which cells already have a populate goroutine
+// inflight, so concurrent cold-misses on the SAME cell only spawn ONE
+// populate goroutine.
+func populateClusterListCellAsync(
+	customerCtx context.Context,
+	log *slog.Logger,
+	apiCall *templates.API,
+	ep endpoints.Endpoint,
+	gvr schema.GroupVersionResource,
+	contentKey string,
+	clusterCall httpcall.RequestOptions,
+	apistageStore *cache.ResolvedCacheStore,
+) {
+	// Per-cell dedup: only ONE populate goroutine inflight per cell.
+	// LoadOrStore returns (loaded=true) when the key was already
+	// present — another populate is in flight; this one returns
+	// without spawning.
+	if _, loaded := clusterListInflightCells.LoadOrStore(contentKey, struct{}{}); loaded {
+		return
+	}
+
+	// Bounded-concurrency gate (drop-on-full). If GOMAXPROCS populates
+	// are already running, drop this one — the next customer to hit
+	// the same cell will retry. Customer goroutine NEVER blocks here.
+	select {
+	case clusterListAsyncSemaphore <- struct{}{}:
+	default:
+		// Drop. Release the inflight marker so the next caller can
+		// re-try (otherwise the cell would be permanently locked
+		// inflight=true with no populate running).
+		clusterListInflightCells.Delete(contentKey)
+		log.Debug("cluster_list.cell.async_populate_dropped",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("reason", "concurrency cap reached — next customer will retry"),
+		)
+		return
+	}
+
+	go func() {
+		defer func() {
+			<-clusterListAsyncSemaphore
+			clusterListInflightCells.Delete(contentKey)
+			if r := recover(); r != nil {
+				log.Error("cluster_list.cell.async_populate_panic",
+					slog.String("subsystem", "cache"),
+					slog.String("gvr", gvr.String()),
+					slog.Any("panic", r),
+				)
+			}
+		}()
+
+		// Detach from the customer ctx — its cancellation must NOT
+		// abort our populate (the customer can return long before we
+		// finish; the populate is for the NEXT customer). We carry the
+		// internal endpoint + REST config + apistage-content-resolve
+		// markers so dispatchViaInformer can serve the cluster-scope
+		// call. Use a fresh timeout context anchored to Background.
+		populateCtx, cancel := context.WithTimeout(context.Background(),
+			clusterListAsyncPopulateTimeout)
+		defer cancel()
+		// Carry endpoint identity from the customer ctx so the
+		// dispatch path can construct the cluster-scope URL. The
+		// internal endpoint + REST config carry over via
+		// cache.WithInternalEndpoint / WithInternalRESTConfig if set
+		// on customerCtx — re-attach them to populateCtx.
+		if iep, ok := cache.InternalEndpointFromContext(customerCtx); ok && iep != nil {
+			populateCtx = cache.WithInternalEndpoint(populateCtx, iep)
+		}
+		if irc, ok := cache.InternalRESTConfigFromContext(customerCtx); ok && irc != nil {
+			populateCtx = cache.WithInternalRESTConfig(populateCtx, irc)
+		}
+		// Carry logger.
+		populateCtx = xcontext.BuildContext(populateCtx, xcontext.WithLogger(log))
+		_ = ep // ep retained in closure for future SA-context wiring if needed
+
+		ok := populateClusterListCellSync(populateCtx, log, apiCall, gvr, contentKey, clusterCall, apistageStore)
+		if ok {
+			log.Debug("cluster_list.cell.async_populate_completed",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+			)
+		}
+	}()
+}
+
+// clusterListAsyncSemaphore bounds the number of concurrent cold-miss
+// populate goroutines spawned by populateClusterListCellAsync.
+// Sized at GOMAXPROCS — matches the existing PIP errgroup limit. Drops
+// excess (customer goroutine NEVER blocks). Initialised in init().
+var clusterListAsyncSemaphore chan struct{}
+
+// clusterListInflightCells dedupes concurrent populate goroutines for
+// the SAME cell. Keyed on contentKey; value is a struct{} sentinel.
+var clusterListInflightCells sync.Map
+
+// clusterListAsyncPopulateTimeout caps a single async populate at 30s.
+// Empirically the worst-case cell (compositions @ 174 MiB) costs ~4s
+// on 8 cores; 30s gives ~7× safety. After timeout the goroutine exits
+// and the cell stays cold; next customer retries via the same cold-miss
+// path.
+const clusterListAsyncPopulateTimeout = 30 * time.Second
+
+// ResetClusterListAsyncStateForTest clears the inflight-cells dedup map
+// + drains the bounded-concurrency semaphore. Test-only — production
+// code MUST NOT call this. Used by tests to prevent state leakage
+// between cases. Path 3.2 / 0.30.218.
+func ResetClusterListAsyncStateForTest() {
+	clusterListInflightCells.Range(func(k, _ any) bool {
+		clusterListInflightCells.Delete(k)
+		return true
+	})
+	// Drain semaphore non-blockingly.
+	for {
+		select {
+		case <-clusterListAsyncSemaphore:
+		default:
+			return
+		}
+	}
+}
+
+func init() {
+	// Match PIP errgroup parallelism (runtime.GOMAXPROCS(0)). Fallback
+	// is 4 if GOMAXPROCS reports <= 0 (defensive — should never happen).
+	n := goMaxProcs()
+	if n <= 0 {
+		n = 4
+	}
+	clusterListAsyncSemaphore = make(chan struct{}, n)
 }
 
 // deriveTargetGVRForClusterList runs ONE jq evaluation of the

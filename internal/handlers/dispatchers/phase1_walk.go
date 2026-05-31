@@ -361,7 +361,18 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		seedFn = engineSeed
 	}
 
-	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm, seedFn)
+	// Path 3.2 / 0.30.218 — Step 7.5 cluster_list cell pre-warm. Runs
+	// BEFORE MarkPhase1Done (the cells must be warm by the time
+	// /readyz flips so the first customer /call hits warm cells, not
+	// the cold-fallback path). Nil-safe: when CACHE_ENABLED=false /
+	// PREWARM_CONTENT_ENABLED=false (no harvested RA set), the hook
+	// is no-op.
+	var clusterListPrewarm clusterListPrewarmFn
+	if harvester != nil {
+		clusterListPrewarm = makeClusterListPrewarmFn(harvester, *saEP, rc, authnNS)
+	}
+
+	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm, clusterListPrewarm, seedFn)
 }
 
 // phase1WarmupWith is the testable core: it takes the watcher, the
@@ -408,7 +419,7 @@ type contentPrewarm func(ctx context.Context)
 // tests); production passes runPIPSeed.
 type pipSeedFn func(ctx context.Context) error
 
-func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm, pipSeed pipSeedFn) error {
+func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm, clusterListPrewarm clusterListPrewarmFn, pipSeed pipSeedFn) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -507,6 +518,17 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// runContentPrewarmPass and never blocks readiness.
 	if contentWarm != nil {
 		contentWarm(ctx)
+	}
+
+	// Step 7.5 (Path 3.2 / 0.30.218) — cluster_list cell pre-warm. Runs
+	// BEFORE MarkPhase1Done so the first customer /call after readiness
+	// flip hits warm cluster_list cells, not the cold-fallback path.
+	// Bounded by 60s (api.ClusterListPrewarmTimeout); on timeout
+	// MarkPhase1Done fires regardless — the cluster_list cold-fallback
+	// path covers any unwarmed cell at /call time. nil-safe when
+	// cache off / no harvester.
+	if clusterListPrewarm != nil {
+		clusterListPrewarm(ctx)
 	}
 
 	// Step 8 — signal Phase1Done. /readyz flips to 200.

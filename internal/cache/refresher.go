@@ -160,6 +160,43 @@ type refresher struct {
 	// the queue is unbounded so a dirty-mark is NEVER dropped.
 	queue workqueue.TypedRateLimitingInterface[string]
 
+	// Path 3.2 / 0.30.218 — TWO-TIER PRIORITY QUEUE for cluster_list cell
+	// refresh. clusterListQueue is the HIGH-PRIORITY tier: cluster_list
+	// apistage cells (identity-free, cluster-scope LIST envelopes of size
+	// 30-174 MiB on the prod cluster) refresh through this queue. The
+	// worker's processNext drains clusterListQueue FIRST when non-empty,
+	// then falls back to the normal queue. Mirrors the prewarm engine's
+	// priority-scope drain pattern (prewarm_engine.go:280-303). The
+	// rationale: cluster_list cells are FEW (~10-15 distinct GVRs) but
+	// EXPENSIVE per refresh (~2-3s each), and a stale cluster_list cell
+	// affects EVERY broad-RBAC user; per-user cells are MANY but CHEAP
+	// per refresh (~50-100ms) and only affect one user at a time. The
+	// two-tier discipline ensures cluster_list cells get fresh ahead of
+	// the long per-user tail under a CRUD storm.
+	//
+	// Customer-priority invariant PRESERVED — yieldToCustomer is called
+	// BEFORE the handler regardless of which queue the key was drawn from
+	// (see processNext below). The two-tier discipline is INSIDE
+	// processNext's source selection, ORTHOGONAL to the customer-yield
+	// gate.
+	//
+	// Same rate-limiter wiring as `queue` — exponential-failure backoff,
+	// idempotent dedup, unbounded so a dirty-mark is NEVER dropped.
+	clusterListQueue workqueue.TypedRateLimitingInterface[string]
+
+	// clusterListKeys is the set of L1 keys known to belong to the
+	// cluster_list cell tier. Populated by EnqueueClusterListRefresh on
+	// every cluster_list cell registration (PIP boot pre-warm Step 7.5,
+	// async populate on cold-miss, or the dep-tracker dirty-mark hook
+	// when the dirtied key matches a known cluster_list cell). The
+	// dep-tracker SetRefreshHook callback consults this set to decide
+	// whether a dirty-marked key should go to clusterListQueue
+	// (high-priority tier) or the normal queue.
+	//
+	// Concurrency: sync.Map — read-mostly. Cluster_list cell cardinality
+	// is bounded (~10-15 GVRs at 50K prod scale) so contention is trivial.
+	clusterListKeys sync.Map
+
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
 
@@ -198,6 +235,18 @@ type refresher struct {
 	yieldedTotal atomic.Uint64
 	cappedTotal  atomic.Uint64
 
+	// Path 3.2 / 0.30.218 — two-tier queue falsifier counters.
+	// clusterListEnqueueTotal ticks every Enqueue into clusterListQueue;
+	// clusterListCompletedTotal ticks every successful drain of
+	// clusterListQueue. Used by AC-P3.2.5 (cluster_list cell refresh
+	// within 30s) and AC-P3.2.13 (per-user tier non-starvation under
+	// sustained burst). Per-tier observability is mandatory because the
+	// dominant residual risk is tier-skew — the two counters let us
+	// distinguish "high-priority tier starves low-priority tier" from
+	// "both tiers progress in proportion".
+	clusterListEnqueueTotal   atomic.Uint64
+	clusterListCompletedTotal atomic.Uint64
+
 	startedOnce sync.Once
 	stopOnce    sync.Once
 	// workersWG lets test cleanup block until every worker goroutine
@@ -230,10 +279,19 @@ func refresherSingleton() *refresher {
 			time.Duration(baseMS)*time.Millisecond,
 			time.Duration(maxMS)*time.Millisecond,
 		)
+		// Path 3.2 — separate rate limiter instance for the cluster_list tier
+		// so per-key NumRequeues counts do not leak between tiers (a
+		// per-user cell's retry history must not affect a cluster_list
+		// cell's retry budget and vice versa).
+		clRL := workqueue.NewTypedItemExponentialFailureRateLimiter[string](
+			time.Duration(baseMS)*time.Millisecond,
+			time.Duration(maxMS)*time.Millisecond,
+		)
 		refresherInstance = &refresher{
-			parallelism: parallelism,
-			queue:       workqueue.NewTypedRateLimitingQueue[string](rl),
-			handlers:    map[string]RefreshFunc{},
+			parallelism:      parallelism,
+			queue:            workqueue.NewTypedRateLimitingQueue[string](rl),
+			clusterListQueue: workqueue.NewTypedRateLimitingQueue[string](clRL),
+			handlers:         map[string]RefreshFunc{},
 		}
 	})
 	return refresherInstance
@@ -278,7 +336,18 @@ func StartRefresher(ctx context.Context) {
 		// directly, not the L1 store. The invalidator is non-blocking
 		// (drop-on-full) so this never delays the refresher enqueue path.
 		Deps().SetRefreshHook(func(l1Key string) {
-			r.enqueue(l1Key)
+			// Path 3.2 / 0.30.218 — two-tier dispatch. If the key is a
+			// registered cluster_list cell, route it to the
+			// HIGH-PRIORITY tier; otherwise the normal tier. The
+			// clusterListKeys set is populated by PIP boot pre-warm
+			// (phase1_clusterlist_prewarm.go) AND by
+			// EnqueueClusterListRefresh from cluster_list.go's
+			// cold-miss async-populate path.
+			if _, isClusterList := r.clusterListKeys.Load(l1Key); isClusterList {
+				r.enqueueClusterList(l1Key)
+			} else {
+				r.enqueue(l1Key)
+			}
 			SubmitSliceabilityInvalidate(l1Key)
 		})
 
@@ -298,11 +367,13 @@ func StartRefresher(ctx context.Context) {
 			}(i)
 		}
 
-		// Shut the queue down when ctx is cancelled — Get unblocks,
-		// every worker's processNext returns false, the loop ends.
+		// Shut the queues down when ctx is cancelled — Get unblocks on
+		// both tiers, every worker's processNext returns false, the
+		// loop ends.
 		go func() {
 			<-ctx.Done()
 			r.queue.ShutDown()
+			r.clusterListQueue.ShutDown()
 		}()
 
 		slog.Info("refresher.started",
@@ -313,12 +384,13 @@ func StartRefresher(ctx context.Context) {
 	})
 }
 
-// StopRefresher shuts the queue down. Safe to call multiple times. Used
-// by tests; production lets the context-cancel path drive shutdown.
+// StopRefresher shuts both queues down. Safe to call multiple times.
+// Used by tests; production lets the context-cancel path drive shutdown.
 func StopRefresher() {
 	r := refresherSingleton()
 	r.stopOnce.Do(func() {
 		r.queue.ShutDown()
+		r.clusterListQueue.ShutDown()
 	})
 }
 
@@ -332,6 +404,63 @@ func (r *refresher) enqueue(l1Key string) {
 	}
 	r.queue.Add(l1Key)
 	r.enqueueTotal.Add(1)
+}
+
+// enqueueClusterList adds l1Key to the HIGH-PRIORITY cluster_list
+// workqueue tier (Path 3.2 / 0.30.218). Same idempotent-dedup +
+// unbounded contract as the normal tier; the only difference is the
+// drain priority — processNext attempts clusterListQueue first.
+//
+// Callers MUST first register l1Key via RegisterClusterListKey so the
+// dep-tracker dirty-mark hook also routes future dirty-marks of the
+// same key to this tier (not just the immediate enqueue). The
+// registration is the source-of-truth for tier membership; this method
+// only schedules ONE refresh.
+func (r *refresher) enqueueClusterList(l1Key string) {
+	if l1Key == "" {
+		return
+	}
+	r.clusterListQueue.Add(l1Key)
+	r.enqueueTotal.Add(1)
+	r.clusterListEnqueueTotal.Add(1)
+}
+
+// RegisterClusterListKey marks l1Key as belonging to the cluster_list
+// cell tier. The dep-tracker dirty-mark hook consults the registered
+// set when deciding which tier to route a dirty-marked key to. Idempotent
+// (sync.Map.Store of a struct{} sentinel) and read-mostly: registration
+// happens at PIP boot pre-warm and on the cold-miss async-populate path
+// (the FIRST customer to hit an unpopulated cell); reads happen on every
+// dep-tracker dirty-mark.
+//
+// Empty l1Key is a no-op. Path 3.2 / 0.30.218.
+func RegisterClusterListKey(l1Key string) {
+	if l1Key == "" {
+		return
+	}
+	refresherSingleton().clusterListKeys.Store(l1Key, struct{}{})
+}
+
+// EnqueueClusterListRefresh schedules an L1 re-resolve via the
+// HIGH-PRIORITY cluster_list tier. Used by cluster_list.go's cold-miss
+// async-populate path: a customer /call hits an unpopulated cluster_list
+// cell, falls back to the per-NS iterator path for THAT request, and
+// triggers an async populate via this method so the NEXT customer of
+// the same cell hits warm. Path 3.2 / 0.30.218.
+//
+// Also registers l1Key in the cluster_list tier (so future
+// dep-tracker dirty-marks of the same key route here too). Idempotent
+// + non-blocking; safe to call from any goroutine.
+func EnqueueClusterListRefresh(l1Key string) {
+	RegisterClusterListKey(l1Key)
+	refresherSingleton().enqueueClusterList(l1Key)
+}
+
+// IsClusterListKey reports whether l1Key has been registered as a
+// cluster_list cell. Read-only — used by tests and metrics. Path 3.2.
+func IsClusterListKey(l1Key string) bool {
+	_, ok := refresherSingleton().clusterListKeys.Load(l1Key)
+	return ok
 }
 
 // EnqueueRefresh is the package-level enqueue entry point for callers
@@ -436,19 +565,79 @@ func (r *refresher) yieldToCustomer(ctx context.Context) {
 // yield is bounded by refresherYieldMaxParked (5s) so a never-decrementing
 // inflight counter cannot stall refresh forever. AC-98.12 (CRUD-to-
 // completed Δt ≤ 10s under quiescent load) is the convergence falsifier.
+//
+// Path 3.2 / 0.30.218 — TWO-TIER PRIORITY DRAIN. The worker probes the
+// HIGH-PRIORITY clusterListQueue FIRST (non-blocking Len() probe; a
+// non-zero Len() means at least one key is queued, and the Get is then
+// guaranteed to return promptly because the queue is non-empty AND
+// workqueue.Get races safely across workers). On Len() == 0 (the steady
+// state — cluster_list events are infrequent), the worker falls through
+// to the blocking normal-tier Get. This preserves the prewarm engine's
+// priority-scope drain shape (prewarm_engine.go:280-303) for the
+// cluster_list cell tier while keeping the normal tier on the same
+// blocking-Get path it had pre-Path-3.2.
+//
+// CORRECTNESS under concurrent workers: workqueue.Get is concurrency-safe
+// (k8s.io/client-go/util/workqueue/queue.go) — if N workers race on a
+// queue with M items, only min(N,M) get items, the rest block. A worker
+// that probes Len()>0 then races into Get may lose to a peer (peer drains
+// it first); the loser's Get blocks. That is a correctness wash — the
+// loser still drains the next available item from EITHER tier on the
+// next iteration. NO key is lost; the priority property is preserved
+// in expectation (every cluster_list arrival wakes at least one worker
+// that will Get it on its next loop iteration).
 func (r *refresher) processNext(ctx context.Context) bool {
-	key, shutdown := r.queue.Get()
-	if shutdown {
-		return false
+	// Path 3.2 — high-priority drain probe. If the cluster_list tier
+	// has work pending, pick it up first. Len() is cheap (atomic read
+	// inside the workqueue); a non-zero value guarantees the next
+	// Get() either returns an item promptly OR returns shutdown=true
+	// (queue ShutDown). On shutdown of clusterListQueue we fall back
+	// to the normal tier (which may still be live during a partial
+	// shutdown window — production shuts both together via the
+	// ctx.Done goroutine, but tests may shutdown only one).
+	var (
+		key      string
+		shutdown bool
+		fromCL   bool
+	)
+	if r.clusterListQueue != nil && r.clusterListQueue.Len() > 0 {
+		key, shutdown = r.clusterListQueue.Get()
+		if !shutdown {
+			fromCL = true
+		}
 	}
-	defer r.queue.Done(key)
+	if !fromCL {
+		// Normal tier blocking Get. This is the steady-state path
+		// (cluster_list events are infrequent — boot pre-warm
+		// populates ~10-15 cells then refreshes only on informer
+		// events on the underlying GVRs).
+		key, shutdown = r.queue.Get()
+		if shutdown {
+			return false
+		}
+	}
+	if fromCL {
+		defer r.clusterListQueue.Done(key)
+	} else {
+		defer r.queue.Done(key)
+	}
 
 	// Customer-priority cooperative yield (Ship #98). Mirrors prewarm
 	// engine's yield-before-scope pattern (prewarm_engine.go:275). The
 	// yield reads the dispatcher-injected customer-inflight hook; with
 	// no hook (unit tests, cache-off) it is a single zero-cost read +
-	// immediate return.
+	// immediate return. Applied IDENTICALLY for both tiers — Path 3.2
+	// preserves the Ship #98 customer-priority invariant: NO refresher
+	// work, cluster_list-tier or otherwise, races a customer /call.
 	r.yieldToCustomer(ctx)
+
+	// Select the queue to mutate on success/failure (Forget /
+	// AddRateLimited / NumRequeues all read per-tier rate-limiter
+	// state).
+	q := r.queue
+	if fromCL {
+		q = r.clusterListQueue
+	}
 
 	if err := r.processOne(ctx, key); err != nil {
 		r.failedTotal.Add(1)
@@ -459,13 +648,14 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// same key starts clean) and DROP it — no AddRateLimited. The
 		// entry stays in L1, stale, until its TTL purges it; a later
 		// informer event can re-enqueue it fresh.
-		if r.queue.NumRequeues(key) >= maxRefreshRequeues {
-			r.queue.Forget(key)
+		if q.NumRequeues(key) >= maxRefreshRequeues {
+			q.Forget(key)
 			r.droppedTotal.Add(1)
 			slog.Warn("refresher.refresh_dropped",
 				slog.String("subsystem", "cache"),
 				slog.String("key_hash", key),
 				slog.Int("requeues", maxRefreshRequeues),
+				slog.Bool("cluster_list_tier", fromCL),
 				slog.String("effect", "deterministic refresh failure — key dropped to TTL outer-net, not retried"),
 			)
 			return true
@@ -474,13 +664,16 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		// Bounded exponential-backoff retry. The key is NOT Forgotten,
 		// so the rate limiter's NumRequeues climbs and the next delay
 		// doubles (capped at maxDelay).
-		r.queue.AddRateLimited(key)
+		q.AddRateLimited(key)
 		return true
 	}
 	// Success — stop the rate limiter tracking this key so a future
 	// dirty-mark of the same key starts from a clean backoff.
-	r.queue.Forget(key)
+	q.Forget(key)
 	r.completedTotal.Add(1)
+	if fromCL {
+		r.clusterListCompletedTotal.Add(1)
+	}
 	return true
 }
 
@@ -541,6 +734,11 @@ type refresherStats struct {
 	skippedStageError uint64 // Ship 0.30.120 layer (b)
 	yielded           uint64 // Ship #98 — customer-priority yields
 	capped            uint64 // Ship #98 — max-parked cap hits
+
+	// Path 3.2 / 0.30.218 — per-tier observability for the two-tier
+	// priority queue.
+	clusterListEnqueued  uint64
+	clusterListCompleted uint64
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -549,17 +747,29 @@ func refresherStatsSnapshot() refresherStats {
 		return refresherStats{}
 	}
 	return refresherStats{
-		enqueued:          r.enqueueTotal.Load(),
-		completed:         r.completedTotal.Load(),
-		failed:            r.failedTotal.Load(),
-		retried:           r.retriedTotal.Load(),
-		dropped:           r.droppedTotal.Load(),
-		skippedNoEntry:    r.skippedNoEntryTotal.Load(),
-		skippedNoHandler:  r.skippedNoHandler.Load(),
-		skippedStageError: r.refresherSkippedStageError.Load(),
-		yielded:           r.yieldedTotal.Load(),
-		capped:            r.cappedTotal.Load(),
+		enqueued:             r.enqueueTotal.Load(),
+		completed:            r.completedTotal.Load(),
+		failed:               r.failedTotal.Load(),
+		retried:              r.retriedTotal.Load(),
+		dropped:              r.droppedTotal.Load(),
+		skippedNoEntry:       r.skippedNoEntryTotal.Load(),
+		skippedNoHandler:     r.skippedNoHandler.Load(),
+		skippedStageError:    r.refresherSkippedStageError.Load(),
+		yielded:              r.yieldedTotal.Load(),
+		capped:               r.cappedTotal.Load(),
+		clusterListEnqueued:  r.clusterListEnqueueTotal.Load(),
+		clusterListCompleted: r.clusterListCompletedTotal.Load(),
 	}
+}
+
+// ClusterListRefresherStats exposes the Path 3.2 two-tier counters for
+// OBS-1 expvar wiring + falsifier tests. Read-only snapshot.
+func ClusterListRefresherStats() (enqueued, completed uint64) {
+	r := refresherSingleton()
+	if r == nil {
+		return 0, 0
+	}
+	return r.clusterListEnqueueTotal.Load(), r.clusterListCompletedTotal.Load()
 }
 
 // resetRefresherForTest tears the singleton down so each test sees a
@@ -571,7 +781,16 @@ func refresherStatsSnapshot() refresherStats {
 // can race with the next test's resetResolvedCacheForTest.
 func resetRefresherForTest() {
 	if refresherInstance != nil {
+		// Clear cluster_list tier registry so a future singleton starts
+		// with no inherited memberships.
+		refresherInstance.clusterListKeys.Range(func(k, _ any) bool {
+			refresherInstance.clusterListKeys.Delete(k)
+			return true
+		})
 		refresherInstance.queue.ShutDown()
+		if refresherInstance.clusterListQueue != nil {
+			refresherInstance.clusterListQueue.ShutDown()
+		}
 		// Wait for workers to drain + exit. Capped at 5s as a defensive
 		// deadline that should never fire.
 		done := make(chan struct{})
