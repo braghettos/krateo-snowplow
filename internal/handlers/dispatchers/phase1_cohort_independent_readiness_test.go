@@ -213,7 +213,7 @@ func TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes(t *testing.T) {
 	defer cancel()
 	// phase1WarmupWith MUST return promptly — it launches the seed in the
 	// background and does not wait on it.
-	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed); err != nil {
+	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed, nil); err != nil {
 		t.Fatalf("Ship 2: phase1WarmupWith returned error: %v", err)
 	}
 
@@ -266,7 +266,7 @@ func TestPhase1_ReadinessFlips_WhenSeedErrors(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed); err != nil {
+	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed, nil); err != nil {
 		t.Fatalf("Ship 2: phase1WarmupWith must NOT propagate a background-seed error as "+
 			"a fatal return: %v", err)
 	}

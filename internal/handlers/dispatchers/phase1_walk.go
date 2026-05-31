@@ -305,8 +305,23 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		}
 	}
 
+	// Path 3.2.2.b (0.30.221) — the deferred apiRef pagination collector.
+	// The walker writes jobs here during Phase 1 (cheap mutex append);
+	// phase1WarmupWith drains them in a background goroutine AFTER
+	// MarkPhase1Done so /readyz flips at the pre-3.2.2 baseline wall-clock
+	// even at 50K-composition scale (the 0.30.220 boot-blocking inline
+	// regression is structurally gone). Always-on when prewarm is enabled
+	// (the 0.30.220 mechanism predicates already gate at COLLECT time on
+	// widget shape + .slice.continue, so flag-off widgets pay no cost).
+	// nil when cache.PrewarmEnabled()==false — walker falls back to
+	// byte-identical-to-pre-3.2.2 page-1-only behaviour.
+	var pagCollector *apiRefPaginationCollector
+	if cache.PrewarmEnabled() {
+		pagCollector = newApiRefPaginationCollector()
+	}
+
 	resolver := func(rctx context.Context, root navigationRoot) error {
-		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester, navHarvester)
+		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester, navHarvester, pagCollector)
 	}
 
 	// Ship 1 — the unified dynamic cohort-prewarm engine. When ON (and the
@@ -372,8 +387,37 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		clusterListPrewarm = makeClusterListPrewarmFn(harvester, *saEP, rc, authnNS)
 	}
 
-	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm, clusterListPrewarm, seedFn)
+	// Path 3.2.2.b (0.30.221) — the post-MarkPhase1Done pagination drain.
+	// Closure over the collector + SA credentials so phase1WarmupWith can
+	// launch the drain goroutine without knowing about endpoints (same
+	// shape as pipSeed). nil when the collector is nil (cache /
+	// prewarm OFF) — the drain step is a clean no-op.
+	var paginationDrain paginationDrainFn
+	if pagCollector != nil {
+		paginationDrain = func(dctx context.Context) {
+			drainApiRefPaginationJobs(dctx, pagCollector.drain(), *saEP, rc)
+		}
+	}
+
+	return phase1WarmupWith(ctx, rw, lister, resolver, contentPrewarm, clusterListPrewarm, seedFn, paginationDrain)
 }
+
+// paginationDrainFn is the Path 3.2.2.b (0.30.221) Step 7.7 callback
+// that drains the deferred apiRef pagination jobs collected during the
+// Phase 1 walk. phase1WarmupWith invokes it on a bounded background
+// goroutine AFTER MarkPhase1Done — readiness is already 200; the drain
+// fills identity-free widgetContent L1 cells for items 6..N of each
+// apiRef+resourcesRefsTemplate widget without blocking /readyz.
+//
+// Lifecycle bound: paginationDrainTimeout (5 min). The drain dies with
+// the process on shutdown via parent ctx cancellation. Outcome is
+// log-only — never withholds readiness, never fail-closes; the page-1
+// envelope (Put before MarkPhase1Done) covers items 1..5 for every
+// widget regardless of drain progress.
+//
+// nil disables the step (flag-off / tests); production passes a closure
+// over the walker's apiRefPaginationCollector + SA credentials.
+type paginationDrainFn func(ctx context.Context)
 
 // phase1WarmupWith is the testable core: it takes the watcher, the
 // navigation-roots lister, and the per-root resolver as injected
@@ -419,7 +463,7 @@ type contentPrewarm func(ctx context.Context)
 // tests); production passes runPIPSeed.
 type pipSeedFn func(ctx context.Context) error
 
-func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm, clusterListPrewarm clusterListPrewarmFn, pipSeed pipSeedFn) error {
+func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm, clusterListPrewarm clusterListPrewarmFn, pipSeed pipSeedFn, paginationDrain paginationDrainFn) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -595,6 +639,50 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		}()
 	}
 
+	// Step 7.7 — Path 3.2.2.b (0.30.221) — the deferred apiRef pagination
+	// drain. Runs AFTER MarkPhase1Done (Step 8 above) on a bounded
+	// background goroutine — readiness is already 200; the drain fills
+	// identity-free widgetContent L1 cells for items 6..N of each
+	// apiRef+resourcesRefsTemplate widget without blocking /readyz.
+	//
+	// Path 3.2.2 (0.30.220) HARD REVERT root cause was that this work
+	// ran INLINE on the Phase 1 walker goroutine; at 50K-composition scale
+	// the per-widget pagination (up to 500 pages × ~125–500ms wall-clock
+	// each) extended the walk past the kubelet startup probe budget so
+	// the pod never became Ready. The MECHANISM (iterateApiRefPages) was
+	// empirically validated correct — only the scheduling was wrong.
+	//
+	// Lifecycle bound: paginationDrainTimeout (5 min). The drain goroutine
+	// is self-terminating (bounded by paginationDrainTimeout) and dies
+	// with the process on shutdown — not a leak. A panic inside the drain
+	// is recovered so a single bad job cannot crash the process. Outcome
+	// is log-only; the page-1 envelope (Put before MarkPhase1Done) covers
+	// items 1..5 for every widget regardless of drain progress.
+	//
+	// nil when cache.PrewarmEnabled()==false / tests — clean no-op.
+	if paginationDrain != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error("phase1.pagination_drain.panic",
+						slog.String("subsystem", "cache"),
+						slog.Any("panic", r),
+						slog.String("effect", "background apiRef pagination drain aborted; "+
+							"readiness UNAFFECTED (already 200) — page-1 cells still correct, "+
+							"items 6..N fall back to per-user serve-time resolve"),
+					)
+				}
+			}()
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), paginationDrainTimeout)
+			defer drainCancel()
+			// Same logger-injection rationale as the PIP seed above
+			// (xcontext.Logger's hardcoded slog.LevelDebug fallback when
+			// the ctx carries no logger). Level-only — log content unchanged.
+			drainCtx = xcontext.BuildContext(drainCtx, xcontext.WithLogger(slog.Default()))
+			paginationDrain(drainCtx)
+		}()
+	}
+
 	log.Info("phase1.warmup.completed",
 		slog.String("subsystem", "cache"),
 		slog.Int("roots_total", len(roots)),
@@ -754,7 +842,7 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	return rctx
 }
 
-func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester) error {
+func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester, pagCollector *apiRefPaginationCollector) error {
 	rctx := withPhase1SAContext(ctx, saEP, saRC)
 
 	w := &phase1Walker{
@@ -762,6 +850,7 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 		visited:            map[string]struct{}{},
 		apiRefHarvester:    harvester,
 		navWidgetHarvester: navHarvester,
+		pagCollector:       pagCollector,
 	}
 	// Ship G (0.30.16x): gvr is threaded from the lister
 	// (listNavigationRootsFromConfigMap, phase1_roots.go) which parses
@@ -830,6 +919,16 @@ type phase1Walker struct {
 	// off — harvestNavWidget is nil-safe so the flag-off path is a clean
 	// no-op.
 	navWidgetHarvester *navWidgetHarvester
+	// pagCollector is the Path 3.2.2.b (0.30.221) deferred apiRef
+	// pagination collector. The walker writes a job per shape-eligible
+	// apiRef+resourcesRefsTemplate widget whose `.slice.continue==true`;
+	// the collector is drained AFTER MarkPhase1Done by a background
+	// goroutine spawned in phase1WarmupWith. nil-safe: when nil the
+	// walker falls back to byte-identical-to-pre-3.2.2 page-1-only
+	// behaviour (no pagination). See phase1_walk_pagination_jobs.go for
+	// the full rationale (deferred-not-inline scheduling fix for the
+	// 0.30.220 boot-blocking inline pagination).
+	pagCollector *apiRefPaginationCollector
 }
 
 // walk resolves widget `in` through the standard widget resolver under
@@ -988,17 +1087,34 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// (which composes its key from paginationInfo's URL-derived tuple).
 	populateWidgetContentL1(ctx, gvr, in, keyPerPage, keyPage, res)
 
-	// Path 3.2.2 (0.30.220) — apiRef pagination. If `in` is an
-	// apiRef+resourcesRefsTemplate-driven widget AND the resolver's
-	// `status.resourcesRefs.slice.continue` signal is true on the
-	// page-1 envelope, iterateApiRefPages walks pages 2..MaxPages,
-	// populating each page's identity-free `widgetContent` cell and
-	// recursing into the per-page children. A no-op when the predicate
-	// is false or .slice.continue is false — byte-identical to pre-
-	// 3.2.2 behaviour for non-paginated widgets. See
-	// phase1_walk_pagination.go for the full rationale, bounds, and
-	// data-driven predicate.
-	iterateApiRefPages(ctx, w, in, gvr, res, depth, perPage, keyPerPage, w.authnNS)
+	// Path 3.2.2.b (0.30.221) — DEFERRED apiRef pagination. Path 3.2.2
+	// (0.30.220) ran iterateApiRefPages INLINE here on the Phase 1
+	// walker goroutine; at 50K-composition scale the per-widget
+	// pagination (up to 500 pages × ~125–500ms wall-clock each) extended
+	// the walk past the 360s kubelet startup probe budget so the pod
+	// never became Ready (HARD REVERT). The MECHANISM was empirically
+	// validated correct; only the scheduling was wrong.
+	//
+	// Path 3.2.2.b fix: COLLECT a pagination job here (nil-cost mutex
+	// append) and DRAIN them through the unchanged iterateApiRefPages
+	// mechanism in a background goroutine launched by phase1WarmupWith
+	// AFTER MarkPhase1Done. /readyz flips at the same wall-clock as the
+	// pre-3.2.2 baseline; the pagination work runs post-readiness with
+	// its own bounded budget (paginationDrainTimeout). nil-safe — when
+	// pagCollector is nil the walker is byte-identical to pre-3.2.2.
+	//
+	// The collector enforces both predicates (isApiRefTemplateDriven +
+	// resolverWantsContinue) at collect time, so the collected set
+	// contains ONLY work that would actually paginate.
+	w.pagCollector.collect(apiRefPaginationJob{
+		In:         in,
+		GVR:        gvr,
+		Page1Res:   res,
+		Depth:      depth,
+		PerPage:    perPage,
+		KeyPerPage: keyPerPage,
+		AuthnNS:    w.authnNS,
+	})
 
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
 	children := extractResourcesRefsItems(res.Object)
