@@ -121,12 +121,18 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 		// FRESH walker per root — new visited map (phase1_walk.go:679).
 		// Harvesters SHARED BY REFERENCE so the re-walk's harvest lands in
 		// the set the seed drains.
-		w := &phase1Walker{
-			authnNS:            deps.authnNS,
-			visited:            map[string]struct{}{},
-			apiRefHarvester:    deps.harvester,
-			navWidgetHarvester: deps.navHarv,
-		}
+		//
+		// Ship 0.30.232 — THE BUG SITE: prior six HARD REVERTs (0.30.226
+		// → 0.30.231) all traced back to THIS literal omitting rc. Now
+		// constructed via newPhase1Walker, which makes rc a REQUIRED
+		// positional parameter — the compiler refuses a missing
+		// argument. deps.saRC is the same SA *rest.Config the seed pass
+		// uses (set once in Phase1Warmup; non-nil per the rePrewarmDeps
+		// contract).
+		w := newPhase1Walker(deps.saRC, deps.authnNS,
+			withApiRefHarvester(deps.harvester),
+			withNavWidgetHarvester(deps.navHarv),
+		)
 		// Same walk() entrypoint + same root tuple as resolveNavigationRoot
 		// (page 1, perPage prewarmPageLimit(), key tuple (-1,-1)) — the
 		// Change A page-number fix is preserved.

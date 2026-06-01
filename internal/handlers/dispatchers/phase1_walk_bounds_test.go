@@ -40,10 +40,11 @@ import (
 // loosens the cap would let walk fall through to widgets.Resolve at
 // unbounded depth and recurse without limit — and fail here.
 func TestPhase1Walk_MaxDepthTruncation(t *testing.T) {
-	w := &phase1Walker{
-		authnNS: "krateo-system",
-		visited: map[string]struct{}{},
-	}
+	// Ship 0.30.232: type-safe construction via newPhase1Walker. The
+	// depth-cap gate fires before any rc consumer runs, so nil rc is
+	// safe here (the constructor accepts nil; runtime safety lives at
+	// the consumer sites). See phase1_walker_new.go for the contract.
+	w := newPhase1Walker(nil, "krateo-system")
 	widget := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "widgets.templates.krateo.io/v1beta1",
 		"kind":       "Widget",

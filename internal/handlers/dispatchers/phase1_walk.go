@@ -849,14 +849,16 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester, pagCollector *apiRefPaginationCollector) error {
 	rctx := withPhase1SAContext(ctx, saEP, saRC)
 
-	w := &phase1Walker{
-		authnNS:            authnNS,
-		rc:                 saRC,
-		visited:            map[string]struct{}{},
-		apiRefHarvester:    harvester,
-		navWidgetHarvester: navHarvester,
-		pagCollector:       pagCollector,
-	}
+	// Ship 0.30.232: type-safe construction via newPhase1Walker. rc is now
+	// a REQUIRED positional parameter — the compiler enforces every
+	// construction site supplies it, eliminating the recurring nil-rc
+	// surface that produced six HARD REVERTs (0.30.226 → 0.30.231). See
+	// phase1_walker_new.go for the constructor contract.
+	w := newPhase1Walker(saRC, authnNS,
+		withApiRefHarvester(harvester),
+		withNavWidgetHarvester(navHarvester),
+		withPagCollector(pagCollector),
+	)
 	// Ship G (0.30.16x): gvr is threaded from the lister
 	// (listNavigationRootsFromConfigMap, phase1_roots.go) which parses
 	// it from the templatesv1.ObjectReference each /call URL decoded

@@ -304,15 +304,13 @@ func drainApiRefPaginationJobs(
 			// drain runs AFTER MarkPhase1Done so the content-pass / PIP-
 			// seed harvesters have already been drained; populating them
 			// now would have no consumer.
-			&phase1Walker{
-				authnNS: j.AuthnNS,
-				// Ship 0.30.230 fix-at-root: the drain shell walker MUST
-				// carry the SA *rest.Config so the page-N
-				// widgets.Resolve at phase1_walk_pagination.go's literal
-				// receives non-nil rc downstream of opts.RC.
-				rc:      saRC,
-				visited: map[string]struct{}{},
-			},
+			// Ship 0.30.232: type-safe construction via newPhase1Walker.
+			// Ship 0.30.230 fix-at-root preserved — the drain shell walker
+			// MUST carry the SA *rest.Config so the page-N
+			// widgets.Resolve at phase1_walk_pagination.go's literal
+			// receives non-nil rc downstream of opts.RC. No harvesters
+			// (drain post-MarkPhase1Done; consumers already drained).
+			newPhase1Walker(saRC, j.AuthnNS),
 			j.In,
 			j.GVR,
 			j.Page1Res,
