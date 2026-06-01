@@ -15,51 +15,10 @@ import (
 	"k8s.io/client-go/restmapper"
 )
 
-// ClientOption configures NewClient. Used by callers that know
-// up-front they will only call methods with an explicit GVR (i.e.
-// Get / List / Create / Delete with Options.GVR set) — they can opt
-// out of the discovery + restmapper build via WithSkipMapper, which
-// eliminates a per-call DiscoveryClient construction (#123).
-type ClientOption func(*clientCfg)
-
-type clientCfg struct {
-	skipMapper bool
-}
-
-// WithSkipMapper returns a ClientOption that suppresses the
-// DiscoveryClient + DeferredDiscoveryRESTMapper build inside
-// NewClient. Use only when EVERY call against the returned client
-// will pass Options.GVR explicitly — the mapper is consulted only
-// in resourceInterfaceFor when GVK is set OR GVR is empty.
-//
-// The Discover() method is NOT supported on a SkipMapper client
-// (it reads from discoveryClient, which is nil). Callers that need
-// Discover must omit this option.
-func WithSkipMapper() ClientOption {
-	return func(c *clientCfg) { c.skipMapper = true }
-}
-
-func NewClient(rc *rest.Config, opts ...ClientOption) (Client, error) {
-	cfg := clientCfg{}
-	for _, o := range opts {
-		o(&cfg)
-	}
-
+func NewClient(rc *rest.Config) (Client, error) {
 	dynamicClient, err := dynamic.NewForConfig(rc)
 	if err != nil {
 		return nil, err
-	}
-
-	if cfg.skipMapper {
-		// Skip both the DiscoveryClient and the DeferredDiscovery
-		// RESTMapper build. Safe because all entry points (Get /
-		// List / Create / Delete) flow through resourceInterfaceFor
-		// which only consults uc.mapper when opts.GVK is set or
-		// opts.GVR is empty — SkipMapper callers MUST pass GVR.
-		return &unstructuredClient{
-			dynamicClient: dynamicClient,
-			converter:     runtime.DefaultUnstructuredConverter,
-		}, nil
 	}
 
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(rc)

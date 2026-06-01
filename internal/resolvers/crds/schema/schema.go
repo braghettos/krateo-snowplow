@@ -69,17 +69,17 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 			}}
 	}
 
-	// Ship 2 (production-aim cleanup 2026-06-01) — inlined CRD GET.
-	// The deleted internal/resolvers/crds.Get helper wrapped the
-	// same two-line dynamic.NewClient + Get call below; inlining
-	// removes the indirection AND lets us drop the unused restmapper
-	// build on every /call via dynamic.WithSkipMapper (#123).
-	//
-	// The CRD GVR is constant (apiextensions.k8s.io/v1/CRD) → the
-	// mapper is dead weight here: resourceInterfaceFor only consults
-	// uc.mapper when opts.GVK is set OR opts.GVR is empty. We pass
-	// Options.GVR explicitly so the mapper is never touched.
-	cli, err := dynamic.NewClient(rc, dynamic.WithSkipMapper())
+	// Ship 0.30.231 (2026-06-01) — inlined CRD GET. The deleted
+	// internal/resolvers/crds.Get helper wrapped the same two-line
+	// dynamic.NewClient + Get call below; inlining removes the
+	// indirection. Earlier (Ship 2) attempted to also skip the
+	// mapper build via dynamic.WithSkipMapper, but the contract was
+	// unsafe — resourceInterfaceFor (client.go:146) calls
+	// uc.mapper.RESTMapping unconditionally; the opts.GVR/opts.GVK
+	// branch at line 138 only chooses the source GVK, it does not
+	// skip the mapper. WithSkipMapper has been removed; the mapper
+	// build is a dead allocation here but cannot panic.
+	cli, err := dynamic.NewClient(rc)
 	if err != nil {
 		return err
 	}
