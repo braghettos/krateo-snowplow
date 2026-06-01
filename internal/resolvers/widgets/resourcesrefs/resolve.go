@@ -11,7 +11,6 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -61,15 +60,22 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 	}
 	gvr := gv.WithResource(in.Resource)
 
-	// Ship D (0.30.141) — F-5: dynamic.KindFor builds a fresh discovery
-	// client + cold restmapper per ResourceRef per widget /call. Record
-	// BEFORE the upstream call so the counter is honest about
-	// reachability (AC-D.3).
-	cache.RecordApiserverFallthrough(ctx, cache.ReasonRestmapperKindFor, gvr.String())
-	gvk, err := dynamic.KindFor(rc, gvr)
+	// Ship 2 / 0.30.226 — plurals-resolver hot-path swap. Replaces
+	// per-/call cold restmapper construction (Ship D F-5) with the
+	// permanent plurals store (Ship 1 / 0.30.225). The store is
+	// pre-warmed by the boot walker; this call is a sync.Map lookup
+	// for built-in scheme + CRD-backed kinds reachable in the walker
+	// corpus. NO fallback to apiserver discovery on miss: a miss is
+	// either a coverage gap (counted as plurals-miss for diagnostic
+	// triage) or a genuinely-unresolvable GVR. See architect brief
+	// 2026-06-01 + feedback_empirical_root_cause_trace_before_fix.
+	kindStr, err := cache.KindForGVR(ctx, gvr, rc)
 	if err != nil {
+		cache.RecordResolverPluralsMiss(ctx, gvr.String())
 		return all, err
 	}
+	cache.RecordResolverPluralsHit(ctx, gvr.String())
+	gvk := gvr.GroupVersion().WithKind(kindStr)
 
 	log.Info("resolving resource ref",
 		slog.String("id", in.ID),

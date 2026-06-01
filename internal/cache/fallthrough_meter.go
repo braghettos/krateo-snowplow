@@ -77,13 +77,21 @@ type FallthroughReason string
 // Construction-site reasons — fired by Layer B wrappers when a fresh
 // apiserver client / discovery client / restmapper is built on a
 // `/call` read path.
+//
+// Ship 2 / 0.30.226 — ReasonCRDGet, ReasonRestmapperKindFor, and
+// ReasonRestmapperResourceFor were DELETED alongside the plurals-
+// resolver hot-path swap. Their dominant call sites (resourcesrefs
+// resolveOne + crds/schema ValidateObjectStatus) were rewired to
+// the permanent plurals store; the CRD GET arm was inlined as a
+// direct apiserver call (counted nowhere because it is now a
+// single one-shot per ValidateObjectStatus, not a hot-path miss).
+// Replaced by ReasonResolverPluralsHit (diagnostic) +
+// ReasonResolverPluralsMiss (true fall-through, coverage gap).
+// Closed-enum count: 22 − 3 + 2 = 21.
 const (
-	ReasonClientBuild           FallthroughReason = "client-build"
-	ReasonSecretGet             FallthroughReason = "secret-get"
-	ReasonCRDDiscover           FallthroughReason = "crd-discover"
-	ReasonCRDGet                FallthroughReason = "crd-get"
-	ReasonRestmapperKindFor     FallthroughReason = "restmapper-kindfor"
-	ReasonRestmapperResourceFor FallthroughReason = "restmapper-resourcefor"
+	ReasonClientBuild FallthroughReason = "client-build"
+	ReasonSecretGet   FallthroughReason = "secret-get"
+	ReasonCRDDiscover FallthroughReason = "crd-discover"
 )
 
 // Resolver-branch-5 sub-reasons — fired by the inner-call worker's
@@ -195,10 +203,54 @@ const (
 	// /api-info/names response shape requires the full Info
 	// (Singular + Shorts) which only the apiserver discovery
 	// response provides.
-	// Closed-enum count: 21 (Ship G) + 1 = 22. Within budget
-	// (cardinality: 10 paths × 50 GVRs × 22 reasons = 11,000 cells).
 	ReasonPluralsDiscoveryHop FallthroughReason = "plurals-discovery-hop"
+
+	// Ship 2 / 0.30.226 — plurals-resolver hot-path swap. Replaces
+	// ReasonRestmapperKindFor (deleted) + ReasonRestmapperResourceFor
+	// (deleted) at the two /call-class resolver sites (resourcesrefs
+	// resolveOne + crds/schema ValidateObjectStatus). Hit/miss split:
+	//
+	//   - ReasonResolverPluralsHit — DIAGNOSTIC. The permanent store
+	//     served the GVR/GVK lookup. NOT a fall-through — no apiserver
+	//     hop occurred. Counted through the same fall-through-meter
+	//     cell model for observability symmetry; expect non-zero on
+	//     every cyberjoker /call.
+	//
+	//   - ReasonResolverPluralsMiss — TRUE FALL-THROUGH. The permanent
+	//     store had no entry for the requested GVR/GVK. This indicates
+	//     a coverage gap (boot walker did not register the kind).
+	//     Customer-facing impact: the resolver returns the GVR-not-
+	//     found error to the caller (no silent fall-through to fresh
+	//     apiserver discovery; see feedback_empirical_root_cause_trace_
+	//     before_fix). PM AC gate 6: this counter MUST stay at 0 under
+	//     normal sustained load.
+	//
+	// Closed-enum count: 22 (Ship 1) − 3 (deletes above) + 2 = 21.
+	// Within budget (cardinality: 10 paths × 50 GVRs × 21 reasons =
+	// 10,500 cells).
+	ReasonResolverPluralsHit  FallthroughReason = "resolver-plurals-hit"
+	ReasonResolverPluralsMiss FallthroughReason = "resolver-plurals-miss"
 )
+
+// RecordResolverPluralsHit is the thin wrapper for the hit arm of the
+// Ship 2 / 0.30.226 plurals-resolver swap. Telemetry-only — the call
+// site has already resolved the GVR/GVK from the permanent store; this
+// just records the cell. Delegates to RecordApiserverFallthrough so the
+// cardinality discipline + cache-toggle compliance + scope-gated
+// behaviour all apply unchanged.
+func RecordResolverPluralsHit(ctx context.Context, key string) {
+	RecordApiserverFallthrough(ctx, ReasonResolverPluralsHit, key)
+}
+
+// RecordResolverPluralsMiss is the thin wrapper for the fall-through
+// arm of the Ship 2 / 0.30.226 plurals-resolver swap. Fires when the
+// permanent store has no entry for the requested GVR/GVK. Indicates a
+// coverage gap (boot walker did not register the kind). Delegates to
+// RecordApiserverFallthrough so the cardinality discipline + cache-
+// toggle compliance + scope-gated behaviour all apply unchanged.
+func RecordResolverPluralsMiss(ctx context.Context, key string) {
+	RecordApiserverFallthrough(ctx, ReasonResolverPluralsMiss, key)
+}
 
 // fallthroughKey is the composite label tuple for one counter cell.
 // We key sync.Map by this struct (Go map key — string-equality) so

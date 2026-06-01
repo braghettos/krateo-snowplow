@@ -513,9 +513,12 @@ func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 
 	// Drive the counter once so the cells are populated — otherwise
 	// the per-cell map is empty (sync.Map only stores on first Inc).
+	//
+	// Ship 2 / 0.30.226 — ReasonCRDGet + ReasonRestmapperKindFor were
+	// DELETED. Use the new Ship 2 hit/miss pair instead.
 	ctx := WithFallthroughScope(context.Background(), ScopeCallWidgets)
-	RecordApiserverFallthrough(ctx, ReasonCRDGet, "apiextensions.k8s.io/v1/customresourcedefinitions")
-	RecordApiserverFallthrough(ctx, ReasonRestmapperKindFor, "v1/pods")
+	RecordApiserverFallthrough(ctx, ReasonResolverPluralsHit, "v1/pods")
+	RecordApiserverFallthrough(ctx, ReasonResolverPluralsMiss, "widgets.templates.krateo.io/v1beta1/unknownresource")
 
 	// Mount expvar.Handler on a test server (the same one-line mount
 	// main.go now does at /debug/vars).
@@ -556,13 +559,16 @@ func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 	if !ok {
 		t.Fatalf("snowplow_apiserver_fallthrough_cells missing or wrong type: %#v", doc["snowplow_apiserver_fallthrough_cells"])
 	}
-	const crdKey = "call-widgets|apiextensions.k8s.io/v1/customresourcedefinitions|crd-get"
-	const kindKey = "call-widgets|v1/pods|restmapper-kindfor"
-	if v, ok := cellsRaw[crdKey].(float64); !ok || uint64(v) != 1 {
-		t.Errorf("expvar cell %q = %#v; want 1", crdKey, cellsRaw[crdKey])
+	// Ship 2 / 0.30.226 — assert the new resolver-plurals hit/miss
+	// cells. crd-get + restmapper-kindfor reasons were deleted along
+	// with the resolver call sites that fired them.
+	const hitKey = "call-widgets|v1/pods|resolver-plurals-hit"
+	const missKey = "call-widgets|widgets.templates.krateo.io/v1beta1/unknownresource|resolver-plurals-miss"
+	if v, ok := cellsRaw[hitKey].(float64); !ok || uint64(v) != 1 {
+		t.Errorf("expvar cell %q = %#v; want 1", hitKey, cellsRaw[hitKey])
 	}
-	if v, ok := cellsRaw[kindKey].(float64); !ok || uint64(v) != 1 {
-		t.Errorf("expvar cell %q = %#v; want 1", kindKey, cellsRaw[kindKey])
+	if v, ok := cellsRaw[missKey].(float64); !ok || uint64(v) != 1 {
+		t.Errorf("expvar cell %q = %#v; want 1", missKey, cellsRaw[missKey])
 	}
 
 	// (3) assertion-violations map — must exist (zero is the
