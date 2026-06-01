@@ -18,6 +18,7 @@ package cache
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -383,6 +384,64 @@ func TestPluralFor_DiscoveryCounter(t *testing.T) {
 	got := FallthroughCount("plurals-test", gvk.String(), ReasonPluralsDiscoveryHop)
 	if got != 1 {
 		t.Errorf("ReasonPluralsDiscoveryHop count: got %d want 1", got)
+	}
+}
+
+// --- TestDiscoverPluralInfo_NilRC_FallsBackInCluster ---------------------
+//
+// 0.30.229 nil-rc in-helper fallback (docs/nil-rc-audit-design-2026-06-01.md
+// Option A). When called with a nil *rest.Config, discoverPluralInfo MUST
+// attempt rest.InClusterConfig() before erroring. In a test process with
+// no KUBERNETES_SERVICE_HOST env var set, that attempt fails — the
+// returned error MUST be the wrapped fallback-failed sentinel, NOT the
+// pre-0.30.229 raw "nil *rest.Config" message. This proves the nil-rc
+// branch is reached AND the fallback is exercised AND error wrapping is
+// correct. The opposite branch (real in-cluster) is exercised end-to-end
+// by Phase 6 against the GKE cluster.
+func TestDiscoverPluralInfo_NilRC_FallsBackInCluster(t *testing.T) {
+	resetPluralsForTest(t)
+	t.Setenv("CACHE_ENABLED", "true")
+	// Ensure InClusterConfig() fails: clear the env vars it reads.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+
+	gvk := schema.GroupVersionKind{Group: "templates.krateo.io", Version: "v1", Kind: "RESTAction"}
+	ctx := fakeCtxWithScope()
+	_, err := discoverPluralInfo(ctx, gvk, nil)
+	if err == nil {
+		t.Fatalf("discoverPluralInfo(nil rc) returned no error; expected fallback-failed wrapped err")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "nil *rest.Config") {
+		t.Errorf("error missing nil-rc sentinel: %q", msg)
+	}
+	if !strings.Contains(msg, "in-cluster fallback failed") {
+		t.Errorf("error missing fallback sentinel: %q", msg)
+	}
+}
+
+// --- TestDiscoverKindForGVR_NilRC_FallsBackInCluster ---------------------
+//
+// Sister test for the reverse direction. See
+// TestDiscoverPluralInfo_NilRC_FallsBackInCluster for rationale.
+func TestDiscoverKindForGVR_NilRC_FallsBackInCluster(t *testing.T) {
+	resetPluralsForTest(t)
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+
+	gvr := schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
+	ctx := fakeCtxWithScope()
+	_, _, err := discoverKindForGVR(ctx, gvr, nil)
+	if err == nil {
+		t.Fatalf("discoverKindForGVR(nil rc) returned no error; expected fallback-failed wrapped err")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "nil *rest.Config") {
+		t.Errorf("error missing nil-rc sentinel: %q", msg)
+	}
+	if !strings.Contains(msg, "in-cluster fallback failed") {
+		t.Errorf("error missing fallback sentinel: %q", msg)
 	}
 }
 

@@ -300,7 +300,16 @@ func discoverPluralInfo(ctx context.Context, gvk schema.GroupVersionKind, rc *re
 	RecordApiserverFallthrough(ctx, ReasonPluralsDiscoveryHop, gvk.String())
 
 	if rc == nil {
-		return plurals.Info{}, fmt.Errorf("plurals discovery: nil *rest.Config for %s", gvk)
+		// Defensive in-helper fallback — restores the pre-Ship-2 contract.
+		// Several call sites (widgets.go, phase1_pip_seed.go, phase1_walk*.go)
+		// invoke GVRFor / PluralFor with nil rc on race-window cold-paths
+		// where the resolver's wireRESTConfig has not yet been threaded.
+		// See docs/nil-rc-audit-design-2026-06-01.md (Option A).
+		var err error
+		rc, err = rest.InClusterConfig()
+		if err != nil {
+			return plurals.Info{}, fmt.Errorf("plurals discovery: nil *rest.Config and in-cluster fallback failed for %s: %w", gvk, err)
+		}
 	}
 	dc, err := discoveryClientBuilder(rc)
 	if err != nil {
@@ -342,7 +351,13 @@ func discoverKindForGVR(ctx context.Context, gvr schema.GroupVersionResource, rc
 	RecordApiserverFallthrough(ctx, ReasonPluralsDiscoveryHop, gvr.String())
 
 	if rc == nil {
-		return "", plurals.Info{}, fmt.Errorf("plurals discovery: nil *rest.Config for %s", gvr)
+		// Defensive in-helper fallback — symmetric with discoverPluralInfo.
+		// See docs/nil-rc-audit-design-2026-06-01.md (Option A).
+		var err error
+		rc, err = rest.InClusterConfig()
+		if err != nil {
+			return "", plurals.Info{}, fmt.Errorf("kind discovery: nil *rest.Config and in-cluster fallback failed for %s: %w", gvr, err)
+		}
 	}
 	dc, err := discoveryClientBuilder(rc)
 	if err != nil {
