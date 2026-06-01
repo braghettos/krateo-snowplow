@@ -51,7 +51,7 @@ func newSyntheticRemoveWatcher(t *testing.T, gvrs ...schema.GroupVersionResource
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:         "RoleBindingList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:         "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
-		customResourceDefinitionGVR: "CustomResourceDefinitionList",
+		{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}: "CustomResourceDefinitionList",
 	}
 	for i, gvr := range gvrs {
 		// The fake dynamic client requires the list-kind to END in "List".
@@ -295,7 +295,7 @@ func syntheticThing(gvr schema.GroupVersionResource, ns, name string) *unstructu
 // EnsureResourceType the SAME stopped, frozen informer on a CRD
 // delete→recreate — a silent stale-serve regression.
 //
-// Option 1: a removable GVR (matchesAutoDiscoverGroup true) runs a
+// Option 1: a removable GVR (IsNavigationDiscoveredGroup true) runs a
 // STANDALONE informer. RemoveResourceType drops it; a re-register
 // constructs a FRESH one. This test drives delete→recreate and asserts
 // the re-added informer is a DISTINCT instance, IsStopped()==false,
@@ -308,15 +308,15 @@ func TestFalsifierFR6ReAdd_DeleteRecreateSelfHeals(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
-	ResetAutoDiscoverGroupsForTest()
-	t.Cleanup(ResetAutoDiscoverGroupsForTest)
+	ResetNavigationDiscoveredGroupsForTest()
+	t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 	// A REMOVABLE GVR — its group must be navigation-discovered so
 	// addResourceTypeLocked takes the standalone-informer branch.
 	gvr := schema.GroupVersionResource{
 		Group: "synthetic-r6-removable.krateo.io", Version: "v1", Resource: "removablethings",
 	}
-	AddAutoDiscoverGroup(gvr.Group)
+	AddNavigationDiscoveredGroup(gvr.Group)
 
 	rw := newSyntheticRemoveWatcher(t, gvr)
 	t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })

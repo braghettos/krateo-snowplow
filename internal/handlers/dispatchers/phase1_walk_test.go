@@ -74,7 +74,7 @@ func phase1TestWatcher(t *testing.T) *cache.ResourceWatcher {
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 		cache.RoutesLoadersGVR():            "RoutesLoaderList",
 		cache.NavMenusGVR():                 "NavMenuList",
-		cache.CustomResourceDefinitionGVR(): "CustomResourceDefinitionList",
+		{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}: "CustomResourceDefinitionList",
 		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}: "RESTActionList",
 		gvrReached: "GithubScaffoldingList",
 		gvrOrphan:  "OrphanThingList",
@@ -116,9 +116,9 @@ func routesLoaderCR(ns, name string) *unstructured.Unstructured {
 func TestPhase1_NoHardcode_OrphanExcluded(t *testing.T) {
 	rw := phase1TestWatcher(t)
 	cache.ResetPhase1DoneForTest()
-	cache.ResetAutoDiscoverGroupsForTest()
+	cache.ResetNavigationDiscoveredGroupsForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)
-	t.Cleanup(cache.ResetAutoDiscoverGroupsForTest)
+	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
 
 	// One routesloaders root — the only navigation seed.
 	lister := func(ctx context.Context) ([]navigationRoot, error) {

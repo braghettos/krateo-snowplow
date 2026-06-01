@@ -78,9 +78,8 @@ const frontendConfigDataKey = "config.json"
 // configMapGVR is the GVR for core/v1 ConfigMap — the meta object Phase 1
 // reads the navigation contract from. This is NOT a business GVR and NOT
 // a per-resource carve-out: it is the bare type of the navigation-config
-// document, exactly as customResourceDefinitionGVR is the bare type the
-// CRD-watch reads. The BUSINESS GVRs (navmenus, routesloaders, …) are
-// still never named in Go — they come out of config.json at runtime.
+// document. The BUSINESS GVRs (navmenus, routesloaders, …) are still
+// never named in Go — they come out of config.json at runtime.
 var configMapGVR = schema.GroupVersionResource{
 	Group:    "",
 	Version:  "v1",

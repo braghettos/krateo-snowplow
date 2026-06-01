@@ -39,7 +39,7 @@ var forbiddenSeedResources = map[string]bool{
 // the seed list fails here. 0.30.105 raised the budget 7->8 by adding
 // the navmenus navigation root; Ship 0 / 0.30.222 lowered it back to 7
 // by removing customresourcedefinitions (walker-spawned via
-// AddAutoDiscoverGroup, no longer a boot primordial).
+// AddNavigationDiscoveredGroup, no longer a boot primordial).
 func TestMetaQuerySeeds_ExactBudget(t *testing.T) {
 	seeds := cache.MetaQuerySeeds()
 	if len(seeds) != 7 {
@@ -72,13 +72,18 @@ func TestMetaQuerySeeds_ExactBudget(t *testing.T) {
 		t.Errorf("meta-query seeds missing sanctioned anchors: %v", want)
 	}
 
-	// Ship 0 / 0.30.222 — the CRD GVR is explicitly walker-driven.
-	// Asserting its ABSENCE from the seed set catches a regression that
-	// re-adds it (which would re-violate Diego's invariant).
+	// Ship 0 / 0.30.222 + Ship 0.5 (v6) — the CRD GVR is explicitly
+	// walker-driven (under v6 the CRD informer no longer exists at all;
+	// composition GVRs come from one-shot apiserver discovery via
+	// cache.DiscoverGroupResources). Asserting its ABSENCE from the
+	// seed set catches a regression that re-adds it.
+	crdGVR := schema.GroupVersionResource{
+		Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions",
+	}
 	for _, s := range seeds {
-		if s == cache.CustomResourceDefinitionGVR() {
+		if s == crdGVR {
 			t.Fatalf("Ship 0 invariant: customresourcedefinitions MUST NOT be a meta-query seed " +
-				"(walker-spawned via AddAutoDiscoverGroup); got %v in seed set", s)
+				"(walker-driven via AddNavigationDiscoveredGroup); got %v in seed set", s)
 		}
 	}
 }
@@ -214,31 +219,31 @@ func TestExtractAPIServerGroupFromTemplatedPath(t *testing.T) {
 }
 
 // TestAutoDiscoverGroups_NavigationDerived asserts the auto-discover set
-// starts EMPTY and only AddAutoDiscoverGroup populates it — no group is
+// starts EMPTY and only AddNavigationDiscoveredGroup populates it — no group is
 // hardcoded.
 func TestAutoDiscoverGroups_NavigationDerived(t *testing.T) {
-	cache.ResetAutoDiscoverGroupsForTest()
-	t.Cleanup(cache.ResetAutoDiscoverGroupsForTest)
+	cache.ResetNavigationDiscoveredGroupsForTest()
+	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
 
-	if got := cache.AutoDiscoverGroupsSnapshot(); len(got) != 0 {
+	if got := cache.NavigationDiscoveredGroupsSnapshot(); len(got) != 0 {
 		t.Fatalf("auto-discover set must start EMPTY — no hardcoded group; got %v", got)
 	}
 
 	// The empty string (core group) is rejected — admitting it would
 	// auto-register informers for every core resource.
-	cache.AddAutoDiscoverGroup("")
-	if got := cache.AutoDiscoverGroupsSnapshot(); len(got) != 0 {
-		t.Fatalf("AddAutoDiscoverGroup(\"\") must be rejected; got %v", got)
+	cache.AddNavigationDiscoveredGroup("")
+	if got := cache.NavigationDiscoveredGroupsSnapshot(); len(got) != 0 {
+		t.Fatalf("AddNavigationDiscoveredGroup(\"\") must be rejected; got %v", got)
 	}
 
-	cache.AddAutoDiscoverGroup("composition.krateo.io")
-	if got := cache.AutoDiscoverGroupsSnapshot(); len(got) != 1 || got[0] != "composition.krateo.io" {
+	cache.AddNavigationDiscoveredGroup("composition.krateo.io")
+	if got := cache.NavigationDiscoveredGroupsSnapshot(); len(got) != 1 || got[0] != "composition.krateo.io" {
 		t.Fatalf("auto-discover set = %v, want [composition.krateo.io]", got)
 	}
 	// Idempotent.
-	cache.AddAutoDiscoverGroup("composition.krateo.io")
-	if got := cache.AutoDiscoverGroupsSnapshot(); len(got) != 1 {
-		t.Fatalf("AddAutoDiscoverGroup must be idempotent; got %v", got)
+	cache.AddNavigationDiscoveredGroup("composition.krateo.io")
+	if got := cache.NavigationDiscoveredGroupsSnapshot(); len(got) != 1 {
+		t.Fatalf("AddNavigationDiscoveredGroup must be idempotent; got %v", got)
 	}
 }
 
@@ -274,7 +279,7 @@ func TestRegisterMetaQuerySeeds_RegistersAndIdempotent(t *testing.T) {
 	// The 4 RBAC GVRs are already registered by NewResourceWatcher; the
 	// 3 non-RBAC seeds (routesloaders, navmenus, restactions) are new.
 	// Ship 0 / 0.30.222: customresourcedefinitions was removed (walker-
-	// spawned via AddAutoDiscoverGroup); the count dropped from 4 to 3.
+	// spawned via AddNavigationDiscoveredGroup); the count dropped from 4 to 3.
 	if first != 3 {
 		t.Fatalf("first RegisterMetaQuerySeeds must register the 3 non-RBAC seeds; got %d", first)
 	}
@@ -298,7 +303,7 @@ func phase1ListKinds() map[schema.GroupVersionResource]string {
 	m := rbacListKinds()
 	m[cache.RoutesLoadersGVR()] = "RoutesLoaderList"
 	m[cache.NavMenusGVR()] = "NavMenuList"
-	m[cache.CustomResourceDefinitionGVR()] = "CustomResourceDefinitionList"
+	m[schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}] = "CustomResourceDefinitionList"
 	m[schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}] = "RESTActionList"
 	for _, g := range lateGVRs() {
 		m[g] = g.Resource + "List"

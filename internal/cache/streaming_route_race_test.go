@@ -3,8 +3,8 @@
 //
 // THE BUG: addResourceTypeLocked's streaming-routing check used to be
 // nested inside `if standalone { ... }`, and `standalone :=
-// matchesAutoDiscoverGroup(gvr.Group)` is FALSE until Phase 1's
-// navigation walk has called AddAutoDiscoverGroup. A composition
+// IsNavigationDiscoveredGroup(gvr.Group)` is FALSE until Phase 1's
+// navigation walk has called AddNavigationDiscoveredGroup. A composition
 // EnsureResourceType landing BEFORE that walk fell to the factory
 // branch — the stock shared-factory informer (the ~80%-of-heap
 // NewFilteredDynamicInformer.func3 driver). The composition GVR's
@@ -78,19 +78,19 @@ func isStreamingInformer(rw *ResourceWatcher, gvr schema.GroupVersionResource) b
 // A composition GVR registered BEFORE Phase 1's walk has run (i.e. with
 // autoDiscoverGroups empty) must route to the streaming informer. This
 // is the exact race the fix closes: pre-fix, the streaming check was
-// gated behind `standalone == matchesAutoDiscoverGroup(...)`, which is
+// gated behind `standalone == IsNavigationDiscoveredGroup(...)`, which is
 // false here, so the GVR fell to the stock factory informer.
 func TestRouteRace_AC1_StreamingBeforePhase1(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv(envCompositionStreamingList, "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
-	ResetAutoDiscoverGroupsForTest()
-	t.Cleanup(ResetAutoDiscoverGroupsForTest)
+	ResetNavigationDiscoveredGroupsForTest()
+	t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 	// autoDiscoverGroups is empty — Phase 1 has NOT run. This is the
 	// pre-Phase-1 registration order.
-	if matchesAutoDiscoverGroup(routeRaceCompositionGVR.Group) {
+	if IsNavigationDiscoveredGroup(routeRaceCompositionGVR.Group) {
 		t.Fatal("precondition: autoDiscoverGroups must be empty for this test")
 	}
 
@@ -121,8 +121,8 @@ func TestRouteRace_AC2_NoStockInformerEitherOrder(t *testing.T) {
 	t.Run("autoDiscoverGroups empty (pre-Phase-1)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 		rw := newRouteRaceWatcher(t, true, routeRaceCompositionGVR)
 		t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -136,12 +136,12 @@ func TestRouteRace_AC2_NoStockInformerEitherOrder(t *testing.T) {
 	t.Run("autoDiscoverGroups populated (post-Phase-1)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 		// Simulate Phase 1 having run: the composition group is now in
 		// the auto-discover set (standalone would be true).
-		AddAutoDiscoverGroup(routeRaceCompositionGVR.Group)
+		AddNavigationDiscoveredGroup(routeRaceCompositionGVR.Group)
 
 		rw := newRouteRaceWatcher(t, true, routeRaceCompositionGVR)
 		t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -177,9 +177,9 @@ func TestRouteRace_AC3_NonStreamingRoutingUnchanged(t *testing.T) {
 	t.Run("auto-discovered non-composition GVR streams (H5 default)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
-		AddAutoDiscoverGroup(autoDiscGVR.Group)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
+		AddNavigationDiscoveredGroup(autoDiscGVR.Group)
 
 		rw := newRouteRaceWatcher(t, true, autoDiscGVR)
 		t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -194,8 +194,8 @@ func TestRouteRace_AC3_NonStreamingRoutingUnchanged(t *testing.T) {
 	t.Run("plain non-composition GVR streams (H5 default)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 		rw := newRouteRaceWatcher(t, true, plainGVR)
 		t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -221,8 +221,8 @@ func TestRouteRace_AC4_StreamingInformerRemovable(t *testing.T) {
 	t.Setenv(envCompositionStreamingList, "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
-	ResetAutoDiscoverGroupsForTest()
-	t.Cleanup(ResetAutoDiscoverGroupsForTest)
+	ResetNavigationDiscoveredGroupsForTest()
+	t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 	rw := newRouteRaceWatcher(t, true, routeRaceCompositionGVR)
 	t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -284,8 +284,8 @@ func TestRouteRace_AC5_CacheEnabledFallback(t *testing.T) {
 		t.Setenv(envCompositionStreamingList, "false")
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 		// REST config IS wired — proving the fallback is driven by the
 		// flag, not by a missing config.
@@ -310,8 +310,8 @@ func TestRouteRace_AC5_CacheEnabledFallback(t *testing.T) {
 		t.Setenv(envCompositionStreamingList, "true")
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 		// NO REST config — newStreamingDynamicInformer returns ok=false,
 		// so gi stays nil and the stock fallback must run.

@@ -8,17 +8,18 @@
 //  1. typed-RBAC snapshot writer: `if isTypedRBACGVR(gvr) { … attach
 //     rbacSnapshotEventHandlers(gvr) … }` (watcher.go).
 //
-//  2. CRD-watch composition auto-discovery: installed via the separate
-//     `StartCRDWatch` entry point, which itself was called once from
-//     phase1_walk.go's Step 2 and guarded by an `rw.crdWatchStarted`
-//     idempotence field.
+//  2. CRD-watch composition auto-discovery: installed via a separate
+//     `StartCRDWatch` entry point, called once from phase1_walk.go's
+//     Step 2 and guarded by a sync.Once idempotence field on the
+//     watcher.
+//     This arm was first refactored under Ship 0 into a declarative
+//     registry entry, then DELETED entirely under Ship 0.5 / 0.30.223
+//     (v6) — the CRD informer no longer exists; composition GVRs are
+//     discovered via cache.DiscoverGroupResources (one-shot apiserver
+//     discovery, synchronous, walker-invoked).
 //
-// Both are "attach this specialised handler set when this GVR's informer
-// is created" — i.e. the same shape, expressed differently. The CRD-watch
-// arm went through a dedicated `StartCRDWatch` function because the CRD
-// GVR was hardcoded into `MetaQuerySeeds()` at Phase 1 boot; the RBAC arm
-// branched inline because the GVR set is built-in. Neither composes with
-// new extensions without editing watcher.go.
+// Both arms were "attach this specialised handler set when this GVR's
+// informer is created" — i.e. the same shape, expressed differently.
 //
 // SOLUTION. A single declarative registry. Each owner package registers a
 // `HandlerExtension` from its own `init()`; the watcher iterates the
@@ -28,15 +29,14 @@
 //
 // CRITICAL — feedback_no_special_cases.md: the registry's call sites
 // (the two `addResourceType*Locked` helpers) carry zero GVR literals.
-// A `HandlerExtension` constant referenced by its predicate (e.g. the
-// CRD-GVR literal in crdwatch.go's predicate) lives in the owner
-// package, NOT in the watcher.
+// A `HandlerExtension` constant referenced by its predicate lives in
+// the owner package, NOT in the watcher.
 //
 // THREAD SAFETY. Production registration happens at package init() and is
 // therefore single-threaded by the Go runtime; the registry is read on
 // the watcher's informer-creation path (always under rw.mu.Lock()) and on
 // the test helper path. Reads use a RWMutex; writes a Mutex; both are
-// cheap (the registry is tiny — current Ship 0 has 2 extensions).
+// cheap (the registry is tiny — post-Ship-0.5 only RBAC remains).
 //
 // OBSERVABILITY. Every successful attach increments the
 // `handler_extensions_attached_count{name=X}` counter. The test corpus
@@ -58,9 +58,8 @@ import (
 // rule. Each owner package registers its own instance from `init()`.
 //
 //   - Name: stable identifier for observability + falsifier counters
-//     (e.g. "crdwatch.composition_auto_discovery",
-//     "rbac.snapshot_writer"). Must be unique per process — duplicate
-//     names panic at registration time.
+//     (e.g. "rbac.snapshot_writer"). Must be unique per process —
+//     duplicate names panic at registration time.
 //
 //   - Predicate: returns true iff this extension's Handlers should attach
 //     to the informer for `gvr`. The owner package decides — could be a
@@ -180,13 +179,12 @@ func incHandlerExtensionsAttached(name string) {
 
 // HandlerExtensionsAttachedCount returns the running total of successful
 // attachments for the named extension. Zero for an unknown / never-
-// attached name. Used by the Ship 0 falsifier corpus to assert
+// attached name. Post-Ship-0.5 the registry holds only the RBAC arm
+// (the CRD-watch arm was deleted with the CRD informer); used by the
+// falsifier corpus to assert
 //
 //	counter == 0 at start of Phase 1
-//	counter == 1 after the first AddAutoDiscoverGroup (crdwatch arm)
-//	counter == 4 after RBAC eager registration (rbac arm — one per GVR)
-//
-// and similar invariants.
+//	counter == 4 after RBAC eager registration (one per GVR)
 func HandlerExtensionsAttachedCount(name string) uint64 {
 	v, ok := handlerExtensionsAttachedTotal.Load(name)
 	if !ok {

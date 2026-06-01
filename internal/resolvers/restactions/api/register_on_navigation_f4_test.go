@@ -97,7 +97,7 @@ func TestF4_RegisterOnNavigation_FlagIndependent(t *testing.T) {
 					Verb: ptr.To("GET"),
 				},
 			}}
-			lazyRegisterInnerCallPaths(slog.Default(), opts)
+			lazyRegisterInnerCallPaths(context.Background(), slog.Default(), opts)
 
 			// The GVR MUST now be registered regardless of the flag.
 			// EnsureResourceType returning added=false proves the GVR is

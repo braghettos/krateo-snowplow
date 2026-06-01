@@ -110,9 +110,9 @@ func phase1RealSACreds(t *testing.T) (endpoints.Endpoint, *rest.Config) {
 func TestPhase1_CredentialReal_FixResolvesRoot(t *testing.T) {
 	rw := phase1TestWatcher(t)
 	cache.ResetPhase1DoneForTest()
-	cache.ResetAutoDiscoverGroupsForTest()
+	cache.ResetNavigationDiscoveredGroupsForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)
-	t.Cleanup(cache.ResetAutoDiscoverGroupsForTest)
+	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
 
 	saEP, saRC := phase1RealSACreds(t)
 
@@ -180,9 +180,9 @@ func TestPhase1_CredentialReal_FixResolvesRoot(t *testing.T) {
 func TestPhase1_CredentialReal_UnfixedPathFailsRoot(t *testing.T) {
 	rw := phase1TestWatcher(t)
 	cache.ResetPhase1DoneForTest()
-	cache.ResetAutoDiscoverGroupsForTest()
+	cache.ResetNavigationDiscoveredGroupsForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)
-	t.Cleanup(cache.ResetAutoDiscoverGroupsForTest)
+	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
 
 	saEP, _ := phase1RealSACreds(t)
 

@@ -186,9 +186,9 @@ func TestRunPIPSeed_NoCapWhenClassesExceedFifty(t *testing.T) {
 func TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes(t *testing.T) {
 	rw := phase1TestWatcher(t)
 	cache.ResetPhase1DoneForTest()
-	cache.ResetAutoDiscoverGroupsForTest()
+	cache.ResetNavigationDiscoveredGroupsForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)
-	t.Cleanup(cache.ResetAutoDiscoverGroupsForTest)
+	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
 
 	lister := func(ctx context.Context) ([]navigationRoot, error) {
 		return []navigationRoot{{Root: routesLoaderCR("ns-a", "main"), GVR: gvrReached}}, nil
@@ -246,9 +246,9 @@ func TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes(t *testing.T) {
 func TestPhase1_ReadinessFlips_WhenSeedErrors(t *testing.T) {
 	rw := phase1TestWatcher(t)
 	cache.ResetPhase1DoneForTest()
-	cache.ResetAutoDiscoverGroupsForTest()
+	cache.ResetNavigationDiscoveredGroupsForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)
-	t.Cleanup(cache.ResetAutoDiscoverGroupsForTest)
+	t.Cleanup(cache.ResetNavigationDiscoveredGroupsForTest)
 
 	lister := func(ctx context.Context) ([]navigationRoot, error) {
 		return []navigationRoot{{Root: routesLoaderCR("ns-a", "main"), GVR: gvrReached}}, nil

@@ -469,21 +469,23 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 
 	// Step 1 — register the hardcoded meta-query seeds. This is the ONLY
 	// place a hardcoded GVR is handed to the watcher at startup. Ship 0
-	// / 0.30.222: the customresourcedefinitions GVR is NO LONGER in this
-	// set — it is walker-spawned via AddAutoDiscoverGroup the first time
-	// the resolver encounters a templated apiserver path; the
-	// composition-auto-discovery event handlers attach automatically via
-	// the handler-extension registry (cache/handler_registry.go) when
-	// EnsureResourceType lands the CRD informer.
+	// / 0.30.222 removed the customresourcedefinitions GVR from this
+	// set; Ship 0.5 / 0.30.223 (v6) DELETED the CRD informer entirely.
+	// Composition GVRs are discovered by one-shot apiserver discovery
+	// (cache.DiscoverGroupResources) invoked synchronously from the
+	// walker the first time it reaches a templated apiserver path.
 	rw.RegisterMetaQuerySeeds()
 
 	// Step 2 — (Ship 0 / 0.30.222) the explicit StartCRDWatch call that
-	// lived here is DELETED. The CRD informer now spawns as a sync.Once
-	// side-effect of the first AddAutoDiscoverGroup call below (Step 4's
-	// walker), and the composition-auto-discovery event handlers attach
-	// automatically via the handler-extension registry. Diego's invariant
-	// 2026-06-01 — "no CRD informer if the CRD object itself is not
-	// walked in frontend navigation" — is now structurally enforced.
+	// lived here was DELETED. Ship 0.5 / 0.30.223 (v6) DELETED the CRD
+	// informer entirely. Composition GVR discovery is now a synchronous
+	// side-effect of the walker's lazyRegisterInnerCallPaths hook
+	// (resolve.go:958-961) — for every templated apiserver path the
+	// walker invokes cache.AddNavigationDiscoveredGroup(grp) + cache.
+	// DiscoverGroupResources(ctx, rc, grp). Diego's invariant 2026-06-01
+	// — "no CRD informer if the CRD object itself is not walked in
+	// frontend navigation" — is now even more strictly enforced (no
+	// CRD informer at all).
 
 	// Step 3 — READ the navigation roots from the frontend ConfigMap
 	// (config.json .api.INIT / .api.ROUTES_LOADER → the two named root
@@ -509,10 +511,11 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 
 	// Step 4 — recursively resolve each navigation root under SA identity.
 	// The resolution's inner-call walk auto-registers an informer per
-	// touched GVR (lazyRegisterInnerCallPaths) and feeds the CRD-watch
-	// auto-discover set. Output discarded. Resolution errors are
-	// collected, not fatal: one broken root must not block warming the
-	// rest.
+	// touched GVR (lazyRegisterInnerCallPaths) and — for every templated
+	// apiserver path — invokes cache.DiscoverGroupResources to register
+	// every composition GVR in the encountered group (Ship 0.5 / v6).
+	// Output discarded. Resolution errors are collected, not fatal: one
+	// broken root must not block warming the rest.
 	var walkErr error
 	resolved := 0
 	for _, root := range roots {
@@ -534,28 +537,19 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		resolved++
 	}
 
-	// Step 5 — reconcile the CRD-watch against the now-complete
-	// auto-discover set. The walk discovers composition groups (e.g.
-	// composition.krateo.io) and the first such call spawns the CRD
-	// informer (Ship 0 walker-spawn via AddAutoDiscoverGroup's sync.Once).
-	// Subsequent CRD replays may still race against later
-	// AddAutoDiscoverGroup calls for OTHER groups — so when the walk
-	// finishes, the auto-discover set is complete; a single CRD store
-	// re-scan registers every composition informer whose CRD was
-	// replayed too early. Idempotent for CRDs already registered live.
-	reconciled := rw.ReconcileAutoDiscoverCRDs()
-	if reconciled > 0 {
-		log.Info("phase1.warmup.crd_reconcile",
-			slog.String("subsystem", "cache"),
-			slog.Int("newly_registered", reconciled),
-		)
-	}
+	// Step 5 — (Ship 0.5 / 0.30.223, v6) DELETED. The pre-v6 path
+	// invoked a CRD-store re-scan here to close the CRD-
+	// informer initial-LIST replay-vs-discover race. v6 deletes the
+	// CRD informer entirely; DiscoverGroupResources is a synchronous
+	// transaction inside lazyRegisterInnerCallPaths, so there is no
+	// replay window, no race, and nothing to reconcile. Composition
+	// informers spawned during Step 4 are already in rw.informers by
+	// the time Step 4 returns.
 
-	// Step 6 — let the registered set settle. The CRD-watch may still be
-	// adding composition informers after the reconcile (the per-GVR
-	// EnsureResourceType + the informer's initial LIST run
-	// asynchronously). Poll RegisteredGVRs until it stops growing for one
-	// settle window, bounded by ctx.
+	// Step 6 — let the registered set settle. A composition informer's
+	// initial LIST runs asynchronously even though its EnsureResource-
+	// Type registration is synchronous. Poll RegisteredGVRs until it
+	// stops growing for one settle window, bounded by ctx.
 	settleRegisteredSet(ctx, rw)
 
 	// Step 7 — the Phase 1 sync barrier. Block until every registered

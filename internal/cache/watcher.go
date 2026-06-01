@@ -746,7 +746,7 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// metadata-only path when annotated/static-seeded, so this is the
 	// common path for the GVRs RemoveResourceType actually tears down.
 	var gi informers.GenericInformer
-	standalone := matchesAutoDiscoverGroup(gvr.Group)
+	standalone := IsNavigationDiscoveredGroup(gvr.Group)
 	if standalone {
 		gi = metadatainformer.NewFilteredMetadataInformer(
 			rw.metaClient,
@@ -983,11 +983,13 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// (client-go dynamicinformer/informer.go:84), with the SAME
 	// listOptionsTweak — paging/strip policy is byte-identical.
 	//
-	// The removable discriminator is matchesAutoDiscoverGroup — the
-	// existing navigation-derived predicate. No new per-resource
-	// special-case (feedback_no_special_cases.md): a GVR is removable iff
-	// its group is one the CRD-watch auto-registers, which is exactly the
-	// set RemoveResourceType is ever wired to tear down.
+	// The removable discriminator is IsNavigationDiscoveredGroup — a GVR
+	// is removable iff its group is one the walker has reached via a
+	// templated apiserver path (composition GVRs). Renamed from the
+	// pre-v6 accessor in Ship 0.5 / 0.30.223 (the walker-driven
+	// discovery design that deletes the CRD informer). Semantics
+	// identical — same navigation-derived predicate, same removable-iff-
+	// walker-discovered contract.
 	var gi informers.GenericInformer
 	indexers := clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc}
 
@@ -1055,13 +1057,15 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// (client-go dynamicinformer/informer.go:84), with the SAME
 	// listOptionsTweak — paging/strip policy is byte-identical.
 	//
-	// The removable discriminator is matchesAutoDiscoverGroup — the
-	// existing navigation-derived predicate. No new per-resource
-	// special-case (feedback_no_special_cases.md): a GVR is removable iff
-	// its group is one the CRD-watch auto-registers, which is exactly the
-	// set RemoveResourceType is ever wired to tear down.
+	// The removable discriminator is IsNavigationDiscoveredGroup — a GVR
+	// is removable iff its group is one the walker has reached via a
+	// templated apiserver path (composition GVRs). Renamed from the
+	// pre-v6 accessor in Ship 0.5 / 0.30.223 (the walker-driven
+	// discovery design that deletes the CRD informer). Semantics
+	// identical — same navigation-derived predicate, same removable-iff-
+	// walker-discovered contract.
 	if gi == nil {
-		standalone := matchesAutoDiscoverGroup(gvr.Group)
+		standalone := IsNavigationDiscoveredGroup(gvr.Group)
 		if standalone {
 			gi = dynamicinformer.NewFilteredDynamicInformer(
 				rw.dyn,
@@ -1142,8 +1146,9 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// branch attaching `rbacSnapshotEventHandlers`, plus a separate
 	// `StartCRDWatch` entry point installing the CRD composition-auto-
 	// discovery handlers. Both wirings are now declared from their
-	// owner packages' init() (rbac_snapshot.go and crdwatch.go) and
-	// attached blind from here — addResourceTypeLocked carries zero
+	// owner packages' init() (rbac_snapshot.go; the CRD-watch entry
+	// was deleted with the CRD informer in Ship 0.5) and attached blind
+	// from here — addResourceTypeLocked carries zero
 	// GVR literals (feedback_no_special_cases.md).
 	//
 	// The handler sets themselves are unchanged. attachMatching* logs
@@ -1266,10 +1271,11 @@ func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource
 // event handlers die with the informer goroutine — no separate
 // unregistration needed.
 //
-// Wired into the CRD-watch's DeleteFunc (crdwatch.go's
-// unregisterCRDObject): when a CRD is removed at runtime, the informer
-// for its GVR is no longer needed and would otherwise leak a goroutine
-// for the process lifetime.
+// Pre-Ship-0.5 wired into the CRD-watch's DeleteFunc; Ship 0.5
+// (0.30.223, v6) deleted that wiring along with the CRD informer.
+// Currently the only RemoveResourceType caller is unit-test fixtures
+// (R6 self-heal coverage). The CRD-DELETE periodic-sweep follow-up
+// (#117) will re-wire it post-Ship-2.
 //
 // Idempotent (AC-R6.1): a second call for the same GVR, or a call for an
 // unknown GVR, is a no-op — closePerGVRStopLocked tolerates a missing /
@@ -1280,13 +1286,14 @@ func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource
 // (feedback_no_special_cases.md).
 //
 // Re-add correctness (R6 Option 1): removable GVRs run a STANDALONE
-// informer (addResourceTypeLocked's matchesAutoDiscoverGroup branch),
-// NOT a shared-factory one. Deleting the GVR from rw.informers here
-// drops the only reference to that standalone informer — nothing pins
-// it. A later EnsureResourceType for the same GVR (a CRD delete→recreate)
-// therefore constructs a FRESH standalone informer that lists + watches
-// from scratch; it does not resurrect a stopped, frozen one. R6 is thus
-// strictly more correct than pre-R6: no leaked goroutine AND no frozen
+// informer (addResourceTypeLocked's IsNavigationDiscoveredGroup
+// branch), NOT a shared-factory one. Deleting the GVR from rw.informers
+// here drops the only reference to that standalone informer — nothing
+// pins it. A later EnsureResourceType for the same GVR (a CRD
+// delete→recreate) therefore constructs a FRESH standalone informer
+// that lists + watches from scratch; it does not resurrect a stopped,
+// frozen one. R6 is thus strictly more correct than pre-R6: no leaked
+// goroutine AND no frozen
 // store on recreate.
 //
 // Note: RemoveResourceType is wired ONLY to CRD-delete, which always

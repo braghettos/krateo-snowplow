@@ -55,8 +55,8 @@ func TestH5_AC1_StreamingIsTheDefault(t *testing.T) {
 		t.Run(label, func(t *testing.T) {
 			ResetDepsForTest()
 			t.Cleanup(ResetDepsForTest)
-			ResetAutoDiscoverGroupsForTest()
-			t.Cleanup(ResetAutoDiscoverGroupsForTest)
+			ResetNavigationDiscoveredGroupsForTest()
+			t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 			rw := newRouteRaceWatcher(t, true, gvr)
 			t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -247,8 +247,8 @@ func TestH5_AC6_ToggleOffRevertsWholeFleet(t *testing.T) {
 		t.Run(label, func(t *testing.T) {
 			ResetDepsForTest()
 			t.Cleanup(ResetDepsForTest)
-			ResetAutoDiscoverGroupsForTest()
-			t.Cleanup(ResetAutoDiscoverGroupsForTest)
+			ResetNavigationDiscoveredGroupsForTest()
+			t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 			rw := newRouteRaceWatcher(t, true, gvr)
 			t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -283,8 +283,8 @@ func TestH5_AC7_SyntheticNewGVRStreams(t *testing.T) {
 	t.Setenv(envCompositionStreamingList, "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
-	ResetAutoDiscoverGroupsForTest()
-	t.Cleanup(ResetAutoDiscoverGroupsForTest)
+	ResetNavigationDiscoveredGroupsForTest()
+	t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 	// A GVR no ship ever allow-listed — a hypothetical future customer
 	// CRD group.

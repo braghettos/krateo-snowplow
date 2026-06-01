@@ -441,7 +441,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// Timing instrumentation: if EnsureResourceType ever blocks
 		// longer than lazyRegisterSlowThreshold we emit a WARN so the
 		// 0.30.92 first-read-latency follow-up has a falsifier.
-		lazyRegisterInnerCallPaths(log, tmp)
+		lazyRegisterInnerCallPaths(ctx, log, tmp)
 
 		// 0.30.95 bounded-parallel inner-call iterator.
 		//
@@ -936,7 +936,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 // Timing: per-call duration is measured; calls slower than
 // lazyRegisterSlowThreshold emit a WARN log so a regression in
 // rw.mu contention or factory.ForResource cost becomes visible.
-func lazyRegisterInnerCallPaths(log *slog.Logger, opts []httpcall.RequestOptions) {
+func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []httpcall.RequestOptions) {
 	rw := cache.Global()
 	if rw == nil {
 		return
@@ -945,19 +945,57 @@ func lazyRegisterInnerCallPaths(log *slog.Logger, opts []httpcall.RequestOptions
 	for i := range opts {
 		path := opts[i].Path
 
-		// 0.30.102 Tag B Part 2 — CRD-watch group feed. Composition
-		// apiserver paths are JQ-templated (`/apis/<group>/${.v}/...`)
-		// so ParseAPIServerPathToGVR (which rejects any `${`) cannot
-		// derive their GVR here. The GROUP segment is static, though —
-		// extract it and feed the CRD-watch's navigation-derived
-		// auto-discover set. Gated by PREWARM_ENABLED so a flag-OFF
-		// process is byte-identical (the auto-discover set stays empty
-		// and the CRD-watch never runs). Non-templated paths also flow
-		// through here harmlessly — their group is added too, which is
-		// correct (it IS navigation-reached).
+		// 0.30.102 Tag B Part 2 — composition-group walker feed.
+		// Composition apiserver paths are JQ-templated
+		// (`/apis/<group>/${.v}/...`), so ParseAPIServerPathToGVR
+		// (which rejects any `${`) cannot derive their GVR here. The
+		// GROUP segment is static, though — extract it and:
+		//
+		//  1. Record it in the navigation-discovered set (so the
+		//     watcher's removable-discriminator at watcher.go:749 +
+		//     :1064 routes composition GVRs to the standalone-informer
+		//     branch — the only branch RemoveResourceType can ever
+		//     tear down).
+		//
+		//  2. Ship 0.5 / 0.30.223 (v6): invoke cache.DiscoverGroup-
+		//     Resources synchronously. One-shot apiserver discovery
+		//     enumerates every CRD-backed resource in `grp`, calls
+		//     EnsureResourceType for each (spawning composition
+		//     informers), and fires the FD1 dirty-mark chain via
+		//     Deps().OnResourceTypeAvailable for genuinely-new GVRs.
+		//     Replaces the deleted CRD-informer event-driven backplane
+		//     (Ship 0 walker-spawn + the pre-v6 CRD-watch file).
+		//     Soft-fails: a
+		//     discovery error is logged and the walker continues
+		//     (subsequent walks retry); the dispatch through the
+		//     unregistered composition GVR will hit apiserver via
+		//     fall-through.
+		//
+		// Gated by PREWARM_ENABLED so a flag-OFF process is byte-
+		// identical (the nav-discovered set stays empty and the
+		// discovery hop never runs). Non-templated paths also flow
+		// through here harmlessly — their group is added too (it IS
+		// navigation-reached).
 		if cache.PrewarmEnabled() {
 			if grp, grpOK := cache.ExtractAPIServerGroupFromTemplatedPath(path); grpOK {
-				cache.AddAutoDiscoverGroup(grp)
+				cache.AddNavigationDiscoveredGroup(grp)
+				// The walker's *rest.Config is wired through
+				// cache.WithInternalRESTConfig during Phase 1 (SA-
+				// credentialed walk). When absent (e.g. a non-Phase-1
+				// /call), the discovery hop is skipped — the only
+				// caller pattern that requires it is the SA-credentialed
+				// walker, which DOES set it.
+				if rcAny, ok := cache.InternalRESTConfigFromContext(ctx); ok {
+					if cfg, ok := rcAny.(*rest.Config); ok && cfg != nil {
+						if _, err := cache.DiscoverGroupResources(ctx, cfg, grp); err != nil {
+							log.Warn("cache.discovery.group_resources_fetch_failed",
+								slog.String("subsystem", "cache"),
+								slog.String("group", grp),
+								slog.Any("err", err),
+							)
+						}
+					}
+				}
 			}
 		}
 

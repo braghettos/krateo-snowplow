@@ -115,7 +115,7 @@ func TestLazyRegisterInnerCallPaths_TriggersEnsureForEveryGVR(t *testing.T) {
 		},
 	}
 
-	lazyRegisterInnerCallPaths(slog.Default(), opts)
+	lazyRegisterInnerCallPaths(context.Background(), slog.Default(), opts)
 
 	mustBeRegistered := []schema.GroupVersionResource{
 		{Group: "composition.krateo.io", Version: "v1", Resource: "compositions"},
@@ -179,7 +179,7 @@ func TestLazyRegisterInnerCallPaths_SkipsNonApiserverPaths(t *testing.T) {
 		// Root path — no GVR.
 		{RequestInfo: httpcall.RequestInfo{Path: "/"}},
 	}
-	lazyRegisterInnerCallPaths(slog.Default(), opts)
+	lazyRegisterInnerCallPaths(context.Background(), slog.Default(), opts)
 
 	// Probe a few inner-call GVRs the helper SHOULD NOT have touched.
 	candidates := []schema.GroupVersionResource{
@@ -209,5 +209,5 @@ func TestLazyRegisterInnerCallPaths_NilWatcherIsSilent(t *testing.T) {
 		{RequestInfo: httpcall.RequestInfo{Path: "/apis/composition.krateo.io/v1/namespaces/x/compositions"}},
 	}
 	// Must not panic.
-	lazyRegisterInnerCallPaths(slog.Default(), opts)
+	lazyRegisterInnerCallPaths(context.Background(), slog.Default(), opts)
 }

@@ -135,10 +135,10 @@ func TestH4_AC1_WidgetGVRRoutesToStreaming(t *testing.T) {
 	t.Run("autoDiscoverGroups empty (pre-Phase-1)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
-		if matchesAutoDiscoverGroup(h4WidgetGVR.Group) {
+		if IsNavigationDiscoveredGroup(h4WidgetGVR.Group) {
 			t.Fatal("precondition: autoDiscoverGroups must be empty for this subtest")
 		}
 
@@ -155,9 +155,9 @@ func TestH4_AC1_WidgetGVRRoutesToStreaming(t *testing.T) {
 	t.Run("autoDiscoverGroups populated (post-Phase-1)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
-		AddAutoDiscoverGroup(h4WidgetGVR.Group)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
+		AddNavigationDiscoveredGroup(h4WidgetGVR.Group)
 
 		rw := newRouteRaceWatcher(t, true, h4WidgetGVR)
 		t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -276,8 +276,8 @@ func TestH4_AC4_OtherRoutingUnchanged(t *testing.T) {
 	t.Setenv(envCompositionStreamingList, "true")
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
-	ResetAutoDiscoverGroupsForTest()
-	t.Cleanup(ResetAutoDiscoverGroupsForTest)
+	ResetNavigationDiscoveredGroupsForTest()
+	t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 	rw := newRouteRaceWatcher(t, true, h4WidgetGVR)
 	t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
@@ -302,8 +302,8 @@ func TestH4_AC5_WidgetFallbackWhenStreamingOff(t *testing.T) {
 		t.Setenv(envCompositionStreamingList, "false")
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 		// REST config IS wired — proving the fallback is flag-driven.
 		rw := newRouteRaceWatcher(t, true, h4WidgetGVR)
@@ -325,8 +325,8 @@ func TestH4_AC5_WidgetFallbackWhenStreamingOff(t *testing.T) {
 		t.Setenv(envCompositionStreamingList, "true")
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
-		ResetAutoDiscoverGroupsForTest()
-		t.Cleanup(ResetAutoDiscoverGroupsForTest)
+		ResetNavigationDiscoveredGroupsForTest()
+		t.Cleanup(ResetNavigationDiscoveredGroupsForTest)
 
 		// NO REST config — newStreamingDynamicInformer returns ok=false.
 		rw := newRouteRaceWatcher(t, false, h4WidgetGVR)

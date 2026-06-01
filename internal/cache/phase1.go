@@ -30,16 +30,15 @@
 // navigation roots.
 //
 // Ship 0 / 0.30.222: the customresourcedefinitions GVR was REMOVED from
-// the seed set. Pre-Ship-0 the CRD informer spawned at boot regardless of
-// whether anything in frontend navigation reached a CRD object; Diego's
-// invariant 2026-06-01 ("no CRD informer if the CRD object itself is not
-// walked in frontend navigation") demanded a walker-driven spawn. The
-// CRD informer now spawns as a sync.Once side-effect of the first
-// AddAutoDiscoverGroup call (crdwatch.go). The 4 RBAC GVRs +
-// restactions + routesloaders + navmenus remain primordial because they
-// have justified chicken-and-egg semantics (walker queries them to start
-// the walk); the CRD GVR has none — by the time the walker encounters a
-// templated path it is already running.
+// the seed set. Ship 0.5 / 0.30.223 (v6): the CRD informer is DELETED
+// entirely. Composition GVRs are discovered by one-shot apiserver
+// discovery (cache.DiscoverGroupResources, invoked synchronously from
+// the walker) instead of via an in-process CRD-informer event stream.
+// The 4 RBAC GVRs + restactions + routesloaders + navmenus remain
+// primordial because they have justified chicken-and-egg semantics
+// (walker queries them to start the walk); the CRD GVR has none — by
+// the time the walker encounters a templated path it is already
+// running.
 //
 // BEHAVIOR-NEUTRAL — PrewarmEnabled() gates the whole feature behind
 // PREWARM_ENABLED (default OFF), mirroring PREWARM_REGISTER_ENABLED.
@@ -62,8 +61,8 @@ import (
 )
 
 // envPrewarmEnabled is the opt-in gate for the Tag B startup warmup
-// (Phase 1 + CRD-watch). Default OFF — absent / "" / anything but
-// "true" => the feature is dormant and behavior-neutral.
+// (Phase 1 + walker-driven discovery). Default OFF — absent / "" /
+// anything but "true" => the feature is dormant and behavior-neutral.
 const envPrewarmEnabled = "PREWARM_ENABLED"
 
 // PrewarmEnabled reports whether the Tag B startup warmup is opted in.
@@ -74,8 +73,9 @@ func PrewarmEnabled() bool {
 
 // phase1Done is the process-wide atomic that flips true exactly once,
 // when the Phase 1 SA-credentialed resolution walk has finished AND
-// every registered informer (including the CRD-watch-spawned composition
-// informers that exist at boot) has reached HasSynced.
+// every registered informer (including composition informers spawned
+// via cache.DiscoverGroupResources during the walk) has reached
+// HasSynced.
 //
 // When PrewarmEnabled()==false the startup sequence calls
 // MarkPhase1Done immediately (nothing to wait for) so /readyz is a
@@ -135,28 +135,12 @@ func ResetPhase1DoneForTest() {
 	phase1Done.Store(false)
 }
 
-// customResourceDefinitionGVR is the GVR of the apiextensions
-// CustomResourceDefinition resource — the navigation root the CRD-watch
-// registers an informer against to discover composition GVRs as their
-// CRDs appear.
-//
-// Ship 0 / 0.30.222: NO LONGER a meta-query seed. The CRD informer is
-// spawned by the walker via AddAutoDiscoverGroup the first time the
-// frontend navigation walks to a templated apiserver path. Retained as a
-// package-level constant because the spawn site (crdwatch.go's
-// AddAutoDiscoverGroup) + the handler-extension Predicate (crdwatch.go's
-// init()) + the tests still reference the same GVR identity.
-//
-// Per feedback_no_special_cases.md: NOT a per-resource policy. The
-// constant lives in the package that owns the CRD-watch behavior, and
-// addResourceTypeLocked / addResourceTypeMetadataOnlyLocked do NOT
-// reference it directly — they iterate the handler-extension registry
-// blind.
-var customResourceDefinitionGVR = schema.GroupVersionResource{
-	Group:    "apiextensions.k8s.io",
-	Version:  "v1",
-	Resource: "customresourcedefinitions",
-}
+// Ship 0.5 / 0.30.223 (v6): the apiextensions CRD GVR constant AND
+// its accessor were DELETED. The CRD informer is no longer spawned
+// anywhere in the cache codebase; the composition-GVR-discovery
+// semantics it used to back are now satisfied by cache.
+// DiscoverGroupResources (one-shot apiserver discovery, synchronous,
+// invoked from the walker — see discovery_lookup.go).
 
 // routesLoadersGVR is the GVR of the `routesloaders` widget CR.
 //
@@ -211,11 +195,6 @@ func NavMenusGVR() schema.GroupVersionResource {
 	return navMenusGVR
 }
 
-// CustomResourceDefinitionGVR exposes the CRD meta-query anchor.
-func CustomResourceDefinitionGVR() schema.GroupVersionResource {
-	return customResourceDefinitionGVR
-}
-
 // MetaQuerySeeds returns the COMPLETE hardcoded seed budget for Tag B —
 // EXACTLY these 7 GVRs, nothing else (feedback_no_special_cases.md is a
 // hard requirement here). Every entry is a meta-query INFORMER-ANCHOR
@@ -238,8 +217,10 @@ func CustomResourceDefinitionGVR() schema.GroupVersionResource {
 //
 // Ship 0 / 0.30.222: customresourcedefinitions is NO LONGER a seed
 // (Diego invariant: "no CRD informer if the CRD object itself is not
-// walked"). It is walker-spawned via AddAutoDiscoverGroup; see
-// crdwatch.go.
+// walked"). Ship 0.5 / 0.30.223 (v6): the CRD informer was deleted
+// entirely; composition GVRs are discovered by one-shot apiserver
+// discovery (cache.DiscoverGroupResources) invoked synchronously from
+// the walker.
 //
 // Every BUSINESS GVR — widgets, panels, compositions — is ABSENT from
 // this set by construction. Those are discovered by RESOLVING the
@@ -262,9 +243,11 @@ func MetaQuerySeeds() []schema.GroupVersionResource {
 // — EnsureResourceType observes added=false for those) — 7 seeds total.
 // Idempotent + singleflighted under rw.mu.
 //
-// Ship 0 / 0.30.222: the CRD GVR is no longer in this list. The CRD
-// informer is walker-spawned via AddAutoDiscoverGroup the first time
-// frontend navigation reaches a templated apiserver path.
+// Ship 0 / 0.30.222: the CRD GVR is no longer in this list. Ship 0.5
+// / 0.30.223 (v6): the CRD informer is deleted; composition GVRs are
+// discovered via cache.DiscoverGroupResources (one-shot apiserver
+// discovery) invoked synchronously from the walker the first time a
+// templated apiserver path is reached.
 //
 // This is the ONLY code that hands a hardcoded GVR to EnsureResourceType
 // at startup. The Phase 1 walk registers everything else by resolution.
@@ -295,34 +278,37 @@ func (rw *ResourceWatcher) RegisterMetaQuerySeeds() int {
 // HasSynced AND no new informer was registered DURING the wait, or ctx
 // is cancelled. This is the Phase 1 sync barrier: after the SA-credentialed
 // resolution walk has fanned out (registering an informer per touched
-// GVR via lazyRegisterInnerCallPaths) AND the CRD-watch has spawned its
-// composition informers, this call guarantees the navigated set is warm
-// before Phase1Done flips.
+// GVR via lazyRegisterInnerCallPaths) AND every templated apiserver
+// path has invoked cache.DiscoverGroupResources to spawn composition
+// informers (v6, Ship 0.5), this call guarantees the navigated set is
+// warm before Phase1Done flips.
 //
 // RE-SNAPSHOT LOOP — the load-bearing concurrency property. A single
-// snapshot+wait has a race: a CRD-add (the CRD-watch's per-GVR
-// EnsureResourceType) that lands AFTER the snapshot is taken but while
-// WaitForCacheSync is blocked would NOT be in the sync set — Phase1Done
-// could then flip while that composition informer is still cold, the
-// exact premature-Ready failure /readyz exists to prevent. So this loop
-// re-snapshots after every WaitForCacheSync pass and only returns when a
-// full pass completed with the registered-informer count UNCHANGED
-// across it (no registration occurred during the wait). client-go's
-// HasSynced is monotonic — once true it stays true — so a stable count
-// across a pass means every informer observed at the start of the pass
-// is synced AND nothing new appeared, hence every informer is synced.
+// snapshot+wait has a race: a late EnsureResourceType (a composition
+// informer spawned by a still-running DiscoverGroupResources, or by a
+// late resolver inner-call touch) that lands AFTER the snapshot is
+// taken but while WaitForCacheSync is blocked would NOT be in the sync
+// set — Phase1Done could then flip while that composition informer is
+// still cold, the exact premature-Ready failure /readyz exists to
+// prevent. So this loop re-snapshots after every WaitForCacheSync pass
+// and only returns when a full pass completed with the registered-
+// informer count UNCHANGED across it (no registration occurred during
+// the wait). client-go's HasSynced is monotonic — once true it stays
+// true — so a stable count across a pass means every informer observed
+// at the start of the pass is synced AND nothing new appeared, hence
+// every informer is synced.
 //
 // It does NOT layer its own timeout — the caller (Phase1Warmup) owns the
 // deadline via ctx so the PHASE1_TIMEOUT_SECONDS budget is the single
-// source of truth and also bounds a pathological never-stabilizing loop
-// (a cluster that keeps adding CRDs forever).
+// source of truth and also bounds a pathological never-stabilizing loop.
 //
 // INVARIANT the count-equality test depends on: the registered-informer
-// set is append-only — informers are never de-registered (there is no
-// delete from rw.informers; the CRD-watch deliberately omits DeleteFunc).
-// So an unchanged COUNT across a pass implies an unchanged SET. If a
-// future change adds a de-registration path, this proxy breaks and the
-// loop must compare the GVR set, not the count.
+// set is append-only during Phase 1 — RemoveResourceType is wired only
+// to the CRD-DELETE path (followup #117, post-Ship 2), which is dormant
+// during Phase 1's bounded walk. So an unchanged COUNT across a pass
+// implies an unchanged SET. If a future change adds an in-Phase-1
+// de-registration path, this proxy breaks and the loop must compare
+// the GVR set, not the count.
 //
 // Returns nil on success, ctx.Err()/DeadlineExceeded on cancellation. In
 // modePassthrough there are no informers — returns nil immediately.
