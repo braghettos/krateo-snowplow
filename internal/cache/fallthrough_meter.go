@@ -182,6 +182,22 @@ const (
 	// 10 paths × 50 GVRs × 21 reasons = 10,500 cells).
 	ReasonWidgetContentHit                 FallthroughReason = "widget-content-hit"
 	ReasonWidgetContentMissPerUserFallback FallthroughReason = "widget-content-miss-per-user-fallback"
+
+	// Ship 1 / 0.30.225 — plurals permanent store (v6 design §3.2
+	// Layer 5). ReasonPluralsDiscoveryHop fires once per gvk per
+	// process lifetime on the first PluralFor / KindForGVR miss
+	// against the permanent sync.Map store. MONOTONICALLY rises to
+	// a bounded ceiling equal to the number of unique CRD-backed
+	// GVKs in the walker corpus, then stays. Built-in scheme GVKs
+	// resolved by GVRFor / KindForGVR fast path NEVER fire this
+	// counter (zero apiserver hop). PluralFor (handler path) DOES
+	// fire it once per built-in GVK as well, since byte-identical
+	// /api-info/names response shape requires the full Info
+	// (Singular + Shorts) which only the apiserver discovery
+	// response provides.
+	// Closed-enum count: 21 (Ship G) + 1 = 22. Within budget
+	// (cardinality: 10 paths × 50 GVRs × 22 reasons = 11,000 cells).
+	ReasonPluralsDiscoveryHop FallthroughReason = "plurals-discovery-hop"
 )
 
 // fallthroughKey is the composite label tuple for one counter cell.
