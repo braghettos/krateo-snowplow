@@ -1,61 +1,60 @@
 package handlers
 
 import (
-	"encoding/json"
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/krateoplatformops/plumbing/env"
-	"k8s.io/client-go/rest"
 )
 
-// Mock di `rest.InClusterConfig`
-var mockInClusterConfig func() (*rest.Config, error)
-
+// mockNSGetter is kept around for signature compatibility — Ship 0.5.5
+// HealthCheck ignores the namespace getter, but callers in main.go
+// still pass one. The test verifies the handler does NOT depend on it.
 func mockNSGetter() (string, error) {
 	return "test-namespace", nil
 }
 
-func TestHealthCheck(t *testing.T) {
-	env.SetTestMode(true)
-
+// TestHealthCheck_AliveOnly verifies the Ship 0.5.5 contract:
+//   - 200 OK
+//   - Content-Type application/json
+//   - Body is exactly {"status":"alive"} (17 bytes, no namespace, no build)
+//   - Handler does NOT depend on rest.InClusterConfig or nsgetter
+func TestHealthCheck_AliveOnly(t *testing.T) {
 	tests := []struct {
-		name               string
-		expectedStatusCode int
-		expectedResponse   serviceInfo
+		name     string
+		nsgetter func() (string, error)
 	}{
 		{
-			name:               "Success - valid cluster config & namespace",
-			expectedStatusCode: http.StatusOK,
-			expectedResponse:   serviceInfo{Name: "test-service", Build: "v1.0.0", Namespace: "test-namespace"},
+			name:     "with non-nil nsgetter (should be ignored)",
+			nsgetter: mockNSGetter,
+		},
+		{
+			name:     "with nil nsgetter (should NOT panic)",
+			nsgetter: nil,
 		},
 	}
 
+	const wantBody = `{"status":"alive"}`
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-
 			req := httptest.NewRequest(http.MethodGet, "/health", nil)
 			rec := httptest.NewRecorder()
 
-			handler := HealthCheck("test-service", "v1.0.0", mockNSGetter)
+			handler := HealthCheck("test-service", "v1.0.0", tc.nsgetter)
 			handler.ServeHTTP(rec, req)
 
-			// Verifica codice HTTP
-			if rec.Code != tc.expectedStatusCode {
-				t.Errorf("expected status %d, got %d", tc.expectedStatusCode, rec.Code)
+			if rec.Code != http.StatusOK {
+				t.Errorf("expected status %d, got %d", http.StatusOK, rec.Code)
 			}
 
-			// Se è un 200 OK, verifichiamo il JSON restituito
-			if tc.expectedStatusCode == http.StatusOK {
-				var resp serviceInfo
-				err := json.Unmarshal(rec.Body.Bytes(), &resp)
-				if err != nil {
-					t.Errorf("failed to parse response JSON: %v", err)
-				}
-				if resp != tc.expectedResponse {
-					t.Errorf("expected response %+v, got %+v", tc.expectedResponse, resp)
-				}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Errorf("expected Content-Type application/json, got %q", got)
+			}
+
+			body := bytes.TrimRight(rec.Body.Bytes(), "\n")
+			if string(body) != wantBody {
+				t.Errorf("expected body %q, got %q", wantBody, string(body))
 			}
 		})
 	}
