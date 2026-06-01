@@ -110,3 +110,145 @@ def tmp_run_dir(tmp_path):
     run_dir = tmp_path / "snowplow-runs" / "test-tag" / "run-20260602-test"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+# ─── Block 3: Playwright fake-page fixture ──────────────────────────────────
+
+
+class FakePage:
+    """Minimal duck-typed Playwright Page stand-in for unit tests.
+
+    Records every call so tests can assert on invocation order. The DOM
+    state is a dict the test pre-populates; `evaluate()` dispatches on
+    JS-string prefix to a method that consults the dict.
+
+    Field semantics:
+      _skeleton_scoped / _skeleton_raw / _skeleton_widget — return values
+        for _WIDGET_SKELETON_COUNT_JS evaluate().
+      _call_count — return value for the resource-timing /call probe.
+      _errored_count — return value for `.ant-result-error`.count().
+      _ui_count — return value for the verify_composition_count_ui JS.
+      _has_token — return value for the K_user localStorage probe.
+      _nav_timing — dict returned by the navigation-timing JS.
+      _waterfall — dict returned by the waterfall-levels JS.
+    """
+
+    def __init__(self, *, skeleton_scoped: int = 0, skeleton_raw: int = 0,
+                 skeleton_widget: int = 0, call_count: int = 0,
+                 errored_count: int = 0, ui_count: int = -1,
+                 has_token: bool = True,
+                 nav_timing: dict | None = None,
+                 waterfall: dict | None = None,
+                 url: str = "http://fake/login"):
+        self._skeleton_scoped = skeleton_scoped
+        self._skeleton_raw = skeleton_raw
+        self._skeleton_widget = skeleton_widget
+        self._call_count = call_count
+        self._errored_count = errored_count
+        self._ui_count = ui_count
+        self._has_token = has_token
+        self._nav_timing = nav_timing or {"domContentLoaded": 100,
+                                          "loadComplete": 200}
+        self._waterfall = waterfall or {"callCount": call_count,
+                                        "waterfallMs": 0,
+                                        "calls": [], "levels": []}
+        self.url = url
+        self.evaluate_log: list[str] = []
+        self.goto_log: list[tuple] = []
+        self.screenshot_log: list[str] = []
+        self.response_listeners: list = []
+
+    def evaluate(self, js, *args):
+        self.evaluate_log.append(js)
+        # Match by canonical prefix snippets — keep the heuristic robust
+        # to whitespace tweaks in the JS literals.
+        if "EXCLUDED_ANCESTORS" in js:
+            return {"scoped": self._skeleton_scoped,
+                    "raw": self._skeleton_raw,
+                    "widget_scoped": self._skeleton_widget}
+        # Order-sensitive: the verify_composition_count_ui JS contains both
+        # `K_user` AND `dashboard-compositions-panel-row-piechart`. Match the
+        # more-specific UI-count probe FIRST so the login-token branch does
+        # not eat the verify call.
+        if "dashboard-compositions-panel-row-piechart" in js:
+            return self._ui_count
+        if "K_user" in js:
+            return self._has_token
+        if "performance.clearResourceTimings" in js:
+            return None
+        if "filter(e => e.name.includes('/call')).length" in js:
+            return self._call_count
+        if "GAP_MS" in js and "calls.length" in js:
+            return dict(self._waterfall, callCount=self._call_count)
+        if "navigation" in js and "loadEventEnd" in js:
+            return self._nav_timing
+        if "scrollIntoView" in js:
+            return True
+        return None
+
+    def goto(self, url, **kwargs):
+        self.goto_log.append((url, kwargs))
+        self.url = url
+
+    def click(self, selector, **kwargs):
+        # Behavioural no-op for login flow.
+        return None
+
+    def wait_for_timeout(self, ms):
+        return None
+
+    def wait_for_load_state(self, state, **kwargs):
+        return None
+
+    def screenshot(self, path: str, **kwargs):
+        self.screenshot_log.append(path)
+        # Touch the file so callers that stat() the path see a file exists.
+        try:
+            from pathlib import Path
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(b"\x89PNG\r\n\x1a\n")
+        except Exception:
+            pass
+
+    def on(self, event, handler):
+        self.response_listeners.append((event, handler))
+
+    def remove_listener(self, event, handler):
+        self.response_listeners = [
+            (e, h) for (e, h) in self.response_listeners
+            if not (e == event and h is handler)
+        ]
+
+    # keyboard.type and locator are used by login + validation paths.
+    @property
+    def keyboard(self):
+        class _KB:
+            def type(self, text, delay=0):
+                return None
+        return _KB()
+
+    def locator(self, selector):
+        page = self
+
+        class _Locator:
+            def count(self_inner):
+                if selector == ".ant-result-error":
+                    return page._errored_count
+                return 0
+        return _Locator()
+
+
+@pytest.fixture
+def fake_page():
+    """Yield a FakePage with sensible defaults (no skeletons, 16 /calls,
+    valid token, dashboard-shaped UI count).
+    """
+    return FakePage(
+        skeleton_scoped=0,
+        skeleton_raw=0,
+        skeleton_widget=0,
+        call_count=16,
+        errored_count=0,
+        ui_count=0,
+        has_token=True,
+    )
