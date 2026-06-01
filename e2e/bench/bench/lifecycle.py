@@ -60,22 +60,15 @@ from bench.cluster import (
 )
 
 
-# ─── Light-weight logging shim ───────────────────────────────────────────────
+# ─── Logger — sourced from cli.py per PM carry-forward #1 ────────────────────
 #
-# The source script wires a coloured log() in module-global scope. The
-# Block-1 modules deliberately do NOT depend on the source's ANSI helpers
-# (that lives in the not-yet-extracted cli.py). For now, print prefixed
-# lines; the CLI module will replace this when it lands in Block 2.
+# Block 1 shipped a print()-based shim here. Block 2 replaces it with the
+# coloured ANSI logger that lives in cli.py. The import is at module load
+# (NOT deferred) so existing callers' bare `log(msg)` references keep
+# working without changes. cli.py does NOT import lifecycle at top-level,
+# so this does not introduce a cycle.
 
-def log(msg):
-    """Block-1 logging shim. Replaced by cli.py:log in Block 2."""
-    ts = time.strftime("%H:%M:%S")
-    print(f"  [{ts}] {msg}", flush=True)
-
-
-def section(title):
-    """Block-1 section banner shim."""
-    print(f"\n  === {title} ===", flush=True)
+from bench.cli import log, section  # noqa: E402
 
 
 # ─── HTTP helpers used by lifecycle (login, snowplow probes) ─────────────────
