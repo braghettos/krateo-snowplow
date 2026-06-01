@@ -34,32 +34,32 @@ var forbiddenSeedResources = map[string]bool{
 }
 
 // TestMetaQuerySeeds_ExactBudget asserts the hardcoded seed set is
-// EXACTLY the 8 declared meta-query anchors and contains no business
+// EXACTLY the 7 declared meta-query anchors and contains no business
 // GVR. A regression that adds a configured widget / composition GVR to
 // the seed list fails here. 0.30.105 raised the budget 7->8 by adding
-// the navmenus navigation root — an entry-point widget CR, not a
-// business GVR.
+// the navmenus navigation root; Ship 0 / 0.30.222 lowered it back to 7
+// by removing customresourcedefinitions (walker-spawned via
+// AddAutoDiscoverGroup, no longer a boot primordial).
 func TestMetaQuerySeeds_ExactBudget(t *testing.T) {
 	seeds := cache.MetaQuerySeeds()
-	if len(seeds) != 8 {
-		t.Fatalf("meta-query seed budget must be EXACTLY 8 (routesloaders, "+
-			"navmenus, restactions, customresourcedefinitions + 4 RBAC); got %d: %v",
+	if len(seeds) != 7 {
+		t.Fatalf("meta-query seed budget must be EXACTLY 7 (routesloaders, "+
+			"navmenus, restactions + 4 RBAC); got %d: %v",
 			len(seeds), seeds)
 	}
 
 	want := map[schema.GroupVersionResource]bool{
-		cache.RoutesLoadersGVR():            true,
-		cache.NavMenusGVR():                 true,
-		cache.CustomResourceDefinitionGVR(): true,
-		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}:                        true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:                        true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:                 true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:                 true,
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}:          true,
+		cache.RoutesLoadersGVR(): true,
+		cache.NavMenusGVR():      true,
+		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}:               true,
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               true,
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        true,
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        true,
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: true,
 	}
 	for _, s := range seeds {
 		if !want[s] {
-			t.Errorf("unexpected meta-query seed %v — not one of the 8 sanctioned anchors", s)
+			t.Errorf("unexpected meta-query seed %v — not one of the 7 sanctioned anchors", s)
 		}
 		delete(want, s)
 		// No business GVR may ever be a hardcoded seed — those are
@@ -70,6 +70,16 @@ func TestMetaQuerySeeds_ExactBudget(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Errorf("meta-query seeds missing sanctioned anchors: %v", want)
+	}
+
+	// Ship 0 / 0.30.222 — the CRD GVR is explicitly walker-driven.
+	// Asserting its ABSENCE from the seed set catches a regression that
+	// re-adds it (which would re-violate Diego's invariant).
+	for _, s := range seeds {
+		if s == cache.CustomResourceDefinitionGVR() {
+			t.Fatalf("Ship 0 invariant: customresourcedefinitions MUST NOT be a meta-query seed " +
+				"(walker-spawned via AddAutoDiscoverGroup); got %v in seed set", s)
+		}
 	}
 }
 
@@ -262,9 +272,11 @@ func TestRegisterMetaQuerySeeds_RegistersAndIdempotent(t *testing.T) {
 
 	first := rw.RegisterMetaQuerySeeds()
 	// The 4 RBAC GVRs are already registered by NewResourceWatcher; the
-	// 4 meta seeds (routesloaders, navmenus, restactions, CRDs) are new.
-	if first != 4 {
-		t.Fatalf("first RegisterMetaQuerySeeds must register the 4 non-RBAC seeds; got %d", first)
+	// 3 non-RBAC seeds (routesloaders, navmenus, restactions) are new.
+	// Ship 0 / 0.30.222: customresourcedefinitions was removed (walker-
+	// spawned via AddAutoDiscoverGroup); the count dropped from 4 to 3.
+	if first != 3 {
+		t.Fatalf("first RegisterMetaQuerySeeds must register the 3 non-RBAC seeds; got %d", first)
 	}
 	for _, gvr := range cache.MetaQuerySeeds() {
 		if !rw.IsRegistered(gvr) {

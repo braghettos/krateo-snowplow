@@ -23,11 +23,23 @@
 // arrives once the navigated informers are warm.
 //
 // CRITICAL — feedback_no_special_cases.md: Phase 1 does NOT consult any
-// configured GVR / RESTAction list. The ONLY hardcoded budget is the 8
+// configured GVR / RESTAction list. The ONLY hardcoded budget is the 7
 // meta-query seeds below — bare anchors needed to bootstrap discovery,
 // not per-resource policy. Every BUSINESS GVR (widgets, panels,
 // compositions) is discovered by recursively resolving the two
 // navigation roots.
+//
+// Ship 0 / 0.30.222: the customresourcedefinitions GVR was REMOVED from
+// the seed set. Pre-Ship-0 the CRD informer spawned at boot regardless of
+// whether anything in frontend navigation reached a CRD object; Diego's
+// invariant 2026-06-01 ("no CRD informer if the CRD object itself is not
+// walked in frontend navigation") demanded a walker-driven spawn. The
+// CRD informer now spawns as a sync.Once side-effect of the first
+// AddAutoDiscoverGroup call (crdwatch.go). The 4 RBAC GVRs +
+// restactions + routesloaders + navmenus remain primordial because they
+// have justified chicken-and-egg semantics (walker queries them to start
+// the walk); the CRD GVR has none — by the time the walker encounters a
+// templated path it is already running.
 //
 // BEHAVIOR-NEUTRAL — PrewarmEnabled() gates the whole feature behind
 // PREWARM_ENABLED (default OFF), mirroring PREWARM_REGISTER_ENABLED.
@@ -125,13 +137,21 @@ func ResetPhase1DoneForTest() {
 
 // customResourceDefinitionGVR is the GVR of the apiextensions
 // CustomResourceDefinition resource — the navigation root the CRD-watch
-// (Part 2) registers an informer against to discover composition GVRs
-// as their CRDs appear.
+// registers an informer against to discover composition GVRs as their
+// CRDs appear.
 //
-// Per feedback_no_special_cases.md: NOT a per-resource policy. It is one
-// of the 7 bare meta-query anchors — the CRD-watch needs SOMETHING to
-// LIST/WATCH to learn about composition CRDs, and that something is the
-// CRD type itself.
+// Ship 0 / 0.30.222: NO LONGER a meta-query seed. The CRD informer is
+// spawned by the walker via AddAutoDiscoverGroup the first time the
+// frontend navigation walks to a templated apiserver path. Retained as a
+// package-level constant because the spawn site (crdwatch.go's
+// AddAutoDiscoverGroup) + the handler-extension Predicate (crdwatch.go's
+// init()) + the tests still reference the same GVR identity.
+//
+// Per feedback_no_special_cases.md: NOT a per-resource policy. The
+// constant lives in the package that owns the CRD-watch behavior, and
+// addResourceTypeLocked / addResourceTypeMetadataOnlyLocked do NOT
+// reference it directly — they iterate the handler-extension registry
+// blind.
 var customResourceDefinitionGVR = schema.GroupVersionResource{
 	Group:    "apiextensions.k8s.io",
 	Version:  "v1",
@@ -197,7 +217,7 @@ func CustomResourceDefinitionGVR() schema.GroupVersionResource {
 }
 
 // MetaQuerySeeds returns the COMPLETE hardcoded seed budget for Tag B —
-// EXACTLY these 8 GVRs, nothing else (feedback_no_special_cases.md is a
+// EXACTLY these 7 GVRs, nothing else (feedback_no_special_cases.md is a
 // hard requirement here). Every entry is a meta-query INFORMER-ANCHOR
 // seed: the watcher pre-registers an informer for the resource type so a
 // `/call` to one of these can be served from cache. None of them is a
@@ -211,34 +231,40 @@ func CustomResourceDefinitionGVR() schema.GroupVersionResource {
 //     type. 0.30.107: no longer a root-selection literal.
 //  3. restactions              — the restActionGVR anchor (already cited
 //     by inventory.go; the resolver's apiRef edges target it).
-//  4. customresourcedefinitions — the CRD-watch root (Part 2).
-//  5-8. the 4 RBACResourceTypes — roles / rolebindings / clusterroles /
+//  4-7. the 4 RBACResourceTypes — roles / rolebindings / clusterroles /
 //     clusterrolebindings (already bootstrap-registered in
 //     NewResourceWatcher; included here so the seed set is the single
 //     auditable source of truth).
 //
+// Ship 0 / 0.30.222: customresourcedefinitions is NO LONGER a seed
+// (Diego invariant: "no CRD informer if the CRD object itself is not
+// walked"). It is walker-spawned via AddAutoDiscoverGroup; see
+// crdwatch.go.
+//
 // Every BUSINESS GVR — widgets, panels, compositions — is ABSENT from
 // this set by construction. Those are discovered by RESOLVING the
 // ConfigMap-derived navigation roots, never named in code. A test
-// asserts this slice has exactly 8 entries and that none of them is a
+// asserts this slice has exactly 7 entries and that none of them is a
 // composition/widget/panel business GVR.
 func MetaQuerySeeds() []schema.GroupVersionResource {
 	seeds := []schema.GroupVersionResource{
 		routesLoadersGVR,
 		navMenusGVR,
 		restActionGVR,
-		customResourceDefinitionGVR,
 	}
 	seeds = append(seeds, RBACResourceTypes...)
 	return seeds
 }
 
-// RegisterMetaQuerySeeds registers an informer for each of the 4
-// non-RBAC meta-query seeds (routesloaders, navmenus, restactions,
-// customresourcedefinitions) plus re-confirms the 4 RBAC GVRs (already
-// registered by NewResourceWatcher — EnsureResourceType observes
-// added=false for those) — 8 seeds total. Idempotent + singleflighted
-// under rw.mu.
+// RegisterMetaQuerySeeds registers an informer for each of the 3
+// non-RBAC meta-query seeds (routesloaders, navmenus, restactions) plus
+// re-confirms the 4 RBAC GVRs (already registered by NewResourceWatcher
+// — EnsureResourceType observes added=false for those) — 7 seeds total.
+// Idempotent + singleflighted under rw.mu.
+//
+// Ship 0 / 0.30.222: the CRD GVR is no longer in this list. The CRD
+// informer is walker-spawned via AddAutoDiscoverGroup the first time
+// frontend navigation reaches a templated apiserver path.
 //
 // This is the ONLY code that hands a hardcoded GVR to EnsureResourceType
 // at startup. The Phase 1 walk registers everything else by resolution.

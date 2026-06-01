@@ -840,15 +840,42 @@ func (rw *ResourceWatcher) rbacSnapshotEventHandlers(gvr schema.GroupVersionReso
 	}
 }
 
+// init registers the typed-RBAC-snapshot handler-extension with the
+// cache-package declarative registry (Ship 0 / 0.30.222). Before Ship 0
+// the watcher's addResourceTypeLocked / addResourceTypeMetadataOnlyLocked
+// branched inline on `if isTypedRBACGVR(gvr)` and attached
+// rbacSnapshotEventHandlers directly. Ship 0 generalises that branch
+// (alongside the CRD-watch composition-auto-discovery branch) into the
+// declarative registry; addResourceType*Locked now iterates blind.
+//
+// The handler set itself (AddFunc / UpdateFunc / DeleteFunc routing
+// through scheduleRBACRebuild + the BindingsByGVR index delta) is
+// byte-identical to the pre-Ship-0 inline branch — only the call-site
+// indirection changes.
+func init() {
+	RegisterHandlerExtension(HandlerExtension{
+		Name:      "rbac.snapshot_writer",
+		Predicate: isTypedRBACGVR,
+		Handlers: func(rw *ResourceWatcher, gvr schema.GroupVersionResource) clientcache.ResourceEventHandler {
+			handlers := rw.rbacSnapshotEventHandlers(gvr)
+			// markRBACSnapshotWired records that at least one typed-RBAC
+			// informer was wired with the snapshot event handler — the
+			// pre-condition AssertRBACSnapshotWired enforces at boot.
+			markRBACSnapshotWired()
+			return handlers
+		},
+	})
+}
+
 // rbacSnapshotWired records whether the watcher has at least one of
 // the typed-RBAC informers wired with the snapshot event handler. Set
 // at NewResourceWatcher time; AssertRBACSnapshotWired panics at boot if
 // it ever stays false despite the 4 RBAC informers being registered.
 var rbacSnapshotHandlerWired atomic.Bool
 
-// markRBACSnapshotWired flips the wired flag. Called by
-// addResourceTypeLocked once per typed-RBAC GVR after attaching the
-// snapshot event handler.
+// markRBACSnapshotWired flips the wired flag. Called by the
+// rbac.snapshot_writer HandlerExtension's Handlers factory (init() above)
+// once per typed-RBAC GVR as the attach occurs.
 func markRBACSnapshotWired() {
 	rbacSnapshotHandlerWired.Store(true)
 }

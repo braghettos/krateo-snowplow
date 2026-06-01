@@ -250,7 +250,9 @@ func TestFalsifierFD2_CRDDeleteDirtyMarksDeps(t *testing.T) {
 func TestShipD_ReconcileAutoDiscoverCRDsFiresD1(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetAutoDiscoverGroupsForTest()
+	ResetCRDInformerSpawnedForTest()
 	t.Cleanup(ResetAutoDiscoverGroupsForTest)
+	t.Cleanup(ResetCRDInformerSpawnedForTest)
 	ResetDepsForTest()
 	t.Cleanup(ResetDepsForTest)
 
@@ -287,9 +289,17 @@ func TestShipD_ReconcileAutoDiscoverCRDsFiresD1(t *testing.T) {
 	}
 	t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
 
-	// StartCRDWatch replays the CRD through AddFunc with the group ABSENT
-	// → dropped (the boot race).
-	rw.StartCRDWatch(context.Background())
+	// Ship 0: publish the watcher as Global so AddAutoDiscoverGroup's
+	// sync.Once can call EnsureResourceType to spawn the CRD informer.
+	SetGlobal(rw)
+	t.Cleanup(func() { SetGlobal(nil) })
+
+	// First AddAutoDiscoverGroup spawns the CRD informer via the
+	// sync.Once. The informer's initial LIST replays the synthetic CRD
+	// through the composition-auto-discovery AddFunc with gvr.Group
+	// ABSENT from the auto-discover set → dropped (the boot race). Use a
+	// distinct seed group so it does not match gvr.Group.
+	AddAutoDiscoverGroup("seedonly.krateo.io")
 	deadline := time.Now().Add(5 * time.Second)
 	for !rw.IsSynced(customResourceDefinitionGVR) {
 		if time.Now().After(deadline) {

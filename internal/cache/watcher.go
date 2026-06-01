@@ -198,14 +198,8 @@ type ResourceWatcher struct {
 	// nil eagerSet = "eager registration not yet completed" — no
 	// WARNs fire (the constructor's own RBAC registrations are not
 	// "lazy").
-	eagerSet     map[schema.GroupVersionResource]struct{}
-	eagerDone    bool
-
-	// crdWatchStarted is the idempotence guard for StartCRDWatch
-	// (0.30.102 Tag B Part 2). Set true on the first StartCRDWatch
-	// call so a duplicate call cannot double-install the CRD informer's
-	// event handler. Guarded by rw.mu.
-	crdWatchStarted bool
+	eagerSet  map[schema.GroupVersionResource]struct{}
+	eagerDone bool
 
 	// informerStop holds the per-GVR stop channel passed to each
 	// informer's Run (and its sync-watcher) — the R6 (0.30.115)
@@ -801,29 +795,6 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// interface used by metaNSName. ADD post-sync gate, UPDATE
 	// dirty-mark, DELETE classify+evict-via-worker are byte-identical
 	// to the full-informer path.
-	// Ship B (0.30.138) — typed-RBAC snapshot writer wiring (defensive
-	// site). The metadata-only path serves PartialObjectMetadata, which
-	// the snapshot writer cannot type-assert to *rbacv1.* — so in
-	// practice an RBAC GVR registered metadata-only would simply produce
-	// an empty snapshot field. Production never reaches here for RBAC
-	// (the eager-registration loop at NewResourceWatcher uses the full
-	// addResourceTypeLocked path); the guard exists so a future caller
-	// that adds RBAC metadata-only does not silently bypass snapshot
-	// wiring. isTypedRBACGVR is false for every non-RBAC GVR — no
-	// overhead on the steady-state metadata-only path.
-	if isTypedRBACGVR(gvr) {
-		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers(gvr)); regErr != nil {
-			slog.Warn("cache.rbac.snapshot.add_event_handler_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("resource_type", resourceType),
-				slog.String("path", "metadata-only"),
-				slog.String("error", regErr.Error()),
-			)
-		} else {
-			markRBACSnapshotWired()
-		}
-	}
-
 	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandlers(gvr)); regErr != nil {
 		slog.Warn("cache.deps.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
@@ -832,6 +803,14 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 			slog.String("error", regErr.Error()),
 		)
 	}
+
+	// Ship 0 / 0.30.222 — declarative handler-extension registry; same
+	// iteration as the full-informer path. Production never reaches here
+	// for RBAC (the eager-registration loop in NewResourceWatcher uses
+	// the full addResourceTypeLocked path); the registry still iterates
+	// — non-matching predicates are O(1) skips — so a future caller that
+	// adds RBAC metadata-only does not silently bypass snapshot wiring.
+	attachMatchingHandlerExtensions(rw, gvr, gi.Informer())
 
 	// 0.30.98 Tag A: install the WATCH-error handler BEFORE Run
 	// (conjunct 3) — same uniform wiring as the dynamic full-informer
@@ -1158,29 +1137,20 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		)
 	}
 
-	// Ship B (0.30.138) — typed-RBAC snapshot writer wiring. For each
-	// of the 4 typed-RBAC GVRs (rbacTypedGVRs, strip.go:101-106) attach
-	// a second event handler that schedules a snapshot rebuild on
-	// ADD/UPDATE/DELETE. Non-RBAC GVRs are skipped — they have no
-	// snapshot to maintain.
+	// Ship 0 / 0.30.222 — declarative handler-extension registry.
+	// Pre-Ship-0 this site carried an inline `if isTypedRBACGVR(gvr)`
+	// branch attaching `rbacSnapshotEventHandlers`, plus a separate
+	// `StartCRDWatch` entry point installing the CRD composition-auto-
+	// discovery handlers. Both wirings are now declared from their
+	// owner packages' init() (rbac_snapshot.go and crdwatch.go) and
+	// attached blind from here — addResourceTypeLocked carries zero
+	// GVR literals (feedback_no_special_cases.md).
 	//
-	// The handler bodies are O(1) atomics (dirty flip + tryLock); the
-	// actual indexer walk runs on a detached goroutine bounded by the
-	// atomic.Bool tryLock (max one in-flight rebuild — watcher.go:1028
-	// "Bounded async L1 refresh" lineage / Bug 7). Safe to attach on
-	// the same processor goroutine as depEventHandlers — neither
-	// handler blocks.
-	if isTypedRBACGVR(gvr) {
-		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers(gvr)); regErr != nil {
-			slog.Warn("cache.rbac.snapshot.add_event_handler_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("resource_type", resourceType),
-				slog.String("error", regErr.Error()),
-			)
-		} else {
-			markRBACSnapshotWired()
-		}
-	}
+	// The handler sets themselves are unchanged. attachMatching* logs
+	// per-failure via the registry; this site stays silent on attach
+	// failures (the contract is "log loud at the owner's branch", not
+	// here).
+	attachMatchingHandlerExtensions(rw, gvr, gi.Informer())
 
 	// 0.30.99 Tag B — watch-handler coverage guard. Install the
 	// conjunct-3 WATCH-error handler UNCONDITIONALLY here, at

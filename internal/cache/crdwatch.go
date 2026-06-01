@@ -29,7 +29,6 @@
 package cache
 
 import (
-	"context"
 	"strings"
 	"sync"
 
@@ -40,6 +39,60 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
 )
+
+// init registers the CRD-watch handler-extension with the cache-package
+// declarative registry (Ship 0 / 0.30.222). Before Ship 0 this wiring
+// lived inside a dedicated `StartCRDWatch` function called once from
+// phase1_walk.go Step 2; the function carried its own idempotence guard
+// (`rw.crdWatchStarted`) and hard-coded the CRD GVR into the watcher's
+// boot seed set (`MetaQuerySeeds()`).
+//
+// Post-Ship-0 the CRD informer is walker-spawned via AddAutoDiscoverGroup
+// — see crdInformerSpawned + that function's body below — and the
+// composition-auto-discovery event handlers attach automatically through
+// this registry entry whenever the watcher's addResourceType* helpers
+// observe the CRD GVR. There is exactly one site that names the CRD GVR
+// in code: this Predicate. addResourceTypeLocked carries no GVR literals
+// (feedback_no_special_cases.md).
+//
+// The handler set itself — AddFunc / UpdateFunc / DeleteFunc routing
+// through registerCRDObject / unregisterCRDObject — is byte-identical to
+// what StartCRDWatch installed pre-Ship-0.
+func init() {
+	RegisterHandlerExtension(HandlerExtension{
+		Name: "crdwatch.composition_auto_discovery",
+		Predicate: func(gvr schema.GroupVersionResource) bool {
+			return gvr == customResourceDefinitionGVR
+		},
+		Handlers: func(rw *ResourceWatcher, _ schema.GroupVersionResource) clientcache.ResourceEventHandler {
+			return clientcache.ResourceEventHandlerFuncs{
+				AddFunc:    func(obj interface{}) { rw.registerCRDObject(obj, "crd-event") },
+				UpdateFunc: func(_, newObj interface{}) { rw.registerCRDObject(newObj, "crd-event") },
+				// D2 (Ship D, 0.30.114) + R6 (Ship 0.30.115): a CRD removal
+				// dirty-marks every L1 entry that LIST- or GET-depends on
+				// the vanished GVR AND tears down the per-GVR informer
+				// (RemoveResourceType) so its Run goroutine does not leak.
+				DeleteFunc: func(obj interface{}) { rw.unregisterCRDObject(obj, "crd-event") },
+			}
+		},
+	})
+}
+
+// crdInformerSpawned ensures the CRD informer is registered exactly once
+// per process, the first time the walker discovers a navigation group
+// (AddAutoDiscoverGroup). Pre-Ship-0 the CRD informer spawned at boot via
+// `MetaQuerySeeds()` regardless of whether anything in frontend navigation
+// reached a CRD object; Ship 0 enforces Diego's invariant ("no CRD
+// informer if the CRD object itself is not walked in frontend
+// navigation"). EnsureResourceType is itself idempotent — the sync.Once
+// is for documentation + cheap-fast-path.
+var crdInformerSpawned sync.Once
+
+// ResetCRDInformerSpawnedForTest resets the sync.Once that gates CRD
+// informer spawning. TEST-ONLY. Production lifecycle is once-per-process.
+func ResetCRDInformerSpawnedForTest() {
+	crdInformerSpawned = sync.Once{}
+}
 
 // autoDiscoverGroups is the set of apiserver groups whose CRDs the
 // CRD-watch auto-registers informers for. NAVIGATION-DERIVED — starts
@@ -63,6 +116,20 @@ var (
 // The empty string is rejected — the core group ("") is never a
 // composition group and admitting it would auto-register informers for
 // every core resource on the cluster.
+//
+// Ship 0 / 0.30.222: AddAutoDiscoverGroup is now the SOLE process-wide
+// site that spawns the CRD informer. The first call (per process) fires
+// the crdInformerSpawned sync.Once, which calls
+// `cache.Global().EnsureResourceType(customResourceDefinitionGVR)` —
+// idempotent w.r.t. an already-registered CRD GVR. The handler-extension
+// registry then attaches the composition-auto-discovery event handlers
+// declared in this file's init(). The pre-Ship-0 boot-time spawn via
+// MetaQuerySeeds() is gone; "no CRD informer if the CRD object itself
+// is not walked in frontend navigation" (Diego invariant 2026-06-01) is
+// now structurally enforced. When Global() is nil (CACHE_ENABLED=false
+// or pre-SetGlobal init paths) the Do() is still consumed exactly once
+// (sync.Once semantics) but no informer is registered — production
+// callers stage AddAutoDiscoverGroup after SetGlobal in phase1_walk.go.
 func AddAutoDiscoverGroup(group string) {
 	if group == "" {
 		return
@@ -78,6 +145,17 @@ func AddAutoDiscoverGroup(group string) {
 			slog.String("note", "navigation-derived — extracted from a resolved templated apiserver path"),
 		)
 	}
+	// Ship 0: spawn the CRD informer the first time a navigation-derived
+	// group is discovered. The walker is the sole source of CRD-informer
+	// spawn — no boot primordial. EnsureResourceType is idempotent under
+	// rw.mu; the sync.Once is for documentation + a cheap fast path.
+	crdInformerSpawned.Do(func() {
+		rw := Global()
+		if rw == nil {
+			return
+		}
+		rw.EnsureResourceType(customResourceDefinitionGVR)
+	})
 }
 
 // matchesAutoDiscoverGroup reports whether group is in the
@@ -144,79 +222,6 @@ func ExtractAPIServerGroupFromTemplatedPath(path string) (string, bool) {
 		return group, true
 	}
 	return "", false
-}
-
-// StartCRDWatch registers a CRD informer (via the customresourcedefinitions
-// meta-query seed) and wires an event handler that, on every CRD add /
-// update, registers a per-GVR informer for the CRD's served version IFF
-// the CRD's group is in the navigation-derived auto-discover set.
-//
-// This reuses EnsureResourceType for the per-GVR informer (the §0.30.93
-// metadata-only routing applies — composition GVRs route to the
-// PartialObjectMetadata informer when annotated / static-seeded). The
-// new wiring is only: the group-membership gate + the CRD event handler.
-//
-// At boot, the CRD informer's initial LIST replays every existing CRD
-// through AddFunc, so composition informers for already-present CRDs are
-// registered as soon as their group is auto-discovered. Phase 1's final
-// sync barrier (WaitAllInformersSynced) therefore includes the
-// CRD-watch-spawned composition informers that exist at boot.
-//
-// Nil-receiver / passthrough are no-ops. Idempotent — guarded by
-// crdWatchStarted so a duplicate call cannot double-register the handler.
-//
-// The CRD informer's run-loop and the per-GVR informers spawned by the
-// handler are all bound by rw.stopCh (EnsureResourceType's late-register
-// branch + the factory) so Stop() reaps them.
-func (rw *ResourceWatcher) StartCRDWatch(ctx context.Context) {
-	if rw == nil || rw.mode == modePassthrough {
-		return
-	}
-	rw.mu.Lock()
-	if rw.crdWatchStarted {
-		rw.mu.Unlock()
-		return
-	}
-	rw.crdWatchStarted = true
-	rw.mu.Unlock()
-
-	// Register the CRD informer through the standard path. EnsureResourceType
-	// is idempotent — if RegisterMetaQuerySeeds already registered the CRD
-	// GVR, this observes added=false and reuses the same informer.
-	rw.EnsureResourceType(customResourceDefinitionGVR)
-
-	rw.mu.RLock()
-	gi, ok := rw.informers[customResourceDefinitionGVR]
-	rw.mu.RUnlock()
-	if !ok || gi == nil {
-		slog.Warn("cache.crdwatch.no_crd_informer",
-			slog.String("subsystem", "cache"),
-			slog.String("hint", "EnsureResourceType did not register the CRD informer — CRD-watch inactive"),
-		)
-		return
-	}
-
-	if _, err := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { rw.registerCRDObject(obj, "crd-event") },
-		UpdateFunc: func(_, newObj interface{}) { rw.registerCRDObject(newObj, "crd-event") },
-		// D2 (Ship D, 0.30.114) + R6 (Ship 0.30.115): a CRD removal
-		// dirty-marks every L1 entry that LIST- or GET-depends on the
-		// vanished GVR AND tears down the per-GVR informer
-		// (RemoveResourceType) so its Run goroutine does not leak.
-		DeleteFunc: func(obj interface{}) { rw.unregisterCRDObject(obj, "crd-event") },
-	}); err != nil {
-		slog.Warn("cache.crdwatch.add_event_handler_failed",
-			slog.String("subsystem", "cache"),
-			slog.String("error", err.Error()),
-		)
-		return
-	}
-
-	slog.Info("cache.crdwatch.started",
-		slog.String("subsystem", "cache"),
-		slog.String("note", "CRD informer event handler installed — composition GVRs auto-register on CRD-add for navigation-discovered groups"),
-	)
-	_ = ctx // ctx reserved: the informer lifecycle is bound by rw.stopCh.
 }
 
 // registerCRDObject is the single per-CRD-object registration step:
@@ -314,13 +319,13 @@ func (rw *ResourceWatcher) unregisterCRDObject(obj interface{}, via string) {
 // re-applies registerCRDObject to every CRD currently present. It exists
 // to close a boot ORDERING race:
 //
-//	StartCRDWatch installs the CRD informer's event handler, and the
-//	informer's initial LIST replays every existing CRD through AddFunc
-//	ONCE. The Phase 1 walk runs AFTER StartCRDWatch — so when the walk
-//	discovers a composition group (AddAutoDiscoverGroup) the CRD informer
-//	has very likely ALREADY replayed that group's CRD with
-//	matchesAutoDiscoverGroup==false, dropping it permanently. AddFunc
-//	never re-fires for a CRD that merely sat in etcd unchanged, so the
+//	The first AddAutoDiscoverGroup call (Ship 0 walker-spawn) registers
+//	the CRD informer; the informer's initial LIST replays every existing
+//	CRD through AddFunc ONCE. The Phase 1 walk visits navigation roots in
+//	an order that can land a CRD's group in autoDiscoverGroups AFTER its
+//	CRD has already been replayed — at which point that CRD was seen
+//	with matchesAutoDiscoverGroup==false and dropped. AddFunc never
+//	re-fires for a CRD that merely sat in etcd unchanged, so the
 //	composition informer would never register.
 //
 // Calling this AFTER the Phase 1 walk has finished discovering all

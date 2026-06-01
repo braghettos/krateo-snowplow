@@ -157,17 +157,15 @@ func TestToUnstructuredMap(t *testing.T) {
 // TestReconcileAutoDiscoverCRDs_ClosesBootRace is the 0.30.105 falsifier
 // for the CRD-watch boot replay-vs-discover ORDERING race.
 //
-// The race: StartCRDWatch's CRD informer replays every existing CRD
-// through AddFunc ONCE at boot. The Phase 1 walk discovers composition
-// groups AFTER that — so the composition CRD is replayed while
-// matchesAutoDiscoverGroup(composition.krateo.io)==false and is dropped
-// permanently; the composition informer never registers.
-//
-// This test reproduces the exact ordering: a composition CRD sits in the
-// CRD informer's store, the CRD-watch event handler has already run with
-// the group ABSENT (so no live registration), and ONLY THEN is the group
-// added. ReconcileAutoDiscoverCRDs must re-scan the store and register
-// the composition informer.
+// Ship 0 / 0.30.222 update: the CRD informer is now walker-spawned via
+// AddAutoDiscoverGroup's sync.Once (no longer a boot primordial). The
+// race scenario this test exercises is "first AddAutoDiscoverGroup
+// spawned the CRD informer + its initial LIST replayed every existing
+// CRD; a SUBSEQUENT AddAutoDiscoverGroup for a different group is
+// discovered AFTER that replay — so the second group's composition CRDs
+// were dropped while matchesAutoDiscoverGroup==false". The test below
+// simulates it via a direct AddAutoDiscoverGroup call (no walker), with
+// the same negative+positive controls.
 //
 // NEGATIVE control inside the same test: before the reconcile (group
 // added but no re-scan) the composition informer is NOT registered —
@@ -175,13 +173,21 @@ func TestToUnstructuredMap(t *testing.T) {
 func TestReconcileAutoDiscoverCRDs_ClosesBootRace(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	ResetAutoDiscoverGroupsForTest()
+	ResetCRDInformerSpawnedForTest()
 	t.Cleanup(ResetAutoDiscoverGroupsForTest)
+	t.Cleanup(ResetCRDInformerSpawnedForTest)
 
 	const (
 		compGroup    = "composition.krateo.io"
 		compResource = "githubscaffoldings"
 		compVersion  = "v1"
 	)
+	// Ship 0: use a SECOND group as the "seed" that fires the CRD-
+	// informer sync.Once via AddAutoDiscoverGroup. The composition group
+	// arrives AFTER the CRD informer's initial LIST has replayed compCRD,
+	// reproducing the same boot replay-vs-discover ordering race the
+	// pre-Ship-0 StartCRDWatch path produced.
+	const seedGroup = "seedonly.krateo.io"
 	compGVR := schema.GroupVersionResource{Group: compGroup, Version: compVersion, Resource: compResource}
 
 	// The composition CRD that will sit in the CRD informer's store.
@@ -213,10 +219,18 @@ func TestReconcileAutoDiscoverCRDs_ClosesBootRace(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	})
 
-	// Start the CRD-watch. Its CRD informer replays compCRD through
-	// AddFunc — but the auto-discover set is EMPTY, so the composition
-	// CRD is dropped (the race condition).
-	rw.StartCRDWatch(context.Background())
+	// Ship 0: publish the watcher as Global so AddAutoDiscoverGroup's
+	// sync.Once can call EnsureResourceType on it.
+	SetGlobal(rw)
+	t.Cleanup(func() { SetGlobal(nil) })
+
+	// First AddAutoDiscoverGroup fires the sync.Once and spawns the CRD
+	// informer. Its initial LIST replays compCRD through the CRD-watch's
+	// composition-auto-discovery AddFunc — but matchesAutoDiscoverGroup
+	// is false for compGroup (only seedGroup is in the set at this
+	// moment), so the composition CRD is dropped. This is the boot
+	// replay-vs-discover ordering race.
+	AddAutoDiscoverGroup(seedGroup)
 
 	// Wait for the CRD informer to sync so its store holds compCRD.
 	deadline := time.Now().Add(5 * time.Second)
@@ -227,13 +241,14 @@ func TestReconcileAutoDiscoverCRDs_ClosesBootRace(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// NEGATIVE control: the group is not yet discovered, so the
-	// composition informer must NOT be registered.
+	// NEGATIVE control: the composition group is not yet discovered, so
+	// the composition informer must NOT be registered.
 	if rw.IsRegistered(compGVR) {
 		t.Fatalf("composition informer registered before its group was discovered — test setup error")
 	}
 
-	// The Phase 1 walk discovers the group LATE — after the CRD replay.
+	// The Phase 1 walk discovers the composition group LATE — after the
+	// CRD replay.
 	AddAutoDiscoverGroup(compGroup)
 
 	// NEGATIVE control: discovering the group alone does NOT register the

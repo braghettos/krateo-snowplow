@@ -468,13 +468,22 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	start := time.Now()
 
 	// Step 1 — register the hardcoded meta-query seeds. This is the ONLY
-	// place a hardcoded GVR is handed to the watcher at startup.
+	// place a hardcoded GVR is handed to the watcher at startup. Ship 0
+	// / 0.30.222: the customresourcedefinitions GVR is NO LONGER in this
+	// set — it is walker-spawned via AddAutoDiscoverGroup the first time
+	// the resolver encounters a templated apiserver path; the
+	// composition-auto-discovery event handlers attach automatically via
+	// the handler-extension registry (cache/handler_registry.go) when
+	// EnsureResourceType lands the CRD informer.
 	rw.RegisterMetaQuerySeeds()
 
-	// Step 2 — start the CRD-watch. Composition informers spawn as the
-	// CRD informer replays existing CRDs (boot) and on CRD-add, but only
-	// for groups Phase 1's walk has fed into the auto-discover set.
-	rw.StartCRDWatch(ctx)
+	// Step 2 — (Ship 0 / 0.30.222) the explicit StartCRDWatch call that
+	// lived here is DELETED. The CRD informer now spawns as a sync.Once
+	// side-effect of the first AddAutoDiscoverGroup call below (Step 4's
+	// walker), and the composition-auto-discovery event handlers attach
+	// automatically via the handler-extension registry. Diego's invariant
+	// 2026-06-01 — "no CRD informer if the CRD object itself is not
+	// walked in frontend navigation" — is now structurally enforced.
 
 	// Step 3 — READ the navigation roots from the frontend ConfigMap
 	// (config.json .api.INIT / .api.ROUTES_LOADER → the two named root
@@ -527,11 +536,12 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 
 	// Step 5 — reconcile the CRD-watch against the now-complete
 	// auto-discover set. The walk discovers composition groups (e.g.
-	// composition.krateo.io) AFTER StartCRDWatch's CRD informer has
-	// already replayed every existing CRD — so the composition CRD was
-	// seen with matchesAutoDiscoverGroup==false and dropped. Now that the
-	// walk has finished, the auto-discover set is complete; a single CRD
-	// store re-scan registers every composition informer whose CRD was
+	// composition.krateo.io) and the first such call spawns the CRD
+	// informer (Ship 0 walker-spawn via AddAutoDiscoverGroup's sync.Once).
+	// Subsequent CRD replays may still race against later
+	// AddAutoDiscoverGroup calls for OTHER groups — so when the walk
+	// finishes, the auto-discover set is complete; a single CRD store
+	// re-scan registers every composition informer whose CRD was
 	// replayed too early. Idempotent for CRDs already registered live.
 	reconciled := rw.ReconcileAutoDiscoverCRDs()
 	if reconciled > 0 {
