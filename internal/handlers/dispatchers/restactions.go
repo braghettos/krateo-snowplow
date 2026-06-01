@@ -196,6 +196,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	}
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
+		SArc:    r.saRC,
 		AuthnNS: r.authnNS,
 		PerPage: perPage,
 		Page:    page,

@@ -428,7 +428,12 @@ func resolveRestActionForRefresh(ctx context.Context, got objects.Result, inputs
 	// Put-gate declines to overwrite the good entry.
 
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
-		In:      &cr,
+		In: &cr,
+		// Ship 0.30.230 fix-at-root: SArc threaded from ctx. The
+		// refresher's resolveAndPopulateL1 attaches the SA rc via
+		// cache.WithInternalRESTConfig (resolve_populate.go:191) before
+		// invoking the resolveOnceFn that lands here.
+		SArc:    rcFromCtx(ctx),
 		AuthnNS: authnNS,
 		PerPage: inputs.PerPage,
 		Page:    inputs.Page,
@@ -460,7 +465,10 @@ func resolveRAFullListForRefresh(ctx context.Context, got objects.Result, inputs
 	// UNPAGINATED — Inputs already carry PerPage=0/Page=0 (RAFullListKeyInputs),
 	// but pass 0/0 explicitly so the contract is local + obvious.
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
-		In:      &cr,
+		In: &cr,
+		// Ship 0.30.230 fix-at-root: SArc from ctx — refresher attaches
+		// SA rc upstream (resolve_populate.go:191).
+		SArc:    rcFromCtx(ctx),
 		AuthnNS: authnNS,
 		PerPage: 0,
 		Page:    0,
@@ -501,7 +509,15 @@ func resolveRAFullListForRefresh(ctx context.Context, got objects.Result, inputs
 // resolve+encode path.
 func resolveWidgetForRefresh(ctx context.Context, got objects.Result, inputs cache.ResolvedKeyInputs, authnNS string) ([]byte, error) {
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
-		In:      got.Unstructured,
+		In: got.Unstructured,
+		// Ship 0.30.230 fix-at-root: RC threaded from ctx. The
+		// refresher's resolveAndPopulateL1 (resolve_populate.go:191)
+		// attaches the SA rc via cache.WithInternalRESTConfig before
+		// invoking the resolveOnceFn that lands here. Without RC set,
+		// downstream crdschema.ValidateObjectStatus → cache.GVRFor →
+		// discoverPluralInfo 500s with "plurals discovery: nil
+		// *rest.Config" (the four-revert root cause).
+		RC:      rcFromCtx(ctx),
 		AuthnNS: authnNS,
 		PerPage: inputs.PerPage,
 		Page:    inputs.Page,

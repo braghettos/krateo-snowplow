@@ -327,6 +327,7 @@ func iterateApiRefPages(
 
 		res, err := widgets.Resolve(resolveCtx, widgets.ResolveOptions{
 			In:      got.Unstructured,
+			RC:      w.rc,
 			AuthnNS: authnNS,
 			PerPage: perPage,
 			Page:    page,

@@ -425,3 +425,24 @@ func snowplowSACtx() (*endpoints.Endpoint, *rest.Config) {
 	}
 	return saEP, saRC
 }
+
+// rcFromCtx returns the SA *rest.Config that an internal driver
+// (Phase 1 walker, L1 refresher, PIP seed, content prewarm) attached
+// upstream via cache.WithInternalRESTConfig. Returns nil when no internal
+// rc is on ctx (the per-user request path) OR when the attached value is
+// of the wrong type.
+//
+// Ship 0.30.230 fix-at-root: ResolveOptions{RC,SArc} construction sites
+// downstream of an internal driver use this helper to thread the SA rc
+// at the construction site, so cache.GVRFor / dynamic.NewClient /
+// crdschema.ValidateObjectStatus never receive a nil rc. Per-user
+// dispatchers (widgets.go, restactions.go) pass r.saRC directly from
+// their handler struct field — they do not need this helper.
+func rcFromCtx(ctx context.Context) *rest.Config {
+	v, ok := cache.InternalRESTConfigFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	rc, _ := v.(*rest.Config)
+	return rc
+}

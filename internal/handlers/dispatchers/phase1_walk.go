@@ -851,6 +851,7 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 
 	w := &phase1Walker{
 		authnNS:            authnNS,
+		rc:                 saRC,
 		visited:            map[string]struct{}{},
 		apiRefHarvester:    harvester,
 		navWidgetHarvester: navHarvester,
@@ -904,6 +905,16 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 // harmless (idempotent informer registration) and rare.
 type phase1Walker struct {
 	authnNS string
+	// rc is the SA *rest.Config (the snowplow ServiceAccount transport)
+	// the walker passes into widgets.ResolveOptions.RC at the construction
+	// site. Ship 0.30.230 fix-at-root: prior to this ship the literal at
+	// w.walk's widgets.Resolve call omitted RC entirely, so downstream
+	// crdschema.ValidateObjectStatus → cache.GVRFor → discoverPluralInfo
+	// received nil rc and 500'd ("plurals discovery: nil *rest.Config").
+	// Set once at resolveNavigationRoot from the same saRC the walker's
+	// SA ctx carries (withPhase1SAContext attaches it to ctx; here we
+	// thread it explicitly for clarity).
+	rc *rest.Config
 	// visited dedupes by the child widget endpoint (resource+apiVersion+
 	// namespace+name) so a shared subtree is resolved once and a cyclic
 	// reference cannot loop forever. With the per-GVR sample cap removed
@@ -1047,6 +1058,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// declared per widget.
 	res, err := widgets.Resolve(resolveCtx, widgets.ResolveOptions{
 		In:      in,
+		RC:      w.rc,
 		AuthnNS: w.authnNS,
 		PerPage: perPage,
 		Page:    page,

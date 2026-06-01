@@ -370,7 +370,11 @@ func prewarmOneRESTAction(rctx context.Context, ref templatesv1.ObjectReference,
 		}))
 
 	res, err := restactions.Resolve(keyCtx, restactions.ResolveOptions{
-		In:      &cr,
+		In: &cr,
+		// Ship 0.30.230 fix-at-root: SArc threaded from ctx — the
+		// content prewarm runs under withContentPrewarmSAContext which
+		// installs the SA rc via cache.WithInternalRESTConfig upstream.
+		SArc:    rcFromCtx(keyCtx),
 		AuthnNS: authnNS,
 		PerPage: -1,
 		Page:    -1,

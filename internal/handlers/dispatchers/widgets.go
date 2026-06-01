@@ -217,6 +217,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
+		RC:      r.saRC,
 		AuthnNS: r.authnNS,
 		PerPage: perPage,
 		Page:    page,

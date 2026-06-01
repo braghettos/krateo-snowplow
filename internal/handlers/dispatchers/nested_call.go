@@ -125,8 +125,15 @@ func ResolveNestedCall(
 	// inner RESTAction enters ResolveNestedCall one level deeper and the
 	// depth cap bounds the whole recursion.
 	innerCtx := cache.WithNestedCallDepth(ctx, depth+1)
+	// Ship 0.30.230 fix-at-root: thread the *rest.Config from ctx when
+	// the nested call runs under an internal driver (Phase 1 walker, PIP
+	// seed, refresher). Per-user nested calls have no internal rc on
+	// ctx; rcFromCtx returns nil and the api resolver's
+	// endpointReferenceMapper falls back to the per-user kubeconfig
+	// path (unchanged from pre-fix behaviour for the per-user path).
 	res, err := restactions.Resolve(innerCtx, restactions.ResolveOptions{
 		In:      &cr,
+		SArc:    rcFromCtx(innerCtx),
 		AuthnNS: env.String("AUTHN_NAMESPACE", ""),
 		PerPage: perPage,
 		Page:    page,

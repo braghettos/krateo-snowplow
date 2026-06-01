@@ -813,6 +813,11 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
 		In:      &cr,
+		// Ship 0.30.230 fix-at-root: SArc is the SA *rest.Config carried
+		// on ctx by withCohortSeedContext upstream. Threading it here
+		// ensures the inner endpointReferenceMapper has a non-nil rc for
+		// the `<user>-clientconfig` Secret fetch.
+		SArc:    rcFromCtx(resCtx),
 		AuthnNS: authnNS,
 		PerPage: -1,
 		Page:    -1,
@@ -933,6 +938,11 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 
 	res, err := widgets.Resolve(resCtx, widgets.ResolveOptions{
 		In:      in,
+		// Ship 0.30.230 fix-at-root: RC is the SA *rest.Config carried
+		// on ctx by withCohortSeedContext upstream. Threading it here
+		// fixes the nil-rc crash at crdschema.ValidateObjectStatus →
+		// cache.GVRFor → discoverPluralInfo (the four-revert root cause).
+		RC:      rcFromCtx(resCtx),
 		AuthnNS: authnNS,
 		PerPage: e.PerPage,
 		Page:    e.Page,
@@ -1005,7 +1015,15 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		pp = 1
 	}
 	if _, rerr := apiref.Resolve(ctx, apiref.ResolveOptions{
-		ApiRef:  apiRef,
+		ApiRef: apiRef,
+		// Ship 0.30.230 fix-at-root: thread the SA rc explicitly so the
+		// downstream restactions.ResolveOptions SArc field chain inside
+		// apiref.Resolve carries a non-nil rc. The ctx upstream
+		// (seedOneWidget's resCtx) already carries it via
+		// withCohortSeedContext / WithInternalRESTConfig — this makes
+		// the option-struct propagation explicit and matches the rest
+		// of the construction-site fixes.
+		RC:      rcFromCtx(ctx),
 		AuthnNS: authnNS,
 		PerPage: pp,
 		Page:    1,
