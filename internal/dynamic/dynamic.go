@@ -6,55 +6,14 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-
-	xenv "github.com/krateoplatformops/plumbing/env"
-	"k8s.io/client-go/discovery"
-	memory "k8s.io/client-go/discovery/cached"
-	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/restmapper"
 )
 
-func ResourceFor(rc *rest.Config, gvk schema.GroupVersionKind) (schema.GroupVersionResource, error) {
-	if rc == nil && !xenv.TestMode() {
-		var err error
-		rc, err = rest.InClusterConfig()
-		if err != nil {
-			return schema.GroupVersionResource{}, err
-		}
-	}
-
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(rc)
-	if err != nil {
-		return schema.GroupVersionResource{}, err
-	}
-
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(
-		memory.NewMemCacheClient(discoveryClient),
-	)
-
-	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-	if err != nil {
-		return schema.GroupVersionResource{}, err
-	}
-
-	return mapping.Resource, nil
-}
-
-func KindFor(rc *rest.Config, gvr schema.GroupVersionResource) (gvk schema.GroupVersionKind, err error) {
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(rc)
-	if err != nil {
-		return gvk, err
-	}
-
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(
-		cacheddiscovery.NewMemCacheClient(discoveryClient),
-	)
-
-	gvk, err = mapper.KindFor(gvr)
-
-	return
-}
+// Ship 2 (production-aim cleanup 2026-06-01) — ResourceFor and KindFor
+// removed. Their construction sites (one in schema.ValidateObjectStatus,
+// one in resourcesrefs.resolveOne) now use cache.GVRFor / cache.KindForGVR
+// which serve via the in-process built-in scheme + permanent plurals
+// store, eliminating a per-/call cold restmapper + DiscoveryClient
+// build.
 
 func GroupVersion(obj map[string]any) schema.GroupVersion {
 	av := getNestedString(obj, "apiVersion")

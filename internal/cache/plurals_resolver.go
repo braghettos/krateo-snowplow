@@ -241,6 +241,39 @@ func KindForGVR(ctx context.Context, gvr schema.GroupVersionResource, rc *rest.C
 	return actual.(string), nil
 }
 
+// IsResolverPluralsHit reports whether KindForGVR(gvr) would be
+// served from the in-process cache (builtin fast path OR permanent
+// reverse store) without an apiserver discovery hop. Used by the
+// resolver call sites in Ship 2 to attribute hit vs miss to the
+// per-resolver fall-through cells without changing KindForGVR's
+// signature.
+//
+// Pure read — no LoadOrStore, no mutation. Safe to call from any
+// goroutine concurrent with KindForGVR.
+func IsResolverPluralsHit(gvr schema.GroupVersionResource) bool {
+	if _, ok := builtinGVRToKind[gvr]; ok {
+		return true
+	}
+	if _, ok := pluralsKindReverseStore.Load(gvr); ok {
+		return true
+	}
+	return false
+}
+
+// IsResolverGVRHit reports whether GVRFor(gvk) would be served from
+// the in-process cache (builtin fast path OR permanent plurals
+// store) without an apiserver discovery hop. Sister to
+// IsResolverPluralsHit for the GVK→GVR direction.
+func IsResolverGVRHit(gvk schema.GroupVersionKind) bool {
+	if _, ok := builtinGVKToGVR[gvk]; ok {
+		return true
+	}
+	if _, ok := pluralsStore.Load(gvk); ok {
+		return true
+	}
+	return false
+}
+
 // PluralsStore exposes the permanent store for tests / observability
 // only. PRODUCTION CODE MUST NOT mutate the returned map directly —
 // the only supported writers are PluralFor / KindForGVR (which use

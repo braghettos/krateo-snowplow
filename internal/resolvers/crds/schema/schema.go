@@ -7,10 +7,10 @@ import (
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/crds"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
@@ -18,14 +18,33 @@ const (
 	widgetDataKey = "widgetData"
 )
 
+// crdGVR is the hardcoded apiextensions.k8s.io/v1 CRD GroupVersionResource.
+// Stable across all clusters; pinning here avoids both a discovery hop
+// and a string-build allocation on every widget /call.
+var crdGVR = runtimeschema.GroupVersionResource{
+	Group:    "apiextensions.k8s.io",
+	Version:  "v1",
+	Resource: "customresourcedefinitions",
+}
+
 func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]any) error {
 	gv := dynamic.GroupVersion(obj)
 	gvk := gv.WithKind(dynamic.GetKind(obj))
-	// Ship D (0.30.141) — F-4: dynamic.ResourceFor builds a fresh
-	// discovery client + cold restmapper per widget /call. Record
-	// BEFORE the upstream construction (AC-D.3).
-	cache.RecordApiserverFallthrough(ctx, cache.ReasonRestmapperResourceFor, gvk.String())
-	gvr, err := dynamic.ResourceFor(rc, gvk)
+
+	// Ship 2 (production-aim cleanup 2026-06-01) — resolve the
+	// composition GVR through cache.GVRFor. The builtin scheme arm
+	// covers apiextensions.k8s.io/v1 itself; the permanent plurals
+	// store covers the composition's own CRD-backed GVK after one
+	// discovery hop per process lifetime (already counted by
+	// ReasonPluralsDiscoveryHop inside PluralFor). Replaces Ship D's
+	// ReasonRestmapperResourceFor + the dynamic.ResourceFor cold-
+	// restmapper build per /call (the helper was deleted in Ship 2).
+	if cache.IsResolverGVRHit(gvk) {
+		cache.RecordResolverPluralsHit(ctx, gvk.String())
+	} else {
+		cache.RecordResolverPluralsMiss(ctx, gvk.String())
+	}
+	gvr, err := cache.GVRFor(ctx, gvk, rc)
 	if err != nil {
 		return err
 	}
@@ -50,13 +69,32 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 			}}
 	}
 
-	crd, err := crds.Get(ctx, crds.GetOptions{
-		RC:      rc,
-		Name:    fmt.Sprintf("%s.%s", gvr.Resource, gvr.Group),
-		Version: gvr.Version,
+	// Ship 2 (production-aim cleanup 2026-06-01) — inlined CRD GET.
+	// The deleted internal/resolvers/crds.Get helper wrapped the
+	// same two-line dynamic.NewClient + Get call below; inlining
+	// removes the indirection AND lets us drop the unused restmapper
+	// build on every /call via dynamic.WithSkipMapper (#123).
+	//
+	// The CRD GVR is constant (apiextensions.k8s.io/v1/CRD) → the
+	// mapper is dead weight here: resourceInterfaceFor only consults
+	// uc.mapper when opts.GVK is set OR opts.GVR is empty. We pass
+	// Options.GVR explicitly so the mapper is never touched.
+	cli, err := dynamic.NewClient(rc, dynamic.WithSkipMapper())
+	if err != nil {
+		return err
+	}
+	crdObj, err := cli.Get(ctx, fmt.Sprintf("%s.%s", gvr.Resource, gvr.Group), dynamic.Options{
+		GVR:       crdGVR,
+		Namespace: "",
 	})
 	if err != nil {
 		return err
+	}
+	var crd map[string]any
+	if crdObj != nil {
+		crd = crdObj.UnstructuredContent()
+	} else {
+		crd = map[string]any{}
 	}
 
 	crv, err := extractOpenAPISchemaFromCRD(crd, gvr.Version)

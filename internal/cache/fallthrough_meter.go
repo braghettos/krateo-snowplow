@@ -55,8 +55,7 @@ import (
 // Grouped for documentation:
 //
 //   - Construction-site reasons (Layer B wrappers fire on client build):
-//     ReasonClientBuild, ReasonSecretGet, ReasonCRDDiscover,
-//     ReasonCRDGet, ReasonRestmapperKindFor, ReasonRestmapperResourceFor.
+//     ReasonClientBuild, ReasonSecretGet, ReasonCRDDiscover.
 //   - Resolver-branch-5 sub-reasons (resolve.go:716 fall-throughs by
 //     gate-miss cause; AC-D.3 §F-2 sub-classification):
 //     ReasonInformerNotSynced, ReasonInformerNotServable,
@@ -77,13 +76,23 @@ type FallthroughReason string
 // Construction-site reasons — fired by Layer B wrappers when a fresh
 // apiserver client / discovery client / restmapper is built on a
 // `/call` read path.
+//
+// Ship 2 (production-aim cleanup 2026-06-01) removed three reasons
+// whose construction sites were deleted from the codebase:
+//   - ReasonCRDGet — `crds.Get` deleted; inlined direct CRD GET in
+//     internal/resolvers/crds/schema/schema.go uses
+//     ReasonResolverPluralsHit/Miss via the GVRFor wrappers below.
+//   - ReasonRestmapperKindFor — `dynamic.KindFor` deleted; the call
+//     site in internal/resolvers/widgets/resourcesrefs/resolve.go
+//     now uses cache.KindForGVR which records
+//     ReasonResolverPluralsHit/Miss.
+//   - ReasonRestmapperResourceFor — `dynamic.ResourceFor` deleted;
+//     the call site in internal/resolvers/crds/schema/schema.go now
+//     uses cache.GVRFor which records ReasonResolverPluralsHit/Miss.
 const (
-	ReasonClientBuild           FallthroughReason = "client-build"
-	ReasonSecretGet             FallthroughReason = "secret-get"
-	ReasonCRDDiscover           FallthroughReason = "crd-discover"
-	ReasonCRDGet                FallthroughReason = "crd-get"
-	ReasonRestmapperKindFor     FallthroughReason = "restmapper-kindfor"
-	ReasonRestmapperResourceFor FallthroughReason = "restmapper-resourcefor"
+	ReasonClientBuild FallthroughReason = "client-build"
+	ReasonSecretGet   FallthroughReason = "secret-get"
+	ReasonCRDDiscover FallthroughReason = "crd-discover"
 )
 
 // Resolver-branch-5 sub-reasons — fired by the inner-call worker's
@@ -198,7 +207,43 @@ const (
 	// Closed-enum count: 21 (Ship G) + 1 = 22. Within budget
 	// (cardinality: 10 paths × 50 GVRs × 22 reasons = 11,000 cells).
 	ReasonPluralsDiscoveryHop FallthroughReason = "plurals-discovery-hop"
+
+	// Ship 2 / production-aim cleanup 2026-06-01 — resolver-side
+	// plurals/kind lookup. ReasonResolverPluralsHit fires when the
+	// in-process cache (built-in fast path or permanent store)
+	// serves the request without an apiserver hop;
+	// ReasonResolverPluralsMiss fires when the resolver had to fall
+	// through to discovery (already counted separately by
+	// ReasonPluralsDiscoveryHop — these two cells let the tester
+	// see hit/miss ratios on the resolver call sites without
+	// untangling per-process counters).
+	//
+	// Replaces the deleted ReasonRestmapperKindFor /
+	// ReasonRestmapperResourceFor / ReasonCRDGet construction-site
+	// counters from Ship D (0.30.141). Net closed-enum count
+	// (Ship G's 21 + Ship 1's +1 + Ship 2's +2 − Ship 2's −3) = 21.
+	ReasonResolverPluralsHit  FallthroughReason = "resolver-plurals-hit"
+	ReasonResolverPluralsMiss FallthroughReason = "resolver-plurals-miss"
 )
+
+// RecordResolverPluralsHit records that a resolver-side plurals/kind
+// lookup was served entirely by the in-process cache (built-in fast
+// path or permanent sync.Map store) — no apiserver discovery hop.
+// Thin wrapper over RecordApiserverFallthrough so the call site stays
+// one-line and the constant choice is centralised here.
+func RecordResolverPluralsHit(ctx context.Context, gvr string) {
+	RecordApiserverFallthrough(ctx, ReasonResolverPluralsHit, gvr)
+}
+
+// RecordResolverPluralsMiss records that a resolver-side plurals/kind
+// lookup missed the in-process cache and fell through to discovery.
+// The underlying discovery hop is ALSO counted by
+// ReasonPluralsDiscoveryHop at the PluralFor / KindForGVR sites; this
+// wrapper captures the miss at the resolver call site so tester
+// dashboards can attribute traffic to the originating resolver.
+func RecordResolverPluralsMiss(ctx context.Context, gvr string) {
+	RecordApiserverFallthrough(ctx, ReasonResolverPluralsMiss, gvr)
+}
 
 // fallthroughKey is the composite label tuple for one counter cell.
 // We key sync.Map by this struct (Go map key — string-equality) so

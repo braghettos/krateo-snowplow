@@ -11,7 +11,6 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -61,15 +60,36 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 	}
 	gvr := gv.WithResource(in.Resource)
 
-	// Ship D (0.30.141) — F-5: dynamic.KindFor builds a fresh discovery
-	// client + cold restmapper per ResourceRef per widget /call. Record
-	// BEFORE the upstream call so the counter is honest about
-	// reachability (AC-D.3).
-	cache.RecordApiserverFallthrough(ctx, cache.ReasonRestmapperKindFor, gvr.String())
-	gvk, err := dynamic.KindFor(rc, gvr)
+	// Ship 2 (production-aim cleanup 2026-06-01) — resolve the Kind
+	// through cache.KindForGVR. Built-in scheme arm + permanent
+	// pluralsKindReverseStore serve the vast majority of widget
+	// resourceRefs without an apiserver hop; CRD-backed kinds fall
+	// through to one discovery hop per process lifetime (already
+	// counted by ReasonPluralsDiscoveryHop inside KindForGVR).
+	//
+	// Counter attribution: ReasonResolverPluralsHit fires when the
+	// in-process arms serve the lookup; ReasonResolverPluralsMiss
+	// fires when discovery is required. We detect the hit/miss arm by
+	// consulting the permanent reverse store BEFORE the call — the
+	// builtin map is constant + the reverse store is monotonically
+	// populated, so the pre-check is race-free w.r.t. attribution
+	// (worst case: a concurrent KindForGVR populates the store
+	// between our check and our call, and we record a "miss" the
+	// next caller would record as "hit" — the per-cell counter still
+	// rises monotonically and the attribution stabilises after the
+	// first miss per (gvr) tuple). Replaces Ship D's
+	// ReasonRestmapperKindFor + the dynamic.KindFor cold-restmapper
+	// build per call (the helper was deleted in Ship 2).
+	if cache.IsResolverPluralsHit(gvr) {
+		cache.RecordResolverPluralsHit(ctx, gvr.String())
+	} else {
+		cache.RecordResolverPluralsMiss(ctx, gvr.String())
+	}
+	kindStr, err := cache.KindForGVR(ctx, gvr, rc)
 	if err != nil {
 		return all, err
 	}
+	gvk := gvr.GroupVersion().WithKind(kindStr)
 
 	log.Info("resolving resource ref",
 		slog.String("id", in.ID),

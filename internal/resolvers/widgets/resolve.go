@@ -8,7 +8,6 @@ import (
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
-	xenv "github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/maps"
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -141,11 +140,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	}
 
 	validateStart := time.Now()
-	if xenv.TestMode() {
-		err = crdschema.ValidateObjectStatus(ctx, opts.RC, opts.In.Object)
-	} else {
-		err = crdschema.ValidateObjectStatus(ctx, nil, opts.In.Object)
-	}
+	// Ship 2 (production-aim cleanup 2026-06-01) — pass opts.RC in
+	// BOTH paths. The previous TestMode-gated branch passed nil to
+	// ValidateObjectStatus on the production path, forcing the
+	// validator to recover the rc via rest.InClusterConfig() —
+	// useless work AND a latent defect for non-in-cluster
+	// deployments (the seed path runs with a context-injected
+	// internal-dispatch rc, NOT in-cluster). The call site KNOWS
+	// the rc; the helper shouldn't recover it.
+	err = crdschema.ValidateObjectStatus(ctx, opts.RC, opts.In.Object)
 	phaseValidateMs = time.Since(validateStart).Milliseconds()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
