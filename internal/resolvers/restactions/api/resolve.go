@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/trace"
 	"strconv"
 	"sync"
 	"time"
@@ -883,8 +884,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// this is the load-bearing security gate that turns cluster-
 		// wide-read into user-scoped result sets.
 		if uafActive {
-			rf := applyUserAccessFilter(ctx, dict, apiCall)
-			emitRefilterFalsifier(log, apiCall, user.Username, rf)
+			trace.WithRegion(ctx, "resolver.applyUAF", func() {
+				rf := applyUserAccessFilter(ctx, dict, apiCall)
+				emitRefilterFalsifier(log, apiCall, user.Username, rf)
+			})
 		}
 
 		// Ship F1 (0.30.119): the api-stage L1 is now CONTENT-keyed —

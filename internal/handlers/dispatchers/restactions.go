@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/trace"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -14,6 +15,7 @@ import (
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -58,6 +60,14 @@ type restActionHandler struct {
 var _ http.Handler = (*restActionHandler)(nil)
 
 func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
+	// Ship I (0.30.227) — runtime/trace instrumentation. Open a per-call
+	// task on the request ctx so go-tool-trace exposes the customer /call
+	// timeline. Every downstream region attaches as a child of this task
+	// via the propagated ctx (req.WithContext below). No behavior change.
+	ctx, task := trace.NewTask(req.Context(), "snowplow.call")
+	defer task.End()
+	req = req.WithContext(ctx)
+
 	log := xcontext.Logger(req.Context())
 
 	start := time.Now()
@@ -82,7 +92,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	got := fetchObject(req)
+	var got objects.Result
+	trace.WithRegion(ctx, "dispatch.fetchObject", func() { got = fetchObject(req) })
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
@@ -94,7 +105,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// Cache=off skips this gate — fetchObject already runs per-user
 	// against apiserver, which enforces RBAC inline.
 	if !cache.Disabled() {
-		if !checkDispatchRBAC(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
+		var rbacOK bool
+		trace.WithRegion(ctx, "dispatch.rbac", func() {
+			rbacOK = checkDispatchRBAC(req.Context(), got.GVR, got.Unstructured.GetNamespace())
+		})
+		if !rbacOK {
 			log.Warn("RESTAction dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
@@ -120,10 +135,22 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	//   * UPDATE/PATCH enqueue refresh via the background refresher
 	//     (stale-while-revalidate; never evicts).
 	//   * TTL remains the outer safety net.
-	cacheKey, cacheHandle, cacheInputs := dispatchCacheLookupKey(req.Context(), "restactions",
-		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
-		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
-		perPage, page, extras)
+	var (
+		cacheKey    string
+		ch          cacheHandle
+		cacheInputs *cache.ResolvedKeyInputs
+		l1HitEntry  *cache.ResolvedEntry
+		l1HitOK     bool
+	)
+	trace.WithRegion(ctx, "dispatch.l1Lookup", func() {
+		cacheKey, ch, cacheInputs = dispatchCacheLookupKey(req.Context(), "restactions",
+			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+			perPage, page, extras)
+		if ch != nil {
+			l1HitEntry, l1HitOK = ch.Get(cacheKey)
+		}
+	})
 	// Ship 0.30.188 — diagnostic slog: emit the dispatcher-side cache
 	// key + components symmetrically with widgets.go for the PIP-seed
 	// vs dispatcher-get key-divergence investigation.
@@ -132,11 +159,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		perPage, page, extras)
-	if cacheHandle != nil {
-		if entry, ok := cacheHandle.Get(cacheKey); ok {
-			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
+	if ch != nil {
+		if l1HitOK {
+			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, len(l1HitEntry.RawJSON))
 			pcs.l1Hit = "hit"
-			writeResolvedJSON(wri, entry.RawJSON)
+			trace.WithRegion(ctx, "dispatch.writeResponse", func() {
+				writeResolvedJSON(wri, l1HitEntry.RawJSON)
+			})
 			log.Info("RESTAction successfully resolved",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
@@ -168,7 +197,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	ctx := xcontext.BuildContext(req.Context())
+	ctx = xcontext.BuildContext(req.Context())
 	// Ship 0.30.167 — Option 2 parallelism regression fix.
 	// Read the SA transport pair from struct fields populated once at
 	// RESTAction() construction (Ship 0.30.166 attached the pair to ctx
@@ -194,12 +223,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContext(ctx, cacheKey)
 	}
-	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
-		In:      &cr,
-		AuthnNS: r.authnNS,
-		PerPage: perPage,
-		Page:    page,
-		Extras:  extras,
+	var res *v1.RESTAction
+	trace.WithRegion(ctx, "resolver.Resolve", func() {
+		res, err = restactions.Resolve(ctx, restactions.ResolveOptions{
+			In:      &cr,
+			AuthnNS: r.authnNS,
+			PerPage: perPage,
+			Page:    page,
+			Extras:  extras,
+		})
 	})
 	if err != nil {
 		log.Error("unable to resolve rest action",
@@ -214,7 +246,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// bytes for the next lookup. Sharing the same []byte between the
 	// http.ResponseWriter write path and the cache entry is safe
 	// because the cache treats RawJSON as immutable once put.
-	encoded, err := encodeResolvedJSON(res)
+	var encoded []byte
+	trace.WithRegion(ctx, "dispatch.encodeJSON", func() {
+		encoded, err = encodeResolvedJSON(res)
+	})
 	if err != nil {
 		log.Error("unable to encode rest action response",
 			slog.String("name", cr.Name),
@@ -223,7 +258,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		response.InternalError(wri, err)
 		return
 	}
-	if cacheHandle != nil && cacheKey != "" {
+	if ch != nil && cacheKey != "" {
 		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback
 		// Put site's cache key + components symmetrically with widgets.go.
 		emitDispatchCacheKeyDiag(log, "per_user_fallback_put", req.Context(),
@@ -231,7 +266,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, extras)
-		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
+		ch.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,
 		})
@@ -258,5 +293,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		slog.String("l1", "miss"),
 	)
 
-	writeResolvedJSON(wri, encoded)
+	trace.WithRegion(ctx, "dispatch.writeResponse", func() {
+		writeResolvedJSON(wri, encoded)
+	})
 }

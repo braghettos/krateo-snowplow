@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/trace"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
@@ -301,7 +302,14 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 	}
 	// Ship A (0.30.137): EvalValue returns gojq's result value directly
 	// (design §3.4.3). Fail-closed for every non-single-array outcome.
-	v, ok, err := EvalValue(ctx, uaf.ResourcesFrom, dict, jqsupport.ModuleLoader())
+	var (
+		v   any
+		ok  bool
+		err error
+	)
+	trace.WithRegion(ctx, "resolver.evalValue.resourcesFrom", func() {
+		v, ok, err = EvalValue(ctx, uaf.ResourcesFrom, dict, jqsupport.ModuleLoader())
+	})
 	if err != nil {
 		// Parse/compile/runtime error OR ErrMultiYield. Pre-Ship-A the
 		// jqutil.Eval err branch logs "JQ eval failed"; the multi-yield
@@ -363,7 +371,14 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 // data is any (0.30.111 Part 1): jq `.` on a string yields the string;
 // a map receiver is unchanged.
 func evalJQString(ctx context.Context, expr string, data any) (string, error) {
-	v, ok, err := EvalValue(ctx, expr, data, jqsupport.ModuleLoader())
+	var (
+		v   any
+		ok  bool
+		err error
+	)
+	trace.WithRegion(ctx, "resolver.evalValue.cond", func() {
+		v, ok, err = EvalValue(ctx, expr, data, jqsupport.ModuleLoader())
+	})
 	if errors.Is(err, ErrMultiYield) {
 		// DELIBERATE CHANGE — see §3.4.5. Pre-Ship-A a multi-yield expr
 		// returned the concatenated invalid-JSON string verbatim (latent
