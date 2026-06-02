@@ -220,104 +220,122 @@ func seedScopeYielding(ctx context.Context,
 
 	log := slog.Default()
 
-	// Global fallback cohort set — computed once, reused for any target
-	// the index can't scope. Empty when no snapshot is published.
-	globalCohorts := cache.EnumerateBindingSetClasses()
+	// Ship 0.30.241 — `globalCohorts` + `cohortsFor` + `seedTarget` helpers
+	// removed. Under the v4 identity-free L1 key contract there is NO per-
+	// cohort cell to enumerate — all cohorts share the same key per RA
+	// tuple. The resource-driven cohort scoping below was sound under the
+	// v3 per-cohort key shape but is dead weight under v4.
 
-	// cohortsFor resolves the resource-driven cohort set for a target GVR,
-	// falling back to the global set when the index yields nothing (index
-	// not built / no matching bindings / runtime-discovered target). The
-	// bool reports whether the result was index-scoped (telemetry).
-	cohortsFor := func(gvr schema.GroupVersionResource, haveGVR bool) ([]cache.Cohort, bool) {
-		if haveGVR {
-			if rc := cache.EnumerateResourceCohorts(gvr); len(rc) > 0 {
-				return rc, true
-			}
-		}
-		return globalCohorts, false
-	}
+	// Ship 0.30.241 — SA-UNIFORM SEED (architect D.3 §7 fix; closes the
+	// 5-ship L1-miss-after-CRUD defect chain).
+	//
+	// V4 contract (design 2026-06-02 §5): ResolvedKeyInputs is identity-
+	// free. ComputeKey produces the SAME L1 key for the same (CEC, GVR,
+	// ns, name, perPage, page, extras, stage) tuple REGARDLESS of which
+	// cohort dispatches. The v3 inner-cohort iteration that lived here
+	// pre-0.30.241 emitted N_cohort identical Puts per RA — same key,
+	// last-writer-wins, pure waste.
+	//
+	// Concrete cost of the inner loop (measured on 0.30.240 prod):
+	//   - 21 RAs × 35 cohorts = 735 seed invocations.
+	//   - Each seedOneRestaction wall-clock ≈ 5s (per phase1.seed.restaction.
+	//     timing on production).
+	//   - Total seed wall-clock: 735 × 5s / GOMAXPROCS yielding = ~1 hr
+	//     until ALL cohort × RA tuples Put. The verify-serve-stale gate
+	//     fires WELL before that — D.1.B empirically witnessed 0.30.235
+	//     fresh-boot AND 0.30.240 both FAIL the gate at ~2 min post-boot
+	//     because `krateo-system/compositions-list` hadn't been reached
+	//     in the inner loop yet.
+	//
+	// V4 seed (this fix): ONE seedOneRestaction per RA under SA identity.
+	//   - 21 RAs × 1 SA call = 21 seed invocations.
+	//   - 21 × 5s / GOMAXPROCS yielding = ~25 s wall-clock to seed every
+	//     harvested cell. The 5-ship verify-serve-stale gate is empirically
+	//     PASSable.
+	//
+	// SA identity matches the v4 refresher's SA-uniform contract at
+	// resolve_populate.go:164-174 — the refresher uniformly re-resolves
+	// every v4 cell under SA. The seed populating under SA produces a
+	// cell the refresher's SA refresh produces byte-identically; the cell
+	// stays valid across refresh cycles without identity re-keying.
+	//
+	// PER-USER NARROWING moves entirely to SERVE time per design §4:
+	// gateWidgetsServeBytes / gateRestactionsServeBytes / gateRAFullList-
+	// ServeBytes (serve_gate.go). The cached cell is SA-maximal; each
+	// /call narrows on the wire to the request's identity.
+	//
+	// PROCESS-LEVEL ARCHITECT MANDATE (D.3 §10): every ship touching
+	// ResolvedKeyInputs / dispatchCacheLookupKey / withCohortSeedContext /
+	// resolveAndPopulateL1 / seedOne* / resolved.go Put|ComputeKey MUST
+	// include the seed-coverage falsifier shape from
+	// seed_coverage_falsifier_test.go (TestBootSeedCoverage_AllHarvestedRAsSeeded
+	// + TestBootSeedCoverage_V4CellCollapseOneRAAcrossCohorts). The
+	// falsifier mechanically prevents the v3-style key explosion from
+	// re-emerging.
 
-	// seedTarget runs one (cohort, target) seed under a per-cohort timeout
-	// (pipCohortTimeout — matches seedCohort's stuck-cohort guard) and the
-	// cohort seed context. The per-target seed primitive (seedOneRestaction
-	// / seedOneWidget) is passed as a closure so the restaction + widget
-	// loops share the timeout + yield + error-containment wrapper.
-	seedTarget := func(c cache.Cohort, do func(cohortCtx context.Context) error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		engineYieldCheckpoint(ctx)
-		cctx, cancel := context.WithTimeout(ctx, pipCohortTimeout)
-		defer cancel()
-		cohortCtx := withCohortSeedContext(cctx, c, saEP, saRC)
-		return do(cohortCtx)
-	}
-
-	// ── RESTActions seed — scoped on each RA's TARGET GVR.
+	// ── RESTActions seed — ONE Put per RA under SA identity (v4 contract).
+	//
+	// SEAM: production calls go through seedOneRestactionFn /
+	// withPhase1SAContextFn (see prewarm_engine_boot_test_seam.go).
+	// Production binary's defaults are the real functions; tests swap
+	// via setXxxForTest helpers. Function-pointer overhead is ~1 ns
+	// per call — irrelevant vs the seed's per-RA ~5s wall-clock.
 	for _, ref := range restactionRefs {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		engineYieldCheckpoint(ctx)
 
-		targetGVR, haveTarget := restActionTargetGVR(ctx, ref)
-		cohorts, scoped := cohortsFor(targetGVR, haveTarget)
-		log.Info("prewarm.engine.seed.restaction_cohorts",
+		log.Info("prewarm.engine.seed.restaction_sa_uniform",
 			slog.String("subsystem", "cache"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("target_gvr", targetGVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("cohorts", len(cohorts)),
 		)
-		for _, c := range cohorts {
-			err := seedTarget(c, func(cohortCtx context.Context) error {
-				return seedOneRestaction(cohortCtx, cohortLogLabel(c), ref, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
+
+		cctx, cancel := context.WithTimeout(ctx, pipCohortTimeout)
+		saCtx := withPhase1SAContextFn(cctx, saEP, saRC)
+		if err := seedOneRestactionFn(saCtx, "sa-uniform", ref, authnNS); err != nil {
+			if ctx.Err() != nil {
+				cancel()
 				return ctx.Err()
 			}
-			if err != nil {
-				slog.Warn("prewarm.engine.seed.restaction_skipped",
-					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(c)),
-					slog.String("restaction", ref.Namespace+"/"+ref.Name),
-					slog.Any("err", err),
-				)
-			}
+			slog.Warn("prewarm.engine.seed.restaction_skipped",
+				slog.String("subsystem", "cache"),
+				slog.String("cohort", "sa-uniform"),
+				slog.String("restaction", ref.Namespace+"/"+ref.Name),
+				slog.Any("err", err),
+			)
 		}
+		cancel()
 	}
 
-	// ── Widgets seed — scoped on each widget's GVR.
+	// ── Widgets seed — ONE Put per widget under SA identity (v4 contract).
 	for _, e := range widgetEntries {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		engineYieldCheckpoint(ctx)
 
-		cohorts, scoped := cohortsFor(e.GVR, true)
-		log.Info("prewarm.engine.seed.widget_cohorts",
+		log.Info("prewarm.engine.seed.widget_sa_uniform",
 			slog.String("subsystem", "cache"),
 			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
 			slog.String("gvr", e.GVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("cohorts", len(cohorts)),
 		)
-		for _, c := range cohorts {
-			err := seedTarget(c, func(cohortCtx context.Context) error {
-				return seedOneWidget(cohortCtx, e, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
+
+		cctx, cancel := context.WithTimeout(ctx, pipCohortTimeout)
+		saCtx := withPhase1SAContextFn(cctx, saEP, saRC)
+		if err := seedOneWidgetFn(saCtx, e, authnNS); err != nil {
+			if ctx.Err() != nil {
+				cancel()
 				return ctx.Err()
 			}
-			if err != nil {
-				slog.Warn("prewarm.engine.seed.widget_skipped",
-					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(c)),
-					slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-					slog.Any("err", err),
-				)
-			}
+			slog.Warn("prewarm.engine.seed.widget_skipped",
+				slog.String("subsystem", "cache"),
+				slog.String("cohort", "sa-uniform"),
+				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+				slog.Any("err", err),
+			)
 		}
+		cancel()
 	}
 	return nil
 }
