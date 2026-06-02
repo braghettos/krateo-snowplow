@@ -190,6 +190,13 @@ func (w *depWatch) stopDeleteWorker() {
 //     propagate (could storm) and never block (could deadlock).
 func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
 	w := depWatchSingleton()
+	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once
+	// per handler-set construction, NOT per-event. The predicate is
+	// a structural equality check (IsCRDGVR — see crd_gvr.go);
+	// hoisting it here keeps the AddFunc hot path free of any
+	// GVR-comparison cost for the 99% case where gvr is NOT the
+	// CRD meta-GVR.
+	crdSideEffect := IsCRDGVR(gvr)
 	return clientcache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			if !rw.addEventPostSync(gvr, w) {
@@ -199,6 +206,17 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			ns, name := metaNSName(obj)
 			w.counters.addPropagated.Add(1)
 			Deps().OnAdd(gvr, ns, name)
+			// Ship 0.30.233 — CRD-ADD discovery side-effect.
+			// Dispatches to the bounded worker channel so the
+			// network-bound DiscoverGroupResources hop runs OFF
+			// the informer processor goroutine (PM tightening
+			// #1). triggerCRDDiscovery has its own defer recover
+			// (PM tightening #2) so a malformed CRD object cannot
+			// panic-kill the worker or this processor goroutine.
+			// See crd_discovery_side_effect.go.
+			if crdSideEffect {
+				crdDiscoverySingleton().submitCRDDiscoveryEvent(obj)
+			}
 		},
 		UpdateFunc: func(_, newObj interface{}) {
 			ns, name := metaNSName(newObj)

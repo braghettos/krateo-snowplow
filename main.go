@@ -204,6 +204,19 @@ func main() {
 					cacheWatcher = w
 					cache.SetGlobal(w)
 
+					// Ship 0.30.233 — wire the SA *rest.Config as a
+					// process singleton so the CRD-ADD discovery
+					// side-effect (crd_discovery_side_effect.go) can
+					// invoke DiscoverGroupResources without a per-call
+					// ctx. The informer processor goroutine has no
+					// InternalRESTConfigFromContext attached; the
+					// singleton is the bridge between the informer
+					// event surface and the discovery API. Mirrors the
+					// SetGlobal pattern above — single set at startup,
+					// idempotent, soft-fails to walker-only discovery
+					// if ever unset.
+					cache.SetProcessSARestConfig(rc)
+
 					// Ship 0.30.122 R4 Lever 1: wire the in-cluster
 					// *rest.Config so the composition GVR's streaming
 					// ListWatch can issue raw paged-LIST HTTP requests and
