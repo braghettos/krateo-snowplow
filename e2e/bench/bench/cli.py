@@ -594,7 +594,9 @@ def cmd_phase6(args) -> int:
     """Run Phase 6 with --from-stage / --to-stage / --video / --scale.
 
     On ConvergenceTimeout (raised by any stage runner after persisting
-    state.json), exits 4. On other failures, exits 1.
+    state.json), exits 4. On other failures, exits 1. On stale overlay
+    (>14d, no --allow-stale-overlay), exits 2 with stderr pointing to
+    `python -m bench calibrate`.
     """
     from bench import phases, browser
     tag = (getattr(args, "tag", None) or
@@ -604,6 +606,18 @@ def cmd_phase6(args) -> int:
     to_stage = getattr(args, "to_stage", None)
     cache_mode = getattr(args, "cache_mode", "OFF")
     video = getattr(args, "video", "representative")
+
+    # Overlay-freshness gate (acceptance (g)). Refuses to start when the
+    # overlay is stale (>14d) unless --allow-stale-overlay was passed.
+    # Reuses the same path as `bench check` Gate 7.
+    allow_stale = bool(getattr(args, "allow_stale_overlay", False))
+    ok, msg = _gate_overlay_freshness(allow_stale=allow_stale)
+    if not ok:
+        sys.stderr.write(
+            f"{RED}{BOLD}phase6: {msg}. "
+            f"Run `python -m bench calibrate` to refresh.{RESET}\n"
+        )
+        return 2
 
     run_dir_arg = getattr(args, "run_dir", None)
     run_dir = Path(run_dir_arg) if run_dir_arg else _default_run_dir(args)

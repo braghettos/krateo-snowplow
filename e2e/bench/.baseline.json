@@ -1,7 +1,7 @@
 {
-  "baseline_tag": null,
-  "baseline_warm_p50_ms": null,
-  "captured_at": null,
-  "source": "project_north_star_ledger.md most-recent PASS row at Block 5 start",
-  "_notes": "Block 4 ships the FILE FORMAT + ledger.read_baseline() reader. Block 5 captures the actual baseline values at acceptance-run time. Both fields null = no anchor yet; ledger.compute_baseline_delta() returns None and the ±15% gate becomes informational, not blocking."
+  "baseline_tag": "0.30.218",
+  "baseline_warm_p50_ms": 2233,
+  "captured_at": "2026-06-02T00:00:00Z",
+  "source": "project_north_star_ledger.md most-recent PASS row: 2026-05-31 ~22:30 Ship Phase 3' / portal-chart 0.30.177 (snowplow 0.30.218 UNCHANGED). Mix-weighted (0.95 cj + 0.05 admin) /compositions warm = 2,233ms.",
+  "_notes": "Captured at Block 5 prep. Schema mismatch caveat: ledger uses portal-chart tag + ship-specific scoring metric (Chrome MCP lastCall_ms for /compositions warm), not 'mix_weighted.warm_p50_ms' field literal. Closest semantic equivalent: 0.95*cj_compositions_warm_median + 0.05*admin_compositions_warm_median = 2,233 ms. The first full Phase 6 lifecycle on 0.30.232 (task #126) will produce the canonical mix_weighted.warm_p50_ms baseline; +/-15% gate becomes binding then."
 }

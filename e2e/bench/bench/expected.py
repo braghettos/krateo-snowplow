@@ -151,15 +151,29 @@ class OverlayStale(Exception):
         )
 
 
-def overlay_age_seconds(path: str = EXPECTED_CALLS_OVERLAY_PATH) -> float:
+def _resolve_overlay_path(path: str | None) -> str:
+    # Resolve the path FRESHLY from the module at call-time so
+    # monkeypatch.setattr(expected_mod, "EXPECTED_CALLS_OVERLAY_PATH", ...)
+    # reaches the stat call. A default like
+    # `path: str = EXPECTED_CALLS_OVERLAY_PATH` would capture the value
+    # at def-time and the monkeypatch would be silently bypassed.
+    if path is not None:
+        return path
+    import sys as _sys
+    mod = _sys.modules[__name__]
+    return mod.EXPECTED_CALLS_OVERLAY_PATH
+
+
+def overlay_age_seconds(path: str | None = None) -> float:
     """Return the overlay file's age in seconds (`math.inf` when missing).
 
     Source-of-truth for 'age' is the overlay file's `os.stat().st_mtime`,
     NOT any `captured_at` JSON field. Hand-edits to a JSON field cannot
     forge freshness; mtime is set by the kernel when the file is rewritten.
     """
+    resolved = _resolve_overlay_path(path)
     try:
-        st = os.stat(path)
+        st = os.stat(resolved)
     except FileNotFoundError:
         return math.inf
     except OSError:
@@ -168,7 +182,7 @@ def overlay_age_seconds(path: str = EXPECTED_CALLS_OVERLAY_PATH) -> float:
 
 
 def overlay_freshness_or_die(max_age_days: int = 14,
-                             path: str = EXPECTED_CALLS_OVERLAY_PATH) -> None:
+                             path: str | None = None) -> None:
     """Raise OverlayStale when the overlay file is older than max_age_days.
 
     Source-of-truth for 'age' is the overlay file's `os.stat().st_mtime`,
@@ -179,10 +193,11 @@ def overlay_freshness_or_die(max_age_days: int = 14,
     message in the OverlayStale exception points to `python -m bench
     calibrate` so the recovery path is one copy-paste away.
     """
-    age = overlay_age_seconds(path)
+    resolved = _resolve_overlay_path(path)
+    age = overlay_age_seconds(resolved)
     max_age_seconds = max_age_days * 86400.0
     if age > max_age_seconds:
-        raise OverlayStale(path=path, age_seconds=age,
+        raise OverlayStale(path=resolved, age_seconds=age,
                            max_age_days=max_age_days)
 
 
