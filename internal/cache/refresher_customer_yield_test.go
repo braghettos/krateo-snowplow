@@ -23,6 +23,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -51,7 +52,7 @@ func TestRefresher_YieldEngagesAndReleases(t *testing.T) {
 	customerHookInstall(t, func() bool { return inflight.Load() })
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0xfeed}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "yield-feed"} // 0.30.240 identity-free
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"y":1}`), Inputs: &inputs})
 
@@ -104,7 +105,7 @@ func TestRefresher_NilHookNoYield(t *testing.T) {
 
 	// No SetCustomerInflightHook call → hook is nil.
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x42}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "yield-42"} // 0.30.240 identity-free
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -154,7 +155,7 @@ func TestRefresher_YieldCapBound(t *testing.T) {
 	customerHookInstall(t, func() bool { return true })
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0xdead}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "yield-dead"} // 0.30.240 identity-free
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -230,7 +231,10 @@ func TestRefresher_ConvergesUnderIntermittentBurst(t *testing.T) {
 	const N = 16
 	keys := make([]string, N)
 	for i := 0; i < N; i++ {
-		in := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: uint64(0x100 + i)}
+		// Ship 0.30.240 — BindingSetHash removed; distinct keys come from
+		// distinct Name now. Per-iteration name varies to keep the test
+		// shape (N distinct L1 cells in the refresher's workqueue).
+		in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: fmt.Sprintf("widget-%03d", i)}
 		k := ComputeKey(in)
 		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		keys[i] = k
@@ -281,7 +285,9 @@ func TestRefresher_RaceYieldUnderConcurrentInflightFlips(t *testing.T) {
 	const N = 64
 	keys := make([]string, N)
 	for i := 0; i < N; i++ {
-		in := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: uint64(0xc000 + i)}
+		// Ship 0.30.240 — BindingSetHash removed; vary Name to generate
+		// distinct cells.
+		in := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: fmt.Sprintf("race-widget-%03d", i)}
 		k := ComputeKey(in)
 		c.Put(k, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &in})
 		keys[i] = k
@@ -433,8 +439,8 @@ func TestRefresher_YieldUniformAcrossKinds(t *testing.T) {
 	customerHookInstall(t, func() bool { return inflight.Load() })
 
 	c := ResolvedCache()
-	widgetInputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x1}
-	rsInputs := ResolvedKeyInputs{CacheEntryClass: "restactions", BindingSetHash: 0x2}
+	widgetInputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "yield-mixed-w"}   // 0.30.240 identity-free
+	rsInputs := ResolvedKeyInputs{CacheEntryClass: "restactions", Name: "yield-mixed-ra"} // 0.30.240 identity-free
 	wk := ComputeKey(widgetInputs)
 	rk := ComputeKey(rsInputs)
 	c.Put(wk, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &widgetInputs})

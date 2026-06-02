@@ -203,15 +203,13 @@ func TestShip97_F3_NonApistageClassesUnaffected(t *testing.T) {
 	c := cache.ResolvedCache()
 	for _, class := range []string{"widgets", "restactions"} {
 		inputs := cache.ResolvedKeyInputs{
-			CacheEntryClass:        class,
-			Group:                  "widgets.templates.krateo.io",
-			Version:                "v1beta1",
-			Resource:               "buttons",
-			Namespace:              "demo",
-			Name:                   "save-btn",
-			BindingSetHash:         0xc01dface,
-			RepresentativeUsername: "cyberjoker",
-			RepresentativeGroups:   []string{"devs"},
+			// Ship 0.30.240 — ResolvedKeyInputs identity-free.
+			CacheEntryClass: class,
+			Group:           "widgets.templates.krateo.io",
+			Version:         "v1beta1",
+			Resource:        "buttons",
+			Namespace:       "demo",
+			Name:            "save-btn",
 		}
 		key := cache.ComputeKey(inputs)
 		c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})

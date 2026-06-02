@@ -151,41 +151,50 @@ func TestLever2_ApistageRefreshUsesSACanonicalIdentity(t *testing.T) {
 	}
 }
 
-// TestLever2_PerCohortClassesStillUseRepresentativeIdentity is the LEAK
-// REGRESSION GUARD. The per-cohort identity-bound classes (widgets /
-// restactions / RAFullList) are keyed by BindingSetHash and MUST refresh
-// under the cohort's REPRESENTATIVE identity — NEVER the SA override. If
-// lever 2 leaked into these classes, a cohort cell would be re-resolved
-// with SA-maximal visibility and then served (no per-user gate on the
-// per-cohort widgets class) → cross-cohort data leak
-// (feedback_l1_per_user_keyed_never_cohort). This guards that boundary.
-func TestLever2_PerCohortClassesStillUseRepresentativeIdentity(t *testing.T) {
+// TestLever2_AllClassesUseSACanonicalIdentity_v4 — Ship 0.30.240 (v4)
+// INVERSION of the pre-v4 leak-guard. v4 identity-free L1 (design
+// 2026-06-02 §4) makes ALL FIVE cache classes identity-free at the
+// key layer — the cached bytes are SA-maximal, and per-user RBAC
+// narrowing runs at serve time via the post-cache filter. The refresher
+// therefore re-resolves EVERY class under the SA canonical identity;
+// pre-v4 representative-identity tuples (RepresentativeUsername /
+// RepresentativeGroups) are GONE from ResolvedKeyInputs.
+//
+// Cross-user leak is prevented at the SERVE FILTER (applyUserAccessFilter
+// + gateWidgetEnvelope + gateListItemsWithMemo) — same mechanism that
+// already protects apistage + widgetContent in v3 production. This test
+// pins the v4 contract: ALL classes refresh as SA, regardless of which
+// class is queried.
+//
+// Pre-v4 (REVERSED): TestLever2_PerCohortClassesStillUseRepresentativeIdentity
+// asserted the per-cohort classes refreshed under their representative
+// identity (the cohort-leak guard). v4 removes representative identity
+// entirely, so the test now asserts the inverse: all classes refresh as SA.
+func TestLever2_AllClassesUseSACanonicalIdentity_v4(t *testing.T) {
 	saEP := &endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: phase1RealSAToken}
 	saRC := &rest.Config{Host: "https://kubernetes.default.svc"}
 
 	for _, class := range []string{"widgets", "restactions", cache.CacheEntryClassRAFullList} {
 		t.Run(class, func(t *testing.T) {
 			inputs := cache.ResolvedKeyInputs{
-				CacheEntryClass:        class,
-				Group:                  "widgets.templates.krateo.io",
-				Version:                "v1beta1",
-				Resource:               "panels",
-				Namespace:              "krateo-system",
-				Name:                   "some-panel",
-				BindingSetHash:         0xc01dface,
-				RepresentativeUsername: "cyberjoker",
-				RepresentativeGroups:   []string{"devs"},
+				// Ship 0.30.240 — ResolvedKeyInputs identity-free.
+				CacheEntryClass: class,
+				Group:           "widgets.templates.krateo.io",
+				Version:         "v1beta1",
+				Resource:        "panels",
+				Namespace:       "krateo-system",
+				Name:            "some-panel",
 			}
 			gotUser, gotGroups := captureRefreshIdentity(t, inputs, saEP, saRC)
-			if gotUser != "cyberjoker" {
-				t.Fatalf("LEAK GUARD FAIL: per-cohort class %q refreshed as %q; want the "+
-					"cohort representative %q. The SA override MUST be confined to the "+
-					"identity-free (gated) classes — leaking it here is a cross-cohort "+
-					"data-leak (feedback_l1_per_user_keyed_never_cohort).",
-					class, gotUser, "cyberjoker")
+			if gotUser != canonicalSAUsernameForTest {
+				t.Fatalf("v4: class %q refreshed as %q; want SA canonical identity %q "+
+					"(all five v4 cache classes are identity-free; refresher uniformly "+
+					"resolves under SA). Per-user narrowing runs at serve time.",
+					class, gotUser, canonicalSAUsernameForTest)
 			}
-			if len(gotGroups) != 1 || gotGroups[0] != "devs" {
-				t.Fatalf("LEAK GUARD: per-cohort class %q lost its representative groups; got %v",
+			// SA identity is username-only (mirrors withPhase1SAContext).
+			if len(gotGroups) != 0 {
+				t.Fatalf("v4: class %q SA refresh identity must be username-only; got groups=%v",
 					class, gotGroups)
 			}
 		})
@@ -235,8 +244,13 @@ func TestLever2_SATokenAbsentFallsBackToRepresentative(t *testing.T) {
 	}
 }
 
-// TestIsIdentityFreeClass pins the predicate's truth table — the single
-// source of truth for which classes get the lever-2 SA override.
+// TestIsIdentityFreeClass — Ship 0.30.240 (v4) truth table. ALL five
+// v4 cache classes are identity-free at the L1 key layer; the empty
+// string remains false (unknown class — degraded safety posture).
+//
+// Pre-v4 the predicate returned true only for widgetContent + apistage.
+// v4 (design 2026-06-02 §4) extends identity-free to widgets, restactions,
+// raFullList — every class.
 func TestIsIdentityFreeClass(t *testing.T) {
 	cases := []struct {
 		class string
@@ -244,9 +258,9 @@ func TestIsIdentityFreeClass(t *testing.T) {
 	}{
 		{cache.CacheEntryClassWidgetContent, true},
 		{cache.CacheEntryClassApistage, true},
-		{"widgets", false},
-		{"restactions", false},
-		{cache.CacheEntryClassRAFullList, false},
+		{"widgets", true},
+		{"restactions", true},
+		{cache.CacheEntryClassRAFullList, true},
 		{"", false},
 	}
 	for _, c := range cases {

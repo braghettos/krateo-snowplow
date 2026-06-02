@@ -175,21 +175,31 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // the caller can stash it on the L1 entry. Refresher reuses Inputs to
 // drive a re-resolve on UPDATE/PATCH events.
 //
-// Ship A.3 / 0.30.179 — identity is folded as a single uint64 via
-// cache.BindingSetHash(ui.Username, ui.Groups) — one call per request.
-// The hash is the FNV-64a of the cohort's matched RBAC binding-pointer-
-// set; two users whose binding-set is pointer-equal collapse into ONE
-// L1 cell (per-COHORT keying). The pre-A.3 Username + sorted Groups
-// literal columns are GONE from ResolvedKeyInputs (HG-178.6 falsifier).
+// Ship A.3 / 0.30.179 — identity was folded as a single uint64 via
+// cache.BindingSetHash. The pre-A.3 Username + sorted Groups literal
+// columns were already GONE from ResolvedKeyInputs at that point.
+//
+// Ship 0.30.240 — identity REMOVED from ResolvedKeyInputs entirely
+// (design 2026-06-02). BindingSetHash, RepresentativeUsername,
+// RepresentativeGroups are all gone. The L1 cell is now SA-maximal and
+// shared across all customers; per-user RBAC narrowing runs at SERVE
+// time via the post-cache filter. The pattern mirrors client-go's
+// cache.Indexer: keyed store + per-request view filter at the consumer.
+//
+// IDENTITY GUARD: we STILL require an identity in the request context.
+// The downstream serve-time filter narrows rows against it; an
+// anonymous request would have no narrowing target and would risk
+// serving SA-maximal bytes to an unauthenticated caller. Same fail-
+// closed posture as v3 — only the gating point moved from key
+// construction to serve filter precondition.
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
 	c := cache.ResolvedCache()
 	if c == nil {
 		return "", nil, nil
 	}
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		// Defence in depth — without an identity we cannot key
-		// safely. Skip the cache for this request.
+	if _, err := xcontext.UserInfo(ctx); err != nil {
+		// Defence in depth — without an identity the serve-time
+		// filter has nothing to narrow against. Skip the cache.
 		return "", nil, nil
 	}
 	inputs := cache.ResolvedKeyInputs{
@@ -199,17 +209,9 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
-		BindingSetHash:  cache.BindingSetHash(ui.Username, ui.Groups),
-		// Ship A.3 / 0.30.179 Option A — representative cohort tuple for
-		// the refresher's re-resolve. Carried on Inputs but NOT folded
-		// into ComputeKey (the cell is keyed by BindingSetHash, not by
-		// the literal name). The first writer's identity is the cell's
-		// representative; cohort members produce byte-identical output.
-		RepresentativeUsername: ui.Username,
-		RepresentativeGroups:   ui.Groups,
-		PerPage:                perPage,
-		Page:                   page,
-		Extras:                 extras,
+		PerPage:         perPage,
+		Page:            page,
+		Extras:          extras,
 	}
 	return cache.ComputeKey(inputs), c, &inputs
 }
@@ -252,12 +254,11 @@ func emitResolvedCacheLookup(log *slog.Logger, handlerKind, gvrString, key strin
 
 // emitDispatchCacheKeyDiag — Ship 0.30.188 — pure-additive diagnostic
 // instrumentation for the PIP-seed vs dispatcher-get key-divergence
-// investigation (architect's TRACED diff on `BindingSetHash`). Emits a
-// structured slog line carrying ALL the components that fold into
-// `dispatchCacheLookupKey`'s ComputeKey, so the three emit sites (PIP
-// seed Put, dispatcher Get, per-user fallback Put) can be diff'd line-
-// by-line for ONE widget/restaction to identify which field(s) drive
-// the seed→serve miss.
+// investigation. Emits a structured slog line carrying every component
+// that folds into `dispatchCacheLookupKey`'s ComputeKey, so the three
+// emit sites (PIP seed Put, dispatcher Get, per-user fallback Put) can
+// be diff'd line-by-line for ONE widget/restaction to identify which
+// field(s) drive the seed→serve miss.
 //
 // IDENTITY EXTRACTION: pulls Username + Groups from xcontext.UserInfo
 // (the cohort ctx for seed sites, the request ctx for dispatcher
@@ -266,20 +267,22 @@ func emitResolvedCacheLookup(log *slog.Logger, handlerKind, gvrString, key strin
 // handle) we emit a sentinel "anonymous" / empty groups so the log
 // still differentiates the divergent component.
 //
-// BindingSetHash is read from `inputs.BindingSetHash` — the SAME value
-// that ComputeKey folded into the returned cacheKey — rather than re-
-// computing it. This guarantees the logged hash and the cache key are
-// derived from the same snapshot read.
+// Ship 0.30.240 — `binding_set_hash` field REMOVED from the emission.
+// The v4 L1 key is identity-free (design 2026-06-02 §5); the
+// `resolvedKeyVersion v3→v4` salt rotation already observably distinct-
+// uates v3 keys from v4 keys on the rolling restart, so the per-cohort
+// hash field is dead carry-over. Username + Groups stay on the line for
+// per-user request correlation; the cache cell itself no longer
+// differentiates by identity.
 //
 // NIL-GUARD: a nil `inputs` (cache disabled or identity missing) is
-// permitted; the function still emits with BindingSetHash=0 so the
-// "why was the lookup skipped" question is greppable. The dispatcher
-// callers MUST still nil-check the handle separately.
+// permitted; the function still emits so the "why was the lookup
+// skipped" question is greppable. The dispatcher callers MUST still
+// nil-check the handle separately.
 //
 // COST: one slog.Info per /call per site. Volume = O(num_widgets +
-// num_restactions × num_cohorts) at startup (PIP seed) + O(/call rate)
-// at serve time. Acceptable for the diagnostic ship; revert
-// 0.30.189+ once the divergent field is identified.
+// num_restactions) at startup (PIP seed) + O(/call rate) at serve time.
+// Acceptable for the diagnostic ship.
 func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context,
 	cacheKey string, inputs *cache.ResolvedKeyInputs,
 	handlerKind, group, version, resource, namespace, name string,
@@ -296,20 +299,12 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		username = ui.Username
 		groups = ui.Groups
 	}
-	var bindingSetHash uint64
-	if inputs != nil {
-		bindingSetHash = inputs.BindingSetHash
-	} else {
-		// Compute directly so the field still differentiates — the
-		// cache-disabled / no-identity branch returns nil inputs, but
-		// the architect's diff is interested in the hash value itself.
-		bindingSetHash = cache.BindingSetHash(username, groups)
-	}
+	_ = inputs // Ship 0.30.240 — inputs.BindingSetHash field gone; the
+	// signature is preserved so callers don't need to rewire.
 	log.Info("dispatch.cache_key.computed",
 		slog.String("subsystem", "cache"),
 		slog.String("site", site),
 		slog.String("key_hash", cacheKey),
-		slog.Uint64("binding_set_hash", bindingSetHash),
 		slog.String("username", username),
 		slog.Any("groups", groups),
 		slog.String("handler_kind", handlerKind),
@@ -323,23 +318,15 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 
 	// Ship 0.30.190 Fix B / 0.30.191 carried-forward — additive
 	// single-line stderr lane. The slog.Info above is the authoritative
-	// emit; the existing call stays ON regardless of this knob. This
-	// extra fmt.Fprintf is a pragmatic robustness fallback for the
-	// 0.30.189 validation gap where the tester could not grep the multi-
-	// line pretty-handler JSON via kubectl logs (candidates: pretty-
-	// handler multi-line formatting, kubelet log rotation, otel
-	// daemonset filter — can't be disambiguated from code alone).
-	// Greppable as a single line with every field inline. Default OFF;
-	// chart values.yaml flips it ON for diagnostic ships and OFF for
-	// steady-state.
+	// emit; the existing call stays ON regardless of this knob. Default
+	// OFF; chart values.yaml flips it ON for diagnostic ships and OFF
+	// for steady-state.
 	//
-	// feedback_no_park_broken_behind_flag does NOT apply: this is an
-	// ADDITIVE diagnostic lane, not a correctness fix parked behind a
-	// flag.
+	// Ship 0.30.240 — `bsh=` field REMOVED from the stderr line too.
 	if env.True("DISPATCH_KEY_DIAG_ENABLED") {
 		fmt.Fprintf(os.Stderr,
-			"DISPATCH_KEY_DIAG site=%s key=%s bsh=%d user=%s groups=%v handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
-			site, cacheKey, bindingSetHash, username, groups,
+			"DISPATCH_KEY_DIAG site=%s key=%s user=%s groups=%v handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
+			site, cacheKey, username, groups,
 			handlerKind, group, version, resource, namespace, name, perPage, page, len(extras),
 		)
 	}

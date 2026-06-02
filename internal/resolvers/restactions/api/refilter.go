@@ -396,6 +396,22 @@ func setRefilteredEmpty(dict map[string]any, apiName string) error {
 	return nil
 }
 
+// ApplyUserAccessFilterOnPigForServe — Ship 0.30.240 (v4 serve gate).
+//
+// EXPORTED entrypoint to the package-private applyUserAccessFilterOnPig
+// for use by the dispatchers package's serve-time gate
+// (handlers/dispatchers/serve_gate.go). Returns no value; callers
+// inspect `pig[stageName]` for the user-narrowed result. Identical
+// fail-closed semantics to applyUserAccessFilter (refilter.go:71).
+//
+// §4.6 PATTERN B CONTRACT: the caller MUST allocate `pig` per /call
+// (`pig := map[string]any{}` per serve; NEVER pool/reuse unless fully
+// cleared between uses — see feedback_shared_vs_copy_is_a_concurrency_
+// change + the 0.30.128 crash class).
+func ApplyUserAccessFilterOnPigForServe(ctx context.Context, pig map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) {
+	_ = applyUserAccessFilterOnPig(ctx, pig, stageName, uaf)
+}
+
 // applyUserAccessFilterOnPig is the Ship-0.30.235 jsonHandlerCore-side
 // shim. It runs the UAF refilter on the per-stage `pig` map (the
 // {opts.key: rawEnvelope} jsonHandlerCore assembles BEFORE the stage
@@ -405,6 +421,9 @@ func setRefilteredEmpty(dict map[string]any, apiName string) error {
 // applyUserAccessFilter (refilter.go:71). The pre-0.30.235 post-g.Wait()
 // applyUserAccessFilter call (resolve.go:879-888 in dbbea37) is DELETED;
 // this shim is the new sole production callsite.
+//
+// Ship 0.30.240: wrapped by ApplyUserAccessFilterOnPigForServe (above)
+// for external use by handlers/dispatchers/serve_gate.go.
 func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) refilterResult {
 	log := xcontext.Logger(ctx)
 	res := refilterResult{}

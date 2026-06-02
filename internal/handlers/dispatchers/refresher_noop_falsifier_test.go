@@ -59,15 +59,13 @@ func TestFalsifierFNoop_RefreshFuncReallyReResolves(t *testing.T) {
 		t.Fatalf("ResolvedCache nil — CACHE_ENABLED test setup wrong")
 	}
 	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass:        "widgets",
-		Group:                  "widgets.templates.krateo.io",
-		Version:                "v1beta1",
-		Resource:               "buttons",
-		Namespace:              "demo",
-		Name:                   "save-btn",
-		BindingSetHash:         0xc01dface,
-		RepresentativeUsername: "cyberjoker",
-		RepresentativeGroups:   []string{"devs"},
+		// Ship 0.30.240 — ResolvedKeyInputs identity-free.
+		CacheEntryClass: "widgets",
+		Group:           "widgets.templates.krateo.io",
+		Version:         "v1beta1",
+		Resource:        "buttons",
+		Namespace:       "demo",
+		Name:            "save-btn",
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":true}`), Inputs: &inputs})

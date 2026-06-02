@@ -316,9 +316,9 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 	// (a) verdict MUST stay UNKNOWN — NOT recorded as sliceable.
 	shape := cache.SliceShapeHash(raFullListCallerClass, gvr().Group, gvr().Version,
 		gvr().Resource, "krateo-system", raName, raSliceJQ)
+	// Ship 0.30.240 — RAFullListKeyInputs identity-free (no BindingSetHash arg).
 	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
-		"krateo-system", raName,
-		cache.BindingSetHash("admin", []string{"system:masters"}), nil)
+		"krateo-system", raName, nil)
 	raKey := cache.ComputeKey(keyInputs)
 	if _, known := cache.SliceabilityLookup(raKey, shape); known {
 		t.Fatalf("empty full MUST NOT record a sliceability verdict (must stay UNKNOWN/re-verifiable)")

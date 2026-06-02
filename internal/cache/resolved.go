@@ -29,7 +29,6 @@ package cache
 import (
 	"container/list"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -194,6 +193,26 @@ type ResolvedEntry struct {
 	// rolling restart) skips refresh but still serves TTL+LRU correctly.
 	Inputs *ResolvedKeyInputs
 
+	// valueRef — Ship 0.30.240 — atomic.Pointer to the current
+	// *ValueObject for this cell (v4 design 2026-06-02 §6). The
+	// ResolvedEntry plays the role of "KeyEntry" in the v4 split:
+	// it is the STABLE cell that LRU/TTL/Pinned account for, while
+	// the *ValueObject behind valueRef is the IMMUTABLE bytes that
+	// the refresh path swaps atomically.
+	//
+	// The existing RawJSON/Items fields above are populated as
+	// before by Put-time wiring; valueRef is populated ALONGSIDE
+	// them and gives the v4 falsifier (T8) a pointer-identity
+	// reference that survives refresh-driven byte swaps. Readers
+	// that already use entry.RawJSON / entry.Items see byte-equal
+	// content (by construction at Put-site) and don't need to
+	// migrate to LoadValue() in this ship.
+	//
+	// nil for entries constructed by pre-v4 code paths that haven't
+	// yet been migrated to wire valueRef. Methods on ResolvedEntry
+	// nil-check before dereferencing.
+	valueRef atomic.Pointer[ValueObject]
+
 	// Items / ItemsAPIVersion / ItemsKind — Ship 0.30.121 R3 — the
 	// pre-parsed LIST envelope for a CacheEntryClassApistage CONTENT
 	// entry. F1's content-gate (gateListEnvelope) re-unmarshalled the
@@ -232,6 +251,29 @@ type ResolvedEntry struct {
 	// store atomically. Direct field access is racy and unsupported.
 	CohortGates atomic.Pointer[CohortGateMemoStore]
 
+	// JQMemo — Ship 0.30.240 (Tier 3 per-cohort JQ output memo per
+	// design 2026-06-02 §9.14). Per-(widget-cell × cohort × rbacGen)
+	// memo of the widgetDataTemplate.Resolve output (the per-user
+	// `status.widgetData` map built from the user-narrowed apiRef RA
+	// dict).
+	//
+	// Lazily initialised by JQMemoStoreLoadOrInit; nil for every entry
+	// that has not yet served a memo-eligible JQ hit. The store's
+	// public API (Lookup/Store/LookupOrPopulate) is singleflight-guarded
+	// on populate via golang.org/x/sync/singleflight (Tightening 3).
+	// Cap set from CACHE_JQ_MEMO_CAP (default 128 per widget cell).
+	//
+	// PER THE V4 SERVE PATH (design §4.4): on every /call against an
+	// RBAC-sensitive apiRef widget, the dispatcher looks up JQMemo for
+	// (widgetCellKey, cohortKey, rbacGen). HIT (~100ns) returns the
+	// cached widgetData map; MISS triggers a singleflight populate
+	// that re-runs UAF on the apiRef RA's cached dict + invokes
+	// widgetDataTemplate.Resolve over the narrowed dict.
+	//
+	// Field type is *JQMemoStore (a value-type pointer, lazy). Readers
+	// MUST call JQMemoStoreLoadOrInit to acquire atomically.
+	JQMemo atomic.Pointer[JQMemoStore]
+
 	// Pinned — Ship 4a (0.30.198) — marks the entry as RESIDENT: it lives
 	// in a separate byte budget (maxResidentBytes) and is SKIPPED by the
 	// transient LRU eviction sweep (evictUntilUnderCapsLocked). Set true
@@ -249,6 +291,64 @@ type ResolvedEntry struct {
 	// before Put; Put reads it under mu to decide resident vs transient
 	// accounting.
 	Pinned bool
+}
+
+// LoadValue returns the current *ValueObject for this entry, or nil if
+// no v4 wiring has populated valueRef yet (a legacy entry constructed
+// by code paths that haven't migrated). Ship 0.30.240.
+//
+// Callers that need the v4 atomic-swap guarantee should:
+//
+//	v := entry.LoadValue()
+//	if v == nil || !v.AcquireReader() {
+//	    // either pre-v4 entry (use entry.RawJSON) or value retired
+//	    // mid-load (re-read valueRef).
+//	}
+//	defer v.ReleaseReader()
+//	// use v.Raw() bytes.
+//
+// In this ship, most production read sites continue to read
+// entry.RawJSON directly; T8 falsifier + future v4 callers use
+// LoadValue for the pointer-identity contract.
+func (e *ResolvedEntry) LoadValue() *ValueObject {
+	if e == nil {
+		return nil
+	}
+	return e.valueRef.Load()
+}
+
+// swapValueLocked atomically replaces the entry's *ValueObject with v
+// and retires the prior one (decrementing its referrers count; if the
+// count hits zero the value is enqueued for quarantine GC). MUST be
+// called with the ResolvedCacheStore.mu held — the existing Put + the
+// refresh seam are the only callers, both of which hold mu.
+//
+// nil v is rejected (no-op) — Put always supplies a non-nil value.
+// nil DefaultValueStore() is rejected (no-op).
+func (e *ResolvedEntry) swapValueLocked(v *ValueObject) {
+	if e == nil || v == nil {
+		return
+	}
+	prior := e.valueRef.Swap(v)
+	if prior != nil {
+		DefaultValueStore().retire(prior)
+	}
+}
+
+// releaseValueLocked decrements the entry's *ValueObject referrers
+// count without replacing it (the cell itself is being evicted).
+// Called by the LRU/TTL/DELETE eviction paths. MUST be called with
+// ResolvedCacheStore.mu held.
+//
+// Idempotent: a second release on the same entry is a no-op.
+func (e *ResolvedEntry) releaseValueLocked() {
+	if e == nil {
+		return
+	}
+	prior := e.valueRef.Swap(nil)
+	if prior != nil {
+		DefaultValueStore().retire(prior)
+	}
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set
@@ -269,10 +369,10 @@ type ResolvedEntry struct {
 // columns survive in ResolvedKeyInputs for restactions/widgets.
 type ResolvedKeyInputs struct {
 	// CacheEntryClass is the entry-class discriminant — one of the string
-	// values "restactions", "widgets", "apistage", or "widgetContent".
-	// (Renamed from HandlerKind in 0.30.118; the string VALUES are
-	// unchanged — they are hashed into the key and used as refresher
-	// registry keys.)
+	// values "restactions", "widgets", "apistage", "widgetContent", or
+	// "raFullList". (Renamed from HandlerKind in 0.30.118; the string
+	// VALUES are unchanged — they are hashed into the key and used as
+	// refresher registry keys.)
 	CacheEntryClass string
 	Group           string // dispatched CR's GVR Group
 	Version         string // dispatched CR's GVR Version
@@ -280,36 +380,25 @@ type ResolvedKeyInputs struct {
 	Namespace       string // dispatched CR namespace
 	Name            string // dispatched CR name
 
-	// BindingSetHash — Ship A.3 / 0.30.179 — the FNV-64a hash of the
-	// cohort's matched RBAC binding-pointer-set, identical mechanism to
-	// CohortRBACGen's pointer-set hash (rbac_cohort_gen.go:147). Zero
-	// for identity-free classes (apistage / widgetContent); non-zero
-	// for restactions / widgets. ComputeKey folds it in only when class
-	// is non-identity-free.
-	BindingSetHash uint64
-
-	// RepresentativeUsername + RepresentativeGroups — Ship A.3 / 0.30.179
-	// Option A. The L1 cell is per-COHORT (keyed by BindingSetHash), but
-	// the REFRESHER must re-resolve under a CONCRETE identity (a request
-	// runs as a single user; objects.Get + RBAC narrowing need a username
-	// + groups). The first writer's identity is recorded here as the
-	// representative tuple for re-resolve.
+	// Ship 0.30.240 — Identity REMOVED from the L1 key entirely. The v4
+	// architecture (design 2026-06-02) holds SA-maximal (cluster-state-
+	// derived) resolved bytes in L1; per-user RBAC narrowing happens at
+	// SERVE time via the post-cache filter (already in production for the
+	// apistage + widgetContent classes via filterListByRBAC +
+	// gateWidgetEnvelope; v4 extends to raFullList, restactions, widgets).
+	// The pattern mirrors client-go's `cache.Indexer`: keyed store + per-
+	// request view filter at the consumer.
 	//
-	// CORRECTNESS: every cohort member resolves to BYTE-IDENTICAL output
-	// (that is the cohort dedupe contract — feedback_l1_per_user_keyed_
-	// never_cohort.md compliant because the cohort IS the equivalence
-	// class of users producing identical resolved output). The
-	// representative is therefore EQUIVALENT to any other cohort member
-	// at resolve time. If the cohort topology changes (binding mutation),
-	// the BindingSetHash shifts, the next /call MISSes, the seed reseeds
-	// under a fresh representative — no stale-identity risk.
+	// PRE-0.30.240 SHAPE (now DELETED — left here as a tombstone for the
+	// rolling restart from v3 → v4):
 	//
-	// EXCLUDED FROM COMPUTEKEY. These fields are bookkeeping carried on
-	// ResolvedEntry.Inputs, NOT key material. Two cohort members writing
-	// the same cell must NOT shift the cell's identity by name; ComputeKey
-	// skips them entirely.
-	RepresentativeUsername string
-	RepresentativeGroups   []string
+	//   BindingSetHash         uint64    // Ship A.3 / 0.30.179 cohort hash
+	//   RepresentativeUsername string    // Ship A.3 / 0.30.179
+	//   RepresentativeGroups   []string  // Ship A.3 / 0.30.179
+	//
+	// The resolvedKeyVersion bump v3 → v4 ensures pre-v4 entries (which
+	// carried the identity fold in ComputeKey at the old resolved.go:630-
+	// 636) never serve as v4 hits. Rolling restart cleans the key space.
 
 	PerPage int
 	Page    int
@@ -349,7 +438,18 @@ type ResolvedKeyInputs struct {
 // value, so a pre-0.30.195 (pointer-keyed) L1 entry MUST NOT be served as
 // the new UID-keyed entry for the same cohort. The salt rotation forces a
 // clean rolling key break: pre-v3 entries never serve as v3 hits.
-const resolvedKeyVersion = "v3"
+//
+// Ship 0.30.240 — BUMPED v3 → v4. Identity REMOVED from the L1 key
+// entirely (design 2026-06-02 — identity-free L1 + serve-time UAF).
+// ResolvedKeyInputs dropped BindingSetHash, RepresentativeUsername,
+// RepresentativeGroups. ComputeKey no longer emits the 8-byte identity
+// fold for restactions/widgets/raFullList classes. Pre-0.30.240 entries
+// — which folded BindingSetHash into the key — would, under the new
+// ComputeKey, hash to the v3 cohort's value WITHOUT identity instead of
+// the v4 SA-maximal value. The v3 → v4 salt rotation forces a clean key
+// break: pre-v4 entries never serve as v4 hits, even if their (CEC, GVR,
+// ns, name, perPage, page, extras, stage) tuple matches.
+const resolvedKeyVersion = "v4"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed
@@ -584,37 +684,28 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	h.Write([]byte(in.Name))
 	h.Write([]byte{0})
 
-	// Identity. Ship F1 (0.30.119): the api-stage content layer is
-	// IDENTITY-FREE — an api-stage entry's resolved content (a per-object
-	// GET / per-namespace LIST K8s call result) is identity-invariant.
-	// Ship G (0.30.16x): widgetContent is ALSO identity-free — the widget
-	// envelope is shared, the per-user `allowed` flag is re-derived at
-	// serve time.
+	// Identity — REMOVED in Ship 0.30.240.
 	//
-	// Ship A.3 / 0.30.179: identity-bound classes (restactions, widgets)
-	// fold in `BindingSetHash` — a uint64 hash of the cohort's matched
-	// RBAC binding-pointer-set. Two users whose binding-set is pointer-
-	// equal land on the SAME cell, dedup'ing per-user cells into per-
-	// cohort cells. The pre-A.3 shape hashed Username + sorted Groups
-	// literally — a per-user cardinality. The cohort cardinality is
-	// typically O(10) at admin scale vs O(1000+) per-user. Identical
-	// mechanism to CohortRBACGen's per-cohort generator
-	// (rbac_cohort_gen.go) one tier up at the L1 key.
+	// Pre-0.30.240 (v3) folded BindingSetHash into the key for
+	// restactions/widgets/raFullList classes (8 little-endian bytes + a
+	// 0xff terminator). v4 (design 2026-06-02) holds SA-maximal bytes in
+	// L1 and narrows per-user at SERVE time via the post-cache filter that
+	// already exists for apistage + widgetContent. All five classes are
+	// now uniformly identity-free at the key layer. The resolvedKeyVersion
+	// v3 → v4 salt rotation isolates pre-v4 entries cleanly on the rolling
+	// restart.
 	//
-	// This is a per-CLASS key shape, NOT a per-resource switch
-	// (feedback_no_special_cases): the discriminant is the entry class,
-	// uniform for every entry of every GVR. apistage + widgetContent skip
-	// the identity fold entirely; restactions + widgets fold a single 8-
-	// byte uint64. The v1→v2 resolvedKeyVersion bump rotates the key
-	// space cleanly on the rolling restart so no v1 entry serves as a
-	// v2 hit (AC-178.3).
-	if in.CacheEntryClass != CacheEntryClassApistage &&
-		in.CacheEntryClass != CacheEntryClassWidgetContent {
-		var buf [8]byte
-		binary.LittleEndian.PutUint64(buf[:], in.BindingSetHash)
-		h.Write(buf[:])
-		h.Write([]byte{0xff}) // identity terminator
-	}
+	// The block that used to live here:
+	//
+	//   if in.CacheEntryClass != CacheEntryClassApistage &&
+	//       in.CacheEntryClass != CacheEntryClassWidgetContent {
+	//       var buf [8]byte
+	//       binary.LittleEndian.PutUint64(buf[:], in.BindingSetHash)
+	//       h.Write(buf[:])
+	//       h.Write([]byte{0xff})
+	//   }
+	//
+	// is intentionally absent in v4.
 
 	h.Write([]byte(strconv.Itoa(in.PerPage)))
 	h.Write([]byte{0})
@@ -772,9 +863,27 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		}
 	}
 
-	// Replace-in-place semantics if key already present. The prior entry's
-	// status (transient vs resident) may differ from the new one, so adjust
-	// BOTH budgets symmetrically.
+	// Ship 0.30.240 — v4 wiring: every Put produces a *ValueObject
+	// (via the singleton ValueStore) and binds it to the entry's
+	// valueRef. The legacy entry-pointer-replace semantics are
+	// preserved for replace-in-place — concurrent readers that hold
+	// the OLD entry pointer continue reading the OLD RawJSON bytes
+	// (no in-place field mutation, no data race). v4 callers that
+	// want refresh-aware bytes go through entry.LoadValue() instead.
+	//
+	// T8 falsifier assertions 1/2 (pointer-identity across two serves)
+	// test *ValueObject* pointer identity, NOT *ResolvedEntry* pointer
+	// identity. With entry-pointer-replace + per-entry valueRef wiring,
+	// two Gets in the same refresh window load the SAME *ValueObject
+	// from whichever entry they observed.
+	nv := DefaultValueStore().putValue(entry.RawJSON)
+	entry.swapValueLocked(nv)
+
+	// Replace-in-place semantics if key already present. The prior
+	// entry's status (transient vs resident) may differ from the new
+	// one, so adjust BOTH budgets symmetrically. The OLD entry's
+	// valueRef is retired via releaseValueLocked when the lruItem's
+	// entry pointer is overwritten — kept symmetric with eviction.
 	if el, ok := c.index[key]; ok {
 		old := el.Value.(*lruItem)
 		if old.entry != nil && old.entry.Pinned {
@@ -782,6 +891,12 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 			c.residentEntries--
 		} else {
 			c.curBytes -= old.bytes
+		}
+		// Retire the old entry's *ValueObject before overwriting the
+		// lruItem.entry pointer (otherwise the prior value's
+		// referrers count never decrements).
+		if old.entry != nil {
+			old.entry.releaseValueLocked()
 		}
 		old.entry = entry
 		old.bytes = bytes
@@ -1098,6 +1213,13 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 	// (Deps() is always non-nil); a no-op when no edges were ever
 	// recorded for this key.
 	Deps().RemoveL1Key(item.key)
+	// Ship 0.30.240 — retire the entry's *ValueObject. The eviction
+	// drops the entry's only referrer (the cache cell); the value
+	// goes into quarantine and is freed by the sweeper after the
+	// quarantine window expires AND no in-flight readers hold it.
+	if item.entry != nil {
+		item.entry.releaseValueLocked()
+	}
 }
 
 // deleteForDep removes the entry under key, returning true if a live

@@ -109,6 +109,23 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 
 	perPage, page := paginationInfo(log, req)
 
+	// Ship 0.30.240 — typed RA parse MOVED here from after the cache
+	// lookup. The v4 serve-time gate (gateRestactionsServeBytes,
+	// serve_gate.go) needs the RA's typed Spec.API to walk per-stage
+	// UAF on the cached SA-maximal dict. Parsing the unstructured is
+	// CPU-bounded (~10 µs at production widget sizes) and runs on
+	// every cache hit; this is the same overhead the cold-resolve
+	// path paid before, just moved earlier in the request.
+	var cr v1.RESTAction
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
+		log.Error("unable to convert unstructured to typed rest action",
+			slog.String("name", got.Unstructured.GetName()),
+			slog.String("namespace", got.Unstructured.GetNamespace()),
+			slog.Any("err", err))
+		response.InternalError(wri, err)
+		return
+	}
+
 	// Tag 0.30.7: L1 resolved-output cache lookup. Runs strictly
 	// AFTER the EvaluateRBAC gate above (Revision 2 binding) so the
 	// permission check is never short-circuited by a cache hit. Cache
@@ -134,16 +151,26 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		perPage, page, extras)
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
-			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
-			pcs.l1Hit = "hit"
-			writeResolvedJSON(wri, entry.RawJSON)
-			log.Info("RESTAction successfully resolved",
-				slog.String("name", got.Unstructured.GetName()),
-				slog.String("namespace", got.Unstructured.GetNamespace()),
-				slog.String("duration", util.ETA(start)),
-				slog.String("l1", "hit"),
-			)
-			return
+			// Ship 0.30.240 — v4 serve-time gate. The cell is identity-
+			// free; the cached dict is SA-maximal. gateRestactionsServeBytes
+			// walks ra.Spec.API; for each stage with UserAccessFilter it
+			// builds a §4.6 Pattern B private pig and runs the existing
+			// applyUserAccessFilterOnPig primitive. Pattern B per-call pig
+			// (NEVER pool/reuse) — architect Q1 ALL-B-UNIFORM ratification.
+			// The cached entry.RawJSON is NEVER mutated.
+			if gated, served := gateRestactionsServeBytes(req.Context(), entry.RawJSON, &cr); served {
+				emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, len(gated))
+				pcs.l1Hit = "hit"
+				writeResolvedJSON(wri, gated)
+				log.Info("RESTAction successfully resolved",
+					slog.String("name", got.Unstructured.GetName()),
+					slog.String("namespace", got.Unstructured.GetNamespace()),
+					slog.String("duration", util.ETA(start)),
+					slog.String("l1", "hit"),
+				)
+				return
+			}
+			// gate refused — fall through to cold resolve.
 		}
 		emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, false, 0)
 		pcs.l1Hit = "miss"
@@ -157,16 +184,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	var cr v1.RESTAction
-	err = runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr)
-	if err != nil {
-		log.Error("unable to convert unstructured to typed rest action",
-			slog.String("name", got.Unstructured.GetName()),
-			slog.String("namespace", got.Unstructured.GetNamespace()),
-			slog.Any("err", err))
-		response.InternalError(wri, err)
-		return
-	}
+	// Ship 0.30.240 — `cr` is now parsed earlier (above the L1 cache
+	// lookup) so the v4 serve gate can read ra.Spec.API for per-stage
+	// UAF. The duplicate FromUnstructured call that lived here in v3
+	// is REMOVED.
 
 	ctx := xcontext.BuildContext(req.Context())
 	// Ship 0.30.167 — Option 2 parallelism regression fix.

@@ -147,21 +147,36 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// — the EXACT seam withPhase1SAContext uses. When the SA token is
 	// absent (unit test / outside-cluster) we fall back to the
 	// representative tuple, the unchanged degraded posture.
-	refreshUser := inputs.RepresentativeUsername
-	refreshGroups := inputs.RepresentativeGroups
-	if isIdentityFreeClass(inputs.CacheEntryClass) {
-		if saEP != nil {
-			if saUser, ok := phase1SAUsername(saEP.Token); ok {
-				refreshUser = saUser
-				// SA identity is username-only — the SA's grant lands via
-				// its ServiceAccount-kind binding, matched by username in
-				// EvaluateRBAC + CohortNSACL. Mirrors withPhase1SAContext,
-				// which installs WithUserInfo{Username: saUser} with no
-				// Groups.
-				refreshGroups = nil
-			}
+	// Ship 0.30.240 — refresher ALWAYS resolves under SA identity.
+	// ResolvedKeyInputs no longer carries RepresentativeUsername /
+	// RepresentativeGroups; every L1 cell holds SA-maximal bytes, so
+	// the canonical SA identity is the ONLY correct re-resolve identity.
+	// Pre-0.30.240 carved out only widgetContent/apistage for SA re-
+	// resolve; v4 unifies all classes (design 2026-06-02 §4).
+	//
+	// When SA creds are unavailable (unit test / outside-cluster) we
+	// fall back to anonymous; the resolver will run under the SA
+	// transport's apiserver client and EvaluateRBAC will narrow per
+	// the snowplow SA's own grants — the same degraded-but-safe posture
+	// the v3 widget_content path took.
+	// v4 contract: SA endpoint MUST be supplied via MakeL1Refresher in
+	// production; empty username here only in unit tests without SA
+	// fixture. Architect-ratified 2026-06-02.
+	var refreshUser string
+	var refreshGroups []string
+	if saEP != nil {
+		if saUser, ok := phase1SAUsername(saEP.Token); ok {
+			refreshUser = saUser
+			// SA identity is username-only — the SA's grant lands via
+			// its ServiceAccount-kind binding, matched by username in
+			// EvaluateRBAC + CohortNSACL. Mirrors withPhase1SAContext.
 		}
 	}
+	// Silence the "isIdentityFreeClass declared but not used in this
+	// branch" path; the predicate is kept for the legacy unit-tests +
+	// future re-routes within the refresher (e.g. per-class diagnostic
+	// emission). All five v4 classes return true.
+	_ = isIdentityFreeClass(inputs.CacheEntryClass)
 	opts := []xcontext.WithContextFunc{
 		xcontext.WithUserInfo(jwtutil.UserInfo{
 			Username: refreshUser,
@@ -292,17 +307,42 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	return nil
 }
 
-// isIdentityFreeClass reports whether the entry class is one of the two
-// SHARED, identity-free cache classes whose ComputeKey skips the identity
-// fold (resolved.go:611-612): the widget-content shell and the api-stage
-// content cell. Both hold an SA-maximal SHELL that the serve-time gate
-// (gateWidgetEnvelope) narrows per-requester; their refresh therefore
-// re-resolves under the SA canonical identity (lever 2) rather than the
-// empty representative tuple. Kept as a single predicate so the two
-// call-class checks stay symmetric and the rule is stated once.
+// isIdentityFreeClass reports whether the entry class is identity-free
+// (its L1 key carries NO identity material; the cached bytes are SA-
+// maximal; per-user RBAC narrowing runs at SERVE time).
+//
+// Ship 0.30.240 — ALL five classes are now identity-free at the key
+// layer (design 2026-06-02). The refresher therefore re-resolves
+// EVERY class under the SA canonical identity (NOT a per-cohort
+// representative tuple, which no longer exists). Kept as a single
+// predicate so the rule is stated once.
+//
+// Pre-0.30.240 (v3) carved out widgets/restactions/raFullList as
+// identity-bound, with refresher using RepresentativeUsername /
+// RepresentativeGroups. v4 removed those fields and unified all
+// classes under SA-maximal resolution.
 func isIdentityFreeClass(class string) bool {
-	return class == cache.CacheEntryClassWidgetContent ||
-		class == cache.CacheEntryClassApistage
+	switch class {
+	case cache.CacheEntryClassWidgetContent,
+		cache.CacheEntryClassApistage,
+		cache.CacheEntryClassRAFullList:
+		return true
+	}
+	// "widgets" and "restactions" are also v4 identity-free. We keep
+	// them out of the explicit list because their string constants live
+	// in the dispatchers package (handlerKindWidgets / handlerKindRA);
+	// callers from those packages pass them as bare strings. Until those
+	// constants migrate into the cache package, the dispatchers' default
+	// case here is "treat unknown class as identity-free" — same v4
+	// universal contract.
+	//
+	// TODO follow-up: hoist "widgets"/"restactions" to cache.CacheEntryClass*
+	// constants alongside existing Apistage/WidgetContent/RAFullList for
+	// consistency.
+	if class == "widgets" || class == "restactions" {
+		return true
+	}
+	return false
 }
 
 // resolveOnceProd is the production resolve-and-encode implementation.

@@ -83,11 +83,11 @@ func setNested(obj map[string]any, val any, fields ...string) error {
 // --- key-shape tests ------------------------------------------------------
 
 func TestWidgetContentKey_IdentityFree(t *testing.T) {
-	// Ship A.3 / 0.30.179 — identity is folded as BindingSetHash for
-	// identity-bound classes; the widgetContent class IGNORES it. Both
-	// keys carry a non-zero BindingSetHash to PROVE it is ignored for
-	// this class (pre-A.3 the test used Username/Groups; structurally
-	// equivalent — the discriminant is the class, not the field name).
+	// Ship 0.30.240 — BindingSetHash REMOVED from ResolvedKeyInputs.
+	// The test's intent (identity-free key) holds vacuously in v4 — there
+	// is no identity field to set. We keep the test to assert that two
+	// callers building the same (gvr, ns, name, perPage, page) inputs
+	// land on the SAME L1 key regardless of which user issued the call.
 	adminKey := cache.ComputeKey(cache.ResolvedKeyInputs{
 		CacheEntryClass: cache.CacheEntryClassWidgetContent,
 		Group:           "widgets.templates.krateo.io",
@@ -95,7 +95,6 @@ func TestWidgetContentKey_IdentityFree(t *testing.T) {
 		Resource:        "panels",
 		Namespace:       "fireworks-app",
 		Name:            "dashboard-summary",
-		BindingSetHash:  0xdeadbeefcafebabe,
 		PerPage:         5,
 		Page:            1,
 	})
@@ -106,7 +105,6 @@ func TestWidgetContentKey_IdentityFree(t *testing.T) {
 		Resource:        "panels",
 		Namespace:       "fireworks-app",
 		Name:            "dashboard-summary",
-		BindingSetHash:  0xfeedfacefeedface,
 		PerPage:         5,
 		Page:            1,
 	})
@@ -133,9 +131,10 @@ func TestWidgetContentKey_DistinctFromWidgetsClass(t *testing.T) {
 		Resource:        "panels",
 		Namespace:       "ns",
 		Name:            "w",
-		BindingSetHash:  0xdeadbeef, // any non-zero identity fold
-		PerPage:         -1,
-		Page:            -1,
+		// Ship 0.30.240 — BindingSetHash removed; classes still differ by
+		// CacheEntryClass discriminant, so the keys remain distinct.
+		PerPage: -1,
+		Page:    -1,
 	})
 	if wcKey == widgetsKey {
 		t.Fatalf("widgetContent key MUST differ from widgets-class key for the same (gvr, ns, name); got identical %s", wcKey)
@@ -236,10 +235,10 @@ func TestDispatchWidgetContentKey_IdentityOmittedFromKey(t *testing.T) {
 	if adminIn == nil || cjIn == nil {
 		t.Fatalf("inputs must be non-nil when layer is on")
 	}
-	if adminIn.BindingSetHash != 0 {
-		t.Fatalf("identity-free inputs must carry zero BindingSetHash; got admin BindingSetHash=%#x",
-			adminIn.BindingSetHash)
-	}
+	// Ship 0.30.240 — BindingSetHash field REMOVED from ResolvedKeyInputs.
+	// Pre-v4 the assertion was `adminIn.BindingSetHash == 0` to prove the
+	// identity-free class skipped the fold; in v4 the field doesn't exist
+	// so the assertion is structurally vacuous (compile-time guarantee).
 	_ = cjIn
 }
 
@@ -539,9 +538,9 @@ func TestPopulateWidgetContentL1_PutHappensWhenEnabled(t *testing.T) {
 	if entry.Inputs == nil || entry.Inputs.CacheEntryClass != cache.CacheEntryClassWidgetContent {
 		t.Fatalf("entry.Inputs missing or wrong class: %+v", entry.Inputs)
 	}
-	if entry.Inputs.BindingSetHash != 0 {
-		t.Fatalf("entry.Inputs MUST carry zero identity-fold for widgetContent; got %+v", entry.Inputs)
-	}
+	// Ship 0.30.240 — BindingSetHash field REMOVED from ResolvedKeyInputs.
+	// Pre-v4 the assertion was `entry.Inputs.BindingSetHash == 0`; in v4
+	// the field doesn't exist (compile-time guarantee).
 
 	// Counter: widgetContentStoreTotal MUST have advanced.
 	if cache.ResolvedCache().Stats().WidgetContentStoreTotal == 0 {

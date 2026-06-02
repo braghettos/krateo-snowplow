@@ -66,7 +66,7 @@ func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
 	defer cleanup()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0xabc}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets"} // 0.30.240 — identity-free key
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"x":1}`), Inputs: &inputs})
 

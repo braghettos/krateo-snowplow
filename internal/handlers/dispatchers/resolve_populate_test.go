@@ -31,28 +31,29 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
+	// Ship 0.30.240 — ResolvedKeyInputs no longer carries identity (no
+	// BindingSetHash, no Representative{Username,Groups}). The refresher
+	// re-resolves EVERY class under SA identity; without an SA endpoint
+	// (nil saEP) the test exercises the degraded fall-through path where
+	// the refresh ctx carries no identity (the SA transport supplies the
+	// apiserver client). See resolve_populate.go's v4 refreshUser block.
 	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass:        "restactions",
-		Group:                  "templates.krateo.io",
-		Version:                "v1",
-		Resource:               "restactions",
-		Namespace:              "team-a",
-		Name:                   "list-users",
-		BindingSetHash:         0xc01dface,
-		RepresentativeUsername: "cyberjoker",
-		RepresentativeGroups:   []string{"devs", "qa"},
+		CacheEntryClass: "restactions",
+		Group:           "templates.krateo.io",
+		Version:         "v1",
+		Resource:        "restactions",
+		Namespace:       "team-a",
+		Name:            "list-users",
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
 
 	// Capture the context the resolve seam is handed.
 	var gotUser string
-	var gotGroups []string
 	var gotL1Key string
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
 		if ui, err := xcontext.UserInfo(ctx); err == nil {
 			gotUser = ui.Username
-			gotGroups = ui.Groups
 		}
 		gotL1Key = cache.L1KeyFromContext(ctx)
 		return []byte(`{"fresh":1}`), nil
@@ -63,14 +64,13 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 		t.Fatalf("resolveAndPopulateL1 error: %v", err)
 	}
 
-	// Ship A.3 / 0.30.179 — re-resolve runs under the REPRESENTATIVE
-	// cohort tuple recorded on Inputs (the first writer's identity).
-	if gotUser != "cyberjoker" {
-		t.Fatalf("AC-C7: re-resolve ran as %q; want the cohort's representative %q",
-			gotUser, "cyberjoker")
-	}
-	if len(gotGroups) != 2 || gotGroups[0] != "devs" || gotGroups[1] != "qa" {
-		t.Fatalf("AC-C7: re-resolve groups=%v; want the cohort's representative [devs qa]", gotGroups)
+	// Ship 0.30.240 — re-resolve runs under SA identity for ALL classes
+	// (no representative tuple exists in v4). With saEP=nil here the SA
+	// resolution falls through to anonymous; the SA-token codepath is
+	// exercised by the SA-aware tests in ship97_refresher_populates_items_test.go.
+	if gotUser != "" {
+		t.Fatalf("v4: re-resolve ran as %q; want empty (no SA endpoint supplied)",
+			gotUser)
 	}
 	// WithL1KeyContext: the ctx carries the L1 key so dep edges re-record.
 	if gotL1Key != key {
@@ -160,25 +160,28 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
+	// Ship 0.30.240 — ResolvedKeyInputs no longer carries identity.
 	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass:        "widgets",
-		Group:                  "widgets.templates.krateo.io",
-		Version:                "v1beta1",
-		Resource:               "panels",
-		Namespace:              "demo",
-		Name:                   "compositions-panel",
-		BindingSetHash:         0xc01dface,
-		RepresentativeUsername: "cyberjoker",
-		RepresentativeGroups:   []string{"devs"},
+		CacheEntryClass: "widgets",
+		Group:           "widgets.templates.krateo.io",
+		Version:         "v1beta1",
+		Resource:        "panels",
+		Namespace:       "demo",
+		Name:            "compositions-panel",
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
 
+	// SA token shape — system:serviceaccount:<ns>:<name>. phase1SAUsername
+	// parses the JWT `sub` claim; without a valid JWT the username falls
+	// through to empty. For this test we want to assert SA-transport
+	// installation, not identity propagation specifically — the SA
+	// transport is supplied; whether phase1SAUsername succeeds depends on
+	// JWT shape and is covered in ship97_refresher_populates_items_test.go.
 	saEP := &endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: "sa-token"}
 	saRC := &rest.Config{Host: "https://kubernetes.default.svc"}
 
 	var (
-		gotUser    string
 		gotUserCfg endpoints.Endpoint
 		userCfgOK  bool
 		gotIntEP   any
@@ -187,9 +190,6 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 		intRCOK    bool
 	)
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
-		if ui, err := xcontext.UserInfo(ctx); err == nil {
-			gotUser = ui.Username
-		}
 		if ep, err := xcontext.UserConfig(ctx); err == nil {
 			gotUserCfg, userCfgOK = ep, true
 		}
@@ -201,12 +201,6 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 
 	if err := resolveAndPopulateL1(context.Background(), inputs, saEP, saRC); err != nil {
 		t.Fatalf("resolveAndPopulateL1 error: %v", err)
-	}
-
-	// Identity is STILL the entry's own user — SA is transport, not identity.
-	if gotUser != "cyberjoker" {
-		t.Fatalf("Part B: re-resolve identity=%q; want the entry's own %q (SA must not replace identity)",
-			gotUser, "cyberjoker")
 	}
 	// WithUserConfig present — this is the fix for "user *Endpoint not found in context".
 	if !userCfgOK {
@@ -239,7 +233,7 @@ func TestPartB_NilSATransportIsIdentityOnly(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
-	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "no-sa", RepresentativeUsername: "u"}
+	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "no-sa"} // 0.30.240 identity-free
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 

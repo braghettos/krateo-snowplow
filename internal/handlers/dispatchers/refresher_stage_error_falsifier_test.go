@@ -74,15 +74,13 @@ func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
 
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass:        "restactions",
-		Group:                  "templates.krateo.io",
-		Version:                "v1",
-		Resource:               "restactions",
-		Namespace:              "krateo-system",
-		Name:                   "compositions-list",
-		BindingSetHash:         0xc01dface,
-		RepresentativeUsername: "cyberjoker",
-		RepresentativeGroups:   []string{"devs"},
+		// Ship 0.30.240 — ResolvedKeyInputs no longer carries identity.
+		CacheEntryClass: "restactions",
+		Group:           "templates.krateo.io",
+		Version:         "v1",
+		Resource:        "restactions",
+		Namespace:       "krateo-system",
+		Name:            "compositions-list",
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})
@@ -139,11 +137,11 @@ func TestRefresher_LegitimateEmptyIsStored(t *testing.T) {
 
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass:        "restactions",
-		Resource:               "restactions",
-		Namespace:              "krateo-system",
-		Name:                   "compositions-list",
-		RepresentativeUsername: "loner",
+		// Ship 0.30.240 — identity-free key.
+		CacheEntryClass: "restactions",
+		Resource:        "restactions",
+		Namespace:       "krateo-system",
+		Name:            "compositions-list-loner",
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: stageErrGoodEntry, Inputs: &inputs})

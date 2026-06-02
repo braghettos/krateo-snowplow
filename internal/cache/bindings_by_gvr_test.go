@@ -219,8 +219,10 @@ func TestRAFullListMemoExpvarPublished(t *testing.T) {
 	}
 
 	// Seed two entries: one TRUE verdict + labels, one FALSE verdict + labels.
+	// Ship 0.30.240 — RAFullListKeyInputs no longer takes a BindingSetHash
+	// argument (identity-free L1 key). Pre-v4 used 0x1234 here.
 	raKeyA := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
-		"krateo-system", "compositions-panels", 0x1234, nil))
+		"krateo-system", "compositions-panels", nil))
 	shapeA := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
 		"tables", "krateo-system", "compositions-page-datagrid", "{}")
 	labelsA := SliceabilityLabels{
@@ -233,8 +235,10 @@ func TestRAFullListMemoExpvarPublished(t *testing.T) {
 	}
 	RecordSliceabilityWithLabels(raKeyA, shapeA, true, labelsA)
 
+	// Ship 0.30.240 — identity-free key; distinct cells come from distinct
+	// (gvr, ns, name) — pre-v4 used 0xC0FFEE BindingSetHash for variety.
 	raKeyB := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
-		"OTHER-NS", "compositions-panels", 0xC0FFEE, nil))
+		"OTHER-NS", "compositions-panels", nil))
 	shapeB := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
 		"charts", "krateo-system", "compositions-chart", "{ sum: 0 }")
 	labelsB := SliceabilityLabels{

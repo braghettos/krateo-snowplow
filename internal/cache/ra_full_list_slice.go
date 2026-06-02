@@ -68,17 +68,23 @@ func extrasMinusSlice(extras map[string]any) map[string]any {
 
 // RAFullListKeyInputs builds the canonical page-INDEPENDENT ResolvedKeyInputs
 // for a RAFullList cell. It takes the RESTACTION's OWN identity (gvr/ns/name
-// — NOT the calling widget's), the cohort BindingSetHash, and the request
-// Extras, and forces PerPage=0/Page=0 + extrasMinusSlice(extras). The result
-// fed to ComputeKey folds ONLY the page-independent material (ComputeKey
-// folds PerPage at resolved.go's PerPage write + Page; both 0 here) so every
-// page of the same (RA × cohort × non-slice-extras) hashes to ONE key.
+// — NOT the calling widget's) and the request Extras, and forces
+// PerPage=0/Page=0 + extrasMinusSlice(extras). The result fed to ComputeKey
+// folds ONLY the page-independent material (ComputeKey folds PerPage at
+// resolved.go's PerPage write + Page; both 0 here) so every page of the same
+// (RA × non-slice-extras) hashes to ONE key.
 //
-// bindingSetHash is the cohort hash (BindingSetHash(username, groups)) — the
-// SAME per-cohort identity the restactions/widgets classes use; RAFullList is
-// identity-BOUND (RA output is RBAC-narrowed), so ComputeKey folds it.
+// Ship 0.30.240 — bindingSetHash parameter REMOVED. raFullList is now
+// identity-FREE at the L1 key layer (design 2026-06-02 §4.3): the cached
+// bytes are SA-maximal (cluster-state-derived); per-user RBAC narrowing
+// runs at serve time over the cached rows via applyUserAccessFilter. This
+// mirrors what apistage + widgetContent already do.
+//
+// Callers that previously computed BindingSetHash(username, groups) and
+// threaded it here can simply drop the argument; the per-request RBAC
+// gate is invoked at the serve site, not at the key site.
 func RAFullListKeyInputs(group, version, resource, namespace, name string,
-	bindingSetHash uint64, extras map[string]any) ResolvedKeyInputs {
+	extras map[string]any) ResolvedKeyInputs {
 	return ResolvedKeyInputs{
 		CacheEntryClass: CacheEntryClassRAFullList,
 		Group:           group,
@@ -86,7 +92,6 @@ func RAFullListKeyInputs(group, version, resource, namespace, name string,
 		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
-		BindingSetHash:  bindingSetHash,
 		// Page-INDEPENDENT: slice folded out of the key.
 		PerPage: 0,
 		Page:    0,

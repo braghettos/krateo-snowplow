@@ -75,17 +75,19 @@ func raFullListServe(
 		return nil, false, nil // cache off — fall back
 	}
 
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		// No identity — cannot key the per-cohort cell safely. Fall back to
-		// the page-keyed resolve (which itself runs under the request
-		// identity). NEVER serve a cohort cell without an identity.
+	// Ship 0.30.240 — raFullList is now identity-FREE at the L1 key layer.
+	// The cached bytes hold SA-maximal (cluster-state-derived) rows; per-
+	// user RBAC narrowing runs at SERVE time over the cached rows via
+	// applyUserAccessFilter (design 2026-06-02 §4.3). We still require an
+	// identity in the request context so the serve-time filter has
+	// something to narrow against; bail out if the request is anonymous
+	// (same fail-closed posture as v3 — only the gating point moved).
+	if _, err := xcontext.UserInfo(ctx); err != nil {
 		return nil, false, nil
 	}
-	bindingSetHash := cache.BindingSetHash(ui.Username, ui.Groups)
 
 	keyInputs := cache.RAFullListKeyInputs(gvr.Group, gvr.Version, gvr.Resource,
-		namespace, name, bindingSetHash, extras)
+		namespace, name, extras)
 	raKey := cache.ComputeKey(keyInputs)
 
 	// fullCtx scopes the UNPAGINATED resolves' inner-call dep edges to the

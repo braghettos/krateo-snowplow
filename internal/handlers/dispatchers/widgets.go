@@ -182,14 +182,39 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		perPage, page, extras)
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
-			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
-			pcs.l1Hit = "hit"
-			writeResolvedJSON(wri, entry.RawJSON)
-			log.Info("Widget successfully resolved",
-				slog.String("duration", util.ETA(start)),
-				slog.String("l1", "hit"),
-			)
-			return
+			// Ship 0.30.240 — v4 serve-time gate. The cell is identity-
+			// free; the cached bytes are SA-maximal. Two paths:
+			//
+			//   - Non-RBAC-sensitive widget: gateWidgetsServeBytes
+			//     delegates to gateWidgetEnvelope (allowed-flag recompute).
+			//   - RBAC-sensitive apiRef widget (architect-caught defect
+			//     closure): gateWidgetsApiRefServeBytes looks up the
+			//     apiRef RA's cached cell, runs Pattern B per-stage UAF
+			//     + widgetdatatemplate.Resolve over the cohort-narrowed
+			//     dict, and overlays per-cohort widgetData. Tier 3 JQ
+			//     memo (singleflight-guarded) absorbs cold-cohort cost.
+			//
+			// Fail-closed on no identity / malformed bytes / missing
+			// apiRef cache cell → fall through to cold resolve. §4.6
+			// invariant: cached entry.RawJSON is NEVER mutated.
+			//
+			// The widget CR carries spec.apiRef + spec.widgetDataTemplate
+			// which the apiRef gate path reads. Passing got.Unstructured.Object
+			// here is a stable nil-safe access (cache HIT only fires after
+			// got was already fetched at line ~62).
+			if gated, served := gateWidgetsServeBytes(req.Context(), cacheKey, entry,
+				got.Unstructured.Object, entry.RawJSON); served {
+				emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(gated))
+				pcs.l1Hit = "hit"
+				writeResolvedJSON(wri, gated)
+				log.Info("Widget successfully resolved",
+					slog.String("duration", util.ETA(start)),
+					slog.String("l1", "hit"),
+				)
+				return
+			}
+			// gate refused → fall through to cold resolve, same posture
+			// as the widgetContent gate at line ~141.
 		}
 		emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, false, 0)
 		pcs.l1Hit = "miss"

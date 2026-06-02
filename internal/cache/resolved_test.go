@@ -59,10 +59,11 @@ func TestComputeKey_StableAcrossCalls(t *testing.T) {
 		Resource:        "compositionsgrids",
 		Namespace:       "demo",
 		Name:            "main",
-		BindingSetHash:  0x0123456789abcdef, // Ship A.3 / 0.30.179
-		PerPage:         20,
-		Page:            1,
-		Extras:          map[string]any{"foo": "bar", "n": float64(7)},
+		// Ship 0.30.240 — BindingSetHash REMOVED from ResolvedKeyInputs;
+		// the v4 L1 key carries no identity (design 2026-06-02 §5).
+		PerPage: 20,
+		Page:    1,
+		Extras:  map[string]any{"foo": "bar", "n": float64(7)},
 	}
 	a := ComputeKey(in)
 	b := ComputeKey(in)
@@ -74,21 +75,32 @@ func TestComputeKey_StableAcrossCalls(t *testing.T) {
 	}
 }
 
-// Ship A.3 / 0.30.179 — group order invariance moves from ComputeKey to
-// BindingSetHash (which sorts pointer addresses). At the ComputeKey layer
-// two inputs with the same BindingSetHash hash identically by construction.
-func TestComputeKey_BindingSetHashInvariant(t *testing.T) {
-	in1 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x42}
-	in2 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x42}
+// Ship 0.30.240 — v4 identity-free invariant. Two ResolvedKeyInputs
+// identical in every (CacheEntryClass, GVR, ns, name, perPage, page,
+// extras, stage) field MUST produce the same ComputeKey regardless of
+// the calling identity. Per design 2026-06-02 §5 the key carries no
+// identity — every cohort, every user, every customer maps to the SAME
+// L1 cell.
+//
+// Pre-0.30.240 this test was named TestComputeKey_BindingSetHashInvariant
+// and asserted that two inputs with the same BindingSetHash hashed
+// identically. The renamed v4 version asserts the stronger statement.
+func TestComputeKey_IdentityFreeInvariant(t *testing.T) {
+	in1 := ResolvedKeyInputs{CacheEntryClass: "widgets"}
+	in2 := ResolvedKeyInputs{CacheEntryClass: "widgets"}
 	if ComputeKey(in1) != ComputeKey(in2) {
-		t.Fatalf("ComputeKey should be deterministic on identical BindingSetHash; got divergent keys")
+		t.Fatalf("ComputeKey should be identity-free in v4; got divergent keys for two byte-equal inputs")
 	}
 }
 
 func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 	base := ResolvedKeyInputs{
 		CacheEntryClass: "widgets", Group: "g", Version: "v", Resource: "r",
-		Namespace: "ns", Name: "n", BindingSetHash: 0x01,
+		Namespace: "ns", Name: "n",
+		// Ship 0.30.240 — BindingSetHash REMOVED. Pre-v4 the base value
+		// included a non-zero BindingSetHash and the mutator set asserted
+		// sensitivity to it; v4 removes both because the key no longer
+		// carries identity.
 		PerPage: 1, Page: 1, Extras: map[string]any{"k": "v"},
 	}
 	mutators := []struct {
@@ -101,7 +113,9 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 		{"Resource", func(in *ResolvedKeyInputs) { in.Resource = "r2" }},
 		{"Namespace", func(in *ResolvedKeyInputs) { in.Namespace = "ns2" }},
 		{"Name", func(in *ResolvedKeyInputs) { in.Name = "n2" }},
-		{"BindingSetHash", func(in *ResolvedKeyInputs) { in.BindingSetHash = 0x02 }},
+		// Ship 0.30.240 — BindingSetHash mutator REMOVED. The field no
+		// longer exists; sensitivity-to-identity is no longer a v4
+		// contract (it's anti-contract — see TestComputeKey_IdentityFreeInvariant).
 		{"PerPage", func(in *ResolvedKeyInputs) { in.PerPage = 2 }},
 		{"Page", func(in *ResolvedKeyInputs) { in.Page = 2 }},
 		{"Extras", func(in *ResolvedKeyInputs) { in.Extras = map[string]any{"k": "w"} }},
@@ -275,7 +289,8 @@ func TestResolvedCache_EmptyTreatedAsMiss(t *testing.T) {
 func TestComputeKey_EmptyStageByteIdenticalToPreShipE(t *testing.T) {
 	in := ResolvedKeyInputs{
 		CacheEntryClass: "restactions", Group: "g", Version: "v", Resource: "r",
-		Namespace: "ns", Name: "n", BindingSetHash: 0xabc,
+		Namespace: "ns", Name: "n",
+		// Ship 0.30.240 — BindingSetHash removed; v4 keys carry no identity.
 		PerPage: 1, Page: 1,
 	}
 	withEmptyStage := in
