@@ -436,13 +436,41 @@ func buildCohortPlans(ctx context.Context,
 	// the index can't scope. Empty when no snapshot is published.
 	globalCohorts := cache.EnumerateBindingSetClasses()
 
+	// Ship 0.30.238 Component A — cohort-set UNION (was fallback-only).
+	//
+	// Defect: for widget GVRs, EnumerateResourceCohorts(gvr) returns only
+	// the K8s-RBAC-bound subjects (cyberjoker + every UAF-only user is
+	// structurally excluded — UAF is a snowplow-internal layer, not a K8s
+	// (Cluster)RoleBinding, so the BindingsByGVR index does not see it).
+	// The pre-0.30.238 code took the rc-non-empty branch unconditionally
+	// and never reached globalCohorts → UAF-only users were never seeded.
+	//
+	// Fix: union the per-GVR scoped set with the global EnumerateBindingSet
+	// Classes() snapshot. unionCohorts is symmetric, dedup'd on cohortKey
+	// (Username + sorted Groups), preserves the fallback semantics when
+	// either input is empty, and is mechanism-uniform (no per-user / per-
+	// GVR special-cases). See docs/ship-0.30.238-stage-2-crud-triggered-re-
+	// prewarm-2026-06-02.md §4.1.
 	cohortsFor := func(gvr schema.GroupVersionResource, haveGVR bool) []cache.Cohort {
+		var rc []cache.Cohort
 		if haveGVR {
-			if rc := cache.EnumerateResourceCohorts(gvr); len(rc) > 0 {
-				return rc
-			}
+			rc = cache.EnumerateResourceCohorts(gvr)
 		}
-		return globalCohorts
+		unioned := unionCohorts(rc, globalCohorts)
+		// Per-call instrumentation — design §4.4.1. One log line per
+		// (target-GVR × call site) at boot (~3,700 lines for a full union,
+		// single boot pass, then never again). Lets the post-deploy
+		// falsifier observe the union directly via `kubectl logs … | grep
+		// prewarm.engine.cohortsFor` without inferring from /debug/vars.
+		slog.Info("prewarm.engine.cohortsFor",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.Bool("have_gvr", haveGVR),
+			slog.Int("rc_count", len(rc)),
+			slog.Int("global_count", len(globalCohorts)),
+			slog.Int("unioned_count", len(unioned)),
+		)
+		return unioned
 	}
 
 	for _, ref := range restactionRefs {
@@ -515,4 +543,53 @@ func restActionTargetGVR(ctx context.Context, ref templatesv1.ObjectReference) (
 		}, true
 	}
 	return schema.GroupVersionResource{}, false
+}
+
+// unionCohorts returns a ∪ b dedup'd by canonical cohort key (Username +
+// sorted Groups, joined by '|' and ','). Preserves the fallback semantics
+// of the pre-0.30.238 cohortsFor: when either input is empty the other is
+// returned UNCHANGED (no copy, no dedup pass). Order is deterministic:
+// elements of a first (in input order), then elements of b not already
+// keyed.
+//
+// Used by Ship 0.30.238 Component A — see docs/ship-0.30.238-stage-2-
+// crud-triggered-re-prewarm-2026-06-02.md §4.1. The cohortKey shape is
+// IDENTICAL to buildCohortPlans's cohortKey closure so the union dedup
+// matches the plan map dedup downstream — sentinel-prefixed group-only
+// cohorts and real-user-carrying-groups remain DISTINCT identities
+// (Username is part of the key).
+//
+// Cost: O(|a| + |b|) — single allocation of the seen set + the out slice.
+// Boot scope only — runs once per pod lifetime.
+func unionCohorts(a, b []cache.Cohort) []cache.Cohort {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	key := func(c cache.Cohort) string {
+		gs := append([]string(nil), c.Groups...)
+		sort.Strings(gs)
+		return c.Username + "|" + strings.Join(gs, ",")
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]cache.Cohort, 0, len(a)+len(b))
+	for _, c := range a {
+		k := key(c)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, c)
+	}
+	for _, c := range b {
+		k := key(c)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, c)
+	}
+	return out
 }
