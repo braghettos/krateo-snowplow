@@ -73,13 +73,15 @@ def test_browser_measure_stage_raises_ConvergenceTimeout(monkeypatch, fake_page,
     would still pass if an upstream `except:` swallowed the exception.
     """
     # Cluster has 1200 compositions; piechart returns 0 (cache stale).
+    # Post-Ship-0.30.234: admin expected_for_user == cluster_total = 1200
+    # via cluster-wide SSAR short-circuit. api=0 != expected=1200 → raise.
     _patch_cluster_count(monkeypatch, comp_count=1200, ns_count=20)
-    # Both verify probes return 0, never matching cluster=1200.
     monkeypatch.setattr(browser_mod, "verify_composition_count_api",
                         lambda token: 0)
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: 0)
-    # _expected_calls_lookup returns None so no widget-validation failure.
+    monkeypatch.setattr(browser_mod, "_user_visible_composition_count",
+                        lambda user, token: 1200)
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
                         lambda u, p: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
@@ -109,12 +111,18 @@ def test_browser_measure_stage_raises_ConvergenceTimeout(monkeypatch, fake_page,
 def test_browser_measure_stage_passes_when_api_equals_ui_equals_cluster(
         monkeypatch, fake_page, tmp_path):
     """Happy path: VERIFY poll matches on the first iteration → returns
-    the stage dict with convergence_ms >= 0, no exception."""
+    the stage dict with convergence_ms >= 0, no exception.
+
+    Post-Ship-0.30.234: admin expected_for_user == cluster_total (42)
+    via cluster-wide SSAR short-circuit. api=ui=expected=42 → matched.
+    """
     _patch_cluster_count(monkeypatch, comp_count=42, ns_count=2)
     monkeypatch.setattr(browser_mod, "verify_composition_count_api",
                         lambda token: 42)
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: 42)
+    monkeypatch.setattr(browser_mod, "_user_visible_composition_count",
+                        lambda user, token: 42)
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
                         lambda u, p: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
@@ -139,15 +147,19 @@ def test_browser_measure_stage_passes_when_api_equals_ui_equals_cluster(
 
 def test_browser_measure_stage_cyber_uses_intra_user_consistency(
         monkeypatch, fake_page, tmp_path):
-    """When `verify_against_cluster=False` (cyberjoker), the gate is
-    api == ui, NOT cluster equality. Cluster has 50K but cyberjoker
-    sees 10 (RBAC scoped to one namespace); api == ui == 10 must PASS.
+    """Post-Ship-0.30.234: cyberjoker's narrow-RBAC expected_for_user=10
+    (one Role granting list across the 10 visible compositions).
+    api=ui=expected=10 must PASS even when cluster_total=50K. The
+    legacy "intra-user consistency (api == ui)" gate is subsumed by
+    the per-user expected count.
     """
     _patch_cluster_count(monkeypatch, comp_count=50_000, ns_count=50)
     monkeypatch.setattr(browser_mod, "verify_composition_count_api",
                         lambda token: 10)
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: 10)
+    monkeypatch.setattr(browser_mod, "_user_visible_composition_count",
+                        lambda user, token: 10)
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
                         lambda u, p: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)

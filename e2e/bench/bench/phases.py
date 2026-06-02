@@ -473,6 +473,12 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc) -> list[dict]:
     for u_name, u_state in list(ctx.user_pages.items()):
         if u_name.startswith("__"):
             continue
+        # `verify_against_cluster` is retained for backward compat but
+        # has no behavioural effect post-Ship 0.30.234: VERIFY computes
+        # a per-user expected count via cluster.user_visible_composition_count
+        # (admin → cluster total via SSAR all-namespaces short-circuit;
+        # narrow-RBAC users → per-ns SSAR sum). The flag is True for
+        # admin only as informational metadata for the proof writer.
         r = browser.browser_measure_stage(
             u_state["page"], stage_num, stage_desc, ctx.cache_mode,
             token=u_state["token"], user=u_name,
@@ -563,6 +569,17 @@ def stage_s2_one_ns_compdef(ctx: StageContext) -> StageProof:
         lifecycle.create_bench_namespaces(1, 1)
         lifecycle.wait_for_bench_namespaces(1)
         cd_ready = cluster.deploy_compositiondefinition("bench-ns-01")
+        # Ship 0.30.234 / #146 scope: provision a namespace-scoped Role
+        # for every non-admin user_subject in bench-ns-01, modelling the
+        # customer narrow-RBAC shape (single Role in one ns). This is
+        # mechanism-uniform (parameterized on user subject); cleanup is
+        # automatic when bench-ns-01 is deleted in the cleanup phase.
+        # The portal helm chart owns prod RBAC; the bench harness owns
+        # bench RBAC. See project_narrow_rbac_shape.md (2026-06-02).
+        for u_name in c.user_pages:
+            if u_name.startswith("__") or u_name == "admin":
+                continue
+            cluster.provision_narrow_rbac_role(u_name, "bench-ns-01")
         time.sleep(15)
         _post_mutation_pause(c.cache_mode)
         results = _measure_all_users(c, 2, "1 ns + compdef")

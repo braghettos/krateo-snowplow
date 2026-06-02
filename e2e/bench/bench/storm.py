@@ -357,6 +357,18 @@ def run_user_scaling(tokens):
     create_bench_namespaces(1, ns_count)
     wait_for_bench_namespaces(ns_count, timeout=600)
     deploy_compositiondefinition("bench-ns-01")
+    # Ship 0.30.234 / #146 scope: provision narrow-RBAC Role for every
+    # non-admin user in bench-ns-01 so the storm models the customer
+    # narrow-RBAC shape (one Role in one ns, NOT zero RBAC). Cleanup is
+    # automatic when bench-ns-01 is deleted in the cleanup phase. The
+    # subject list is parameterized (USERS dict via browser._ensure_users
+    # at storm time); we provision for any subject the caller has minted
+    # a token for, EXCEPT admin (cluster-wide RBAC; doesn't need a Role).
+    from bench.cluster import provision_narrow_rbac_role  # type: ignore
+    for u_name in tokens:
+        if u_name == "admin":
+            continue
+        provision_narrow_rbac_role(u_name, "bench-ns-01")
     if not wait_for_crd(timeout=300):
         _log("ERROR: CRD not ready after 300s, aborting")
         return

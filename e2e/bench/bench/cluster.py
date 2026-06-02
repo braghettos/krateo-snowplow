@@ -567,6 +567,224 @@ def list_composition_names():
     return names
 
 
+# ─── Per-user visibility (SSAR-driven, RBAC-aware) ───────────────────────────
+
+
+def _decode_jwt_groups(token):
+    """Extract `groups` claim from a JWT (no signature verification — we
+    only need the subject + groups to construct an SSAR with the SAME
+    identity snowplow sees from its own context extractor).
+
+    Returns a list of group names, or [] when the token is missing /
+    malformed. Mechanism: standard JWT base64url-decode of payload.
+    """
+    if not token or "." not in token:
+        return []
+    parts = token.split(".")
+    if len(parts) < 2:
+        return []
+    import base64 as _b64
+    import json as _json
+    payload_raw = parts[1]
+    pad = payload_raw + "=" * (-len(payload_raw) % 4)
+    try:
+        payload = _json.loads(_b64.urlsafe_b64decode(pad))
+    except Exception:
+        return []
+    g = payload.get("groups") or []
+    if isinstance(g, list):
+        return [str(x) for x in g]
+    return []
+
+
+def kubectl_auth_can_i(
+    user, token, *,
+    verb, resource, group=COMP_GVR,
+    namespace=None, all_namespaces=False,
+):
+    """Probe RBAC reach for `user` via `kubectl auth can-i --as=<user>`.
+
+    Returns True/False/None (None on probe-itself failure — caller should
+    treat as conservative deny). Mechanism-uniform: works for any user/
+    resource pair; never hardcodes user names or resource identifiers.
+
+    `--as=<user>` impersonates the user via the kubeconfig admin
+    credentials. When `token` is supplied, the JWT's `groups` claim is
+    decoded and forwarded as `--as-group=<g>` flags so the SSAR sees the
+    SAME (user, groups) identity snowplow's UserConfig context carries.
+    Without group impersonation the bench would diverge from snowplow
+    semantics on group-bound ClusterRoleBindings (cluster-admin group
+    `admins`, narrow-RBAC group `devs`).
+
+    The bench's local kubeconfig has impersonation rights (cluster-
+    admin); this is the same mechanism the architect used in the
+    2026-06-02 P2 cluster-state probes that confirmed H1.
+
+    Returns:
+        True  — verb allowed for user on (group, resource[, namespace])
+        False — verb denied (no matching RoleBinding/ClusterRoleBinding)
+        None  — kubectl probe itself failed (network, no impersonation
+                rights, missing kubectl); callers SHOULD treat as deny.
+    """
+    args = ["auth", "can-i", verb, f"{resource}.{group}", f"--as={user}"]
+    for grp in _decode_jwt_groups(token):
+        args.append(f"--as-group={grp}")
+    if all_namespaces:
+        args.append("--all-namespaces")
+    elif namespace:
+        args.extend(["-n", namespace])
+    rc, out, _ = kubectl(*args, timeout_secs=30)
+    out_low = (out or "").strip().lower()
+    # kubectl auth can-i exits 0 for "yes", 1 for "no", other non-zero
+    # for probe errors. Out is "yes"/"no" on success cases.
+    if out_low == "yes":
+        return True
+    if out_low == "no":
+        return False
+    return None
+
+
+def user_visible_composition_count(
+    user, token, *,
+    gvr=COMP_GVR, resource=COMP_RES,
+):
+    """Return how many compositions `user` can list cluster-wide.
+
+    Mechanism (matches snowplow's cache=on userAccessFilter):
+      1. If `user` has cluster-wide list RBAC (SSAR --all-namespaces=yes),
+         short-circuit and return the cluster total (admin path —
+         bounds cost to 1 SSAR).
+      2. Otherwise enumerate every namespace containing a composition
+         (ground truth via kubectl), SSAR `list` per-namespace with
+         `user`'s token, and count compositions in permitted namespaces.
+
+    Pure read-only. No special cases — works uniformly for admin,
+    narrow-RBAC, zero-RBAC users. Returns 0 (not None) when the user
+    has no RBAC reach so caller comparisons stay numeric.
+
+    Returns -1 on probe failure (kubectl missing, network blip) so
+    the caller can distinguish "legitimately zero" from "couldn't
+    measure" — the VERIFY loop treats -1 as a transient retry
+    signal, same as it does for ui_count == -1.
+    """
+    # Step 0: cluster ground truth (admin path; doesn't need user token).
+    # Uses the same jsonpath escape pattern as list_composition_names
+    # (separator '/' literal; kubectl's "\\n" emits a newline).
+    rc, out, _ = kubectl(
+        "get", f"{resource}.{gvr}", "--all-namespaces",
+        "-o", "jsonpath={range .items[*]}{.metadata.namespace}/"
+              "{.metadata.name}{\"\\n\"}{end}",
+    )
+    if rc != 0:
+        return -1
+    by_ns = {}
+    for line in (out or "").strip().split("\n"):
+        line = line.strip()
+        if "/" not in line:
+            continue
+        ns_name, _name = line.split("/", 1)
+        by_ns.setdefault(ns_name, 0)
+        by_ns[ns_name] += 1
+    cluster_total = sum(by_ns.values())
+
+    # Step 1: admin short-circuit — saves N×SSAR calls when the user has
+    # cluster-wide list rights.
+    can_all = kubectl_auth_can_i(
+        user, token, verb="list", resource=resource, group=gvr,
+        all_namespaces=True,
+    )
+    if can_all is True:
+        return cluster_total
+
+    # Step 2: per-namespace SSAR for narrow-RBAC users.
+    permitted_total = 0
+    for ns_name, count in by_ns.items():
+        can_ns = kubectl_auth_can_i(
+            user, token, verb="list", resource=resource, group=gvr,
+            namespace=ns_name,
+        )
+        if can_ns is True:
+            permitted_total += count
+    return permitted_total
+
+
+# ─── Narrow-RBAC Role provisioning (parameterized; per Diego #146 scope) ────
+
+
+def _narrow_rbac_default_role_name(user, resource):
+    """Default Role/RoleBinding name for a user×resource pair.
+
+    Parameterized so the harness can provision RBAC for any user, not
+    just cyberjoker. Pattern: `<user>-<resource>-reader` (lowercased).
+    Wildcard `"*"` resource normalizes to "all" for shell-friendly
+    kubectl naming (resource names with `*` need quoting).
+    """
+    resource_token = "all" if resource == "*" else resource.lower()
+    return f"{user.lower()}-{resource_token}-reader"
+
+
+def provision_narrow_rbac_role(
+    user, ns, *,
+    group=COMP_GVR, resources=("*",), verbs=("get", "list", "watch"),
+    role_name=None,
+):
+    """Provision a namespace-scoped Role+RoleBinding granting `user`
+    visibility into `(group, resources, verbs)` within `ns`.
+
+    Mechanism-uniform: the (user, ns, group, resources, verbs) tuple is
+    config-driven. The function never hardcodes user names or resource
+    identifiers. Idempotent (uses `kubectl apply`).
+
+    Used by the bench harness to model the customer-shape narrow-RBAC
+    pattern (single Role in one namespace) when the test cluster's
+    default state is too restrictive (zero bindings).
+
+    Returns True on apply success, False otherwise.
+    """
+    name = role_name or _narrow_rbac_default_role_name(user, resources[0])
+    api_groups_yaml = "[\"" + group + "\"]"
+    resources_yaml = "[" + ", ".join(f'"{r}"' for r in resources) + "]"
+    verbs_yaml = "[" + ", ".join(f'"{v}"' for v in verbs) + "]"
+    body = f"""\
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {name}
+  namespace: {ns}
+rules:
+- apiGroups: {api_groups_yaml}
+  resources: {resources_yaml}
+  verbs: {verbs_yaml}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {name}
+  namespace: {ns}
+subjects:
+- kind: User
+  name: {user}
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {name}
+"""
+    rc, _, _ = kubectl("apply", "-f", "-", input_data=body)
+    return rc == 0
+
+
+def cleanup_narrow_rbac_role(user, ns, *, resources=("*",), role_name=None):
+    """Tear down a Role+RoleBinding previously created by
+    provision_narrow_rbac_role. Idempotent (--ignore-not-found).
+    """
+    name = role_name or _narrow_rbac_default_role_name(user, resources[0])
+    kubectl("delete", "rolebinding", name, "-n", ns,
+            "--ignore-not-found", "--wait=false")
+    kubectl("delete", "role", name, "-n", ns,
+            "--ignore-not-found", "--wait=false")
+
+
 # ─── Composition deploy + YAML helpers ───────────────────────────────────────
 
 def composition_yaml(ns, name):
@@ -783,6 +1001,12 @@ __all__ = [
     "count_compositions_in_ns",
     "count_bench_ns",
     "list_composition_names",
+    # Per-user visibility (SSAR-driven, RBAC-aware)
+    "kubectl_auth_can_i",
+    "user_visible_composition_count",
+    # Narrow-RBAC Role provisioning (parameterized; #146 scope)
+    "provision_narrow_rbac_role",
+    "cleanup_narrow_rbac_role",
     # Composition + namespace ops
     "deploy_compositiondefinition",
     "composition_yaml",

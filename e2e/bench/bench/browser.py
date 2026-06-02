@@ -73,6 +73,8 @@ __all__ = [
     "USERS",
     # Convergence-timeout
     "ConvergenceTimeout",
+    # VERIFY-poll match logic (pure function, unit-testable)
+    "_verify_poll_match",
     # Playwright-based helpers
     "browser_login",
     "browser_measure_navigation",
@@ -137,6 +139,57 @@ def _list_composition_names():
     """Defer to bench.cluster (CONTENT-correctness check post-VERIFY)."""
     from bench.cluster import list_composition_names  # type: ignore
     return list_composition_names()
+
+
+def _user_visible_composition_count(user, token):
+    """Defer to bench.cluster — per-user expected count for VERIFY logic.
+
+    Computed once per stage VERIFY entry (not per poll). Returns the
+    composition count the user's RBAC permits them to list, or -1 on
+    probe failure.
+    """
+    from bench.cluster import user_visible_composition_count  # type: ignore
+    return user_visible_composition_count(user, token)
+
+
+# ─── VERIFY-poll match logic (extracted for unit testability) ───────────────
+
+
+def _verify_poll_match(api_count, ui_count, expected,
+                       consecutive_api_correct_count):
+    """Pure-function gate for one VERIFY poll iteration.
+
+    Per Ship 0.30.234 / PM tightening #1: tolerate ui=-1 as transient
+    ONLY after K=3 consecutive polls where api==expected. Before that
+    threshold, ui=-1 is a hard mismatch (could be masking a real defect).
+
+    Returns dict:
+      matched: bool — break-out signal for the poll loop
+      ui_unavailable: bool — ui returned -1; track for stage-end pct gate
+      api_correct: bool — api matched expected this poll
+      next_consecutive: int — value to carry into next poll
+
+    `expected` must be >= 0. `api_count`/`ui_count` may be -1 (probe
+    failure / transient).
+    """
+    api_correct = (api_count >= 0 and api_count == expected)
+    next_consecutive = (
+        consecutive_api_correct_count + 1 if api_correct else 0
+    )
+    ui_unavailable = (ui_count == -1)
+    if ui_unavailable:
+        # PM tightening #1: only tolerate ui=-1 once api has stabilized
+        # at expected for K=3 consecutive polls.
+        ui_ok = (next_consecutive >= 3)
+    else:
+        ui_ok = (ui_count == expected)
+    matched = api_correct and ui_ok
+    return {
+        "matched": matched,
+        "ui_unavailable": ui_unavailable,
+        "api_correct": api_correct,
+        "next_consecutive": next_consecutive,
+    }
 
 
 def _pct(data, p):
@@ -1208,12 +1261,28 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
     The page must already be logged in as `user`; this argument is
     metadata only.
 
-    `verify_against_cluster` controls the S6 piechart convergence check.
-    For admin (cluster-wide RBAC) the piechart value must converge to
-    the cluster's total composition count; for cyberjoker (RBAC scoped
-    to a single namespace) the piechart will legitimately show fewer,
-    so we fall back to an intra-user UI-vs-API consistency check
-    (api_count == ui_count).
+    VERIFY-poll semantics (Ship 0.30.234 — per-user expected count).
+
+    Convergence checks `api_count == expected_for_user` AND (`ui_count
+    == expected_for_user` OR `ui_count == -1` AFTER api has been
+    correct for K=3 consecutive polls). `expected_for_user` is computed
+    ONCE per VERIFY entry via `cluster.user_visible_composition_count`,
+    which short-circuits to the cluster total for admin (cluster-wide
+    RBAC) and per-namespace SSARs for narrow-RBAC users. The function
+    is mechanism-uniform: no special cases for admin or cyberjoker.
+
+    ui_count == -1 handling (PM tightening #1+#2):
+      - Tolerated as transient only after K=3 consecutive polls of
+        api == expected. Before that threshold a -1 is a hard
+        mismatch (could be masking a real serve defect).
+      - At stage end, fail the stage if ui_unavailable_pct > 25%
+        (raises ConvergenceTimeout with the unavailability count).
+
+    `verify_against_cluster` is RETAINED for backward compat but
+    has no effect on the convergence gate — the per-user expected
+    count is the sole truth. For admin (cluster-wide RBAC),
+    `expected_for_user == cluster_count` mathematically, so the
+    admin path is byte-identical to the prior cluster-equality gate.
 
     On VERIFY-poll deadline expiry with `matched=False`, this function
     RAISES `ConvergenceTimeout(stage, user, api, ui, cluster, timeout_secs)`
@@ -1268,6 +1337,27 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                 last_cluster_check = time.time()
                 matched = False
 
+                # Per-user expected count (Ship 0.30.234). Computed ONCE
+                # per VERIFY entry — cluster ground truth × user RBAC.
+                # admin → cluster_total via SSAR all-namespaces short-circuit;
+                # narrow-RBAC users → per-ns SSAR sum.
+                expected_for_user = _user_visible_composition_count(
+                    user, token)
+                if expected_for_user < 0:
+                    # SSAR probe itself failed (kubectl missing, network
+                    # blip). Fall back to the cluster total so the legacy
+                    # admin path still converges; emit a warning so the
+                    # post-run diagnosis surfaces this.
+                    _log(f"    VERIFY: user_visible_composition_count "
+                         f"probe failed for user={user}; falling back to "
+                         f"cluster_total={fresh_comp_count}")
+                    expected_for_user = fresh_comp_count
+
+                # PM tightening #1+#2 state.
+                consecutive_api_correct_count = 0
+                ui_unavailable_polls = 0
+                ui_unavailable = False
+
                 poll_num = 0
                 while time.time() < deadline:
                     poll_num += 1
@@ -1281,7 +1371,8 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                     api_str_p = f"{api_count}" if api_count >= 0 else "?"
                     ui_str_p = f"{ui_count}" if ui_count >= 0 else "?"
                     _log(f"    VERIFY poll {poll_num}: api={api_str_p} "
-                         f"ui={ui_str_p} cluster={fresh_comp_count} ({elapsed_ms}ms)")
+                         f"ui={ui_str_p} expected={expected_for_user} "
+                         f"cluster={fresh_comp_count} ({elapsed_ms}ms)")
 
                     try:
                         page.evaluate("""() => {
@@ -1317,25 +1408,59 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                         except Exception as e:
                             _log(f"    screenshot failed: {e}")
 
-                    if verify_against_cluster:
-                        api_ok = (api_count >= 0 and api_count == fresh_comp_count)
-                        ui_ok = (ui_count >= 0 and ui_count == fresh_comp_count)
-                        if api_ok and ui_ok:
-                            matched = True
-                            break
-                    else:
-                        if (api_count >= 0 and ui_count >= 0
-                                and api_count == ui_count):
-                            matched = True
-                            break
+                    # Per-user VERIFY gate (Ship 0.30.234). The
+                    # `verify_against_cluster` flag is preserved as a
+                    # function arg for backward compat but has no
+                    # effect — the per-user expected count subsumes both
+                    # branches uniformly.
+                    poll_result = _verify_poll_match(
+                        api_count, ui_count, expected_for_user,
+                        consecutive_api_correct_count,
+                    )
+                    consecutive_api_correct_count = (
+                        poll_result["next_consecutive"])
+                    if poll_result["ui_unavailable"]:
+                        ui_unavailable_polls += 1
+                    if poll_result["matched"]:
+                        matched = True
+                        ui_unavailable = poll_result["ui_unavailable"]
+                        break
                     time.sleep(verify_interval)
 
                 convergence_ms = int((time.time() - verify_start) * 1000)
+                total_polls = max(poll_num, 1)
+                ui_unavailable_pct = (
+                    100.0 * ui_unavailable_polls / total_polls)
                 m["verified_api"] = api_count
                 m["verified_ui"] = ui_count
+                m["verified_expected"] = expected_for_user
                 m["convergence_ms"] = convergence_ms if matched else -1
+                m["ui_unavailable_polls"] = ui_unavailable_polls
+                m["ui_unavailable_pct"] = round(ui_unavailable_pct, 2)
+                if ui_unavailable:
+                    m["ui_unavailable"] = True
                 api_str = f"{api_count}" if api_count >= 0 else "?"
                 ui_str = f"{ui_count}" if ui_count >= 0 else "?"
+
+                # PM tightening #2: even if `matched=True`, fail the
+                # stage when the browser-fetch was unavailable on more
+                # than 25% of polls — sustained -1 may mask a real
+                # cache=OFF serve defect (WriteTimeout etc.).
+                if matched and ui_unavailable_pct > 25.0:
+                    _log(f"    VERIFY ✗ api={api_str} ui={ui_str} "
+                         f"expected={expected_for_user} "
+                         f"cluster={fresh_comp_count} "
+                         f"ui_unavailable_pct={ui_unavailable_pct:.1f}% "
+                         f"({ui_unavailable_polls}/{total_polls}) "
+                         f"> 25% threshold — raising ConvergenceTimeout")
+                    raise ConvergenceTimeout(
+                        stage=stage_num,
+                        user=user,
+                        api=api_count,
+                        ui=ui_count,
+                        cluster=fresh_comp_count,
+                        timeout_secs=verify_timeout,
+                    )
 
                 if not matched:
                     # ConvergenceTimeout — replaces the source-script's
@@ -1344,6 +1469,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                     # writes a stage proof with passed=False, and
                     # re-raises to abort the run with exit 4.
                     _log(f"    VERIFY ✗ api={api_str} ui={ui_str} "
+                         f"expected={expected_for_user} "
                          f"cluster={fresh_comp_count} converged=TIMEOUT — "
                          f"raising ConvergenceTimeout")
                     raise ConvergenceTimeout(
@@ -1355,8 +1481,13 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                         timeout_secs=verify_timeout,
                     )
 
+                ui_unavail_str = (
+                    f" ui_unavailable=true ({ui_unavailable_polls}/"
+                    f"{total_polls} polls)" if ui_unavailable else "")
                 _log(f"    VERIFY ✓ api={api_str} ui={ui_str} "
-                     f"cluster={fresh_comp_count} converged={convergence_ms}ms")
+                     f"expected={expected_for_user} "
+                     f"cluster={fresh_comp_count} "
+                     f"converged={convergence_ms}ms{ui_unavail_str}")
 
                 # Content-level correctness check: compare composition NAMES,
                 # not just counts. Catches silent cache corruption where the
