@@ -117,6 +117,14 @@ const (
 	// either is off, PIP stays inert regardless of this knob.
 	envPrewarmPIPEnabled = "PREWARM_PIP_ENABLED"
 
+	// envPrewarmBootTimeoutMinutes is the Ship 0.30.237 Stage-1 Lever A
+	// configmap-tunable for pipGlobalTimeout. Default stays 8 (the
+	// 0.30.179 raised value) so the falsifier projection is unchanged.
+	// Operator can shift to 12 / 15 min via chart values without a code
+	// change when the parallel cohort seed runs into a tight worst-case
+	// unit count under a particular customer's RBAC topology.
+	envPrewarmBootTimeoutMinutes = "PREWARM_BOOT_TIMEOUT_MINUTES"
+
 	// Ship 2 / 0.30.196 — the PER-COHORT CAP IS DELETED. pipCohortCapDefault
 	// (50), envPrewarmPIPCohortCap ("PREWARM_PIP_COHORT_CAP"), and
 	// pipCohortCap() are GONE. The cap was the not-Ready-forever landmine:
@@ -146,16 +154,30 @@ const (
 	// 0.30.191 ships the instrumentation that will tell us empirically
 	// which abort cause fires before any further timeout change.
 	pipCohortTimeout = 120 * time.Second
-
-	// pipGlobalTimeout is the absolute Step 7.6 budget. Designed to fit
-	// the architect's pod-start→phase1Done projection (baseline + seed
-	// ceiling). Ship A.3 / 0.30.179 — raised 40s -> 8 minutes per the
-	// PM gate's "baseline + 8 min seed ceiling" target. The per-cohort
-	// timeout × cohort cap caps the total at 50 × 120 s = 6000 s but the
-	// parallelism + harvest dedup keep the empirical wall-clock well
-	// inside 8 min.
-	pipGlobalTimeout = 8 * time.Minute
 )
+
+// pipGlobalTimeout is the absolute Step 7.6 budget. Designed to fit
+// the architect's pod-start→phase1Done projection (baseline + seed
+// ceiling). Ship A.3 / 0.30.179 — raised 40s -> 8 minutes per the
+// PM gate's "baseline + 8 min seed ceiling" target. The per-cohort
+// timeout × cohort cap caps the total at 50 × 120 s = 6000 s but the
+// parallelism + harvest dedup keep the empirical wall-clock well
+// inside 8 min.
+//
+// Ship 0.30.237 Stage-1 Lever A: was const, now var initialised from
+// PREWARM_BOOT_TIMEOUT_MINUTES at package-init time (default = 8 min,
+// matches the prior const). Operator can shift via chart values without
+// a code change when the parallel cohort seed encounters a tight
+// worst-case unit count under a particular customer's RBAC topology.
+// Test invariant in phase1_pip_seed_test.go still pins the default at
+// 8 min — the env override is opt-in.
+var pipGlobalTimeout = func() time.Duration {
+	m := env.Int(envPrewarmBootTimeoutMinutes, 8)
+	if m < 1 {
+		m = 1
+	}
+	return time.Duration(m) * time.Minute
+}()
 
 // PrewarmPIPEnabled reports whether the Ship PIP per-identity prewarm
 // seed is opted in. Defaults FALSE as of 0.30.176 (Phase A.1): the

@@ -39,13 +39,16 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
+	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/krateoplatformops/plumbing/endpoints"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
+	"golang.org/x/sync/errgroup"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -186,7 +189,7 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 	// propagates; withCohortSeedContext OVERRIDES identity per cohort for the
 	// actual seed, so the SA base is correct for both the derivation fetch
 	// and as the per-cohort seed base.
-	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS); err != nil {
+	if err := seedScopeParallel(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS); err != nil {
 		return err
 	}
 
@@ -197,146 +200,275 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 	return nil
 }
 
-// seedScopeYielding seeds the per-user top-level L1 for the harvested
-// restactions + widgets, PER-TARGET-GVR-scoped cohorts, yielding to
-// customer /call between cohorts. Replaces runPIPSeed's global single
-// EnumerateBindingSetClasses() cohort source with the resource-driven
-// EnumerateResourceCohorts(targetGVR) per harvested target.
+// seedScopeParallel seeds the per-user top-level L1 for the harvested
+// restactions + widgets, PER-TARGET-GVR-scoped cohorts, COHORT-PARALLEL
+// with serial RA/widget iteration inside each cohort. Replaces the pre-
+// 0.30.237 serial seedScopeYielding (outer-RA × inner-cohort) shape that
+// silently regressed the legacy runPIPSeed parallelism (phase1_pip_seed.go:
+// 382-387 — errgroup.SetLimit(GOMAXPROCS), cohort-parallel goroutines)
+// and produced only ~0.68 puts/s wall-clock at 5K scale, missing Gate C.
 //
-// The two loops are SYMMETRIC:
-//   - widget loop: cohorts scoped on the widget's GVR (e.namWidgetEntry.GVR).
+// Ship 0.30.237 Stage 1 — cohort-parallel restoration. The shape matches
+// runPIPSeed line-by-line (golang.org/x/sync/errgroup, GOMAXPROCS limit,
+// for-range over cohorts schedules one g.Go per cohort). Widget/RA work
+// remains serial INSIDE the cohort to bound transient resident bytes per
+// cohort (envelope-bytes per (RA+widget) × cohort-count is unchanged) and
+// to mirror the legacy seedCohort body's iteration order.
+//
+// The two inner loops are SYMMETRIC:
+//   - widget loop: cohorts scoped on the widget's GVR (e.GVR).
 //   - restaction loop: cohorts scoped on the RESTAction's TARGET GVR (the
 //     GVR it LISTs, derived from the RA's userAccessFilter). So the
 //     apiRef/RAFullList layer is bounded identically (~3-6 not 34).
 //
 // FALLBACK — when EnumerateResourceCohorts(gvr) yields nothing (index not
 // built, or a GVR with no matching bindings, or a runtime-discovered
-// target with no static resource) the loop falls back to the global
+// target with no static resource) the plan falls back to the global
 // EnumerateBindingSetClasses() for that target (safe over-inclusion;
 // under-inclusion would be a cold first /call).
-func seedScopeYielding(ctx context.Context,
+//
+// CUSTOMER PRIORITY (feedback_customer_priority_over_refresher). The
+// engineYieldCheckpoint is invoked:
+//   - BEFORE scheduling each new cohort goroutine (in the outer for-range),
+//     so a customer burst arriving DURING boot defers UNSCHEDULED cohorts.
+//   - BETWEEN each (RA, widget) unit INSIDE a cohort, so an in-flight
+//     cohort goroutine also steps aside between units.
+//
+// In-flight cohort goroutines run to completion OR until their 120s
+// per-cohort timeout (pipCohortTimeout). Worst-case in-flight CPU
+// contention is GOMAXPROCS background seed goroutines vs customer
+// goroutines — the same shape the refresher precedent accepts.
+func seedScopeParallel(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
 
 	log := slog.Default()
 
+	// (1) Build per-cohort work plans up front. This inverts the per-RA
+	// and per-widget cohort-scoping into a (cohort → [RAs], [widgets])
+	// view so each goroutine drains one cohort's units serially.
+	plans, planOrder, plannedUnits := buildCohortPlans(ctx, restactionRefs, widgetEntries)
+
+	// Lever C — publish planned-units BEFORE g.Go schedules, so the
+	// operator can read /debug/vars and project ETA before any work
+	// completes. Atomic-Store is the single-writer pattern (boot scope
+	// runs once per pod lifetime).
+	pipSeedUnitsPlannedTotal.Store(uint64(plannedUnits))
+
+	if len(plans) == 0 {
+		log.Info("prewarm.engine.seed.no_plans",
+			slog.String("subsystem", "cache"),
+			slog.Int("restactions", len(restactionRefs)),
+			slog.Int("widgets", len(widgetEntries)),
+		)
+		return nil
+	}
+
+	log.Info("prewarm.engine.seed.scope_start",
+		slog.String("subsystem", "cache"),
+		slog.Int("cohorts", len(plans)),
+		slog.Int("restactions", len(restactionRefs)),
+		slog.Int("widgets", len(widgetEntries)),
+		slog.Int("planned_units", plannedUnits),
+		slog.Int("parallelism", runtime.GOMAXPROCS(0)),
+	)
+
+	// (2) Bounded errgroup at GOMAXPROCS — restores the legacy
+	// phase1_pip_seed.go:382-387 shape. limit < 1 guard mirrors the
+	// runPIPSeed clamp.
+	g, gctx := errgroup.WithContext(ctx)
+	limit := runtime.GOMAXPROCS(0)
+	if limit < 1 {
+		limit = 1
+	}
+	g.SetLimit(limit)
+
+	// Iterate planOrder (sorted) so cohort scheduling is deterministic
+	// across pod restarts — matches the EnumerateRBACCohorts log-stability
+	// guarantee.
+	for _, key := range planOrder {
+		plan := plans[key]
+		cohort := plan.cohort // pin loop variable
+
+		// CUSTOMER PRIORITY — yield BEFORE scheduling a new cohort
+		// goroutine. In-flight cohorts complete on their own
+		// pipCohortTimeout cap; new cohorts wait while the burst clears.
+		engineYieldCheckpoint(gctx)
+		if gctx.Err() != nil {
+			break
+		}
+
+		cohortPlan := plan
+		g.Go(func() error {
+			// Per-cohort 120s deadline — matches pipCohortTimeout legacy
+			// cap. A stuck cohort cannot wedge the pool.
+			cctx, ccancel := context.WithTimeout(gctx, pipCohortTimeout)
+			defer ccancel()
+			cohortCtx := withCohortSeedContext(cctx, cohort, saEP, saRC)
+			label := cohortLogLabel(cohort)
+			cohortStart := time.Now()
+
+			// RESTActions seed for THIS cohort — serial inside the goroutine.
+			raDone := 0
+			for _, ref := range cohortPlan.restactionRefs {
+				if cohortCtx.Err() != nil {
+					// Non-fatal — cohort timeout fires, other cohorts continue.
+					return nil
+				}
+				engineYieldCheckpoint(cohortCtx)
+				if err := seedOneRestaction(cohortCtx, label, ref, authnNS); err != nil {
+					slog.Warn("prewarm.engine.seed.restaction_skipped",
+						slog.String("subsystem", "cache"),
+						slog.String("cohort", label),
+						slog.String("restaction", ref.Namespace+"/"+ref.Name),
+						slog.Any("err", err),
+					)
+					continue
+				}
+				// Ship 0.30.236 telemetry — engine path bumps the per-engine
+				// counters (the legacy seedCohort loop only fires when the
+				// engine is disabled). Required so /debug/vars reflects "did
+				// the seed run?" on the engine code path.
+				pipSeedRestactionsTotal.Add(1)
+				incCohortCounter(&pipSeedRestactionsByCohort, label)
+				raDone++
+			}
+
+			// Widgets seed for THIS cohort — serial inside the goroutine.
+			widgetDone := 0
+			for _, e := range cohortPlan.widgetEntries {
+				if cohortCtx.Err() != nil {
+					return nil
+				}
+				engineYieldCheckpoint(cohortCtx)
+				if err := seedOneWidget(cohortCtx, e, authnNS); err != nil {
+					slog.Warn("prewarm.engine.seed.widget_skipped",
+						slog.String("subsystem", "cache"),
+						slog.String("cohort", label),
+						slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+						slog.Any("err", err),
+					)
+					continue
+				}
+				pipSeedWidgetsTotal.Add(1)
+				incCohortCounter(&pipSeedWidgetsByCohort, label)
+				widgetDone++
+			}
+
+			// Lever B — per-cohort progress checkpoint. Lets an operator
+			// reading kubectl logs mid-boot project ETA per cohort and tell
+			// "slow but progressing" from "stuck".
+			slog.Info("prewarm.engine.seed.cohort_progress",
+				slog.String("subsystem", "cache"),
+				slog.String("cohort", label),
+				slog.Int("restactions_done", raDone),
+				slog.Int("restactions_planned", len(cohortPlan.restactionRefs)),
+				slog.Int("widgets_done", widgetDone),
+				slog.Int("widgets_planned", len(cohortPlan.widgetEntries)),
+				slog.Int64("elapsed_ms", time.Since(cohortStart).Milliseconds()),
+			)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// cohortPlan is the per-cohort work plan built by buildCohortPlans —
+// the set of restactions + widgets to seed for one cohort. The cohort
+// field carries the original cache.Cohort so the goroutine can pass it
+// to withCohortSeedContext without re-resolving from the map key.
+type cohortPlan struct {
+	cohort         cache.Cohort
+	restactionRefs []templatesv1.ObjectReference
+	widgetEntries  []navWidgetEntry
+}
+
+// buildCohortPlans inverts (RA → cohorts) and (widget → cohorts) into
+// (cohort → [RAs], [widgets]) using the SAME per-target-GVR scoping
+// rules as the legacy seedScopeYielding (cohortsFor with global
+// fallback). Returns the plan map, a deterministic iteration order, and
+// the total planned-unit count (Σ per-cohort (RAs + widgets) for Lever C).
+//
+// Map keying — Cohort has Username + Groups []string; Go maps cannot
+// key on a slice. Mitigation: build a canonical string key
+// "username|<sorted groups joined by ,>" and use map[string]*cohortPlan;
+// the *cohortPlan carries the original cache.Cohort so the goroutine
+// resolves identity without re-decoding the key.
+func buildCohortPlans(ctx context.Context,
+	restactionRefs []templatesv1.ObjectReference,
+	widgetEntries []navWidgetEntry,
+) (plans map[string]*cohortPlan, order []string, plannedUnits int) {
+
+	plans = map[string]*cohortPlan{}
+
+	cohortKey := func(c cache.Cohort) string {
+		// Sort Groups for stable key — EnumerateRBACCohorts sorts
+		// usernames but groups within a cohort may not be sorted.
+		gs := append([]string(nil), c.Groups...)
+		sort.Strings(gs)
+		return c.Username + "|" + strings.Join(gs, ",")
+	}
+
+	addRA := func(c cache.Cohort, ref templatesv1.ObjectReference) {
+		k := cohortKey(c)
+		p, ok := plans[k]
+		if !ok {
+			p = &cohortPlan{cohort: c}
+			plans[k] = p
+		}
+		p.restactionRefs = append(p.restactionRefs, ref)
+	}
+	addWidget := func(c cache.Cohort, e navWidgetEntry) {
+		k := cohortKey(c)
+		p, ok := plans[k]
+		if !ok {
+			p = &cohortPlan{cohort: c}
+			plans[k] = p
+		}
+		p.widgetEntries = append(p.widgetEntries, e)
+	}
+
 	// Global fallback cohort set — computed once, reused for any target
 	// the index can't scope. Empty when no snapshot is published.
 	globalCohorts := cache.EnumerateBindingSetClasses()
 
-	// cohortsFor resolves the resource-driven cohort set for a target GVR,
-	// falling back to the global set when the index yields nothing (index
-	// not built / no matching bindings / runtime-discovered target). The
-	// bool reports whether the result was index-scoped (telemetry).
-	cohortsFor := func(gvr schema.GroupVersionResource, haveGVR bool) ([]cache.Cohort, bool) {
+	cohortsFor := func(gvr schema.GroupVersionResource, haveGVR bool) []cache.Cohort {
 		if haveGVR {
 			if rc := cache.EnumerateResourceCohorts(gvr); len(rc) > 0 {
-				return rc, true
+				return rc
 			}
 		}
-		return globalCohorts, false
+		return globalCohorts
 	}
 
-	// seedTarget runs one (cohort, target) seed under a per-cohort timeout
-	// (pipCohortTimeout — matches seedCohort's stuck-cohort guard) and the
-	// cohort seed context. The per-target seed primitive (seedOneRestaction
-	// / seedOneWidget) is passed as a closure so the restaction + widget
-	// loops share the timeout + yield + error-containment wrapper.
-	seedTarget := func(c cache.Cohort, do func(cohortCtx context.Context) error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		engineYieldCheckpoint(ctx)
-		cctx, cancel := context.WithTimeout(ctx, pipCohortTimeout)
-		defer cancel()
-		cohortCtx := withCohortSeedContext(cctx, c, saEP, saRC)
-		return do(cohortCtx)
-	}
-
-	// ── RESTActions seed — scoped on each RA's TARGET GVR.
 	for _, ref := range restactionRefs {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		engineYieldCheckpoint(ctx)
-
 		targetGVR, haveTarget := restActionTargetGVR(ctx, ref)
-		cohorts, scoped := cohortsFor(targetGVR, haveTarget)
-		log.Info("prewarm.engine.seed.restaction_cohorts",
-			slog.String("subsystem", "cache"),
-			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("target_gvr", targetGVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("cohorts", len(cohorts)),
-		)
+		cohorts := cohortsFor(targetGVR, haveTarget)
 		for _, c := range cohorts {
-			err := seedTarget(c, func(cohortCtx context.Context) error {
-				return seedOneRestaction(cohortCtx, cohortLogLabel(c), ref, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err != nil {
-				slog.Warn("prewarm.engine.seed.restaction_skipped",
-					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(c)),
-					slog.String("restaction", ref.Namespace+"/"+ref.Name),
-					slog.Any("err", err),
-				)
-				continue
-			}
-			// Ship 0.30.236 telemetry fix — the engine seed path runs in
-			// production (the legacy seedCohort loop at phase1_pip_seed.go
-			// only fires when the engine is disabled), and pre-0.30.236
-			// only the legacy path bumped pipSeedRestactionsTotal. Without
-			// this bump, snowplow_phase1_seed_restactions_total reads 0 in
-			// /debug/vars even after a successful boot — masking "did the
-			// seed run?" from the post-deploy Gate A.
-			pipSeedRestactionsTotal.Add(1)
-			incCohortCounter(&pipSeedRestactionsByCohort, cohortLogLabel(c))
+			addRA(c, ref)
 		}
 	}
-
-	// ── Widgets seed — scoped on each widget's GVR.
 	for _, e := range widgetEntries {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		engineYieldCheckpoint(ctx)
-
-		cohorts, scoped := cohortsFor(e.GVR, true)
-		log.Info("prewarm.engine.seed.widget_cohorts",
-			slog.String("subsystem", "cache"),
-			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-			slog.String("gvr", e.GVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("cohorts", len(cohorts)),
-		)
+		cohorts := cohortsFor(e.GVR, true)
 		for _, c := range cohorts {
-			err := seedTarget(c, func(cohortCtx context.Context) error {
-				return seedOneWidget(cohortCtx, e, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err != nil {
-				slog.Warn("prewarm.engine.seed.widget_skipped",
-					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(c)),
-					slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-					slog.Any("err", err),
-				)
-				continue
-			}
-			// Ship 0.30.236 telemetry fix — symmetric with the restaction
-			// loop above. Without this bump the post-deploy Gate A cannot
-			// distinguish "seed ran" from "seed skipped" on the engine
-			// path.
-			pipSeedWidgetsTotal.Add(1)
-			incCohortCounter(&pipSeedWidgetsByCohort, cohortLogLabel(c))
+			addWidget(c, e)
 		}
 	}
-	return nil
+
+	// Deterministic iteration order — sort keys so cohort scheduling
+	// matches across pod restarts (mirrors EnumerateRBACCohorts's
+	// stability guarantee).
+	order = make([]string, 0, len(plans))
+	for k, p := range plans {
+		order = append(order, k)
+		plannedUnits += len(p.restactionRefs) + len(p.widgetEntries)
+	}
+	sort.Strings(order)
+	return plans, order, plannedUnits
 }
 
 // restActionTargetGVR derives the GVR a RESTAction LISTs from its

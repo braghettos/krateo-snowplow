@@ -60,6 +60,17 @@ var (
 	// internal/cache (single source of truth).
 	pipBindingSetSeedResolvesTotal atomic.Uint64
 	pipBindingSetSeedFailuresTotal atomic.Uint64
+
+	// Ship 0.30.237 Stage-1 Lever C — planned-units counter. Set ONCE by
+	// buildCohortPlans at boot-scope start to the total number of
+	// (cohort × seed-unit) pairs the engine intends to seed. Operator
+	// compares planned vs (restactions_total + widgets_total) at runtime
+	// to verify the math projection: if planned > empirical-throughput ×
+	// bootTimeoutMinutes, the parallel seed will not complete on the
+	// default 8-min budget and Lever A (PREWARM_BOOT_TIMEOUT_MINUTES)
+	// recovers without HARD REVERT. Set via Store (single-writer at boot
+	// scope), read via Load by the expvar publisher.
+	pipSeedUnitsPlannedTotal atomic.Uint64
 )
 
 // Per-cohort counters. sync.Map keyed by cohort label, value is
@@ -196,6 +207,11 @@ func registerPIPMetrics() {
 		}))
 		expvar.Publish("snowplow_phase1_enum_powerset_skipped", expvar.Func(func() any {
 			return cache.Phase1EnumPowersetSkippedTotal()
+		}))
+
+		// Ship 0.30.237 Stage-1 Lever C — planned-units counter (see decl).
+		expvar.Publish("snowplow_phase1_seed_units_planned_total", expvar.Func(func() any {
+			return pipSeedUnitsPlannedTotal.Load()
 		}))
 
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so
