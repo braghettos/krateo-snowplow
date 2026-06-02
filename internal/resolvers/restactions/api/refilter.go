@@ -396,6 +396,119 @@ func setRefilteredEmpty(dict map[string]any, apiName string) error {
 	return nil
 }
 
+// applyUserAccessFilterOnPig is the Ship-0.30.235 jsonHandlerCore-side
+// shim. It runs the UAF refilter on the per-stage `pig` map (the
+// {opts.key: rawEnvelope} jsonHandlerCore assembles BEFORE the stage
+// filter applies its projection). Mutates pig[stageName] in place with
+// the user-narrowed subset. Reuses refilterSlice / evalSingle /
+// resolveUAFResources — identical fail-closed semantics to
+// applyUserAccessFilter (refilter.go:71). The pre-0.30.235 post-g.Wait()
+// applyUserAccessFilter call (resolve.go:879-888 in dbbea37) is DELETED;
+// this shim is the new sole production callsite.
+func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) refilterResult {
+	log := xcontext.Logger(ctx)
+	res := refilterResult{}
+
+	if uaf == nil {
+		return res
+	}
+
+	user, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		log.Error("userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
+			slog.String("api", stageName),
+			slog.Any("err", err),
+		)
+		_ = setRefilteredEmpty(pig, stageName)
+		return res
+	}
+
+	// Ship 0.30.129 ResourcesFrom contract — fail-closed.
+	resources, resOK := resolveUAFResources(ctx, log, uaf, pig)
+	if !resOK {
+		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
+			slog.String("api", stageName),
+		)
+		_ = setRefilteredEmpty(pig, stageName)
+		return res
+	}
+
+	raw, ok := pig[stageName]
+	if !ok || raw == nil {
+		return res
+	}
+
+	switch v := raw.(type) {
+	case map[string]any:
+		itemsRaw, hasItems := v["items"]
+		if !hasItems {
+			// Single-object shape (GET-by-name).
+			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v)
+			res.EvaluateRBACCalls++
+			if permitted {
+				res.Kept++
+			} else {
+				res.Dropped++
+				pig[stageName] = map[string]any{}
+			}
+			return res
+		}
+		items, ok := itemsRaw.([]any)
+		if !ok {
+			log.Warn("userAccessFilter: items is not a slice; passing through unchanged",
+				slog.String("api", stageName),
+				slog.Any("items_type", fmt.Sprintf("%T", itemsRaw)),
+			)
+			return res
+		}
+		kept, dropped, calls := refilterSlice(ctx, log, user.Username, user.Groups, uaf, resources, items)
+		v["items"] = kept
+		res.Kept = len(kept)
+		res.Dropped = dropped
+		res.EvaluateRBACCalls = calls
+
+	case []any:
+		kept, dropped, calls := refilterSlice(ctx, log, user.Username, user.Groups, uaf, resources, v)
+		pig[stageName] = kept
+		res.Kept = len(kept)
+		res.Dropped = dropped
+		res.EvaluateRBACCalls = calls
+
+	default:
+		log.Warn("userAccessFilter: unrecognised result shape; passing through unchanged",
+			slog.String("api", stageName),
+			slog.Any("result_type", fmt.Sprintf("%T", raw)),
+		)
+	}
+
+	return res
+}
+
+// emitRefilterFalsifierFromHandler emits the per-call refilter falsifier
+// from jsonHandlerCore — Ship 0.30.235 sibling of emitRefilterFalsifier.
+// Output shape identical (consumed by the bench's grep harness).
+func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, apiCallName string, uaf *templates.UserAccessFilterSpec, res refilterResult) {
+	if log == nil || uaf == nil {
+		return
+	}
+	username := ""
+	if u, err := xcontext.UserInfo(ctx); err == nil {
+		username = u.Username
+	}
+	log.Info("userAccessFilter",
+		slog.String("subsystem", "uaf"),
+		slog.String("dispatch", "service_account"),
+		slog.String("user", username),
+		slog.String("api", apiCallName),
+		slog.String("verb", uaf.Verb),
+		slog.String("group", uaf.Group),
+		slog.String("resource", uaf.Resource),
+		slog.Int("refilter_kept", res.Kept),
+		slog.Int("refilter_dropped", res.Dropped),
+		slog.Int("evaluate_rbac_calls", res.EvaluateRBACCalls),
+	)
+}
+
 // emitRefilterFalsifier emits the per-call falsifier per plan
 // §"Code-path falsifier" line:
 //

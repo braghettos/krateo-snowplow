@@ -509,7 +509,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			//   * innerValue (any) — an apistage content-cache hit whose
 			//     gated envelope is already a decoded structured value;
 			//     skips both the marshal and the unmarshal.
-			hOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
+			// Ship 0.30.235 — UAF spec + stage name plumbed in so
+			// jsonHandlerCore can run the refilter on the RAW envelope
+			// BEFORE the stage filter projects items. The pre-0.30.235
+			// post-g.Wait() applyUserAccessFilter call is DELETED.
+			hOpts := jsonHandlerOptions{
+				key:         id,
+				out:         dict,
+				filter:      apiCall.Filter,
+				uaf:         apiCall.UserAccessFilter,
+				apiCallName: apiCall.Name,
+			}
 			inner := jsonHandler(gctx, hOpts)
 			innerBytesFn := jsonHandlerBytes(gctx, hOpts)
 			innerValueFn := jsonHandlerValue(gctx, hOpts)
@@ -876,16 +886,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
 
-		// Tag 0.30.9 Sub-scope A: refilter the SA-dispatched result
-		// in-process. Runs AFTER all dispatched calls for this API
-		// stage complete + their jsonHandler has populated dict[id].
-		// Per Revision 2 binding: EvaluateRBAC fires per object —
-		// this is the load-bearing security gate that turns cluster-
-		// wide-read into user-scoped result sets.
-		if uafActive {
-			rf := applyUserAccessFilter(ctx, dict, apiCall)
-			emitRefilterFalsifier(log, apiCall, user.Username, rf)
-		}
+		// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
+		// applyUserAccessFilter call was DELETED; UAF now runs per-worker
+		// inside jsonHandlerCore on the raw envelope. See
+		// refilter_layering_test.go for the permanent regression gate.
 
 		// Ship F1 (0.30.119): the api-stage L1 is now CONTENT-keyed —
 		// the per-K8s-call Put happens inside the g.Go worker (each call

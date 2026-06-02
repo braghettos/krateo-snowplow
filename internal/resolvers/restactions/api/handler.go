@@ -10,13 +10,24 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/ptr"
+	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 )
 
+// jsonHandlerOptions plumbs per-stage knobs into jsonHandlerCore.
+//
+// Ship 0.30.235 — `uaf` and `apiCallName` plumb the UserAccessFilter
+// spec into jsonHandlerCore so the refilter runs on the RAW envelope
+// BEFORE the stage filter applies its projection. The pre-0.30.235
+// post-g.Wait() applyUserAccessFilter call ran on the projected shape,
+// which broke NamespaceFrom for any filter that dropped .metadata. See
+// refilter_layering_test.go for the permanent regression gate.
 type jsonHandlerOptions struct {
-	key    string
-	out    map[string]any
-	filter *string
+	key         string
+	out         map[string]any
+	filter      *string
+	uaf         *templates.UserAccessFilterSpec
+	apiCallName string
 }
 
 // jsonHandler is the HTTP-body-shaped entry point — the form
@@ -88,6 +99,15 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	}
 	if si, ok := opts.out["slice"]; ok {
 		pig["slice"] = si
+	}
+
+	// Ship 0.30.235 — UAF refilter runs on the RAW envelope BEFORE the
+	// stage filter projects items. The projection can omit .metadata;
+	// running UAF first uses the K8s-canonical shape the spec documents.
+	// nil-UAF is a single early-return — pre-0.30.235 byte-identical.
+	if opts.uaf != nil {
+		rf := applyUserAccessFilterOnPig(ctx, pig, opts.key, opts.uaf)
+		emitRefilterFalsifierFromHandler(ctx, log, opts.apiCallName, opts.uaf, rf)
 	}
 
 	if opts.filter != nil {
