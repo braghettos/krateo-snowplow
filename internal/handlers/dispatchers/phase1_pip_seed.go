@@ -833,9 +833,20 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
+	//
+	// Ship 0.30.236 — PIN the cohort cell so it lives in the resident
+	// region (RESOLVED_CACHE_MAX_RESIDENT_BYTES) and is SKIPPED by the
+	// transient LRU sweep. Customer-facing per-cohort cells must survive
+	// the CRUD-storm dirty-mark wave; without the pin, refresher re-Puts
+	// of OTHER cohorts evict this cell via LRU, and the next customer
+	// /call pays a synchronous cold-fill — the F3 defect traced in
+	// docs/ship-0.30.236-l1-miss-after-mutation-trace-2026-06-02.md.
+	// Pin-honour at resolved.go:761-773 degrades to transient on resident
+	// overflow (no OOM path).
 	handle.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
+		Pinned:  true,
 	})
 
 	// Record the self-dep + ensure the informer for the RESTAction GVR
@@ -956,9 +967,13 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		return fmt.Errorf("encode widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), err)
 	}
 
+	// Ship 0.30.236 — PIN the cohort cell (symmetric with
+	// seedOneRestaction above). See the longer rationale comment at the
+	// seedOneRestaction Put site; same F3 defect, same fix.
 	handle.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
+		Pinned:  true,
 	})
 
 	// Record widget deps — self + apiRef + render-eligible

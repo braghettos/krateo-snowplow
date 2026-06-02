@@ -262,9 +262,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, extras)
+		// Ship 0.30.236 — PIN the freshly resolved cohort cell
+		// (symmetric with the restactions.go per-user fallback Put). The
+		// dispatcher fallback writes a cohort cell that must outlive
+		// the LRU pressure from refresher re-Puts of OTHER cohorts.
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,
+			Pinned:  true,
 		})
 		// 0.30.8: record dep edges. Widget self-dep, apiRef→RestAction
 		// dep, and render-eligible resourcesRefs deps (action-only

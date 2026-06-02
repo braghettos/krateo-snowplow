@@ -175,6 +175,25 @@ const CacheEntryClassWidgetContent = "widgetContent"
 // it would invalidate every in-flight entry.
 const CacheEntryClassRAFullList = "raFullList"
 
+// CacheEntryClassWidgets / CacheEntryClassRestactions — Ship 0.30.236.
+//
+// The dispatcher per-cohort L1 classes. Pre-0.30.236 the codebase
+// referred to these as bare string literals ("widgets" / "restactions");
+// they have ALWAYS been load-bearing in the same sense as
+// CacheEntryClassApistage / CacheEntryClassWidgetContent /
+// CacheEntryClassRAFullList: hashed into the cache key (ComputeKey) AND
+// used as the refresher registry key. Promoting them to named constants
+// removes a class of feedback_no_special_cases trip-hazards at the
+// branching site in resolveAndPopulateL1 (resolve_populate.go), where
+// 0.30.236 introduces a per-class pin decision keyed on these classes.
+//
+// The string VALUES are unchanged — rotating them would invalidate every
+// in-flight cohort entry across a rolling restart.
+const (
+	CacheEntryClassWidgets     = "widgets"
+	CacheEntryClassRestactions = "restactions"
+)
+
 // ResolvedEntry is the L1 cache value. The pre-encoded JSON bytes are
 // what we hand back on a hit; storing the encoded form (rather than the
 // runtime *RESTAction / *Widget object) avoids racey shared-state on

@@ -283,7 +283,17 @@ func seedScopeYielding(ctx context.Context,
 					slog.String("restaction", ref.Namespace+"/"+ref.Name),
 					slog.Any("err", err),
 				)
+				continue
 			}
+			// Ship 0.30.236 telemetry fix — the engine seed path runs in
+			// production (the legacy seedCohort loop at phase1_pip_seed.go
+			// only fires when the engine is disabled), and pre-0.30.236
+			// only the legacy path bumped pipSeedRestactionsTotal. Without
+			// this bump, snowplow_phase1_seed_restactions_total reads 0 in
+			// /debug/vars even after a successful boot — masking "did the
+			// seed run?" from the post-deploy Gate A.
+			pipSeedRestactionsTotal.Add(1)
+			incCohortCounter(&pipSeedRestactionsByCohort, cohortLogLabel(c))
 		}
 	}
 
@@ -316,7 +326,14 @@ func seedScopeYielding(ctx context.Context,
 					slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
 					slog.Any("err", err),
 				)
+				continue
 			}
+			// Ship 0.30.236 telemetry fix — symmetric with the restaction
+			// loop above. Without this bump the post-deploy Gate A cannot
+			// distinguish "seed ran" from "seed skipped" on the engine
+			// path.
+			pipSeedWidgetsTotal.Add(1)
+			incCohortCounter(&pipSeedWidgetsByCohort, cohortLogLabel(c))
 		}
 	}
 	return nil

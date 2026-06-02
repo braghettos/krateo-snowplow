@@ -232,9 +232,17 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, extras)
+		// Ship 0.30.236 — PIN the freshly resolved cohort cell. The
+		// dispatcher per-user fallback path runs when the boot PIP seed
+		// did NOT cover this (cohort × restaction) tuple; pinning here
+		// gives the cell the same residency protection as the seeded
+		// cells so the second /call lands a stale-served HIT rather than
+		// being evicted by a later refresher Put. See F3 trace in
+		// docs/ship-0.30.236-l1-miss-after-mutation-trace-2026-06-02.md.
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,
+			Pinned:  true,
 		})
 		// 0.30.8: record the self-dep so a DELETE on this RestAction
 		// CR evicts the cached entry, and an UPDATE re-resolves it.

@@ -252,14 +252,33 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		return nil
 	}
 
+	// Ship 0.30.236 — per-class pin decision on refresher re-populate.
+	//
+	//   - RAFullList   — preserve the resident pin captured in `prePinned`
+	//                    (Ship 4a contract: refresh of an expensive prewarmed
+	//                    cell never demotes it to transient).
+	//   - Widgets /    — ALWAYS re-pin. The cohort cell is the customer-
+	//     Restactions    facing serve target; demoting on every refresher
+	//                    cycle re-creates the F3 LRU-eviction window the
+	//                    boot seed Put was meant to close (see
+	//                    docs/ship-0.30.236-l1-miss-after-mutation-trace-
+	//                    2026-06-02.md).
+	//   - other        — unchanged; carries `prePinned` (false for every
+	//                    class that does not capture a prior pin).
+	//
+	// Per feedback_no_special_cases the discriminants are named constants
+	// (CacheEntryClass*) — no bare string literals at this branch site.
+	// Pin-honour at resolved.go:761-773 already degrades to transient on
+	// resident-budget overflow, so this branch cannot OOM the pod.
+	pinThis := prePinned
+	switch inputs.CacheEntryClass {
+	case cache.CacheEntryClassWidgets, cache.CacheEntryClassRestactions:
+		pinThis = true
+	}
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &inputs,
-		// Ship 4a (0.30.198) — preserve the resident pin on a RAFullList
-		// refresh so a dirty-mark re-resolve never demotes a prewarmed
-		// expensive cell to the transient LRU. Put honours the pin subject
-		// to the resident budget (else demotes — the safe degrade).
-		Pinned: prePinned,
+		Pinned:  pinThis,
 	}
 	// Ship #97 (0.30.214) — restore the R3 fast-path on refresher Puts
 	// of apistage-class LIST entries. Pre-fix the refresher Put wrote
