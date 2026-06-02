@@ -280,18 +280,23 @@ def login_all():
     return tokens
 
 
-def http_get(path, token, base_url=None, timeout=120, retries=3):
+def http_get(path, token, base_url=None, timeout=120, retries=3, trace_id=None):
     """GET `path` against snowplow with Bearer auth + gzip decode.
 
     Returns (elapsed_ms, http_code, body_bytes). Retries up to `retries`
     times on connection failure (code==0); HTTP errors return their
     status code without retry.
+
+    `trace_id`, when set, is sent as the `X-Krateo-TraceId` header — per
+    plumbing@v0.9.3/server/use/traceid.go:14-18 the server ADOPTS the
+    client-supplied header, so callers can correlate logs via the same
+    id (used by bench.verify_serve_stale).
     """
     url = (base_url or SNOWPLOW) + path
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": "Bearer " + token, "Accept-Encoding": "gzip"},
-    )
+    headers = {"Authorization": "Bearer " + token, "Accept-Encoding": "gzip"}
+    if trace_id:
+        headers["X-Krateo-TraceId"] = trace_id
+    req = urllib.request.Request(url, headers=headers)
     elapsed_ms = 0
     code = 0
     body = b""
@@ -330,13 +335,17 @@ def http_get_json(path, token, **kw):
         return ms, code, None
 
 
-def http_get_with_headers(path, token, base_url=None, timeout=120):
-    """Like http_get but also returns response headers as a dict."""
+def http_get_with_headers(path, token, base_url=None, timeout=120, trace_id=None):
+    """Like http_get but also returns response headers as a dict.
+
+    `trace_id`, when set, is sent as the `X-Krateo-TraceId` header (same
+    semantics as http_get).
+    """
     url = (base_url or SNOWPLOW) + path
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": "Bearer " + token, "Accept-Encoding": "gzip"},
-    )
+    headers = {"Authorization": "Bearer " + token, "Accept-Encoding": "gzip"}
+    if trace_id:
+        headers["X-Krateo-TraceId"] = trace_id
+    req = urllib.request.Request(url, headers=headers)
     t0 = time.perf_counter()
     code, body, hdrs = 0, b"", {}
     try:

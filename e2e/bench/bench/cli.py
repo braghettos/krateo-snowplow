@@ -46,6 +46,7 @@ __all__ = [
     "cmd_phase7",
     "cmd_phase8",
     "cmd_report",
+    "cmd_verify_serve_stale",
     "verify_deployed_image",
 ]
 
@@ -676,6 +677,59 @@ def cmd_phase8(args) -> int:
         return 1
 
 
+# ─── cmd_verify_serve_stale (serve-stale-while-refresh contract) ────────────
+
+
+def cmd_verify_serve_stale(args) -> int:
+    """Run the verify-serve-stale subcommand.
+
+    Per docs/bench-verify-serve-stale-design-2026-06-02.md +
+    feedback_l1_hit_miss_via_metrics_not_timing +
+    feedback_mutation_serves_stale_while_refresh. Implements PM Option A
+    (mandatory) — informer-ack check is a hard gate before the mid-probe.
+
+    Exit codes:
+        0 — PASS
+        1 — INDETERMINATE_*
+        2 — FAIL_*
+        3 — non-GKE context (inherited from _gke_context_guard)
+    """
+    from bench import verify_serve_stale as vss
+
+    allow_non_gke = bool(getattr(args, "allow_non_gke", False))
+    _gke_context_guard(allow_non_gke=allow_non_gke)
+
+    user = (getattr(args, "user", None) or "cyberjoker").strip() or "cyberjoker"
+    target = (getattr(args, "target", None) or "compositions-list").strip() \
+        or "compositions-list"
+    tag = (getattr(args, "tag", None) or "").strip() or None
+
+    run_dir_arg = getattr(args, "run_dir", None)
+    if run_dir_arg:
+        run_dir = Path(run_dir_arg)
+    elif tag:
+        run_dir = Path("/tmp/snowplow-runs") / tag
+    else:
+        run_dir = Path("/tmp/snowplow-runs") / "verify-serve-stale"
+
+    try:
+        exit_code, bundle = vss.run_verify_serve_stale(
+            user=user, target=target, tag=tag,
+            run_dir=run_dir,
+            log=log, section=section,
+        )
+        return int(exit_code)
+    except vss._VerifyError as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}verify-serve-stale ERROR: {e}{RESET}\n")
+        return 1
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}verify-serve-stale FAILED: "
+            f"{type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
 # ─── cmd_report (Block 4) ───────────────────────────────────────────────────
 
 
@@ -852,6 +906,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_rep.add_argument("--run-dir", dest="run_dir", required=True)
     p_rep.set_defaults(func=cmd_report)
+
+    # ─── verify-serve-stale ─────────────────────────────────────────────
+    p_vss = sub.add_parser(
+        "verify-serve-stale",
+        help=("Explicit serve-stale-while-refresh contract test "
+              "(3 probes around one composition annotation mutation)."),
+    )
+    p_vss.add_argument(
+        "--user", choices=["admin", "cyberjoker"],
+        default="cyberjoker",
+        help="Subject whose JWT issues the probes (default: cyberjoker).")
+    p_vss.add_argument(
+        "--target", choices=["compositions-list"],
+        default="compositions-list",
+        help="Resolver class under test (v1 supports compositions-list).")
+    p_vss.add_argument(
+        "--tag", default=None,
+        help="Image tag context (logged into the JSON bundle).")
+    p_vss.add_argument(
+        "--run-dir", dest="run_dir", default=None,
+        help="Bundle output directory (default: "
+             "/tmp/snowplow-runs/<tag>/).")
+    p_vss.set_defaults(func=cmd_verify_serve_stale)
 
     return p
 
