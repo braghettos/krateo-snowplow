@@ -47,6 +47,7 @@ __all__ = [
     "cmd_phase8",
     "cmd_report",
     "cmd_verify_serve_stale",
+    "cmd_probe_determinism",
     "verify_deployed_image",
 ]
 
@@ -730,6 +731,62 @@ def cmd_verify_serve_stale(args) -> int:
         return 1
 
 
+# ─── cmd_probe_determinism (body_sha stability under repeated reads) ───────
+
+
+def cmd_probe_determinism(args) -> int:
+    """Run the probe-determinism subcommand.
+
+    Disambiguates issue #161 — whether verify-serve-stale's
+    body_sha pre/mid/post mismatch (with identical key_hash) was caused
+    by refresher rewrite (1) or per-call response stamping (2). Single-
+    file subcommand; no cluster mutation.
+
+    Exit codes:
+        0 — DETERMINISTIC (all hit + body_sha stable)
+        2 — NON_DETERMINISTIC (all hit + body_sha differs)
+        3 — MIXED (at least one miss; re-run)
+        1 — INDETERMINATE_* (HTTP error / log gap / login failed)
+        3 — non-GKE context (inherited from _gke_context_guard)
+    """
+    from bench import probe_determinism as pd
+
+    allow_non_gke = bool(getattr(args, "allow_non_gke", False))
+    _gke_context_guard(allow_non_gke=allow_non_gke)
+
+    user = (getattr(args, "user", None) or "cyberjoker").strip() or "cyberjoker"
+    path = (getattr(args, "path", None) or "").strip()
+    probes_n = int(getattr(args, "probes", None) or 5)
+    tag = (getattr(args, "tag", None) or "").strip() or None
+    inter = float(getattr(args, "inter_probe_delay_s", None) or 0.0)
+
+    run_dir_arg = getattr(args, "run_dir", None)
+    if run_dir_arg:
+        run_dir = Path(run_dir_arg)
+    elif tag:
+        run_dir = Path("/tmp/snowplow-runs") / tag
+    else:
+        run_dir = Path("/tmp/snowplow-runs") / "probe-determinism"
+
+    try:
+        exit_code, _bundle = pd.run_probe_determinism(
+            user=user, target_path=path, probes_n=probes_n,
+            tag=tag, run_dir=run_dir,
+            inter_probe_delay_s=inter,
+            log=log, section=section,
+        )
+        return int(exit_code)
+    except pd._ProbeError as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}probe-determinism ERROR: {e}{RESET}\n")
+        return 1
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}probe-determinism FAILED: "
+            f"{type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
 # ─── cmd_report (Block 4) ───────────────────────────────────────────────────
 
 
@@ -906,6 +963,40 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_rep.add_argument("--run-dir", dest="run_dir", required=True)
     p_rep.set_defaults(func=cmd_report)
+
+    # ─── probe-determinism ──────────────────────────────────────────────
+    p_pd = sub.add_parser(
+        "probe-determinism",
+        help=("N back-to-back probes against the same /call path with "
+              "no mutation — verifies body_sha256 stability "
+              "(disambiguates #161 refresher-rewrite vs response-stamping)."),
+    )
+    p_pd.add_argument(
+        "--user", choices=["admin", "cyberjoker"],
+        default="cyberjoker",
+        help="Subject whose JWT issues the probes (default: cyberjoker).")
+    p_pd.add_argument(
+        "--path", required=True,
+        help="snowplow /call query path including leading '/' (e.g. "
+             "'/call?apiVersion=templates.krateo.io%%2Fv1"
+             "&resource=restactions&name=compositions-list"
+             "&namespace=krateo-system').")
+    p_pd.add_argument(
+        "--probes", type=int, default=5,
+        help="Number of back-to-back probes (default 5; min 2).")
+    p_pd.add_argument(
+        "--inter-probe-delay-s", dest="inter_probe_delay_s",
+        type=float, default=0.0,
+        help="Optional sleep between probes (default 0 — fire as fast "
+             "as urllib can; useful >0 to let refresher cycles tick).")
+    p_pd.add_argument(
+        "--tag", default=None,
+        help="Image tag context (logged into the JSON bundle).")
+    p_pd.add_argument(
+        "--run-dir", dest="run_dir", default=None,
+        help="Bundle output directory (default: "
+             "/tmp/snowplow-runs/<tag>/).")
+    p_pd.set_defaults(func=cmd_probe_determinism)
 
     # ─── verify-serve-stale ─────────────────────────────────────────────
     p_vss = sub.add_parser(
