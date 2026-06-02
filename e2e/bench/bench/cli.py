@@ -1,26 +1,17 @@
 """Command-line surface for the bench harness.
 
-Block 2 ships ONLY:
-  - `_gke_context_guard` (subset of `cluster.gke_context_guard` — delegates
-    so the canonical gate stays single-sourced; per PM carry-forward #2).
-  - `cmd_check(args)` — the 7-item preflight gate (no mutations, 60s budget).
-  - `verify_deployed_image()` — moved from worktree source 951-984; used by
-    `cmd_check` and (Block 4) `cmd_phase6`.
-  - `_setup_logger()` — coloured logger that replaces lifecycle.py's
-    Block-1 `log()` shim (per PM carry-forward #1).
+Subcommands: check, calibrate, cleanup, storm, converge, measure, phase6,
+phase7, phase8, report. Every entrypoint goes through `_gke_context_guard`
+first per feedback_kubectl_verify_gke_context.
 
-Subsequent commands (calibrate, cleanup, storm, converge, measure, phase6,
-phase7, phase8, report) land in Block 4. Every entrypoint passes through
-`_gke_context_guard()` first per feedback_kubectl_verify_gke_context.
-
-Per docs/bench-restructure-path-b-plan-2026-06-02.md §A.9 + §G Block 2.
+Per docs/bench-restructure-path-b-plan-2026-06-02.md §A.9 + §G Block 4.
 
 Exit codes:
   0 — success
   1 — generic failure
   2 — preflight gate fail (one or more gates FAILED; stderr names each)
   3 — non-GKE kubectl context (refused to operate)
-  4 — convergence timeout (raised by Block-3 ConvergenceTimeout)
+  4 — convergence timeout (raised by browser.ConvergenceTimeout)
 """
 
 from __future__ import annotations
@@ -33,6 +24,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from bench import cluster
 from bench.cluster import (
@@ -42,7 +34,20 @@ from bench.cluster import (
 )
 
 
-__all__ = ["main", "cmd_check", "verify_deployed_image"]
+__all__ = [
+    "main",
+    "cmd_check",
+    "cmd_calibrate",
+    "cmd_cleanup",
+    "cmd_storm",
+    "cmd_converge",
+    "cmd_measure",
+    "cmd_phase6",
+    "cmd_phase7",
+    "cmd_phase8",
+    "cmd_report",
+    "verify_deployed_image",
+]
 
 
 # ─── ANSI helpers + logger ──────────────────────────────────────────────────
@@ -451,7 +456,261 @@ def _stderr_log(msg):
     sys.stderr.write(f"  [{ts}] {msg}\n")
 
 
-# ─── argparse wiring (Block 2 — only `check`) ───────────────────────────────
+# ─── cmd_calibrate / cmd_cleanup / cmd_storm (Block 4) ──────────────────────
+
+
+def cmd_calibrate(args) -> int:
+    """Refresh the EXPECTED_CALLS overlay against the live cluster.
+
+    Wraps `bench.expected.run_calibrate_expected_calls`. Block 4 wires the
+    overlay-writer path; an acceptance run captures the actual overlay at
+    Block 5 time.
+    """
+    from bench.expected import run_calibrate_expected_calls
+    try:
+        out = run_calibrate_expected_calls()
+        log(f"calibrate: wrote overlay to {out}")
+        return 0
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}calibrate FAILED: {type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
+def cmd_cleanup(args) -> int:
+    """Cluster cleanup: clean_environment + assert_clean."""
+    from bench.lifecycle import clean_environment, assert_clean
+    allow_destructive = bool(getattr(args, "allow_destructive", False))
+    try:
+        clean_environment()
+        assert_clean(retry_with_cleanup=True,
+                     allow_destructive=allow_destructive)
+        log("cleanup: complete")
+        return 0
+    except SystemExit as e:
+        # destructive_clean_guard raises SystemExit; preserve its exit code.
+        return int(e.code) if isinstance(e.code, int) else 1
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}cleanup FAILED: {type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
+def cmd_storm(args) -> int:
+    """Run a disruptive scenario (storm.crb_delete_burst etc.)."""
+    from bench import browser, storm
+    scenario = getattr(args, "scenario", "crb-delete")
+    try:
+        tokens = browser.login_all()
+    except Exception:
+        tokens = {}
+    if not tokens:
+        sys.stderr.write(f"{RED}storm: login_all returned no tokens{RESET}\n")
+        return 1
+    if scenario == "crb-delete":
+        storm.crb_delete_burst(tokens)
+    elif scenario == "user-scaling":
+        storm.run_user_scaling(tokens)
+    else:
+        sys.stderr.write(
+            f"{RED}storm: unknown scenario {scenario!r}{RESET}\n")
+        return 1
+    return 0
+
+
+# ─── cmd_converge / cmd_measure (Block 4) ───────────────────────────────────
+
+
+def cmd_converge(args) -> int:
+    """Run a single Phase 6 stage with VERIFY poll only.
+
+    Wraps `phases.STAGE_REGISTRY[args.stage]` against the supplied
+    --run-dir + --tag + --scale.
+    """
+    from bench import phases, browser
+    stage_id = getattr(args, "stage", None)
+    if not stage_id or stage_id not in phases.STAGE_REGISTRY:
+        sys.stderr.write(
+            f"{RED}converge: --stage required (one of "
+            f"{sorted(phases.STAGE_REGISTRY)}){RESET}\n")
+        return 1
+    run_dir = Path(getattr(args, "run_dir", None) or _default_run_dir(args))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        tokens = browser.login_all()
+    except Exception:
+        tokens = {}
+    ctx = phases.StageContext(
+        tag=(getattr(args, "tag", None) or "").strip() or "unknown",
+        scale=int(getattr(args, "scale", None)
+                  or os.environ.get("SCALE", "5000")),
+        tokens=tokens,
+        admin_token=tokens.get("admin"),
+        run_dir=run_dir,
+        state_path=run_dir / "state.json",
+        cache_mode=getattr(args, "cache_mode", "OFF"),
+    )
+    try:
+        phases.STAGE_REGISTRY[stage_id](ctx)
+        return 0
+    except phases.ConvergenceTimeout as ct:
+        sys.stderr.write(
+            f"{RED}{BOLD}ConvergenceTimeout: {ct}{RESET}\n")
+        return 4
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}converge FAILED: {type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
+def cmd_measure(args) -> int:
+    """Alias of cmd_converge that REFUSES lifecycle mutation stages.
+
+    Allowed stages: S0, S1, S9. The S2-S8 stages mutate cluster state by
+    design (create_bench_namespaces, deploy_compositions, etc.), so
+    `bench measure` would not be a no-op.
+    """
+    measure_allowed = {"S0", "S1", "S9"}
+    stage_id = getattr(args, "stage", None)
+    if stage_id not in measure_allowed:
+        sys.stderr.write(
+            f"{RED}measure: --stage must be in {sorted(measure_allowed)} "
+            f"(others mutate cluster state — use `converge`).{RESET}\n")
+        return 1
+    return cmd_converge(args)
+
+
+# ─── cmd_phase6 / cmd_phase7 / cmd_phase8 (Block 4) ─────────────────────────
+
+
+def _default_run_dir(args) -> Path:
+    tag = (getattr(args, "tag", None) or
+           os.environ.get("EXPECTED_IMAGE_TAG", "unknown")).strip() or "unknown"
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return Path("/tmp/snowplow-runs") / tag / f"run-{ts}"
+
+
+def cmd_phase6(args) -> int:
+    """Run Phase 6 with --from-stage / --to-stage / --video / --scale.
+
+    On ConvergenceTimeout (raised by any stage runner after persisting
+    state.json), exits 4. On other failures, exits 1.
+    """
+    from bench import phases, browser
+    tag = (getattr(args, "tag", None) or
+           os.environ.get("EXPECTED_IMAGE_TAG", "unknown")).strip() or "unknown"
+    scale = int(getattr(args, "scale", None) or os.environ.get("SCALE", "5000"))
+    from_stage = getattr(args, "from_stage", None)
+    to_stage = getattr(args, "to_stage", None)
+    cache_mode = getattr(args, "cache_mode", "OFF")
+    video = getattr(args, "video", "representative")
+
+    run_dir_arg = getattr(args, "run_dir", None)
+    run_dir = Path(run_dir_arg) if run_dir_arg else _default_run_dir(args)
+
+    section(f"phase6 — {tag} scale={scale} from={from_stage} to={to_stage}")
+    log(f"run_dir={run_dir}")
+    try:
+        phases.run_phase6(
+            tag, scale,
+            from_stage=from_stage, to_stage=to_stage,
+            cache_mode=cache_mode, video=video, run_dir=run_dir,
+        )
+        return 0
+    except browser.ConvergenceTimeout as ct:
+        sys.stderr.write(
+            f"{RED}{BOLD}phase6 ConvergenceTimeout: {ct}{RESET}\n")
+        return 4
+    except phases.IncompatibleStateSchema as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}phase6: incompatible state.json schema: {e}{RESET}\n")
+        return 2
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}phase6 FAILED: {type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
+def cmd_phase7(args) -> int:
+    """Run Phase 7 (multi-user warmup-after-restart)."""
+    from bench import phases
+    try:
+        phases.run_phase7_user_scaling(
+            tag=getattr(args, "tag", None),
+            run_dir=getattr(args, "run_dir", None),
+        )
+        return 0
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}phase7 FAILED: {type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
+def cmd_phase8(args) -> int:
+    """Run Phase 8 (per-mutation convergence)."""
+    from bench import phases
+    run_dir = getattr(args, "run_dir", None)
+    try:
+        phases.run_phase8_per_mutation(
+            tag=getattr(args, "tag", None),
+            run_dir=Path(run_dir) if run_dir else None,
+        )
+        return 0
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}phase8 FAILED: {type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
+# ─── cmd_report (Block 4) ───────────────────────────────────────────────────
+
+
+def cmd_report(args) -> int:
+    """Read state.json + per-stage proofs; build ledger row + summary."""
+    from bench import phases, ledger
+    run_dir_arg = getattr(args, "run_dir", None)
+    if not run_dir_arg:
+        sys.stderr.write(
+            f"{RED}report: --run-dir is required{RESET}\n")
+        return 1
+    run_dir = Path(run_dir_arg)
+    try:
+        state = phases.load_state(run_dir)
+    except phases.IncompatibleStateSchema as e:
+        sys.stderr.write(
+            f"{RED}report: incompatible state.json schema: {e}{RESET}\n")
+        return 2
+    if not state:
+        sys.stderr.write(
+            f"{RED}report: state.json missing under {run_dir}{RESET}\n")
+        return 1
+    # Reconstruct all_results from the stage_proofs ingest hook is not
+    # done today — the bench harness keeps Phase 6 measurements in the
+    # ctx.all_results buffer during the live run and writes them via
+    # ledger.write_run_bundle at S9. cmd_report supports the post-hoc
+    # case where a run was interrupted before S9; we emit a row with
+    # whatever the state.json captures (verdict will likely be INVALID).
+    proofs = state.get("stage_proofs") or {}
+    # Try to recover any all_results stored in S6 / S9 proof for a
+    # backward-compat path. Today's stages don't stash all_results in
+    # the proof body — this is a forward-compat shim for future migrations.
+    fallback = []
+    for sid, p in proofs.items():
+        ar = (p.get("proof") or {}).get("all_results")
+        if ar:
+            fallback.extend(ar)
+    row = ledger.write_run_bundle(
+        run_dir, fallback,
+        per_stage_proofs=proofs,
+        tag=state.get("tag"),
+        scale=state.get("scale"),
+    )
+    log(f"report: ledger row verdict={row['verdict']}")
+    print(json.dumps(row, indent=2, default=str))
+    return 0
+
+
+# ─── argparse wiring ─────────────────────────────────────────────────────────
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -485,14 +744,111 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_check.set_defaults(func=cmd_check)
 
+    # ─── calibrate ──────────────────────────────────────────────────────
+    p_cal = sub.add_parser(
+        "calibrate",
+        help="Refresh EXPECTED_CALLS overlay against the live cluster.",
+    )
+    p_cal.add_argument("--tag", default=None,
+                       help="Image tag context (logged only).")
+    p_cal.set_defaults(func=cmd_calibrate)
+
+    # ─── cleanup ────────────────────────────────────────────────────────
+    p_clean = sub.add_parser(
+        "cleanup",
+        help="clean_environment + assert_clean (consults destructive guard).",
+    )
+    p_clean.add_argument("--allow-destructive", action="store_true",
+                         help="Bypass destructive_clean_guard (DANGER).")
+    p_clean.set_defaults(func=cmd_cleanup)
+
+    # ─── storm ──────────────────────────────────────────────────────────
+    p_storm = sub.add_parser(
+        "storm",
+        help="Disruptive scenarios: crb-delete, user-scaling.",
+    )
+    p_storm.add_argument("--scenario",
+                         choices=["crb-delete", "user-scaling"],
+                         default="crb-delete")
+    p_storm.set_defaults(func=cmd_storm)
+
+    # ─── converge / measure ─────────────────────────────────────────────
+    def _add_stage_args(parser, allowed=None):
+        parser.add_argument("--tag", default=None,
+                            help="Image tag under test.")
+        parser.add_argument("--scale", type=int, default=None,
+                            help="Target composition count.")
+        parser.add_argument("--stage", required=True,
+                            help="Stage ID (S0..S9).")
+        parser.add_argument("--cache-mode",
+                            dest="cache_mode",
+                            choices=["ON", "OFF"], default="OFF")
+        parser.add_argument("--run-dir", dest="run_dir", default=None)
+
+    p_conv = sub.add_parser("converge",
+                            help="Run a single Phase 6 stage.")
+    _add_stage_args(p_conv)
+    p_conv.set_defaults(func=cmd_converge)
+
+    p_meas = sub.add_parser("measure",
+                            help="Single-stage measurement (no mutations).")
+    _add_stage_args(p_meas)
+    p_meas.set_defaults(func=cmd_measure)
+
+    # ─── phase6 ─────────────────────────────────────────────────────────
+    p_p6 = sub.add_parser(
+        "phase6",
+        help="Browser scaling (S1-S8) with --from-stage / --to-stage.",
+    )
+    p_p6.add_argument("--tag", default=None,
+                      help="Image tag under test.")
+    p_p6.add_argument("--scale", type=int, default=None,
+                      help="Target composition count.")
+    p_p6.add_argument("--from-stage", dest="from_stage", default=None,
+                      help="Resume from this stage (S0..S9).")
+    p_p6.add_argument("--to-stage", dest="to_stage", default=None,
+                      help="Stop after this stage (S0..S9, inclusive).")
+    p_p6.add_argument("--cache-mode", dest="cache_mode",
+                      choices=["ON", "OFF", "BOTH"], default="OFF")
+    p_p6.add_argument("--video", choices=["none", "representative", "all"],
+                      default="representative")
+    p_p6.add_argument("--run-dir", dest="run_dir", default=None,
+                      help="Output bundle root.")
+    p_p6.add_argument("--allow-stale-overlay", action="store_true",
+                      dest="allow_stale_overlay")
+    p_p6.set_defaults(func=cmd_phase6)
+
+    # ─── phase7 / phase8 ────────────────────────────────────────────────
+    p_p7 = sub.add_parser("phase7",
+                          help="User scaling (synthetic users, warmup).")
+    p_p7.add_argument("--tag", default=None)
+    p_p7.add_argument("--run-dir", dest="run_dir", default=None)
+    p_p7.set_defaults(func=cmd_phase7)
+
+    p_p8 = sub.add_parser("phase8",
+                          help="Per-mutation convergence (HOT/WARM/COLD).")
+    p_p8.add_argument("--tag", default=None)
+    p_p8.add_argument("--run-dir", dest="run_dir", default=None)
+    p_p8.set_defaults(func=cmd_phase8)
+
+    # ─── report ─────────────────────────────────────────────────────────
+    p_rep = sub.add_parser(
+        "report",
+        help="Read run state + emit canonical ledger row.",
+    )
+    p_rep.add_argument("--run-dir", dest="run_dir", required=True)
+    p_rep.set_defaults(func=cmd_report)
+
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for `python -m bench`.
 
-    Returns the exit code; callers should `sys.exit(main())`. Block 2
-    only wires `check`; subsequent subcommands land in Block 4.
+    Returns the exit code; callers should `sys.exit(main())`.
+    Per feedback_kubectl_verify_gke_context: bench.cluster's import-time
+    guard runs first (already exited if non-GKE). Subcommand handlers
+    receive args with `--allow-non-gke` available; tests bypass via env.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -505,4 +861,9 @@ def main(argv: list[str] | None = None) -> int:
     if func is None:
         parser.print_help()
         return 0
-    return int(func(args))
+    try:
+        return int(func(args))
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        return 130

@@ -1,0 +1,358 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://krateo.io/snowplow/bench/ledger_row.schema.json",
+  "title": "Snowplow bench canonical ledger row",
+  "description": "Frozen schema covering docs/bench-restructure-path-b-plan-2026-06-02.md \u00a7F.1 key list. Bumping requires a fresh PM gate.",
+  "type": "object",
+  "required": [
+    "tag",
+    "ship_date",
+    "scale",
+    "uptime_at_capture_s",
+    "cells",
+    "mix_weighted",
+    "convergence_mass_s6_p99",
+    "convergence_mass_s7_p99",
+    "convergence_mass_s8_p99",
+    "convergence_per_mutation_p99_mix",
+    "convergence_per_class_hot_p99",
+    "convergence_per_class_warm_p99",
+    "convergence_per_class_cold_p99",
+    "tag_specific_verifications",
+    "pod_restart_count",
+    "validation",
+    "verdict"
+  ],
+  "properties": {
+    "tag": {
+      "type": "string"
+    },
+    "ship_date": {
+      "type": "string"
+    },
+    "scale": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "minItems": 1,
+      "maxItems": 2
+    },
+    "uptime_at_capture_s": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cells": {
+      "type": "object",
+      "required": [
+        "admin_on",
+        "admin_off",
+        "cyber_on",
+        "cyber_off"
+      ],
+      "properties": {
+        "admin_on": {
+          "type": "object",
+          "required": [
+            "cold_ms",
+            "warm_p50_ms",
+            "warm_p99_ms",
+            "valid_nav_count",
+            "invalid_nav_count",
+            "terminal_fail_rate"
+          ],
+          "properties": {
+            "cold_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p50_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p99_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "valid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "invalid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "terminal_fail_rate": {
+              "type": "number"
+            },
+            "mirrored_from": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "admin_off": {
+          "type": "object",
+          "required": [
+            "cold_ms",
+            "warm_p50_ms",
+            "warm_p99_ms",
+            "valid_nav_count",
+            "invalid_nav_count",
+            "terminal_fail_rate"
+          ],
+          "properties": {
+            "cold_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p50_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p99_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "valid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "invalid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "terminal_fail_rate": {
+              "type": "number"
+            },
+            "mirrored_from": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "cyber_on": {
+          "type": "object",
+          "required": [
+            "cold_ms",
+            "warm_p50_ms",
+            "warm_p99_ms",
+            "valid_nav_count",
+            "invalid_nav_count",
+            "terminal_fail_rate"
+          ],
+          "properties": {
+            "cold_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p50_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p99_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "valid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "invalid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "terminal_fail_rate": {
+              "type": "number"
+            },
+            "mirrored_from": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "cyber_off": {
+          "type": "object",
+          "required": [
+            "cold_ms",
+            "warm_p50_ms",
+            "warm_p99_ms",
+            "valid_nav_count",
+            "invalid_nav_count",
+            "terminal_fail_rate"
+          ],
+          "properties": {
+            "cold_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p50_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "warm_p99_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "valid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "invalid_nav_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "terminal_fail_rate": {
+              "type": "number"
+            },
+            "mirrored_from": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "mix_weighted": {
+      "type": "object",
+      "required": [
+        "cold_ms",
+        "warm_p50_ms",
+        "warm_p99_ms"
+      ],
+      "properties": {
+        "cold_ms": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "warm_p50_ms": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "warm_p99_ms": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "convergence_mass_s6_p99": {
+      "type": "integer"
+    },
+    "convergence_mass_s7_p99": {
+      "type": "integer"
+    },
+    "convergence_mass_s8_p99": {
+      "type": "integer"
+    },
+    "convergence_per_mutation_p99_mix": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "convergence_per_class_hot_p99": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "convergence_per_class_warm_p99": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "convergence_per_class_cold_p99": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "tag_specific_verifications": {
+      "type": "object"
+    },
+    "pod_restart_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "validation": {
+      "type": "object",
+      "required": [
+        "navs_terminal_pass",
+        "navs_terminal_fail",
+        "skeleton_failures",
+        "errored_widgets_total",
+        "call_count_mismatches"
+      ],
+      "properties": {
+        "navs_terminal_pass": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "navs_terminal_fail": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skeleton_failures": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "errored_widgets_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "call_count_mismatches": {
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "WEAK_PASS",
+        "FAIL",
+        "FLOOR",
+        "INVALID",
+        "REJECT"
+      ]
+    }
+  },
+  "additionalProperties": true
+}

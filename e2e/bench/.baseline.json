@@ -1,0 +1,7 @@
+{
+  "baseline_tag": null,
+  "baseline_warm_p50_ms": null,
+  "captured_at": null,
+  "source": "project_north_star_ledger.md most-recent PASS row at Block 5 start",
+  "_notes": "Block 4 ships the FILE FORMAT + ledger.read_baseline() reader. Block 5 captures the actual baseline values at acceptance-run time. Both fields null = no anchor yet; ledger.compute_baseline_delta() returns None and the ±15% gate becomes informational, not blocking."
+}
