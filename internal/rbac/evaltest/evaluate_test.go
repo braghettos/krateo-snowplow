@@ -141,7 +141,7 @@ func TestEvaluateRBAC_AllowByClusterRoleBinding(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
 	})
 	if err != nil {
@@ -162,7 +162,7 @@ func TestEvaluateRBAC_AllowByRoleBindingToRole(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "bob", Verb: "list", Group: "", Resource: "configmaps", Namespace: "demo-system",
 	})
 	if err != nil {
@@ -183,7 +183,7 @@ func TestEvaluateRBAC_AllowByRoleBindingToClusterRole(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "charlie", Verb: "get", Group: "", Resource: "pods", Namespace: "demo-system",
 	})
 	if err != nil {
@@ -204,7 +204,7 @@ func TestEvaluateRBAC_DenyWhenNoBindingMatches(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "eve", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
 	})
 	if err != nil {
@@ -232,7 +232,7 @@ func TestEvaluateRBAC_WildcardVerbAndResource(t *testing.T) {
 		{"delete", "secrets"},
 		{"list", "pods"},
 	} {
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "alice", Verb: c.verb, Group: "", Resource: c.resource, Namespace: "default",
 		})
 		if err != nil {
@@ -254,7 +254,7 @@ func TestEvaluateRBAC_WildcardAPIGroup(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "templates.krateo.io", Resource: "restactions", Namespace: "default",
 	})
 	if err != nil {
@@ -275,7 +275,7 @@ func TestEvaluateRBAC_GroupMembershipMatch(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "cyberjoker", Groups: []string{"devs"},
 		Verb: "get", Group: "", Resource: "configmaps", Namespace: "default",
 	})
@@ -297,7 +297,7 @@ func TestEvaluateRBAC_ServiceAccountSubjectMatch(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "system:serviceaccount:krateo-system:snowplow",
 		Verb:     "create", Group: "", Resource: "events", Namespace: "any",
 	})
@@ -320,7 +320,7 @@ func TestEvaluateRBAC_NamespaceScopeNotEscalated(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "bob", Verb: "list", Group: "", Resource: "configmaps", Namespace: "other",
 	})
 	if err != nil {
@@ -348,7 +348,7 @@ func TestEvaluateRBAC_CacheOffFallsThroughToSAR(t *testing.T) {
 	}
 
 	// No UserConfig in ctx — UserCan will log error and return false.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "configmaps", Namespace: "default",
 	})
 	if err != nil {
@@ -398,7 +398,7 @@ func TestEvaluateRBAC_CacheOnNeverCallsSAR(t *testing.T) {
 		{Username: "eve", Verb: "get", Group: "", Resource: "secrets", Namespace: "default"},
 		{Username: "alice", Verb: "delete", Group: "", Resource: "configmaps", Namespace: "demo-system"},
 	} {
-		if _, err := rbac.EvaluateRBAC(context.Background(), opts); err != nil {
+		if _, _, err := rbac.EvaluateRBAC(context.Background(), opts); err != nil {
 			t.Fatalf("EvaluateRBAC: %v", err)
 		}
 	}
@@ -417,7 +417,7 @@ func TestEvaluateRBAC_CacheOnWithoutGlobalDenies(t *testing.T) {
 	cache.SetGlobal(nil)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
 	})
 	if err == nil {
@@ -520,7 +520,7 @@ func TestEvaluateRBAC_TypedHappyPath(t *testing.T) {
 		{"eve", "get", "anything", false},     // no binding
 	}
 	for _, c := range cases {
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: c.user, Verb: c.verb, Group: "", Resource: c.resource, Namespace: "default",
 		})
 		if err != nil {
@@ -572,7 +572,7 @@ func TestEvaluateRBAC_UnstructuredFallbackEquivalence(t *testing.T) {
 	}
 
 	// EvaluateRBAC MUST still produce a correct allow.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
 	})
 	if err != nil {
@@ -583,7 +583,7 @@ func TestEvaluateRBAC_UnstructuredFallbackEquivalence(t *testing.T) {
 	}
 
 	// Negative: deny case must also be correct.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "eve", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
 	})
 	if err != nil {
@@ -618,7 +618,7 @@ func TestEvaluateRBAC_SubjectIndex_AllKinds(t *testing.T) {
 			clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
 			clusterRoleBinding("admin-bind", "admin", userSubject("alice-169")),
 		)
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "alice-169", Verb: "get", Resource: "secrets", Namespace: "default",
 		})
 		if err != nil {
@@ -634,7 +634,7 @@ func TestEvaluateRBAC_SubjectIndex_AllKinds(t *testing.T) {
 			clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
 			clusterRoleBinding("admin-bind", "admin", groupSubject("devs-169")),
 		)
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "bob-169", Groups: []string{"devs-169"},
 			Verb: "get", Resource: "secrets", Namespace: "default",
 		})
@@ -651,7 +651,7 @@ func TestEvaluateRBAC_SubjectIndex_AllKinds(t *testing.T) {
 			clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
 			clusterRoleBinding("admin-bind", "admin", saSubject("krateo-system", "snowplow-169")),
 		)
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "system:serviceaccount:krateo-system:snowplow-169",
 			Groups:   []string{"system:authenticated"},
 			Verb:     "get", Resource: "secrets", Namespace: "default",
@@ -674,7 +674,7 @@ func TestEvaluateRBAC_SubjectIndex_AllKinds(t *testing.T) {
 				groupSubject("system:authenticated"),
 			),
 		)
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "anyone-169",
 			Verb:     "get", Resource: "secrets", Namespace: "default",
 		})
@@ -696,7 +696,7 @@ func TestEvaluateRBAC_SubjectIndex_AllKinds(t *testing.T) {
 				groupSubject("system:serviceaccounts:krateo-system"),
 			),
 		)
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "system:serviceaccount:krateo-system:any-sa",
 			Groups:   []string{"system:authenticated"},
 			Verb:     "get", Resource: "secrets", Namespace: "default",
@@ -718,7 +718,7 @@ func TestEvaluateRBAC_SubjectIndex_AllKinds(t *testing.T) {
 				userSubject("carol-169"),
 			),
 		)
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "carol-169", Verb: "get", Resource: "configmaps", Namespace: "ns-169",
 		})
 		if err != nil {
@@ -757,7 +757,7 @@ func TestEvaluateRBAC_SubjectIndex_NegativesUnaffected(t *testing.T) {
 	for _, opts := range deniedCases {
 		opts := opts
 		t.Run(opts.Username, func(t *testing.T) {
-			ok, err := rbac.EvaluateRBAC(context.Background(), opts)
+			ok, _, err := rbac.EvaluateRBAC(context.Background(), opts)
 			if err != nil {
 				t.Fatalf("EvaluateRBAC: %v", err)
 			}

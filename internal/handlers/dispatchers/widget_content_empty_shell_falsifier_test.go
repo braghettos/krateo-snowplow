@@ -151,15 +151,20 @@ func TestLever2_ApistageRefreshUsesSACanonicalIdentity(t *testing.T) {
 	}
 }
 
-// TestLever2_PerCohortClassesStillUseRepresentativeIdentity is the LEAK
-// REGRESSION GUARD. The per-cohort identity-bound classes (widgets /
-// restactions / RAFullList) are keyed by BindingSetHash and MUST refresh
-// under the cohort's REPRESENTATIVE identity — NEVER the SA override. If
-// lever 2 leaked into these classes, a cohort cell would be re-resolved
-// with SA-maximal visibility and then served (no per-user gate on the
-// per-cohort widgets class) → cross-cohort data leak
+// TestLever2_PerBindingClassesStillUseRepresentativeIdentity is the LEAK
+// REGRESSION GUARD. The per-binding identity-bound classes (widgets /
+// restactions / RAFullList) are keyed by BindingUID and MUST refresh
+// under the binding's REPRESENTATIVE identity — NEVER the SA override.
+// If lever 2 leaked into these classes, a per-binding cell would be
+// re-resolved with SA-maximal visibility and then served (no per-user
+// gate on the per-binding widgets class) → cross-binding data leak
 // (feedback_l1_per_user_keyed_never_cohort). This guards that boundary.
-func TestLever2_PerCohortClassesStillUseRepresentativeIdentity(t *testing.T) {
+//
+// Ship 0.30.242 H.c-layered Phase 2c — renamed from
+// PerCohortClassesStillUseRepresentativeIdentity to reflect the
+// per-binding granularity that replaced per-cohort keying. Test body
+// semantics unchanged; field rename from BindingSetHash → BindingUID.
+func TestLever2_PerBindingClassesStillUseRepresentativeIdentity(t *testing.T) {
 	saEP := &endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc", Token: phase1RealSAToken}
 	saRC := &rest.Config{Host: "https://kubernetes.default.svc"}
 
@@ -172,7 +177,7 @@ func TestLever2_PerCohortClassesStillUseRepresentativeIdentity(t *testing.T) {
 				Resource:               "panels",
 				Namespace:              "krateo-system",
 				Name:                   "some-panel",
-				BindingSetHash:         0xc01dface,
+				BindingUID:             "uid-c01dface",
 				RepresentativeUsername: "cyberjoker",
 				RepresentativeGroups:   []string{"devs"},
 			}

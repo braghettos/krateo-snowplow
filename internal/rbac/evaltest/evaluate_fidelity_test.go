@@ -56,7 +56,7 @@ func TestEvaluateRBAC_ResourceNamesScopesGet(t *testing.T) {
 	)
 
 	// get foo — IN the resourceNames list → permit.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get",
 		Group: "templates.krateo.io", Resource: "restactions",
 		Namespace: "default", Name: "foo",
@@ -70,7 +70,7 @@ func TestEvaluateRBAC_ResourceNamesScopesGet(t *testing.T) {
 
 	// get bar — NOT in the resourceNames list → deny. This is the
 	// leak that 0.30.109 closes: before the fix this returned permit.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get",
 		Group: "templates.krateo.io", Resource: "restactions",
 		Namespace: "default", Name: "bar",
@@ -108,7 +108,7 @@ func TestEvaluateRBAC_ResourceNamesDoesNotGrantList(t *testing.T) {
 	// resourceNames means the rule cannot grant the collection verb.
 	// Name is "foo" (the per-item name filterListByRBAC threads) — it
 	// must STILL deny, because the verb itself is collection-scoped.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "list",
 		Group: "templates.krateo.io", Resource: "restactions",
 		Namespace: "default", Name: "foo",
@@ -123,7 +123,7 @@ func TestEvaluateRBAC_ResourceNamesDoesNotGrantList(t *testing.T) {
 
 	// Sanity: the same rule still grants `get foo` — the resourceNames
 	// scope only suppresses collection verbs, not name-specific ones.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get",
 		Group: "templates.krateo.io", Resource: "restactions",
 		Namespace: "default", Name: "foo",
@@ -153,7 +153,7 @@ func TestEvaluateRBAC_ResourceNamesWildcardVerb(t *testing.T) {
 	)
 
 	// get foo — wildcard verb + name match → permit.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "secrets",
 		Namespace: "default", Name: "foo",
 	})
@@ -165,7 +165,7 @@ func TestEvaluateRBAC_ResourceNamesWildcardVerb(t *testing.T) {
 	}
 
 	// delete foo — name-specific verb, name match → permit.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "delete", Group: "", Resource: "secrets",
 		Namespace: "default", Name: "foo",
 	})
@@ -177,7 +177,7 @@ func TestEvaluateRBAC_ResourceNamesWildcardVerb(t *testing.T) {
 	}
 
 	// list — collection verb, must deny even with verb wildcard.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "list", Group: "", Resource: "secrets",
 		Namespace: "default", Name: "foo",
 	})
@@ -189,7 +189,7 @@ func TestEvaluateRBAC_ResourceNamesWildcardVerb(t *testing.T) {
 	}
 
 	// get bar — name not in list → deny.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "secrets",
 		Namespace: "default", Name: "bar",
 	})
@@ -223,7 +223,7 @@ func TestEvaluateRBAC_EmptyResourceNamesUnchanged(t *testing.T) {
 		{"list", ""},
 		{"list", "anything"},
 	} {
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: "alice", Verb: c.verb, Group: "", Resource: "configmaps",
 			Namespace: "default", Name: c.name,
 		})
@@ -252,7 +252,7 @@ func TestEvaluateRBAC_ResourceNamesViaRoleBinding(t *testing.T) {
 	)
 
 	// get app-secret — permit.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "bob", Verb: "get", Group: "", Resource: "secrets",
 		Namespace: "demo-system", Name: "app-secret",
 	})
@@ -264,7 +264,7 @@ func TestEvaluateRBAC_ResourceNamesViaRoleBinding(t *testing.T) {
 	}
 
 	// get other-secret — deny.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "bob", Verb: "get", Group: "", Resource: "secrets",
 		Namespace: "demo-system", Name: "other-secret",
 	})
@@ -276,7 +276,7 @@ func TestEvaluateRBAC_ResourceNamesViaRoleBinding(t *testing.T) {
 	}
 
 	// list — deny (collection verb).
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "bob", Verb: "list", Group: "", Resource: "secrets",
 		Namespace: "demo-system", Name: "app-secret",
 	})
@@ -309,7 +309,7 @@ func TestEvaluateRBAC_SAGroupNamespaceScoped(t *testing.T) {
 
 	// A ServiceAccount IN ns1 — implicitly a member of
 	// system:serviceaccounts:ns1 → permit.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "system:serviceaccount:ns1:worker",
 		Verb:     "get", Group: "", Resource: "configmaps", Namespace: "default",
 	})
@@ -322,7 +322,7 @@ func TestEvaluateRBAC_SAGroupNamespaceScoped(t *testing.T) {
 
 	// A ServiceAccount in ns2 — NOT a member of
 	// system:serviceaccounts:ns1 → deny.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "system:serviceaccount:ns2:worker",
 		Verb:     "get", Group: "", Resource: "configmaps", Namespace: "default",
 	})
@@ -352,7 +352,7 @@ func TestEvaluateRBAC_SAAllServiceAccountsGroup(t *testing.T) {
 		"system:serviceaccount:ns2:builder",
 		"system:serviceaccount:krateo-system:snowplow",
 	} {
-		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 			Username: sa, Verb: "get", Group: "", Resource: "pods", Namespace: "default",
 		})
 		if err != nil {
@@ -364,7 +364,7 @@ func TestEvaluateRBAC_SAAllServiceAccountsGroup(t *testing.T) {
 	}
 
 	// A NON-ServiceAccount user must NOT gain the synthetic group.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "alice", Verb: "get", Group: "", Resource: "pods", Namespace: "default",
 	})
 	if err != nil {
@@ -388,7 +388,7 @@ func TestEvaluateRBAC_SASyntheticGroupViaRoleBinding(t *testing.T) {
 	)
 
 	// SA in ns1, request in demo-system (the RoleBinding's namespace) → permit.
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "system:serviceaccount:ns1:worker",
 		Verb:     "create", Group: "", Resource: "events", Namespace: "demo-system",
 	})
@@ -400,7 +400,7 @@ func TestEvaluateRBAC_SASyntheticGroupViaRoleBinding(t *testing.T) {
 	}
 
 	// SA in ns2 → deny.
-	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "system:serviceaccount:ns2:worker",
 		Verb:     "create", Group: "", Resource: "events", Namespace: "demo-system",
 	})
@@ -426,7 +426,7 @@ func TestEvaluateRBAC_SAExplicitSubjectStillWorks(t *testing.T) {
 		),
 	)
 
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username: "system:serviceaccount:krateo-system:snowplow",
 		Verb:     "create", Group: "", Resource: "events", Namespace: "any",
 	})

@@ -40,7 +40,7 @@ func TestShip11Probe_SA_ListNamespaces_ClusterScope(t *testing.T) {
 			saSubject("krateo-system", "snowplow"),
 		),
 	)
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username:  "system:serviceaccount:krateo-system:snowplow",
 		Verb:      "list",
 		Group:     "",
@@ -67,7 +67,7 @@ func TestShip11Probe_SA_ListNamespaces_ConcreteNS(t *testing.T) {
 			saSubject("krateo-system", "snowplow"),
 		),
 	)
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username:  "system:serviceaccount:krateo-system:snowplow",
 		Verb:      "list",
 		Group:     "",
@@ -91,7 +91,7 @@ func TestShip11Probe_User_ListNamespaces_ClusterScope(t *testing.T) {
 			userSubject("alice"),
 		),
 	)
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username:  "alice",
 		Verb:      "list",
 		Group:     "",
@@ -117,7 +117,7 @@ func TestShip11Probe_Group_ListNamespaces_ClusterScope(t *testing.T) {
 			groupSubject("admins"),
 		),
 	)
-	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
 		Username:  "system:cohort:group-only:v1",
 		Groups:    []string{"admins", "system:authenticated"},
 		Verb:      "list",

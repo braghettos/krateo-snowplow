@@ -316,9 +316,15 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 	// (a) verdict MUST stay UNKNOWN — NOT recorded as sliceable.
 	shape := cache.SliceShapeHash(raFullListCallerClass, gvr().Group, gvr().Version,
 		gvr().Resource, "krateo-system", raName, raSliceJQ)
+	// Ship 0.30.242 H.c-layered Phase 2c — the production code path
+	// (ra_full_list.go:85) derives BindingUID via direct rbac.EvaluateRBAC.
+	// In this test harness without a configured RBAC snapshot, the
+	// evaluator returns ("", "", err) — cache.BindingUIDFromCRB/FromRB
+	// is unreachable, so bindingUID == "". The test's raKey computation
+	// MUST match: empty BindingUID.
 	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName,
-		cache.BindingSetHash("admin", []string{"system:masters"}), nil)
+		"", nil)
 	raKey := cache.ComputeKey(keyInputs)
 	if _, known := cache.SliceabilityLookup(raKey, shape); known {
 		t.Fatalf("empty full MUST NOT record a sliceability verdict (must stay UNKNOWN/re-verifiable)")

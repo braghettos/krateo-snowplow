@@ -59,7 +59,7 @@ func TestComputeKey_StableAcrossCalls(t *testing.T) {
 		Resource:        "compositionsgrids",
 		Namespace:       "demo",
 		Name:            "main",
-		BindingSetHash:  0x0123456789abcdef, // Ship A.3 / 0.30.179
+		BindingUID:      "uid-0123456789abcdef", // Ship 0.30.242 H.c-layered (replaces BindingSetHash uint64)
 		PerPage:         20,
 		Page:            1,
 		Extras:          map[string]any{"foo": "bar", "n": float64(7)},
@@ -74,21 +74,22 @@ func TestComputeKey_StableAcrossCalls(t *testing.T) {
 	}
 }
 
-// Ship A.3 / 0.30.179 — group order invariance moves from ComputeKey to
-// BindingSetHash (which sorts pointer addresses). At the ComputeKey layer
-// two inputs with the same BindingSetHash hash identically by construction.
-func TestComputeKey_BindingSetHashInvariant(t *testing.T) {
-	in1 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x42}
-	in2 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0x42}
+// Ship 0.30.242 H.c-layered Phase 2c — BindingUID (per-layer first-match
+// binding identity) replaces BindingSetHash uint64 as the identity fold.
+// At the ComputeKey layer two inputs with the same BindingUID hash
+// identically by construction.
+func TestComputeKey_BindingUIDInvariant(t *testing.T) {
+	in1 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-0042"}
+	in2 := ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-0042"}
 	if ComputeKey(in1) != ComputeKey(in2) {
-		t.Fatalf("ComputeKey should be deterministic on identical BindingSetHash; got divergent keys")
+		t.Fatalf("ComputeKey should be deterministic on identical BindingUID; got divergent keys")
 	}
 }
 
 func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 	base := ResolvedKeyInputs{
 		CacheEntryClass: "widgets", Group: "g", Version: "v", Resource: "r",
-		Namespace: "ns", Name: "n", BindingSetHash: 0x01,
+		Namespace: "ns", Name: "n", BindingUID: "uid-01",
 		PerPage: 1, Page: 1, Extras: map[string]any{"k": "v"},
 	}
 	mutators := []struct {
@@ -101,7 +102,7 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 		{"Resource", func(in *ResolvedKeyInputs) { in.Resource = "r2" }},
 		{"Namespace", func(in *ResolvedKeyInputs) { in.Namespace = "ns2" }},
 		{"Name", func(in *ResolvedKeyInputs) { in.Name = "n2" }},
-		{"BindingSetHash", func(in *ResolvedKeyInputs) { in.BindingSetHash = 0x02 }},
+		{"BindingUID", func(in *ResolvedKeyInputs) { in.BindingUID = "uid-02" }},
 		{"PerPage", func(in *ResolvedKeyInputs) { in.PerPage = 2 }},
 		{"Page", func(in *ResolvedKeyInputs) { in.Page = 2 }},
 		{"Extras", func(in *ResolvedKeyInputs) { in.Extras = map[string]any{"k": "w"} }},
@@ -275,7 +276,7 @@ func TestResolvedCache_EmptyTreatedAsMiss(t *testing.T) {
 func TestComputeKey_EmptyStageByteIdenticalToPreShipE(t *testing.T) {
 	in := ResolvedKeyInputs{
 		CacheEntryClass: "restactions", Group: "g", Version: "v", Resource: "r",
-		Namespace: "ns", Name: "n", BindingSetHash: 0xabc,
+		Namespace: "ns", Name: "n", BindingUID: "uid-0abc",
 		PerPage: 1, Page: 1,
 	}
 	withEmptyStage := in

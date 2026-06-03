@@ -108,7 +108,7 @@ func TestFA98_2_YieldEngagesEndToEnd(t *testing.T) {
 	done := markCustomerInFlightForTest()
 
 	c := cache.ResolvedCache()
-	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", BindingSetHash: 0xCAFE}
+	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", BindingUID: "uid-cafe"}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 

@@ -73,6 +73,11 @@ func buildSnap(crbs []*rbacv1.ClusterRoleBinding, crs []*rbacv1.ClusterRole) *RB
 	return s
 }
 
+// Ship 0.30.242 H.c-layered Phase 2c — assertions migrated from
+// EnumerateResourceCohorts (deleted) to EnumeratePrewarmTargetsForGVR.
+// Same INDEX BEHAVIOUR under test (the wildcard bucket matches every
+// navigated GVR); assertion shape adapted to per-binding targets
+// instead of per-cohort tuples.
 func TestBindingsByGVRIndex_WildcardMatchesEveryGVR(t *testing.T) {
 	ResetBindingsByGVRIndexForTest()
 
@@ -89,18 +94,23 @@ func TestBindingsByGVRIndex_WildcardMatchesEveryGVR(t *testing.T) {
 		t.Fatalf("expected 1 binding enrolled, got %d", n)
 	}
 
-	// The wildcard binding must match EVERY navigated GVR.
+	// The wildcard binding must match EVERY navigated GVR; one
+	// per-binding target per GVR with the admin user as representative.
 	for _, g := range navigated {
-		cohorts := EnumerateResourceCohorts(g)
-		if len(cohorts) != 1 {
-			t.Fatalf("gvr %s: expected 1 cohort (admin via wildcard), got %d: %+v", g, len(cohorts), cohorts)
+		targets := EnumeratePrewarmTargetsForGVR(g, "list")
+		if len(targets) != 1 {
+			t.Fatalf("gvr %s: expected 1 target (admin via wildcard), got %d: %+v", g, len(targets), targets)
 		}
-		if cohorts[0].Username != "admin" {
-			t.Fatalf("gvr %s: expected admin cohort, got %q", g, cohorts[0].Username)
+		if targets[0].Subject.Username != "admin" {
+			t.Fatalf("gvr %s: expected admin representative, got %q", g, targets[0].Subject.Username)
 		}
 	}
 }
 
+// Ship 0.30.242 H.c-layered Phase 2c — migrated assertion shape.
+// Group-only cohort sentinel semantics (groupOnlyCohortSentinel +
+// [group]) collapse to Subject.Username="" + Subject.Groups=[group]
+// per pickRepresentativeFromSubjectKeys (prewarm_enumeration.go).
 func TestBindingsByGVRIndex_ExactMatchScopesToGVR(t *testing.T) {
 	ResetBindingsByGVRIndexForTest()
 
@@ -115,18 +125,18 @@ func TestBindingsByGVRIndex_ExactMatchScopesToGVR(t *testing.T) {
 	panelGVR := gr("widgets.templates.krateo.io", "panels")
 	BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR, panelGVR})
 
-	// devs matches compositions (group-only sentinel cohort).
-	comp := EnumerateResourceCohorts(compGVR)
+	// devs matches compositions (group-only representative: empty Username + [devs] Groups).
+	comp := EnumeratePrewarmTargetsForGVR(compGVR, "list")
 	if len(comp) != 1 {
-		t.Fatalf("compositions: expected 1 cohort, got %d: %+v", len(comp), comp)
+		t.Fatalf("compositions: expected 1 target, got %d: %+v", len(comp), comp)
 	}
-	if comp[0].Username != groupOnlyCohortSentinel || len(comp[0].Groups) != 1 || comp[0].Groups[0] != "devs" {
-		t.Fatalf("compositions cohort: want sentinel+[devs], got %+v", comp[0])
+	if comp[0].Subject.Username != "" || len(comp[0].Subject.Groups) != 1 || comp[0].Subject.Groups[0] != "devs" {
+		t.Fatalf("compositions representative: want group-only [devs], got %+v", comp[0].Subject)
 	}
 
 	// devs does NOT match panels — the scoping must exclude it.
-	if pan := EnumerateResourceCohorts(panelGVR); len(pan) != 0 {
-		t.Fatalf("panels: expected 0 cohorts (devs doesn't grant panels), got %d: %+v", len(pan), pan)
+	if pan := EnumeratePrewarmTargetsForGVR(panelGVR, "list"); len(pan) != 0 {
+		t.Fatalf("panels: expected 0 targets (devs doesn't grant panels), got %d: %+v", len(pan), pan)
 	}
 }
 
@@ -146,13 +156,13 @@ func TestBindingsByGVRIndex_DeltaAddRemove(t *testing.T) {
 	PublishRBACSnapshotForTest(snap)
 
 	BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR})
-	if got := cohortUsernames(EnumerateResourceCohorts(compGVR)); !equalSorted(got, []string{"admin", groupOnlyCohortSentinel}) {
-		t.Fatalf("after build: want [admin sentinel], got %v", got)
+	if got := targetRepresentativeLabels(EnumeratePrewarmTargetsForGVR(compGVR, "list")); !equalSorted(got, []string{"admin", "group:devs"}) {
+		t.Fatalf("after build: want [admin group:devs], got %v", got)
 	}
 
 	// DELETE devs binding → only admin (wildcard) remains.
 	onBindingDelete(devsCRB)
-	if got := cohortUsernames(EnumerateResourceCohorts(compGVR)); !equalSorted(got, []string{"admin"}) {
+	if got := targetRepresentativeLabels(EnumeratePrewarmTargetsForGVR(compGVR, "list")); !equalSorted(got, []string{"admin"}) {
 		t.Fatalf("after devs delete: want [admin], got %v", got)
 	}
 
@@ -166,14 +176,14 @@ func TestBindingsByGVRIndex_DeltaAddRemove(t *testing.T) {
 		[]*rbacv1.ClusterRole{adminCR, opsCR})
 	PublishRBACSnapshotForTest(snap2)
 	onBindingAdd(opsCRB)
-	if got := cohortUsernames(EnumerateResourceCohorts(compGVR)); !equalSorted(got, []string{"admin", groupOnlyCohortSentinel}) {
-		t.Fatalf("after ops add: want [admin sentinel], got %v", got)
+	if got := targetRepresentativeLabels(EnumeratePrewarmTargetsForGVR(compGVR, "list")); !equalSorted(got, []string{"admin", "group:ops"}) {
+		t.Fatalf("after ops add: want [admin group:ops], got %v", got)
 	}
 }
 
 func TestBindingsByGVRIndex_NotBuiltReturnsNil(t *testing.T) {
 	ResetBindingsByGVRIndexForTest()
-	if c := EnumerateResourceCohorts(gr("composition.krateo.io", "compositions")); c != nil {
+	if c := EnumeratePrewarmTargetsForGVR(gr("composition.krateo.io", "compositions"), "list"); c != nil {
 		t.Fatalf("expected nil before build, got %+v", c)
 	}
 	if BindingsByGVRIndexBuilt() {
@@ -220,7 +230,7 @@ func TestRAFullListMemoExpvarPublished(t *testing.T) {
 
 	// Seed two entries: one TRUE verdict + labels, one FALSE verdict + labels.
 	raKeyA := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
-		"krateo-system", "compositions-panels", 0x1234, nil))
+		"krateo-system", "compositions-panels", "uid-1234", nil))
 	shapeA := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
 		"tables", "krateo-system", "compositions-page-datagrid", "{}")
 	labelsA := SliceabilityLabels{
@@ -234,7 +244,7 @@ func TestRAFullListMemoExpvarPublished(t *testing.T) {
 	RecordSliceabilityWithLabels(raKeyA, shapeA, true, labelsA)
 
 	raKeyB := ComputeKey(RAFullListKeyInputs("composition.krateo.io", "v1", "panels",
-		"OTHER-NS", "compositions-panels", 0xC0FFEE, nil))
+		"OTHER-NS", "compositions-panels", "uid-c0ffee", nil))
 	shapeB := SliceShapeHash("apiref", "widgets.templates.krateo.io", "v1beta1",
 		"charts", "krateo-system", "compositions-chart", "{ sum: 0 }")
 	labelsB := SliceabilityLabels{
@@ -888,10 +898,27 @@ func TestRAFullListServeExpvarPublished(t *testing.T) {
 
 // ── helpers ──
 
-func cohortUsernames(cs []Cohort) []string {
-	out := make([]string, 0, len(cs))
-	for _, c := range cs {
-		out = append(out, c.Username)
+// targetRepresentativeLabels renders the per-binding targets' representative
+// SubjectIdentity into stable string labels for set-equality assertions.
+// User-kind representative → bare username (e.g. "admin"). Group-only
+// representative (Username=="", single Group) → "group:<name>". SA-kind →
+// the canonical "system:serviceaccount:<ns>:<name>" Username form. Used by
+// the BindingsByGVRIndex tests to assert WHICH bindings landed without
+// pinning to the per-binding UIDs (which the test fixtures synthesise).
+//
+// Ship 0.30.242 H.c-layered Phase 2c — replaces the pre-ship cohortUsernames
+// helper that returned []Cohort.Username; cohort type is deleted.
+func targetRepresentativeLabels(ts []PrewarmTarget) []string {
+	out := make([]string, 0, len(ts))
+	for _, t := range ts {
+		switch {
+		case t.Subject.Username != "":
+			out = append(out, t.Subject.Username)
+		case len(t.Subject.Groups) > 0:
+			out = append(out, "group:"+t.Subject.Groups[0])
+		default:
+			out = append(out, "<anonymous>")
+		}
 	}
 	return out
 }
@@ -915,7 +942,7 @@ func equalSorted(a, b []string) bool {
 // TestBindingsByGVRIndex_ConcurrentRace (M1) — the concurrency falsifier.
 // N goroutines mutate the index via the delta hooks (onBindingAdd /
 // onBindingUpdate / onBindingDelete / onRoleObjectChanged), M goroutines
-// enumerate (EnumerateResourceCohorts), and one rebuilds
+// enumerate (EnumeratePrewarmTargetsForGVR), and one rebuilds
 // (BuildBindingsByGVRIndex) — all concurrent against the singleton. The
 // real hazard is the RBAC informer processor goroutine mutating while the
 // engine goroutine enumerates; the single-goroutine -race run never
@@ -989,8 +1016,8 @@ func TestBindingsByGVRIndex_ConcurrentRace(t *testing.T) {
 					return
 				default:
 				}
-				_ = EnumerateResourceCohorts(compGVR)
-				_ = EnumerateResourceCohorts(panelGVR)
+				_ = EnumeratePrewarmTargetsForGVR(compGVR, "list")
+				_ = EnumeratePrewarmTargetsForGVR(panelGVR, "list")
 			}
 		}()
 	}

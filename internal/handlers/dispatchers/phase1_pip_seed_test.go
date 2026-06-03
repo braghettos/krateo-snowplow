@@ -37,7 +37,6 @@ import (
 
 	"github.com/krateoplatformops/plumbing/endpoints"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
 )
 
 // TestPipCohortTimeout_RestoredToFixed120s is the Ship 0.30.191 SCOPE
@@ -171,7 +170,9 @@ func TestSeedCohort_CtxCancelEmitsAbortLog(t *testing.T) {
 		Resource:   "restactions",
 	}}
 
-	cohort := cache.Cohort{
+	// Ship 0.30.242 H.c-layered Phase 2c — cache.Cohort replaced by local
+	// dispatcher-package seedTarget (Phase 2b, phase1_pip_seed.go).
+	cohort := seedTarget{
 		Username: "test-cohort",
 	}
 	// Zero-value endpoints + nil REST config — withCohortSeedContext

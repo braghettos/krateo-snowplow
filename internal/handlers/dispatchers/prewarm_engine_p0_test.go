@@ -207,42 +207,30 @@ func TestP0_RestActionTargetGVR_RequiresSACredentialedCtx(t *testing.T) {
 		t.Fatalf("wrong target GVR: got %v, want composition.krateo.io/compositions", gvr)
 	}
 
-	// (c) The headline scoping is live: EnumerateResourceCohorts(target)
-	// returns the ~3-6 subjects (admin via wildcard + 3 groups via exact
-	// match), NOT a 34-cohort global set.
-	cohorts := cache.EnumerateResourceCohorts(gvr)
-	if len(cohorts) < 3 || len(cohorts) > 6 {
-		t.Fatalf("CLAUSE-4: expected cohorts in [3,6] for compositions, got %d: %+v", len(cohorts), cohorts)
+	// (c) The headline scoping is live: EnumeratePrewarmTargetsForGVR(target, "list")
+	// returns the per-binding targets (admin via wildcard + 3 groups via
+	// exact match), NOT a global-fallback universe.
+	//
+	// Ship 0.30.242 H.c-layered Phase 2c — migrated from
+	// EnumerateResourceCohorts (deleted) to EnumeratePrewarmTargetsForGVR.
+	// The per-binding shape can have multiple targets per binding (one per
+	// subject) but the fixture in this test has 1 subject per binding, so
+	// the [3,6] range still applies.
+	targets := cache.EnumeratePrewarmTargetsForGVR(gvr, "list")
+	if len(targets) < 3 || len(targets) > 6 {
+		t.Fatalf("CLAUSE-4: expected targets in [3,6] for compositions, got %d: %+v", len(targets), targets)
 	}
 }
 
 // TestP0_SeedScopeUsesSACtx_ScopedNotGlobal is the integration falsifier:
-// drive seedScopeYielding with the SA rctx (as rePrewarmBoot now does) and
-// confirm the restaction was scoped (target GVR derived). Without a
-// customer call in flight the seed runs immediately; we assert it
-// completes without falling back to the global set by checking the index
-// scoping holds for the derived GVR.
-func TestP0_SeedScopeUsesSACtx_ScopedNotGlobal(t *testing.T) {
-	cache.ResetBindingsByGVRIndexForTest()
-	_, ref := buildP0Watcher(t)
-
-	compGVR := schema.GroupVersionResource{Group: "composition.krateo.io", Resource: "compositions"}
-	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{compGVR})
-
-	// The SA rctx is what rePrewarmBoot now passes to seedScopeYielding.
-	rctx := saCtxForTest(context.Background())
-
-	// Derive through the SAME path seedScopeYielding uses.
-	gvr, ok := restActionTargetGVR(rctx, ref)
-	if !ok {
-		t.Fatal("target GVR derivation failed under SA ctx — P0 fix regressed")
-	}
-	scoped := cache.EnumerateResourceCohorts(gvr)
-	global := cache.EnumerateBindingSetClasses()
-	if len(scoped) == 0 {
-		t.Fatal("scoped cohort set empty — would fall back to global (defeating scoping)")
-	}
-	if len(scoped) >= len(global) && len(global) > 0 {
-		t.Fatalf("scoped set (%d) not narrower than global (%d) — scoping ineffective", len(scoped), len(global))
-	}
-}
+// Ship 0.30.242 H.c-layered Phase 2c — TestP0_SeedScopeUsesSACtx_ScopedNotGlobal
+// DELETED. The test verified that per-GVR scoped cohorts narrowed the
+// global cohort universe — but the global-cohort fallback path is gone
+// (Phase 2b prewarm_engine_boot.go: when EnumeratePrewarmTargetsForGVR
+// returns empty, SKIP the GVR rather than fall back). The scoping
+// invariant the test guarded is now structural (no global fallback
+// path = no possibility of fallback). Coverage gap: ZERO.
+//
+// Surviving in this file: TestP0_RestActionTargetGVR_RequiresSACredentialedCtx
+// tests the SA-credentialed ctx derivation, which is unrelated to the
+// deleted scoping mechanism.

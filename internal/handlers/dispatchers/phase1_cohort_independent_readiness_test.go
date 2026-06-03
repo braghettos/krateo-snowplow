@@ -41,137 +41,28 @@
 package dispatchers
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log/slog"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-
-	rbacv1 "k8s.io/api/rbac/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
-// publishNUserCohortSnapshot publishes an RBAC snapshot with n distinct
-// User-kind cohorts: n ClusterRoleBindings, each with a distinct name +
-// distinct UID and a single distinct User subject. Distinct UIDs give
-// each user a distinct matched-binding-id set, so BindingSetHash yields n
-// distinct classes — EnumerateBindingSetClasses returns n cohorts. Uses
-// ONLY exported cache symbols (cross-package: this test is in the
-// dispatchers package, the cache fixture helpers are unexported). The
-// snapshot is reset to nil on cleanup so the package's other tests see a
-// clean slate.
-func publishNUserCohortSnapshot(t *testing.T, n int) {
-	t.Helper()
-	crbs := make([]*rbacv1.ClusterRoleBinding, 0, n)
-	byUser := map[string][]*rbacv1.ClusterRoleBinding{}
-	for i := 0; i < n; i++ {
-		user := "user-" + itoa(i)
-		crb := &rbacv1.ClusterRoleBinding{
-			TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "bind-" + itoa(i),
-				// Distinct UID per binding — Ship 1 (0.30.195) hashes
-				// metadata.uid, so distinct UIDs guarantee distinct
-				// per-cohort binding-id sets → distinct BindingSetHash →
-				// distinct classes (no accidental dedupe collapse).
-				UID: types.UID("uid-" + itoa(i)),
-			},
-			Subjects: []rbacv1.Subject{{
-				Kind: "User", APIGroup: "rbac.authorization.k8s.io", Name: user,
-			}},
-			RoleRef: rbacv1.RoleRef{
-				APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "role-" + itoa(i),
-			},
-		}
-		crbs = append(crbs, crb)
-		byUser[user] = []*rbacv1.ClusterRoleBinding{crb}
-	}
-	snap := &cache.RBACSnapshot{
-		ClusterRoleBindings: crbs,
-		CRBsByUser:          byUser,
-	}
-	cache.PublishRBACSnapshotForTest(snap)
-	t.Cleanup(func() { cache.PublishRBACSnapshotForTest(nil) })
-}
+// Ship 0.30.242 H.c-layered Phase 2c — publishNUserCohortSnapshot + itoa
+// helpers DELETED alongside the cap-deletion falsifier they supported
+// (TestRunPIPSeed_NoCapWhenClassesExceedFifty — see note below). The
+// surviving TestPhase1_ReadinessFlips_* tests use the simpler
+// phase1TestWatcher fixture (no per-cohort snapshot needed).
 
-// itoa is a tiny dependency-free int->string (avoids importing strconv
-// just for the fixture loop).
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b [20]byte
-	pos := len(b)
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	return string(b[pos:])
-}
-
-// TestRunPIPSeed_NoCapWhenClassesExceedFifty is the Ship 2 / 0.30.196
-// CAP-DELETION falsifier. It drives the REAL runPIPSeed against a snapshot
-// whose EnumerateBindingSetClasses yields 60 binding-set classes (> the
-// OLD cap of 50) and asserts:
-//
-//   - EnumerateBindingSetClasses actually returns > 50 (fixture sanity), AND
-//   - runPIPSeed returns NO error, AND
-//   - NO `cohort_cap_exceeded` log line is emitted.
-//
-// Against OLD code (cap=50 present) the `if len(cohorts) > cap` branch
-// fires: runPIPSeed logs `cohort_cap_exceeded` and returns a non-nil
-// error — both assertions below FAIL. This is a genuine falsifier of the
-// deletion, not a tautology.
-//
-// HERMETIC: the harvesters are empty, so seedCohort iterates zero
-// restactions + zero widgets per cohort and returns nil with NO apiserver
-// / REST round-trip. The zero-value SA endpoint + nil *rest.Config are
-// never dereferenced (withCohortSeedContext only installs context values).
-func TestRunPIPSeed_NoCapWhenClassesExceedFifty(t *testing.T) {
-	const n = 60 // > old cap 50
-	publishNUserCohortSnapshot(t, n)
-
-	// Fixture sanity: confirm the snapshot really enumerates > 50 classes —
-	// otherwise the test would pass vacuously.
-	if got := len(cache.EnumerateBindingSetClasses()); got <= 50 {
-		t.Fatalf("fixture sanity: EnumerateBindingSetClasses returned %d classes; "+
-			"need > 50 to exercise the deleted cap branch", got)
-	}
-
-	// Capture logs so we can assert the cohort_cap_exceeded line is ABSENT.
-	var buf bytes.Buffer
-	h := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	prev := slog.Default()
-	slog.SetDefault(slog.New(h))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	// Empty harvesters — runPIPSeed enumerates the 60 cohorts but each
-	// cohort's seed loop has zero targets (no apiserver calls).
-	emptyApiRef := newContentPrewarmHarvester()
-	emptyNav := newNavWidgetHarvester()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	err := runPIPSeed(ctx, emptyApiRef, emptyNav, endpoints.Endpoint{}, nil /* saRC */, "test-authn-ns")
-	if err != nil {
-		t.Fatalf("Ship 2 CAP-DELETION FAIL: runPIPSeed returned %v for %d cohorts (> old cap 50). "+
-			"The cohort cap fail-closed branch must be DELETED — readiness must never "+
-			"depend on cohort count", err, n)
-	}
-
-	if strings.Contains(buf.String(), "cohort_cap_exceeded") {
-		t.Fatalf("Ship 2 CAP-DELETION FAIL: runPIPSeed emitted a `cohort_cap_exceeded` log line "+
-			"for %d cohorts — the cap branch is still live:\n%s", n, buf.String())
-	}
-}
+// Ship 0.30.242 H.c-layered Phase 2c — TestRunPIPSeed_NoCapWhenClassesExceedFifty
+// DELETED. The test verified absence of a `cohort_cap_exceeded` log line
+// when the enumerated cohort count exceeded 50 — but the underlying
+// EnumerateBindingSetClasses + cohort-cap machinery is gone (deleted in
+// commit 1d93d02). The per-binding-target enumeration (Phase 2b
+// enumerateAggregatePrewarmTargets) has no cap. Coverage gap: ZERO —
+// the asserted ABSENCE invariant is now structural (no cap = no
+// cap-exceeded line possible).
 
 // TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes proves the
 // decoupling directly: while the per-cohort seed is still in flight

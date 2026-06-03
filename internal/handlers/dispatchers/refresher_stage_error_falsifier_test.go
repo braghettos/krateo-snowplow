@@ -80,7 +80,7 @@ func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
 		Resource:               "restactions",
 		Namespace:              "krateo-system",
 		Name:                   "compositions-list",
-		BindingSetHash:         0xc01dface,
+		BindingUID:             "uid-c01dface",
 		RepresentativeUsername: "cyberjoker",
 		RepresentativeGroups:   []string{"devs"},
 	}

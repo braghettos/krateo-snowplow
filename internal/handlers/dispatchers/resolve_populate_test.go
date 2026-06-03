@@ -38,7 +38,7 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 		Resource:               "restactions",
 		Namespace:              "team-a",
 		Name:                   "list-users",
-		BindingSetHash:         0xc01dface,
+		BindingUID:             "uid-c01dface",
 		RepresentativeUsername: "cyberjoker",
 		RepresentativeGroups:   []string{"devs", "qa"},
 	}
@@ -167,7 +167,7 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 		Resource:               "panels",
 		Namespace:              "demo",
 		Name:                   "compositions-panel",
-		BindingSetHash:         0xc01dface,
+		BindingUID:             "uid-c01dface",
 		RepresentativeUsername: "cyberjoker",
 		RepresentativeGroups:   []string{"devs"},
 	}

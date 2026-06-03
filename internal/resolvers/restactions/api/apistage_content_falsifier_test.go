@@ -40,7 +40,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"sort"
 	"testing"
@@ -270,181 +269,30 @@ func f1SortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// --- TestFalsifierF1_CrossUserNoLeak --------------------------------------
-
-// TestFalsifierF1_CrossUserNoLeak is the headline F1 falsifier. The broad
-// user resolves first — the stage's widgets LIST is dispatched un-gated
-// and the raw 4-namespace envelope is stored in the identity-free content
-// entry. The narrow user then resolves the SAME stage: their content Get
-// HITs the broad user's stored entry. Their dict[id] MUST be narrowed to
-// their 2 authorized namespaces — they must NOT see the broad user's
-// 4-namespace view.
+// Ship 0.30.242 H.c-layered Phase 2c — 3 F1 falsifier tests DELETED
+// (decision ratified by team-lead 2026-06-03 per design's transitive
+// architect ACK):
 //
-// PRE-FIX (gate skipped on the hit path) the narrow user sees all 4
-// widgets — the cross-user leak. The fix runs the serve-time RBAC gate on
-// the Get-hit path too.
-func TestFalsifierF1_CrossUserNoLeak(t *testing.T) {
-	newF1Watcher(t)
-	stage := f1ListStage("widgets")
-
-	// Broad user resolves first — populates the content entry un-gated.
-	broadDict := f1ResolveAs(t, f1BroadUser, stage)
-	broadNames := f1WidgetNamesIn(broadDict["widgets"])
-	if len(broadNames) != len(f1AllNamespaces) {
-		t.Fatalf("setup: broad user resolved %d widgets, want %d (all namespaces): %v",
-			len(broadNames), len(f1AllNamespaces), f1SortedKeys(broadNames))
-	}
-
-	// Narrow user resolves the SAME stage — content Get HITs the broad
-	// user's stored entry. The serve-time gate must narrow it to the
-	// narrow user's 2 authorized namespaces.
-	narrowDict := f1ResolveAs(t, f1NarrowUser, stage)
-	narrowNames := f1WidgetNamesIn(narrowDict["widgets"])
-
-	if len(narrowNames) != len(f1NarrowNamespaces) {
-		t.Fatalf("F1 CROSS-USER LEAK: narrow user saw %d widgets, want %d "+
-			"(only their %v namespaces). The narrow user Get-hit the broad "+
-			"user's identity-free content entry and the serve-time RBAC gate "+
-			"did NOT narrow it — they see the broad user's view.\n want: %v\n got:  %v",
-			len(narrowNames), len(f1NarrowNamespaces), f1NarrowNamespaces,
-			[]string{"widget-team-a", "widget-team-b"}, f1SortedKeys(narrowNames))
-	}
-	for _, ns := range f1NarrowNamespaces {
-		if !narrowNames["widget-"+ns] {
-			t.Fatalf("F1: narrow user missing authorized widget widget-%s; got %v",
-				ns, f1SortedKeys(narrowNames))
-		}
-	}
-	// And NONE of the namespaces the narrow user is NOT authorized for.
-	for _, ns := range []string{"team-c", "team-d"} {
-		if narrowNames["widget-"+ns] {
-			t.Fatalf("F1 CROSS-USER LEAK: narrow user saw widget-%s — a namespace "+
-				"they have NO RBAC grant for; the content entry leaked the broad "+
-				"user's view", ns)
-		}
-	}
-}
-
-// --- TestFalsifierF1_GatedFromStoredByteIdentical -------------------------
-
-// TestFalsifierF1_GatedFromStoredByteIdentical asserts AC-F1.2: the
-// gated-from-stored-content dict[id] is byte-identical to a fresh
-// inline-gated resolve for the same identity — INCLUDING a stage `filter`
-// that strips metadata.namespace.
+//   - TestFalsifierF1_CrossUserNoLeak — asserted v3 cohort-gate-memo
+//     serve-time RBAC filtering. Design §3.4 explicitly removed the
+//     cohort-gate-memo apparatus under H.c-layered per-binding cell
+//     keying; UAF shipped on chart 0.30.243 + portal rev 33 as design
+//     §9.4 prerequisite.
+//   - TestFalsifierF1_GatedFromStoredByteIdentical — asserted the
+//     serve-time gate runs on the raw envelope (Reading 1). The
+//     serve-time gate was removed in 2b
+//     (gateListItemsWithMemo → serveParsedListEnvelope).
+//   - TestFalsifierF1_ContentEntryIdentityFreeShared — asserted the v3
+//     apistage content cell is identity-free across users. Under v4
+//     per-binding key (Phase 2a resolved.go) this is structurally
+//     false; the inverse holds (distinct bindings → distinct cells).
 //
-// Reading 1's whole point: the content entry stores the RAW pre-filter
-// apiserver envelope; the RBAC gate runs on THAT (metadata.namespace
-// present); the stage `filter` runs AFTER the gate. So a filter that
-// projects away metadata.namespace cannot defeat the gate.
+// v4 equivalent coverage: Phase 3 F6 (raFullList cross-binding cell
+// isolation under -race) + F7 (Empty-BindingUID invariant). Both F6
+// and F7 MUST PASS LOCALLY before Phase 4 dual-gate review begins —
+// if either surfaces a real defect, this deletion is revisited.
 //
-// Method: first resolve (broad user — cold, populates the content
-// entry). Then the narrow user resolves the SAME stage TWICE: once
-// served from the stored content entry (hit), and the assertion is that
-// the narrow user's output is correctly narrowed even though the stage
-// filter strips namespace. A degenerate gate (gating post-filter) would
-// see no namespace and fail-closed-drop-all or leak.
-func TestFalsifierF1_GatedFromStoredByteIdentical(t *testing.T) {
-	newF1Watcher(t)
-
-	// Stage filter PROJECTS each widget to just its name — stripping
-	// metadata.namespace. Under Reading 1 the gate already ran on the
-	// raw envelope, so the projection is harmless.
-	stage := &templates.API{
-		Name:   "widgets",
-		Path:   "/apis/widgets.krateo.io/v1/widgets",
-		Verb:   ptr.To(http.MethodGet),
-		Filter: ptr.To("[.widgets.items[] | {name: .metadata.name}]"),
-	}
-
-	// Broad user first — cold-resolves, populates the content entry.
-	_ = f1ResolveAs(t, f1BroadUser, stage)
-
-	// Narrow user — served from the stored content entry (Get-hit).
-	narrowDict := f1ResolveAs(t, f1NarrowUser, stage)
-
-	// The projected output: a list of {name: ...}. The narrow user must
-	// see exactly their 2 authorized widgets — the gate ran on the raw
-	// envelope BEFORE the namespace-stripping projection.
-	got := map[string]bool{}
-	if items, ok := narrowDict["widgets"].([]any); ok {
-		for _, it := range items {
-			if m, ok := it.(map[string]any); ok {
-				if name, _ := m["name"].(string); name != "" {
-					got[name] = true
-				}
-			}
-		}
-	}
-	want := map[string]bool{"widget-team-a": true, "widget-team-b": true}
-	if len(got) != len(want) {
-		t.Fatalf("AC-F1.2: namespace-stripping filter — narrow user got %d projected "+
-			"widgets, want %d. The gate must run on the RAW pre-filter envelope "+
-			"(Reading 1); a post-filter gate cannot see metadata.namespace.\n"+
-			" want: %v\n got:  %v", len(got), len(want),
-			f1SortedKeys(want), f1SortedKeys(got))
-	}
-	for name := range want {
-		if !got[name] {
-			t.Fatalf("AC-F1.2: narrow user missing authorized %q; got %v",
-				name, f1SortedKeys(got))
-		}
-	}
-
-	// Byte-identical check: a SECOND narrow-user resolve (also a content
-	// Get-hit) yields the identical dict[id] — the gate is a pure
-	// function of (stored raw envelope, identity, RBAC store).
-	narrowDict2 := f1ResolveAs(t, f1NarrowUser, stage)
-	b1, _ := json.Marshal(narrowDict["widgets"])
-	b2, _ := json.Marshal(narrowDict2["widgets"])
-	if string(b1) != string(b2) {
-		t.Fatalf("AC-F1.2: two narrow-user resolves of the same stage produced "+
-			"different output — the serve-time gate is not deterministic\n"+
-			" first:  %s\n second: %s", b1, b2)
-	}
-}
-
-// --- TestFalsifierF1_ContentEntryIdentityFreeShared -----------------------
-
-// TestFalsifierF1_ContentEntryIdentityFreeShared asserts AC-F1.3: two
-// distinct users resolving the same stage produce exactly ONE shared
-// content entry per K8s call — the content key is identity-free.
-//
-// The stage LISTs widgets cluster-wide = one K8s call. After both users
-// resolve, the resolved-output store must hold exactly ONE apistage
-// content entry (apistage_store_total advanced by exactly 1 — the broad
-// user's cold dispatch Put; the narrow user's resolve is a content
-// Get-hit, no second Put).
-func TestFalsifierF1_ContentEntryIdentityFreeShared(t *testing.T) {
-	newF1Watcher(t)
-	stage := f1ListStage("widgets")
-
-	store := cache.ResolvedCache()
-	if store == nil {
-		t.Fatalf("resolved cache nil under RESOLVED_CACHE_ENABLED=true")
-	}
-	before := store.Stats().ApistageStoreTotal
-
-	// Broad user — cold resolve, ONE content Put for the cluster-wide LIST.
-	_ = f1ResolveAs(t, f1BroadUser, stage)
-	afterBroad := store.Stats().ApistageStoreTotal
-	if afterBroad != before+1 {
-		t.Fatalf("AC-F1.3: broad-user resolve Put %d apistage entries, want exactly 1 "+
-			"(one cluster-wide widgets LIST = one content entry)", afterBroad-before)
-	}
-
-	// Narrow user resolves the SAME stage — the content key is
-	// identity-free, so this is a Get-HIT: NO new content entry.
-	_ = f1ResolveAs(t, f1NarrowUser, stage)
-	afterNarrow := store.Stats().ApistageStoreTotal
-	if afterNarrow != afterBroad {
-		t.Fatalf("AC-F1.3: narrow-user resolve Put %d MORE apistage entries, want 0 "+
-			"— the content entry is identity-free and must be SHARED; a second "+
-			"Put means the key still carries identity", afterNarrow-afterBroad)
-	}
-
-	// And the store holds exactly one apistage entry total.
-	if total := afterNarrow - before; total != 1 {
-		t.Fatalf("AC-F1.3: %d apistage content entries after two users resolved the "+
-			"same stage, want exactly 1 (identity-free, shared)", total)
-	}
-}
+// File helpers (f1ListStage, f1ResolveAs, f1BroadUser, f1NarrowUser,
+// newF1Watcher, etc.) are KEPT — they are reused by
+// apistage_concurrent_isolation_test.go, cluster_list_dep_record_test.go,
+// and resolve_jwt_leak_test.go which test surviving production code.

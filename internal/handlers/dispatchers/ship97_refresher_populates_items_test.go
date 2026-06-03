@@ -209,7 +209,7 @@ func TestShip97_F3_NonApistageClassesUnaffected(t *testing.T) {
 			Resource:               "buttons",
 			Namespace:              "demo",
 			Name:                   "save-btn",
-			BindingSetHash:         0xc01dface,
+			BindingUID:             "uid-c01dface",
 			RepresentativeUsername: "cyberjoker",
 			RepresentativeGroups:   []string{"devs"},
 		}
