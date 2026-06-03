@@ -983,6 +983,19 @@ func PublishRBACSnapshotForTest(s *RBACSnapshot) {
 	rbacSnap.Store(s)
 }
 
+// RebuildSubjectIndexesForTest exposes the unexported
+// rebuildSubjectIndexes for tests that hand-build snapshots and need
+// to populate the CRBsBy*/RBsBy* subject-index maps (which the rbac
+// evaluator's selectCRBCandidates/selectRBCandidates require).
+//
+// Production code uses rebuildRBACSnapshot (which calls
+// rebuildSubjectIndexes internally before publishing) — never this.
+// Ship 0.30.242 H.c-layered Phase 3 F3 added this seam for the mid-
+// test mutation phase (synthetic-snapshot publish path).
+func RebuildSubjectIndexesForTest(s *RBACSnapshot) {
+	rebuildSubjectIndexes(s)
+}
+
 // RebuildRBACSnapshotForTest publicly exposes a synchronous snapshot
 // rebuild for tests. Production code uses `scheduleRBACRebuild` (which
 // is asynchronous, bounded, and dirty-flag-coalesced) — never this.
