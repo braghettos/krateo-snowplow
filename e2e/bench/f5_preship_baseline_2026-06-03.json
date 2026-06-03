@@ -1,0 +1,106 @@
+{
+  "captured_against": "pre-ship cluster (snowplow image 0.30.235 + chart 0.30.243 + portal rev 33)",
+  "captured_at": "2026-06-03T11:21:53Z",
+  "captured_by": "f5_preship_baseline.py (Ship 0.30.242 H.c-layered Phase 3 F5)",
+  "cluster_baseline": {
+    "compositions_cluster_truth": 5000,
+    "kubectl_context": "gke_neon-481711_us-central1-a_cluster-1",
+    "portal_helm": "rev=33 chart=portal-0.30.178",
+    "snowplow_helm": "rev=419 chart=snowplow-0.30.243",
+    "snowplow_image": "ghcr.io/braghettos/snowplow:0.30.235"
+  },
+  "duration_seconds": 62.73,
+  "measurements": {
+    "admin": {
+      "auth_token_obtained": true,
+      "compositions": {
+        "incomplete": true,
+        "label": "Compositions",
+        "load_complete": 251,
+        "nav_call_count": 241,
+        "path": "/compositions",
+        "piechart_count_api": 0,
+        "piechart_count_ui": 0,
+        "validation": {
+          "actual_calls": 241,
+          "calls_within_tolerance": false,
+          "errored_count": 0,
+          "expected_calls": 10,
+          "skeleton_count": 5,
+          "skeleton_count_raw": 5,
+          "skeleton_count_widget_scoped": 5,
+          "terminal_state": "fail",
+          "user": "admin"
+        }
+      },
+      "dashboard": {
+        "incomplete": false,
+        "label": "Dashboard",
+        "load_complete": 261,
+        "nav_call_count": 16,
+        "path": "/dashboard",
+        "piechart_count_api": 0,
+        "piechart_count_ui": 0,
+        "validation": {
+          "actual_calls": 16,
+          "calls_within_tolerance": true,
+          "errored_count": 0,
+          "expected_calls": 16,
+          "skeleton_count": 0,
+          "skeleton_count_raw": 0,
+          "skeleton_count_widget_scoped": 0,
+          "terminal_state": "pass",
+          "user": "admin"
+        }
+      },
+      "login_ok": true,
+      "user": "admin"
+    },
+    "cyberjoker": {
+      "auth_token_obtained": true,
+      "compositions": {
+        "incomplete": false,
+        "label": "Compositions",
+        "load_complete": 235,
+        "nav_call_count": 10,
+        "path": "/compositions",
+        "piechart_count_api": 0,
+        "piechart_count_ui": 0,
+        "validation": {
+          "actual_calls": 10,
+          "calls_within_tolerance": true,
+          "errored_count": 0,
+          "expected_calls": 10,
+          "skeleton_count": 0,
+          "skeleton_count_raw": 0,
+          "skeleton_count_widget_scoped": 0,
+          "terminal_state": "pass",
+          "user": "cyberjoker"
+        }
+      },
+      "dashboard": {
+        "incomplete": false,
+        "label": "Dashboard",
+        "load_complete": 262,
+        "nav_call_count": 16,
+        "path": "/dashboard",
+        "piechart_count_api": 0,
+        "piechart_count_ui": 0,
+        "validation": {
+          "actual_calls": 16,
+          "calls_within_tolerance": true,
+          "errored_count": 0,
+          "expected_calls": 16,
+          "skeleton_count": 0,
+          "skeleton_count_raw": 0,
+          "skeleton_count_widget_scoped": 0,
+          "terminal_state": "pass",
+          "user": "cyberjoker"
+        }
+      },
+      "login_ok": true,
+      "user": "cyberjoker"
+    }
+  },
+  "ship_plan_invariant": "F5 measures customer-visible integer counts (piechart composition count via API + UI), NOT raw wire responses. Wire-level diff would false-positive on metadata churn (resourceVersion, timestamps). F5 integer-equality + F1-F8 orthogonal coverage is the customer-correctness contract. Post-ship Phase 5 MUST match these integer counts byte-equivalently per (user, page) tuple; any drift triggers HARD REVERT."
+}
