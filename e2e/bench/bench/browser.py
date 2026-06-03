@@ -1362,26 +1362,71 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                 # not just counts. Catches silent cache corruption where the
                 # count matches but the cached items are the wrong set
                 # (stale entries present, recent deletes missing, etc.).
+                #
+                # RBAC-aware (task #181): only admin (verify_against_cluster
+                # = True) can compare its cached view against cluster-truth
+                # via `_list_composition_names()`, which returns ALL
+                # compositions cluster-wide. Doing the same diff for cj
+                # always produces a spurious "missing=N" because cj is
+                # RBAC-scoped to a subset of namespaces (~1000/54500 at
+                # SCALE=50K) — cluster-truth is not cj's authoritative
+                # truth. For cj we instead consistency-check the cache
+                # against the same VERIFY-poll api_count/ui_count that
+                # already passed above (intra-user truth, mirrors VERIFY's
+                # `verify_against_cluster=False` branch at line 1326-1330).
+                #
+                # Mirrors `verify_against_cluster` from the surrounding
+                # VERIFY block — single source of truth for the
+                # "admin compares vs cluster, cj compares vs self"
+                # convention.
                 if cache_mode == "ON" and token:
-                    truth = _list_composition_names()
                     cached = list_composition_names_from_cache(token)
-                    if truth is not None and cached is not None:
-                        if truth == cached:
-                            _log(f"    CONTENT ✓ {len(truth)} composition "
-                                 f"names match")
-                            m["content_match"] = True
-                        else:
-                            missing = truth - cached
-                            extra = cached - truth
-                            _log(f"    CONTENT ✗ DRIFT — "
-                                 f"missing={len(missing)} extra={len(extra)}")
-                            if missing:
-                                _log(f"      missing: {sorted(missing)[:3]}...")
-                            if extra:
-                                _log(f"      extra: {sorted(extra)[:3]}...")
-                            m["content_match"] = False
-                            m["content_missing"] = len(missing)
-                            m["content_extra"] = len(extra)
+                    if verify_against_cluster:
+                        truth = _list_composition_names()
+                        if truth is not None and cached is not None:
+                            if truth == cached:
+                                _log(f"    CONTENT ✓ {len(truth)} composition "
+                                     f"names match (vs cluster-truth)")
+                                m["content_match"] = True
+                                m["content_truth_source"] = "cluster"
+                            else:
+                                missing = truth - cached
+                                extra = cached - truth
+                                _log(f"    CONTENT ✗ DRIFT — "
+                                     f"missing={len(missing)} extra={len(extra)}")
+                                if missing:
+                                    _log(f"      missing: {sorted(missing)[:3]}...")
+                                if extra:
+                                    _log(f"      extra: {sorted(extra)[:3]}...")
+                                m["content_match"] = False
+                                m["content_truth_source"] = "cluster"
+                                m["content_missing"] = len(missing)
+                                m["content_extra"] = len(extra)
+                    else:
+                        # RBAC-scoped user (e.g. cj): compare cached
+                        # composition-name count against the api_count /
+                        # ui_count already validated by the VERIFY poll.
+                        # Cluster-truth diff would always falsely flag
+                        # `missing=N` because cj cannot see the cluster's
+                        # full set by design.
+                        if cached is not None:
+                            cached_count = len(cached)
+                            if api_count >= 0 and cached_count == api_count:
+                                _log(f"    CONTENT ✓ {cached_count} composition "
+                                     f"names match (vs intra-user api_count "
+                                     f"— RBAC-scoped truth)")
+                                m["content_match"] = True
+                                m["content_truth_source"] = "intra_user_api"
+                            else:
+                                _log(f"    CONTENT ✗ DRIFT (intra-user) — "
+                                     f"cached_names={cached_count} "
+                                     f"api_count={api_count} "
+                                     f"ui_count={ui_count}")
+                                m["content_match"] = False
+                                m["content_truth_source"] = "intra_user_api"
+                                m["content_cached_count"] = cached_count
+                                m["content_api_count"] = api_count
+                                m["content_ui_count"] = ui_count
 
                 # Final VERIFY screenshot — reload dashboard for fresh data.
                 try:

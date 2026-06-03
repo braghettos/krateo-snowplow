@@ -566,3 +566,138 @@ def test_verify_composition_count_ui_reads_via_page_evaluate(fake_page):
     """
     fake_page._ui_count = 1234
     assert verify_composition_count_ui(fake_page) == 1234
+
+
+# ─── Task #181: CONTENT-DRIFT is RBAC-aware ─────────────────────────────────
+
+
+def test_content_drift_uses_cluster_truth_for_admin(
+        monkeypatch, fake_page, tmp_path):
+    """When `verify_against_cluster=True` (admin), CONTENT-DRIFT compares
+    `list_composition_names_from_cache(token)` against the full cluster
+    via `_list_composition_names()` and sets `content_truth_source =
+    "cluster"` on the navigation result.
+
+    Admin's RBAC permits the cluster-wide LIST so cluster-truth is the
+    authoritative comparison set.
+    """
+    truth_names = {f"ns{i}/comp{i}" for i in range(5)}
+    _patch_cluster_count(monkeypatch, comp_count=len(truth_names), ns_count=2)
+    monkeypatch.setattr(browser_mod, "_list_composition_names",
+                        lambda: truth_names)
+    monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
+                        lambda token: set(truth_names))
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: len(truth_names))
+    monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
+                        lambda page: len(truth_names))
+    monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
+                        lambda u, p: None)
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    result = browser_measure_stage(
+        fake_page, stage_num=6, stage_desc="admin S6",
+        cache_mode="ON", token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+    )
+    dash = result["pages"]["Dashboard"]["navigations"][0]
+    assert dash.get("content_match") is True, (
+        f"admin CONTENT must PASS when cache == cluster-truth; got "
+        f"{dash.get('content_match')!r}")
+    assert dash.get("content_truth_source") == "cluster", (
+        f"admin must compare against cluster-truth, got "
+        f"{dash.get('content_truth_source')!r}")
+
+
+def test_content_drift_uses_intra_user_api_for_cyber(
+        monkeypatch, fake_page, tmp_path):
+    """When `verify_against_cluster=False` (cyberjoker), CONTENT-DRIFT
+    compares `len(list_composition_names_from_cache(token))` against the
+    intra-user api_count (the same VERIFY-poll value) and sets
+    `content_truth_source = "intra_user_api"`.
+
+    Cluster has 50,000 compositions but cj sees 1,000 (RBAC scoped). The
+    cluster-truth diff would spuriously report `missing=49000`; the
+    RBAC-aware behaviour MUST instead PASS when cached_names == api_count.
+    This is the task #181 regression — pre-fix, cj's CONTENT check always
+    failed at SCALE=50K regardless of cache health.
+    """
+    cluster_truth = {f"ns{i}/comp{i}" for i in range(50_000)}
+    cj_view = {f"bench-ns-1/bench-app-1-{i}" for i in range(1_000)}
+    _patch_cluster_count(monkeypatch, comp_count=len(cluster_truth), ns_count=500)
+    monkeypatch.setattr(browser_mod, "_list_composition_names",
+                        lambda: cluster_truth)
+    monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
+                        lambda token: cj_view)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: len(cj_view))
+    monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
+                        lambda page: len(cj_view))
+    monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
+                        lambda u, p: None)
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    result = browser_measure_stage(
+        fake_page, stage_num=6, stage_desc="cj S6",
+        cache_mode="ON", token="tok", num_navs=1, user="cyberjoker",
+        verify_against_cluster=False, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+    )
+    dash = result["pages"]["Dashboard"]["navigations"][0]
+    assert dash.get("content_match") is True, (
+        f"cj CONTENT must PASS when cached_names == api_count even though "
+        f"cluster-truth has 50K names; got content_match="
+        f"{dash.get('content_match')!r}")
+    assert dash.get("content_truth_source") == "intra_user_api", (
+        f"cj must compare against intra-user api_count, got "
+        f"{dash.get('content_truth_source')!r}")
+    # No cluster-truth diff fields should appear for cj (regression
+    # guard: pre-fix the symptom was `content_missing=49000` on every cj
+    # CONTENT check).
+    assert "content_missing" not in dash, (
+        "cj must NOT emit `content_missing` (cluster-truth diff field) — "
+        "task #181 regression guard")
+    assert "content_extra" not in dash, (
+        "cj must NOT emit `content_extra` (cluster-truth diff field) — "
+        "task #181 regression guard")
+
+
+def test_content_drift_cyber_flags_drift_when_cache_diverges_from_api(
+        monkeypatch, fake_page, tmp_path):
+    """Even with the RBAC-aware fix, real cache corruption MUST still
+    flag CONTENT ✗ for cj. Construct a scenario where the cached name
+    set has the WRONG count vs api/ui (the only intra-user signal we
+    can compare against) and assert `content_match=False`.
+
+    Note: api_count and ui_count must still match (otherwise VERIFY
+    raises ConvergenceTimeout BEFORE the CONTENT block runs). Only the
+    cached-name count diverges. This is the residual-defect case the
+    fix MUST still catch.
+    """
+    cj_view_cached = {f"bench-ns-1/bench-app-1-{i}" for i in range(900)}  # cache says 900
+    _patch_cluster_count(monkeypatch, comp_count=50_000, ns_count=500)
+    monkeypatch.setattr(browser_mod, "_list_composition_names",
+                        lambda: {f"ns/c{i}" for i in range(50_000)})
+    monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
+                        lambda token: cj_view_cached)
+    # api == ui == 1000 (VERIFY passes), but the names endpoint reports 900 → drift
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: 1000)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
+                        lambda page: 1000)
+    monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
+                        lambda u, p: None)
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    result = browser_measure_stage(
+        fake_page, stage_num=6, stage_desc="cj S6 cache drift",
+        cache_mode="ON", token="tok", num_navs=1, user="cyberjoker",
+        verify_against_cluster=False, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+    )
+    dash = result["pages"]["Dashboard"]["navigations"][0]
+    assert dash.get("content_match") is False
+    assert dash.get("content_truth_source") == "intra_user_api"
+    assert dash.get("content_cached_count") == 900
+    assert dash.get("content_api_count") == 1000
