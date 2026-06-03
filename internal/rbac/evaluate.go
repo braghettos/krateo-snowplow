@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -91,29 +92,53 @@ type EvaluateOptions struct {
 // the duplicate set here aligns with the single-source-of-truth rule
 // recorded in the design's `feedback_no_special_cases` discussion.
 
-// EvaluateRBAC returns true iff opts describes an action permitted by
-// the cluster Role-Based Access Control rules, evaluated against the
-// in-process informer cache.
+// EvaluateRBAC returns (allowed, matchedBindingUID, err).
 //
-// Semantics match Kubernetes apiserver:
+// allowed: true iff opts describes an action permitted by the cluster
+// Role-Based Access Control rules, evaluated against the in-process
+// informer cache. Semantics match Kubernetes apiserver:
 //   - any matching rule permits (no deny rules in RBAC v1)
 //   - "*" wildcards match every verb / resource / API group
 //   - empty Username / Groups is treated as "no subject matches" → deny
 //
+// matchedBindingUID: the per-binding identity of the FIRST-MATCH CRB or
+// RB that authorised the access (cache.BindingUIDFromCRB / FromRB
+// applied to the matching binding). Ship 0.30.242 H.c-layered (Phase 2
+// step 2a) addition:
+//   - allowed=true  => matchedBindingUID is the first-permitting binding's
+//     UID-stable identity ("C:<uid>" for a CRB; "R:<ns>/<uid>" for an RB).
+//   - allowed=false => matchedBindingUID == "" (no permit, no match).
+//   - cache=off     => matchedBindingUID == "" (no snapshot; SAR fallback).
+//
+// FIRST-MATCH STABLE ORDERING (design §6): within each phase (CRB then
+// RB), candidates are sorted by (Name, UID) AFTER the index pre-filter.
+// CRB phase precedes RB phase (k8s upstream convention; preserves v3's
+// two-phase walk semantics).
+//
 // In cache=off mode (cache.Disabled() == true) the function falls
 // through to SubjectAccessReview-via-UserCan with a synthesised
 // UserCanOptions. The fallback exists so CACHE_ENABLED=false retains
-// the upstream correctness baseline (project_redis_removal.md).
+// the upstream correctness baseline (project_redis_removal.md). No
+// BindingUID is returned under cache=off — there is no in-process
+// snapshot to identify the matching binding from.
 //
-// Returns (true, nil) on permit, (false, nil) on deny, (false, err) on
-// internal evaluator error (failed type assertion etc.).
-func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
+// Returns (true, uid, nil) on permit, (false, "", nil) on deny,
+// (false, "", err) on internal evaluator error.
+//
+// PER-ITEM CALLERS: 6 sites use the ALLOWED return only and ignore the
+// matchedBindingUID via `_` (helpers.go:104, refilter.go:255,
+// informer_dispatch_rbac.go:153 + :259, cluster_list.go:233,
+// informer_serve.go:252). The signature change is the SINGLE source of
+// truth: cache-key callers consume matchedBindingUID; per-item callers
+// consume allowed. No split API.
+func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, error) {
 	log := xcontext.Logger(ctx)
 	evaluateRBACCallCount.Add(1)
 
 	if cache.Disabled() {
 		// Cache=off correctness baseline. UserCan reads the user's
-		// endpoint from ctx and issues a SelfSubjectAccessReview.
+		// endpoint from ctx and issues a SelfSubjectAccessReview. No
+		// BindingUID is available (no snapshot).
 		ok := UserCan(ctx, UserCanOptions{
 			Verb: opts.Verb,
 			GroupResource: schema.GroupResource{
@@ -121,7 +146,7 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 			},
 			Namespace: opts.Namespace,
 		})
-		return ok, nil
+		return ok, "", nil
 	}
 
 	rw := cache.Global()
@@ -137,25 +162,17 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 			slog.String("resource", opts.Resource),
 			slog.String("namespace", opts.Namespace),
 		)
-		return false, fmt.Errorf("rbac: cache=on but ResourceWatcher not wired")
+		return false, "", fmt.Errorf("rbac: cache=on but ResourceWatcher not wired")
 	}
 
 	// Ship B (0.30.138, AC-B.3) — SINGLE rbacSnap.Load() at the top of
 	// EvaluateRBAC. The resulting *cache.RBACSnapshot is threaded as an
-	// explicit parameter into evaluateAgainstInformer AND roleRefPermits,
-	// so every read inside one EvaluateRBAC call observes the SAME
-	// snapshot version. A Load() per site would let two reads in the
-	// same eval see two different snapshots (e.g. a CRB in the new
-	// snapshot but its referenced ClusterRole only in the old) —
-	// correctness regression. The architect-review gate rejects on this
-	// alone.
+	// explicit parameter into evaluateAgainstInformerFirstMatch AND
+	// roleRefPermits, so every read inside one EvaluateRBAC call observes
+	// the SAME snapshot version (AC-B.3).
 	snap := rw.Snapshot()
 	if snap == nil {
-		// AC-B.8 — degrade-to-deny pre-readiness gate. Cache=on
-		// activated but the 4 RBAC syncCh have not all closed AND the
-		// initial rebuildRBACSnapshot has not yet published. Fail
-		// closed; never fall through to UserCan (would violate
-		// Revision 1).
+		// AC-B.8 — degrade-to-deny pre-readiness gate.
 		log.Warn("rbac.evaluate: typed-RBAC snapshot not yet published — denying",
 			slog.String("user", opts.Username),
 			slog.String("verb", opts.Verb),
@@ -163,14 +180,14 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 			slog.String("resource", opts.Resource),
 			slog.String("namespace", opts.Namespace),
 		)
-		return false, fmt.Errorf("rbac: snapshot not yet built")
+		return false, "", fmt.Errorf("rbac: snapshot not yet built")
 	}
 
-	allowed, err := evaluateAgainstInformer(ctx, snap, opts)
+	allowed, matchedBindingUID, err := evaluateAgainstInformerFirstMatch(ctx, snap, opts)
 	if err != nil {
 		log.Error("rbac.evaluate: informer evaluation failed",
 			slog.String("user", opts.Username), slog.Any("err", err))
-		return false, err
+		return false, "", err
 	}
 
 	log.Debug("rbac.evaluate",
@@ -181,15 +198,27 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 		slog.String("resource", opts.Resource),
 		slog.String("namespace", opts.Namespace),
 		slog.Bool("allowed", allowed),
+		slog.String("matched_binding_uid", matchedBindingUID),
 	)
-	return allowed, nil
+	return allowed, matchedBindingUID, nil
 }
 
-// evaluateAgainstInformer walks every ClusterRoleBinding and (when
-// namespace is non-empty) RoleBinding in opts.Namespace looking for a
-// Subject that matches opts.Username / opts.Groups / "system:authenticated".
-// For every match the bound Role / ClusterRole is resolved and its
-// rules walked. First permitting rule wins (RBAC semantics).
+// evaluateAgainstInformerFirstMatch walks every ClusterRoleBinding and
+// (when namespace is non-empty) RoleBinding in opts.Namespace looking
+// for a Subject that matches opts.Username / opts.Groups /
+// "system:authenticated". For every match the bound Role / ClusterRole
+// is resolved and its rules walked. First permitting rule wins (RBAC
+// semantics).
+//
+// Ship 0.30.242 H.c-layered (Phase 2 step 2a) — RENAMED from
+// evaluateAgainstInformer. Two ADDITIVE changes vs the pre-rename body:
+//   (a) selectCRBCandidates / selectRBCandidates results are sorted into
+//       stable lexicographic order (Name, UID) BEFORE iteration. This
+//       guarantees the FIRST-MATCH BindingUID is deterministic across
+//       snapshot republishes (design §6).
+//   (b) on first permit the function returns the binding's UID alongside
+//       the verdict. CRB matches produce "C:<uid>"; RB matches produce
+//       "R:<ns>/<uid>" (cache.BindingUIDFromCRB / FromRB).
 //
 // Ship B (0.30.138) — reads typed *rbacv1.{ClusterRole,Role}Binding
 // from a pre-built `*cache.RBACSnapshot` passed in by EvaluateRBAC. No
@@ -197,49 +226,35 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 // is captured ONCE at the top of EvaluateRBAC and threaded through
 // every sub-read so one eval observes one coherent snapshot version.
 //
-// The pre-Ship-B defensive Unstructured fallback (`as{Kind}` helpers in
-// this file) is no longer reachable from this hot path — the snapshot
-// writer skips non-typed indexer entries upstream with its own WARN
-// (mirroring the 0.30.6 fallback=true invariant). The as{Kind} helpers
-// stay in this file for documentation and for any future caller that
-// reads the indexer outside the snapshot path.
-//
 // 0.30.6's subject-prefilter ordering is preserved (subject match
 // BEFORE the rule walk) so a no-subject CRB still costs only the
 // subject scan, not the expensive PolicyRule walk.
-func evaluateAgainstInformer(ctx context.Context, snap *cache.RBACSnapshot, opts EvaluateOptions) (bool, error) {
+//
+// COST: the sort is O(K log K) where K = candidate count. K is bounded:
+// admin matches ~50 CRBs at production scale; cyberjoker matches ~12.
+// The sort is negligible vs the rule-walk inside roleRefPermits.
+func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnapshot, opts EvaluateOptions) (bool, string, error) {
 	log := xcontext.Logger(ctx)
 
 	// 1) ClusterRoleBindings — apply cluster-wide. Cluster-wide
-	//    permits override namespace scope.
-	//
-	// Ship 0.30.169 — the unconditional linear scan over ALL CRBs
-	// (~8533 on the production cluster) is replaced by an indexed
-	// pre-filter:
-	//
-	//   candidates := selectCRBCandidates(snap, opts)   // O(1+|groups|)
-	//   for _, crb := range candidates { ... }
-	//
-	// The post-lookup `anySubjectMatches` is UNCHANGED — it remains the
-	// canonical correctness barrier (HG-169-2). The index is a strict
-	// pre-filter; over-inclusion is fine (the matcher rejects), but
-	// under-inclusion is a permit-loss bug. Catch-all path (CRBsCatchAll)
-	// handles unrecognised Subject.Kind so future-Kind bindings stay
-	// reachable.
-	for _, crb := range selectCRBCandidates(snap, opts) {
+	//    permits override namespace scope. Sort in stable order
+	//    (design §6) so the first-match BindingUID is deterministic.
+	crbCandidates := selectCRBCandidates(snap, opts)
+	sortCRBsStable(crbCandidates)
+	for _, crb := range crbCandidates {
 		// Subject prefilter FIRST — skip the entire roleRefPermits
-		// walk when no subject matches. Cheaper than the rule-walk.
-		// The index already narrowed the candidate set; this matcher
-		// is the post-lookup correctness gate.
+		// walk when no subject matches. The index already narrowed
+		// the candidate set; this matcher is the post-lookup
+		// correctness gate.
 		if !anySubjectMatches(crb.Subjects, opts) {
 			continue
 		}
 		permits, err := roleRefPermits(snap, "", crb.RoleRef, opts, log)
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 		if permits {
-			return true, nil
+			return true, cache.BindingUIDFromCRB(crb), nil
 		}
 	}
 
@@ -247,29 +262,60 @@ func evaluateAgainstInformer(ctx context.Context, snap *cache.RBACSnapshot, opts
 	//    A RoleBinding's permit is scoped to its own namespace; the
 	//    RoleRef can point at a Role (same namespace) or a ClusterRole
 	//    (cluster-wide) but the binding's effect is the namespace.
-	//
-	// Ship 0.30.169 — same indexed pre-filter, scoped per-namespace.
 	if opts.Namespace != "" {
-		for _, rb := range selectRBCandidates(snap, opts.Namespace, opts) {
+		rbCandidates := selectRBCandidates(snap, opts.Namespace, opts)
+		sortRBsStable(rbCandidates)
+		for _, rb := range rbCandidates {
 			if !anySubjectMatches(rb.Subjects, opts) {
 				continue
 			}
 			permits, err := roleRefPermits(snap, opts.Namespace, rb.RoleRef, opts, log)
 			if err != nil {
-				return false, err
+				return false, "", err
 			}
 			if permits {
-				return true, nil
+				return true, cache.BindingUIDFromRB(rb), nil
 			}
 		}
 	}
 
-	return false, nil
+	return false, "", nil
+}
+
+// sortCRBsStable sorts candidate CRBs into stable lexicographic order
+// on (Name, UID). All candidates share Kind="ClusterRoleBinding" and
+// Namespace="" so those tuple dimensions are implicit. Used by
+// evaluateAgainstInformerFirstMatch to make first-match deterministic.
+//
+// sort.SliceStable is used so equal-key candidates (only possible under
+// apiserver bugs / mocks) preserve their index-pre-filter order.
+func sortCRBsStable(crbs []*rbacv1.ClusterRoleBinding) {
+	sort.SliceStable(crbs, func(i, j int) bool {
+		if crbs[i].Name != crbs[j].Name {
+			return crbs[i].Name < crbs[j].Name
+		}
+		return string(crbs[i].UID) < string(crbs[j].UID)
+	})
+}
+
+// sortRBsStable sorts candidate RBs into stable lexicographic order on
+// (Namespace, Name, UID). Namespace is defensively included even though
+// selectRBCandidates returns RBs from a single ns by construction.
+func sortRBsStable(rbs []*rbacv1.RoleBinding) {
+	sort.SliceStable(rbs, func(i, j int) bool {
+		if rbs[i].Namespace != rbs[j].Namespace {
+			return rbs[i].Namespace < rbs[j].Namespace
+		}
+		if rbs[i].Name != rbs[j].Name {
+			return rbs[i].Name < rbs[j].Name
+		}
+		return string(rbs[i].UID) < string(rbs[j].UID)
+	})
 }
 
 // selectCRBCandidates returns the candidate set of ClusterRoleBindings
 // reachable by opts — a strict SUPERSET of the linear-scan match set.
-// The caller (evaluateAgainstInformer) then post-filters each candidate
+// The caller (evaluateAgainstInformerFirstMatch) then post-filters each candidate
 // with anySubjectMatches (the canonical correctness barrier, evaluate.go:402-431).
 //
 // Routing — mirrors the index population in cache.rebuildSubjectIndexes

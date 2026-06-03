@@ -230,7 +230,9 @@ func attemptClusterListCollapse(
 		Resource:  gvr.Resource,
 		Namespace: "", // cluster-scope check — evaluate.go:213-235
 	}
-	permit, evalErr := rbac.EvaluateRBAC(ctx, permitOpts)
+	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
+	// ignores matchedBindingUID.
+	permit, _, evalErr := rbac.EvaluateRBAC(ctx, permitOpts)
 	if evalErr != nil || !permit {
 		log.Debug("cluster_list.gate_deny.rbac_deny",
 			slog.String("subsystem", "cache"),

@@ -249,7 +249,9 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 		return false
 	}
 
-	allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller ignores
+	// matchedBindingUID.
+	allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 		Username:  user.Username,
 		Groups:    user.Groups,
 		Verb:      "get",

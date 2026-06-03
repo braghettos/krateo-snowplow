@@ -252,7 +252,9 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 	// resource in the set. An empty set yields no iterations -> false
 	// (fail-closed — an unresolvable / empty resource set never permits).
 	for _, resource := range resources {
-		allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
+		// ignores matchedBindingUID return.
+		allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 			Username:  username,
 			Groups:    groups,
 			Verb:      uaf.Verb,

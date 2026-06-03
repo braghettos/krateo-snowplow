@@ -83,6 +83,23 @@ import (
 // extended in lockstep. AC-B.10's snapshot-miss canary will surface a
 // half-done migration loudly.
 type RBACSnapshot struct {
+	// PublishSeq — Ship 0.30.242 H.c-layered (Phase 2 step 2a). Monotone
+	// publish sequence stamped at construction by rebuildRBACSnapshot
+	// BEFORE the atomic Store. Pairs with the free-floating
+	// `rbacSnapshotPublishSeq atomic.Uint64` (kept for log correlation
+	// in RecordRBACSnapshotMiss) but lives on the snapshot itself so any
+	// reader who loads via Snapshot() observes a publish-seq that is
+	// coherent with the snapshot pointer.
+	//
+	// Load-bearing for the per-request authz memo (request_authz_memo.go,
+	// Phase 2b): the memo stamps the publish seq at construction and
+	// invalidates itself on mismatch. Without snap-coherent stamping the
+	// memo could read stale (snap N+1 contents but snap N seq) — design §5.3.
+	//
+	// 0 is a valid value (first publish stamps 1; the writer reads + adds
+	// in one operation against rbacSnapshotPublishSeq).
+	PublishSeq uint64
+
 	// Cluster-wide ClusterRoleBindings — read at evaluate.go:198.
 	ClusterRoleBindings []*rbacv1.ClusterRoleBinding
 
@@ -441,8 +458,32 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 	// snap via Snapshot() sees a fully-formed snapshot, indexes and all.
 	rebuildSubjectIndexes(snap)
 
+	// Ship 0.30.242 H.c-layered (Phase 2 step 2a) — atomic publish-seq
+	// stamp BEFORE rbacSnap.Store. Pre-ship the writer order was
+	// `rbacSnap.Store(snap); rbacSnapshotPublishSeq.Add(1)` — a reader
+	// that loaded snap between those two statements would observe a
+	// snap whose PublishSeq did not yet exist (or trailed the global
+	// counter). The fix: bump the global counter once, stamp it onto
+	// the snapshot itself, THEN Store. Any reader observing snap via
+	// Snapshot() now sees a snap with its PublishSeq already coherent.
+	//
+	// Defensive assertion: snap.PublishSeq > 0 guarantees the stamp
+	// reached the struct. A bug that surfaced this would manifest as
+	// an authz-memo invalidation storm (memo's stamped seq != snap's
+	// seq for every lookup) — easy to detect.
+	snap.PublishSeq = rbacSnapshotPublishSeq.Add(1)
+	if snap.PublishSeq == 0 {
+		// rbacSnapshotPublishSeq.Add(1) returns 0 only on wraparound after
+		// 2^64 publishes — at 4.6 publishes/sec that's ~127 billion years
+		// from now. Still: defence-in-depth — degrade-to-deny rather than
+		// silently publish a snapshot whose PublishSeq is the sentinel
+		// "no snapshot stamped yet" value.
+		slog.Error("cache.rbac.snapshot.publish_seq_wraparound",
+			slog.String("subsystem", "cache"),
+			slog.String("hint", "rbacSnapshotPublishSeq wrapped — refusing to publish"))
+		return
+	}
 	rbacSnap.Store(snap)
-	rbacSnapshotPublishSeq.Add(1)
 
 	slog.Debug("cache.rbac.snapshot.published",
 		slog.String("subsystem", "cache"),

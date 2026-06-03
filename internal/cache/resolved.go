@@ -29,7 +29,6 @@ package cache
 import (
 	"container/list"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -154,21 +153,21 @@ const CacheEntryClassWidgetContent = "widgetContent"
 // UNPAGINATED (PerPage=0/Page=0 → no `.slice` injected → the RA's output jq
 // `.slice.perPage // ($sorted|length)` returns the FULL sorted set).
 //
-// The cell is keyed by the RA's identity (its gvr/ns/name), the cohort
-// (BindingSetHash — identity-bound, same as restactions/widgets), and the
-// NON-slice Extras, with PerPage/Page FORCED to 0 (page-independent). Every
-// paginated /call that matches on non-slice inputs and differs ONLY in slice
-// (page/perPage) SHARES this one cell; the per-/call page is then applied as
-// a cheap Go-slice at serve time (see ra_full_list_slice.go). Widgets that
-// feed the same RA under the same cohort/extras land on the SAME cell — the
-// chokepoint dedupe across widgets.
+// The cell is keyed by the RA's identity (its gvr/ns/name), the per-layer
+// binding (BindingUID — identity-bound, same as restactions/widgets), and
+// the NON-slice Extras, with PerPage/Page FORCED to 0 (page-independent).
+// Every paginated /call that matches on non-slice inputs and differs ONLY
+// in slice (page/perPage) SHARES this one cell; the per-/call page is then
+// applied as a cheap Go-slice at serve time (see ra_full_list_slice.go).
+// Widgets that feed the same RA under the same per-layer binding share the
+// SAME cell — the chokepoint dedupe across widgets.
 //
 // IDENTITY-BOUND (NOT identity-free): RA output is RBAC-narrowed (the
-// userAccessFilter `namespaces` stage), so two cohorts can see different
-// rows. ComputeKey therefore folds BindingSetHash for this class exactly as
-// it does for restactions/widgets. The per-request RBAC gate (apistage
-// cohort-gate + UAF narrowing) is UNTOUCHED — this cell sits ABOVE it,
-// keyed per-cohort, never cross-cohort.
+// userAccessFilter `namespaces` stage), so two binding-classes can see
+// different rows. ComputeKey therefore folds BindingUID for this class
+// exactly as it does for restactions/widgets. The per-request RBAC gate
+// (UAF narrowing) is UNTOUCHED — this cell sits ABOVE it, keyed
+// per-binding, never cross-binding (design §3.3, raFullList row).
 //
 // The string VALUE "raFullList" is load-bearing: it is hashed into the
 // cache key (ComputeKey) AND used as the refresher registry key. Rotating
@@ -214,23 +213,20 @@ type ResolvedEntry struct {
 	ItemsAPIVersion string
 	ItemsKind       string
 
-	// CohortGates — Ship GMC / 0.30.174 — per-(content-entry × cohort)
-	// memo of filterListByRBAC's kept-name set. Lazily initialized by
-	// the apistage gate via CohortGateMemoStoreLoadOrInit; nil for
-	// every entry that has not yet served a memo-eligible LIST hit.
-	//
-	// The store maps cohortKey (string, hash of UserInfo) -> opaque
-	// memo (filled by the api package). The cache package owns the
-	// storage primitive (sync.Map for lock-free Lookup + an
-	// insertion-order eviction cap touched only on the Store miss
-	// path, CACHE_COHORT_MEMO_CAP default 128; cap <= 0 => unbounded,
-	// Ship 3 / 0.30.197); the cohort semantics + key shape live in
-	// api/apistage_cohort_memo.go.
-	//
-	// Field type is *CohortGateMemoStore (a value-type pointer, lazy);
-	// readers must call CohortGateMemoStoreLoadOrInit to acquire the
-	// store atomically. Direct field access is racy and unsupported.
-	CohortGates atomic.Pointer[CohortGateMemoStore]
+	// Ship 0.30.242 H.c-layered Phase 2 step 2a (commit subsequent to
+	// 1d93d02): the previous `CohortGates atomic.Pointer[CohortGateMemoStore]`
+	// field — Ship GMC / 0.30.174's per-(content-entry × cohort) memo of
+	// filterListByRBAC's kept-name set — is REMOVED. Under H.c-layered the
+	// apistage cell is RBAC-narrowed AT POPULATE TIME by the specific
+	// binding that authorised it (design §3.4); the per-cohort gate-memo
+	// is no longer needed because every cohort sharing this binding sees
+	// the SAME items. The CohortGateMemoStore type, NewCohortGateMemoStore
+	// constructor, and CohortGateMemoStoreLoadOrInit accessor were deleted
+	// alongside the field source file (cohort_gate_memo_store.go) in commit
+	// 1d93d02. The serve-time `apistage` filtering call site in
+	// internal/resolvers/restactions/api/apistage.go:586 is migrated in
+	// Phase 2b to serveParsedListEnvelope (a direct cell-items serve — no
+	// per-cohort filter).
 
 	// Pinned — Ship 4a (0.30.198) — marks the entry as RESIDENT: it lives
 	// in a separate byte budget (maxResidentBytes) and is SKIPPED by the
@@ -258,21 +254,26 @@ type ResolvedEntry struct {
 // guarantees clean separation across rolling restarts.
 //
 // Ship A.3 / 0.30.179 — Username + Groups REMOVED. The identity-bound
-// classes (restactions, widgets) now key on BindingSetHash, a uint64
-// hash of the cohort's RBAC binding-pointer-set. Two users whose
-// snapshot binding-set is pointer-equal collapse into ONE L1 cell —
-// matches the cohort dedupe contract EnumerateRBACCohorts encodes
-// (rbac_cohorts.go) one tier up at the cache-key layer. apistage +
-// widgetContent classes are identity-free and ignore BindingSetHash.
+// classes (restactions, widgets) keyed on BindingSetHash, a uint64 hash
+// of the cohort's RBAC binding-pointer-set.
+//
+// Ship 0.30.242 H.c-layered (Phase 2 step 2a) — BindingSetHash REPLACED
+// with BindingUID string. The L1 cell key now carries the metadata.uid
+// of the FIRST-MATCH binding that authorised THIS layer's access for
+// the request's identity. Per-binding sharing (finer granularity than
+// per-cohort): two users granted by the SAME binding share the cell;
+// the same user with different bindings authorising different layers
+// gets different cells per layer (the per-binding granularity advantage
+// over v3, design §1.2).
 //
 // HG-178.6 falsifier: no `Username string` + `Groups []string` literal
 // columns survive in ResolvedKeyInputs for restactions/widgets.
 type ResolvedKeyInputs struct {
 	// CacheEntryClass is the entry-class discriminant — one of the string
-	// values "restactions", "widgets", "apistage", or "widgetContent".
-	// (Renamed from HandlerKind in 0.30.118; the string VALUES are
-	// unchanged — they are hashed into the key and used as refresher
-	// registry keys.)
+	// values "restactions", "widgets", "apistage", "widgetContent", or
+	// "raFullList". (Renamed from HandlerKind in 0.30.118; the string
+	// VALUES are unchanged — they are hashed into the key and used as
+	// refresher registry keys.)
 	CacheEntryClass string
 	Group           string // dispatched CR's GVR Group
 	Version         string // dispatched CR's GVR Version
@@ -280,33 +281,47 @@ type ResolvedKeyInputs struct {
 	Namespace       string // dispatched CR namespace
 	Name            string // dispatched CR name
 
-	// BindingSetHash — Ship A.3 / 0.30.179 — the FNV-64a hash of the
-	// cohort's matched RBAC binding-pointer-set, identical mechanism to
-	// CohortRBACGen's pointer-set hash (rbac_cohort_gen.go:147). Zero
-	// for identity-free classes (apistage / widgetContent); non-zero
-	// for restactions / widgets. ComputeKey folds it in only when class
-	// is non-identity-free.
-	BindingSetHash uint64
+	// BindingUID — Ship 0.30.242 H.c-layered — the per-layer first-match
+	// binding identity that authorised this cell's access for the
+	// request's identity. Replaces the v3 BindingSetHash uint64 cohort
+	// hash with a finer-grained per-binding string identity:
+	//
+	//   ""            — anonymous / no permit / no snapshot (cache=off / pre-ready)
+	//   "C:<uid>"     — ClusterRoleBinding match
+	//   "R:<ns>/<uid>" — RoleBinding match (ns prefix carries scope)
+	//
+	// Folded into ComputeKey for every class EXCEPT widgetContent. The
+	// "C:" / "R:" prefixes keep CRB and RB UIDs from aliasing; the
+	// "R:<ns>/" prefix on RBs also carries namespace scope into the
+	// identifier directly (defensive — apiserver does not reuse UIDs
+	// across namespaces, but the prefix shape makes that invariant
+	// machine-readable from the BindingUID alone).
+	//
+	// SOT for derivation: cache.BindingUIDFromCRB / BindingUIDFromRB in
+	// internal/cache/match_subject.go (the lint-allowlisted derivation
+	// site — design §4.3).
+	BindingUID string
 
 	// RepresentativeUsername + RepresentativeGroups — Ship A.3 / 0.30.179
-	// Option A. The L1 cell is per-COHORT (keyed by BindingSetHash), but
-	// the REFRESHER must re-resolve under a CONCRETE identity (a request
-	// runs as a single user; objects.Get + RBAC narrowing need a username
-	// + groups). The first writer's identity is recorded here as the
-	// representative tuple for re-resolve.
+	// Option A; KEPT in H.c-layered. The L1 cell is per-binding (keyed by
+	// BindingUID), but the REFRESHER must re-resolve under a CONCRETE
+	// identity (a request runs as a single user; objects.Get + RBAC
+	// narrowing need a username + groups). The first writer's identity is
+	// recorded here as the representative tuple for re-resolve.
 	//
-	// CORRECTNESS: every cohort member resolves to BYTE-IDENTICAL output
-	// (that is the cohort dedupe contract — feedback_l1_per_user_keyed_
-	// never_cohort.md compliant because the cohort IS the equivalence
-	// class of users producing identical resolved output). The
-	// representative is therefore EQUIVALENT to any other cohort member
-	// at resolve time. If the cohort topology changes (binding mutation),
-	// the BindingSetHash shifts, the next /call MISSes, the seed reseeds
-	// under a fresh representative — no stale-identity risk.
+	// CORRECTNESS: every member of the equivalence class authorised by
+	// the same BindingUID resolves to BYTE-IDENTICAL output (per-binding
+	// sharing is the equivalence-class invariant — feedback_l1_per_user_
+	// keyed_never_cohort.md compliant because per-binding sharing IS the
+	// equivalence class for users granted by the same binding). The
+	// representative is therefore EQUIVALENT to any other binding-class
+	// member at resolve time. If the binding is deleted, the cell is
+	// dirty-marked by BindingUID; the next /call MISSes, the seed
+	// reseeds under a fresh representative — no stale-identity risk.
 	//
 	// EXCLUDED FROM COMPUTEKEY. These fields are bookkeeping carried on
-	// ResolvedEntry.Inputs, NOT key material. Two cohort members writing
-	// the same cell must NOT shift the cell's identity by name; ComputeKey
+	// ResolvedEntry.Inputs, NOT key material. Two members writing the
+	// same cell must NOT shift the cell's identity by name; ComputeKey
 	// skips them entirely.
 	RepresentativeUsername string
 	RepresentativeGroups   []string
@@ -349,7 +364,24 @@ type ResolvedKeyInputs struct {
 // value, so a pre-0.30.195 (pointer-keyed) L1 entry MUST NOT be served as
 // the new UID-keyed entry for the same cohort. The salt rotation forces a
 // clean rolling key break: pre-v3 entries never serve as v3 hits.
-const resolvedKeyVersion = "v3"
+//
+// Ship 0.30.242 H.c-layered (Phase 2 step 2a) — BUMPED v3 → v4. The
+// identity field changed from BindingSetHash uint64 (cohort hash over
+// the matched binding-set) to BindingUID string (first-match per-layer
+// binding identity). The ComputeKey body fold rotates from a uint64
+// LittleEndian encoding to a UTF-8 string write — pre-v4 keys are
+// structurally different from v4 keys for the SAME logical access. The
+// salt rotation forces a clean rolling key break: pre-v4 (cohort-keyed)
+// entries never serve as v4 (per-binding-keyed) hits.
+//
+// Additionally, the v3-v4 fold also drops the apistage exclusion: under
+// v3 the apistage cell was identity-free at the ComputeKey level (the
+// per-cohort gate-memo filtered items at serve time); under v4 the
+// apistage cell folds BindingUID like every other identity-bound class.
+// The cohort-gate-memo apparatus is deleted (design §3.4). Pre-v4
+// apistage entries CANNOT serve as v4 hits even under the same identity
+// because the v3 key did not encode identity.
+const resolvedKeyVersion = "v4"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed
@@ -584,35 +616,33 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	h.Write([]byte(in.Name))
 	h.Write([]byte{0})
 
-	// Identity. Ship F1 (0.30.119): the api-stage content layer is
-	// IDENTITY-FREE — an api-stage entry's resolved content (a per-object
-	// GET / per-namespace LIST K8s call result) is identity-invariant.
-	// Ship G (0.30.16x): widgetContent is ALSO identity-free — the widget
-	// envelope is shared, the per-user `allowed` flag is re-derived at
-	// serve time.
+	// Identity. Ship G (0.30.16x): widgetContent is identity-free — the
+	// widget envelope is shared, the per-user `allowed` flag is re-derived
+	// at serve time.
 	//
-	// Ship A.3 / 0.30.179: identity-bound classes (restactions, widgets)
-	// fold in `BindingSetHash` — a uint64 hash of the cohort's matched
-	// RBAC binding-pointer-set. Two users whose binding-set is pointer-
-	// equal land on the SAME cell, dedup'ing per-user cells into per-
-	// cohort cells. The pre-A.3 shape hashed Username + sorted Groups
-	// literally — a per-user cardinality. The cohort cardinality is
-	// typically O(10) at admin scale vs O(1000+) per-user. Identical
-	// mechanism to CohortRBACGen's per-cohort generator
-	// (rbac_cohort_gen.go) one tier up at the L1 key.
+	// Ship 0.30.242 H.c-layered (Phase 2 step 2a): identity-bound classes
+	// (restactions, widgets, apistage, raFullList) fold in `BindingUID` —
+	// the first-match per-layer binding identity from the cache snapshot
+	// (cache.BindingUIDFromCRB / FromRB applied to whichever CRB or RB
+	// granted THIS layer's access for the request's identity). Two users
+	// granted by the SAME binding land on the SAME cell — finer-grained
+	// sharing than v3's per-cohort hash (per design §3.3 + §3.4).
+	//
+	// apistage flipped from identity-free (v3) to identity-bound (v4):
+	// under v3 the apistage cell held SA-populated raw items filtered
+	// per-cohort at serve time by gateListItemsWithMemo. Under v4 the
+	// apistage cell is RBAC-narrowed AT POPULATE TIME by the specific
+	// binding that authorised it; the cohort-gate-memo apparatus is
+	// deleted (design §3.4). widgetContent stays identity-free.
 	//
 	// This is a per-CLASS key shape, NOT a per-resource switch
 	// (feedback_no_special_cases): the discriminant is the entry class,
-	// uniform for every entry of every GVR. apistage + widgetContent skip
-	// the identity fold entirely; restactions + widgets fold a single 8-
-	// byte uint64. The v1→v2 resolvedKeyVersion bump rotates the key
-	// space cleanly on the rolling restart so no v1 entry serves as a
-	// v2 hit (AC-178.3).
-	if in.CacheEntryClass != CacheEntryClassApistage &&
-		in.CacheEntryClass != CacheEntryClassWidgetContent {
-		var buf [8]byte
-		binary.LittleEndian.PutUint64(buf[:], in.BindingSetHash)
-		h.Write(buf[:])
+	// uniform for every entry of every GVR. widgetContent skips the
+	// identity fold entirely; all other classes fold the BindingUID
+	// string. The v3 → v4 resolvedKeyVersion bump rotates the key space
+	// cleanly on the rolling restart so no v3 entry serves as a v4 hit.
+	if in.CacheEntryClass != CacheEntryClassWidgetContent {
+		h.Write([]byte(in.BindingUID))
 		h.Write([]byte{0xff}) // identity terminator
 	}
 

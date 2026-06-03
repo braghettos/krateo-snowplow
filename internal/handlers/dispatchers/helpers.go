@@ -101,7 +101,11 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 		return false
 	}
 
-	allowed, evalErr := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+	// Ship 0.30.242 H.c-layered (Phase 2 step 2a) — EvaluateRBAC returns
+	// (allowed, matchedBindingUID, err). This per-item caller ignores
+	// matchedBindingUID; cache-key callers consume it (helpers.go:202 +
+	// :306 via the per-request memo, Phase 2b).
+	allowed, _, evalErr := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 		Username:  ui.Username,
 		Groups:    ui.Groups,
 		Verb:      "get",

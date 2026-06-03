@@ -150,7 +150,9 @@ func filterListByRBAC(
 			// Verb is "list" — Name is deliberately omitted (AC-6): it is
 			// inert for a collection verb and dropping it keeps the
 			// namespace-keyed memo sound.
-			ok, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+			// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
+			// ignores matchedBindingUID.
+			ok, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 				Username:  user.Username,
 				Groups:    user.Groups,
 				Verb:      "list",
@@ -256,7 +258,10 @@ func filterGetByRBAC(
 	// Verb is "get" — a name-specific verb. The object's OWN name is
 	// threaded so a resourceNames-scoped rule (resourceNames: ["foo"])
 	// grants `get foo` but not `get bar` (0.30.109, G1).
-	allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+	//
+	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller ignores
+	// matchedBindingUID.
+	allowed, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
 		Username:  user.Username,
 		Groups:    user.Groups,
 		Verb:      "get",
