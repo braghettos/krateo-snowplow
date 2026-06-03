@@ -22,9 +22,23 @@ import (
 // post-g.Wait() applyUserAccessFilter call ran on the projected shape,
 // which broke NamespaceFrom for any filter that dropped .metadata. See
 // refilter_layering_test.go for the permanent regression gate.
+//
+// Ship K / 0.30.245 — `dict` plumbs the resolver's accumulated
+// stage-output dict so resolveUAFResources can evaluate
+// `userAccessFilter.resourcesFrom` against UPSTREAM stage outputs
+// (e.g. `.crds` populated by a prior stage). Pre-Ship-K passed `pig`
+// (the per-stage scope) to resolveUAFResources, which never contains
+// upstream stage keys → ResourcesFrom always returned []  → fail-closed
+// drop every item → 0-count piechart regression on the live
+// compositions-list RA. Permanent regression gate at
+// refilter_layering_test.go::TestUAFRefilter_ResourcesFromMultiStage_ResolvesAgainstDictNotPig.
+// The dict reference is the SAME map jsonHandlerCore writes to as
+// `out`; refilter reads it BEFORE the merge, so it sees upstream
+// stages but NOT the current stage being filtered.
 type jsonHandlerOptions struct {
 	key         string
 	out         map[string]any
+	dict        map[string]any
 	filter      *string
 	uaf         *templates.UserAccessFilterSpec
 	apiCallName string
@@ -105,8 +119,14 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	// stage filter projects items. The projection can omit .metadata;
 	// running UAF first uses the K8s-canonical shape the spec documents.
 	// nil-UAF is a single early-return — pre-0.30.235 byte-identical.
+	//
+	// Ship K / 0.30.245 — opts.dict is threaded into the refilter so
+	// resolveUAFResources evaluates `resourcesFrom` against the FULL
+	// resolver dict (upstream stage outputs), not the per-stage pig
+	// scope. Fixes the 0-count compositions-list regression preserved
+	// from 0.30.235.
 	if opts.uaf != nil {
-		rf := applyUserAccessFilterOnPig(ctx, pig, opts.key, opts.uaf)
+		rf := applyUserAccessFilterOnPig(ctx, pig, opts.dict, opts.key, opts.uaf)
 		emitRefilterFalsifierFromHandler(ctx, log, opts.apiCallName, opts.uaf, rf)
 	}
 

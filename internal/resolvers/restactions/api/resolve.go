@@ -513,9 +513,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// jsonHandlerCore can run the refilter on the RAW envelope
 			// BEFORE the stage filter projects items. The pre-0.30.235
 			// post-g.Wait() applyUserAccessFilter call is DELETED.
+			// Ship K / 0.30.245 — `dict` plumbs the resolver's
+			// accumulated stage-output dict into jsonHandlerCore so the
+			// UAF refilter's resolveUAFResources evaluates
+			// resourcesFrom against UPSTREAM stage outputs (e.g.
+			// `.crds` from a prior stage). Same map as `out`; refilter
+			// reads BEFORE the merge so the current stage is absent
+			// (correct — resourcesFrom never references the stage it
+			// gates). Pre-Ship-K passed only `pig` (per-stage scope) →
+			// resourcesFrom returned [] → 0-count regression on the
+			// multi-stage compositions-list RA.
 			hOpts := jsonHandlerOptions{
 				key:         id,
 				out:         dict,
+				dict:        dict,
 				filter:      apiCall.Filter,
 				uaf:         apiCall.UserAccessFilter,
 				apiCallName: apiCall.Name,

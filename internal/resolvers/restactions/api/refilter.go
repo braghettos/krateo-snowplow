@@ -407,7 +407,22 @@ func setRefilteredEmpty(dict map[string]any, apiName string) error {
 // applyUserAccessFilter (refilter.go:71). The pre-0.30.235 post-g.Wait()
 // applyUserAccessFilter call (resolve.go:879-888 in dbbea37) is DELETED;
 // this shim is the new sole production callsite.
-func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) refilterResult {
+//
+// Ship K / 0.30.245 — added the `dict` parameter. resolveUAFResources
+// now evaluates `userAccessFilter.resourcesFrom` against the FULL
+// resolver dict (where upstream stage outputs live, e.g. `.crds`
+// populated by a prior stage), NOT the per-stage `pig` (which only
+// contains {stageName: <thisStageRawEnvelope>}). Pre-Ship-K used `pig`,
+// which never contained upstream stage keys → ResourcesFrom always
+// returned [] → fail-closed dropped every item → 0-count piechart
+// regression on the live multi-stage compositions-list RA.
+// `dict` MAY be nil for callers that don't have an upstream dict
+// (single-stage RAs); resolveUAFResources handles nil safely by
+// returning empty resources, which is the existing fail-closed
+// shape for an unresolvable ResourcesFrom — identical to pre-Ship-K
+// behaviour for that case. Per-item refilter still uses `pig` items —
+// that scope is correct for items.
+func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict map[string]any, stageName string, uaf *templates.UserAccessFilterSpec) refilterResult {
 	log := xcontext.Logger(ctx)
 	res := refilterResult{}
 
@@ -426,7 +441,10 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, stageNa
 	}
 
 	// Ship 0.30.129 ResourcesFrom contract — fail-closed.
-	resources, resOK := resolveUAFResources(ctx, log, uaf, pig)
+	// Ship K / 0.30.245 — pass `dict` (full resolver scope) instead of
+	// the per-stage `pig`. `dict` carries upstream stage outputs that
+	// resourcesFrom expressions reference (e.g. `.crds`).
+	resources, resOK := resolveUAFResources(ctx, log, uaf, dict)
 	if !resOK {
 		log.Error("userAccessFilter: resource set unresolved; dropping all items (fail-closed)",
 			slog.String("api", stageName),
