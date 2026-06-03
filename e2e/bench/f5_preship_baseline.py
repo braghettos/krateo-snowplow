@@ -244,6 +244,14 @@ def main() -> int:
         "--out", default=None,
         help="output JSON path (default: f5_preship_baseline_<YYYY-MM-DD>.json "
              "in the script directory)")
+    parser.add_argument(
+        "--label", default=None,
+        help="optional free-form label written to baseline.captured_against. "
+             "If omitted, the label is auto-built from the live cluster's "
+             "snowplow_helm + portal_helm + snowplow_image so the JSON "
+             "always reflects ACTUAL cluster state instead of a "
+             "hardcoded ship version (task #3: F5 baseline labelling). "
+             "Pass e.g. --label 'post-Path-B cluster' to override.")
     args = parser.parse_args()
 
     print("F5 — Chrome customer-probe pre-ship baseline (Ship 0.30.242 H.c-layered)")
@@ -296,10 +304,25 @@ def main() -> int:
 
     # Compose baseline JSON.
     captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # `captured_against` was originally a hardcoded string pinning the
+    # 0.30.242 H.c-layered ship's pre-state. Hardcoding meant every
+    # post-ship rerun emitted a stale "pre-ship cluster (snowplow image
+    # 0.30.235 ...)" label — looking like the cluster hadn't changed
+    # when in fact it had. Now derived from live `cluster_baseline`,
+    # which is captured via `helm history` + `kubectl get pod` at run
+    # start. The operator can override via `--label`.
+    if args.label:
+        captured_against = args.label
+    else:
+        captured_against = (
+            f"live cluster (snowplow {cluster_baseline.get('snowplow_helm', '?')} "
+            f"image {cluster_baseline.get('snowplow_image', '?')} + "
+            f"portal {cluster_baseline.get('portal_helm', '?')})"
+        )
     baseline = {
         "captured_at": captured_at,
         "captured_by": "f5_preship_baseline.py (Ship 0.30.242 H.c-layered Phase 3 F5)",
-        "captured_against": "pre-ship cluster (snowplow image 0.30.235 + chart 0.30.243 + portal rev 33)",
+        "captured_against": captured_against,
         "cluster_baseline": cluster_baseline,
         "ship_plan_invariant": (
             "F5 measures customer-visible integer counts (piechart composition "
