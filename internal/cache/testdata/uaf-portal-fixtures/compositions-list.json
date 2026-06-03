@@ -41,6 +41,7 @@
         "userAccessFilter": {
           "group": "composition.krateo.io",
           "namespaceFrom": ".metadata.namespace",
+          "resourcesFrom": "[ (.crds // [])[] | .plural ]",
           "verb": "list"
         },
         "verb": "GET"
