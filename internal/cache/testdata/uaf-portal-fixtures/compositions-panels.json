@@ -1,0 +1,37 @@
+{
+  "apiVersion": "templates.krateo.io/v1",
+  "kind": "RESTAction",
+  "metadata": {
+    "annotations": {
+      "krateo.io/verbose": "true",
+      "meta.helm.sh/release-name": "portal",
+      "meta.helm.sh/release-namespace": "krateo-system"
+    },
+    "creationTimestamp": "2026-05-13T09:28:47Z",
+    "generation": 7,
+    "labels": {
+      "app.kubernetes.io/managed-by": "Helm"
+    },
+    "name": "compositions-panels",
+    "namespace": "krateo-system",
+    "resourceVersion": "1780258024766831007",
+    "uid": "e3ec167e-40c7-4fff-958b-79d322ce8a53"
+  },
+  "spec": {
+    "api": [
+      {
+        "continueOnError": true,
+        "filter": "[.compositionspanels.items[]?\n | select((.metadata.labels // {})[\"krateo.io/portal-page\"] == \"compositions\")\n | {\n     apiVersion,\n     kind,\n     metadata: {\n       name: .metadata.name,\n       namespace: .metadata.namespace,\n       uid: .metadata.uid,\n       creationTimestamp: .metadata.creationTimestamp,\n       labels: .metadata.labels\n     }\n   }]\n",
+        "name": "compositionspanels",
+        "path": "/apis/widgets.templates.krateo.io/v1beta1/panels",
+        "userAccessFilter": {
+          "group": "widgets.templates.krateo.io",
+          "namespaceFrom": ".metadata.namespace",
+          "resource": "panels",
+          "verb": "list"
+        }
+      }
+    ],
+    "filter": "{\n  compositionspanels: (\n    (.compositionspanels // []) as $items\n    | ($items | sort_by(.metadata.creationTimestamp // \"\") | reverse) as $sorted\n    | (.slice.offset  // 0)                 as $offset\n    | (.slice.perPage // ($sorted | length)) as $perPage\n    | [\n        $sorted\n        | length as $len\n        | range($offset; $offset + $perPage)\n        | select(. < $len)         # avoid out-of-bounds\n        | $sorted[.]\n      ]\n  )\n}\n"
+  }
+}
