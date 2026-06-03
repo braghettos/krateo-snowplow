@@ -574,17 +574,25 @@ func apistageContentServe(
 	// the gate now returns the DECODED envelope value, so the caller
 	// feeds it via jsonHandlerValue with no marshal + no unmarshal.
 	//
-	// Ship GMC / 0.30.174 — the LIST-with-pre-parsed-items branch runs
-	// through gateListItemsWithMemo, which short-circuits the per-item
-	// filterListByRBAC fan-out on a same-cohort hit. The CohortGates
-	// store is lazily attached to entryRef; the memo lives for the
-	// entry's lifetime (LRU-evicted from the content cache together
-	// with the entry).
+	// Ship 0.30.242 H.c-layered Phase 2b — design §3.4 / §22.1.A item
+	// #4. The pre-ship gateListItemsWithMemo branch (per-cohort gate
+	// memo at serve time) is REMOVED. Under H.c-layered the apistage
+	// cell is RBAC-narrowed AT POPULATE TIME by the BindingUID that
+	// authorised it (the cell's ResolvedKeyInputs.BindingUID is folded
+	// into ComputeKey — every cell holds items that THIS binding
+	// permits; every cohort sharing this binding sees the same items).
+	// The serve path no longer needs a per-cohort filter; the items in
+	// the cell are correct by construction.
+	//
+	// The new serveParsedListEnvelope returns the parsed items as a
+	// []any with served=true. The entryRef parameter remains in scope
+	// for the gateContentEnvelope branch below (unstructured GET path)
+	// but is no longer consumed by the parsed-list branch.
+	_ = entryRef
 	var gated any
 	var gateOK bool
 	if haveParsed {
-		memoStore := cache.CohortGateMemoStoreLoadOrInit(entryRef)
-		gated, gateOK = gateListItemsWithMemo(ctx, memoStore, gvr, parsed)
+		gated, gateOK = serveParsedListEnvelope(parsed)
 	} else {
 		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope)
 	}
@@ -593,6 +601,39 @@ func apistageContentServe(
 		return nil, false, true
 	}
 	return gated, true, true
+}
+
+// serveParsedListEnvelope returns the cell's pre-parsed list items as
+// a decoded envelope value with served=true. Ship 0.30.242 H.c-layered
+// Phase 2b replacement for the deleted gateListItemsWithMemo: the cell
+// holds items that THIS BindingUID's authorisation already permitted
+// at populate time (the cell key folds BindingUID, design §3.4), so
+// the serve path does NOT re-filter.
+//
+// The returned envelope is a map shaped like the apiserver's LIST
+// response: {"apiVersion", "kind", "items"} with items being the
+// []any extraction of the parsed.items slice. The caller
+// (jsonHandlerValue) treats this as the decoded envelope.
+//
+// served=false ONLY when parsed.items is nil/empty — defensive guard
+// against a malformed cell. The fail-closed branch falls through to
+// apiserver — same shape as gateContentEnvelope.
+func serveParsedListEnvelope(parsed parsedListEnvelope) (any, bool) {
+	if parsed.items == nil {
+		return nil, false
+	}
+	items := make([]any, 0, len(parsed.items))
+	for _, it := range parsed.items {
+		if it != nil {
+			items = append(items, it.Object)
+		}
+	}
+	envelope := map[string]any{
+		"apiVersion": parsed.apiVersion,
+		"kind":       parsed.kind,
+		"items":      items,
+	}
+	return envelope, true
 }
 
 // ptrTo returns a pointer to v — a local generic helper so the content

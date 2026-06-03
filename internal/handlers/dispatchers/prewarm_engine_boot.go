@@ -198,51 +198,68 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 }
 
 // seedScopeYielding seeds the per-user top-level L1 for the harvested
-// restactions + widgets, PER-TARGET-GVR-scoped cohorts, yielding to
-// customer /call between cohorts. Replaces runPIPSeed's global single
-// EnumerateBindingSetClasses() cohort source with the resource-driven
-// EnumerateResourceCohorts(targetGVR) per harvested target.
+// restactions + widgets, PER-TARGET-GVR-scoped per-binding targets,
+// yielding to customer /call between targets. Replaces the pre-ship
+// per-cohort fan-out with per-binding fan-out via
+// cache.EnumeratePrewarmTargetsForGVR.
 //
 // The two loops are SYMMETRIC:
-//   - widget loop: cohorts scoped on the widget's GVR (e.namWidgetEntry.GVR).
-//   - restaction loop: cohorts scoped on the RESTAction's TARGET GVR (the
-//     GVR it LISTs, derived from the RA's userAccessFilter). So the
-//     apiRef/RAFullList layer is bounded identically (~3-6 not 34).
+//   - widget loop: targets scoped on the widget's GVR (e.GVR).
+//   - restaction loop: targets scoped on the RESTAction's TARGET GVR
+//     (derived from the RA's userAccessFilter). The apiRef/RAFullList
+//     layer is bounded identically (~3-6 targets, not the v3 global ~34
+//     cohort universe).
 //
-// FALLBACK — when EnumerateResourceCohorts(gvr) yields nothing (index not
-// built, or a GVR with no matching bindings, or a runtime-discovered
-// target with no static resource) the loop falls back to the global
-// EnumerateBindingSetClasses() for that target (safe over-inclusion;
-// under-inclusion would be a cold first /call).
+// Ship 0.30.242 H.c-layered Phase 2b — the v3 global-cohort fallback
+// (`globalCohorts := cache.EnumerateBindingSetClasses()`) is REMOVED.
+// Design §22.1.A NACK item #2: when the per-GVR enumerator returns
+// empty (genuinely no authorising bindings), the seed loop SKIPS that
+// GVR rather than fall back to a global universe — a fallback would
+// have included identities that can't authorise the GVR (wasted seed +
+// cells under wrong identity).
+//
+// Runtime-discovered RA targets (ResourcesFrom — no static literal) are
+// skipped by the seed engine here; the customer /call resolves them
+// cold-then-warm via the on-demand dispatcher (helpers.go's
+// dispatchCacheLookupKey populates the cell at first call).
 func seedScopeYielding(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
 
 	log := slog.Default()
 
-	// Global fallback cohort set — computed once, reused for any target
-	// the index can't scope. Empty when no snapshot is published.
-	globalCohorts := cache.EnumerateBindingSetClasses()
-
-	// cohortsFor resolves the resource-driven cohort set for a target GVR,
-	// falling back to the global set when the index yields nothing (index
-	// not built / no matching bindings / runtime-discovered target). The
-	// bool reports whether the result was index-scoped (telemetry).
-	cohortsFor := func(gvr schema.GroupVersionResource, haveGVR bool) ([]cache.Cohort, bool) {
-		if haveGVR {
-			if rc := cache.EnumerateResourceCohorts(gvr); len(rc) > 0 {
-				return rc, true
-			}
+	// targetsFor resolves the per-binding target set for a target GVR.
+	// Empty when (a) the index is not built (pre-readiness), (b) no
+	// binding authorises (gvr, list), or (c) haveGVR=false (runtime-
+	// discovered target — handled on-demand at /call time, no global
+	// fallback per design §22.1.A item #2). The bool reports whether the
+	// result was index-scoped (telemetry).
+	targetsFor := func(gvr schema.GroupVersionResource, haveGVR bool) ([]seedTarget, bool) {
+		if !haveGVR {
+			return nil, false
 		}
-		return globalCohorts, false
+		raw := cache.EnumeratePrewarmTargetsForGVR(gvr, "list")
+		if len(raw) == 0 {
+			return nil, false
+		}
+		out := make([]seedTarget, 0, len(raw))
+		for _, t := range raw {
+			out = append(out, seedTarget{
+				BindingUID: t.BindingUID,
+				Username:   t.Subject.Username,
+				Groups:     append([]string(nil), t.Subject.Groups...),
+			})
+		}
+		return out, true
 	}
 
-	// seedTarget runs one (cohort, target) seed under a per-cohort timeout
-	// (pipCohortTimeout — matches seedCohort's stuck-cohort guard) and the
-	// cohort seed context. The per-target seed primitive (seedOneRestaction
-	// / seedOneWidget) is passed as a closure so the restaction + widget
-	// loops share the timeout + yield + error-containment wrapper.
-	seedTarget := func(c cache.Cohort, do func(cohortCtx context.Context) error) error {
+	// seedOneTarget runs one (target, layer) seed under a per-target
+	// timeout (pipCohortTimeout — matches seedCohort's stuck-cohort
+	// guard) and the cohort seed context. The per-target seed primitive
+	// (seedOneRestaction / seedOneWidget) is passed as a closure so the
+	// restaction + widget loops share the timeout + yield + error-
+	// containment wrapper.
+	seedOneTarget := func(c seedTarget, do func(cohortCtx context.Context) error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -253,7 +270,7 @@ func seedScopeYielding(ctx context.Context,
 		return do(cohortCtx)
 	}
 
-	// ── RESTActions seed — scoped on each RA's TARGET GVR.
+	// ── RESTActions seed — per-binding targets scoped on each RA's TARGET GVR.
 	for _, ref := range restactionRefs {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -261,16 +278,16 @@ func seedScopeYielding(ctx context.Context,
 		engineYieldCheckpoint(ctx)
 
 		targetGVR, haveTarget := restActionTargetGVR(ctx, ref)
-		cohorts, scoped := cohortsFor(targetGVR, haveTarget)
-		log.Info("prewarm.engine.seed.restaction_cohorts",
+		targets, scoped := targetsFor(targetGVR, haveTarget)
+		log.Info("prewarm.engine.seed.restaction_targets",
 			slog.String("subsystem", "cache"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
 			slog.String("target_gvr", targetGVR.String()),
 			slog.Bool("scoped", scoped),
-			slog.Int("cohorts", len(cohorts)),
+			slog.Int("targets", len(targets)),
 		)
-		for _, c := range cohorts {
-			err := seedTarget(c, func(cohortCtx context.Context) error {
+		for _, c := range targets {
+			err := seedOneTarget(c, func(cohortCtx context.Context) error {
 				return seedOneRestaction(cohortCtx, cohortLogLabel(c), ref, authnNS)
 			})
 			if err != nil && ctx.Err() != nil {
@@ -279,7 +296,7 @@ func seedScopeYielding(ctx context.Context,
 			if err != nil {
 				slog.Warn("prewarm.engine.seed.restaction_skipped",
 					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(c)),
+					slog.String("target", cohortLogLabel(c)),
 					slog.String("restaction", ref.Namespace+"/"+ref.Name),
 					slog.Any("err", err),
 				)
@@ -287,23 +304,23 @@ func seedScopeYielding(ctx context.Context,
 		}
 	}
 
-	// ── Widgets seed — scoped on each widget's GVR.
+	// ── Widgets seed — per-binding targets scoped on each widget's GVR.
 	for _, e := range widgetEntries {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		engineYieldCheckpoint(ctx)
 
-		cohorts, scoped := cohortsFor(e.GVR, true)
-		log.Info("prewarm.engine.seed.widget_cohorts",
+		targets, scoped := targetsFor(e.GVR, true)
+		log.Info("prewarm.engine.seed.widget_targets",
 			slog.String("subsystem", "cache"),
 			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
 			slog.String("gvr", e.GVR.String()),
 			slog.Bool("scoped", scoped),
-			slog.Int("cohorts", len(cohorts)),
+			slog.Int("targets", len(targets)),
 		)
-		for _, c := range cohorts {
-			err := seedTarget(c, func(cohortCtx context.Context) error {
+		for _, c := range targets {
+			err := seedOneTarget(c, func(cohortCtx context.Context) error {
 				return seedOneWidget(cohortCtx, e, authnNS)
 			})
 			if err != nil && ctx.Err() != nil {
@@ -312,7 +329,7 @@ func seedScopeYielding(ctx context.Context,
 			if err != nil {
 				slog.Warn("prewarm.engine.seed.widget_skipped",
 					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(c)),
+					slog.String("target", cohortLogLabel(c)),
 					slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
 					slog.Any("err", err),
 				)

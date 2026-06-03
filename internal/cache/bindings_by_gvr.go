@@ -11,12 +11,17 @@
 //
 // CRITICAL — LIST not KEY (project_resource_driven_cohort_design_2026_05_28).
 // This index changes only WHICH SUBJECTS the seed enumerates per GVR. It
-// does NOT change the cohort KEY: the per-cohort L1 cell stays keyed by
-// `BindingSetHash` over the subject's FULL matched binding-set (NOT
-// GVR-scoped) — a GVR-scoped key would collapse subjects whose g-verdict
-// matches but whose ns-visibility differs (RBAC leak). EnumerateResourceCohorts
-// returns Cohort values that route through the EXISTING BindingSetHash /
-// sentinel / system:authenticated machinery unchanged.
+// does NOT change the L1 cell KEY: the per-(layer, BindingUID) L1 cell
+// stays keyed by the FIRST-MATCH binding's UID, derived per-layer at
+// dispatch time by rbac.EvaluateRBAC. The index is SEED-TARGETING only
+// — it picks WHICH BindingUIDs to prewarm per GVR via the
+// EnumeratePrewarmTargetsForGVR enumerator (prewarm_enumeration.go).
+//
+// Ship 0.30.242 H.c-layered Phase 2b: the prior EnumerateResourceCohorts
+// returned `[]Cohort` for a per-cohort dispatch fan-out (cohort dedupe
+// happened at the BindingSetHash layer). H.c-layered replaces that with
+// per-binding targets (each binding → one prewarm dispatch keyed by that
+// binding's UID — cell sharing is finer-grained per design §1.2).
 //
 // AUTHZ BOUNDARY UNTOUCHED. This index is SEED-TARGETING only. The
 // per-request authz boundary remains EvaluateRBAC (evaluate.go:210) over
@@ -64,7 +69,6 @@
 package cache
 
 import (
-	"sort"
 	"sync"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -96,11 +100,20 @@ type subjectKey struct {
 
 // bindingID is the stable per-binding identity the buckets are keyed on
 // for incremental delete. A binding's subjects all share its bindingID;
-// the bucket value is the set of bindingIDs whose roleRef grants the GVR,
-// each carrying the binding's subjects so EnumerateResourceCohorts can
-// project them. Identity is the binding's metadata.uid when present, else
-// the kind+ns+name content tuple (stable across relist) — same shape as
-// crbIdentity/rbIdentity in rbac_cohort_gen.go.
+// the bucket value is the set of bindingIDs whose roleRef grants the
+// GVR, each carrying the binding's subjects.
+//
+// Ship 0.30.242 H.c-layered Phase 2b: the value the bindingID newtype
+// wraps is now produced by cache.BindingUIDFromCRB / FromRB
+// (match_subject.go — the SOT for binding-identity derivation). The
+// seed-time index landing AND the dispatcher-time L1 cell key (the
+// BindingUID string field on ResolvedKeyInputs) both consume the SAME
+// string from these constructors — so seed-vs-dispatch agreement is
+// structural rather than a coincidence of separate identity helpers.
+//
+// The bindingID type stays internal (unexported) so this file's index
+// buckets remain typed independently of the exported ResolvedKeyInputs.BindingUID
+// field; the string value is byte-identical at both sites.
 type bindingID string
 
 // bindingEntry is the per-binding value stored in a GVR bucket: the
@@ -174,15 +187,18 @@ func roleRefKey(namespace string, ref rbacv1.RoleRef) string {
 	}
 }
 
-// crbBindingID / rbBindingID compute the stable binding identity — reuse
-// the same UID-or-content-tuple identity the cohort hash uses so the two
-// never disagree on which logical binding an id refers to.
+// crbBindingID / rbBindingID compute the stable binding identity by
+// delegating to the SOT helpers (match_subject.go). The 1-line wrappers
+// give the index a typed bindingID while keeping the identity STRING
+// byte-identical to the dispatcher-time BindingUID consumed by
+// ResolvedKeyInputs.BindingUID — seed-vs-dispatch agreement is built
+// into the shared SOT.
 func crbBindingID(p *rbacv1.ClusterRoleBinding) bindingID {
-	return bindingID(crbIdentity(p))
+	return bindingID(BindingUIDFromCRB(p))
 }
 
 func rbBindingID(p *rbacv1.RoleBinding) bindingID {
-	return bindingID(rbIdentity(p))
+	return bindingID(BindingUIDFromRB(p))
 }
 
 // subjectsFromRBAC projects a binding's rbac/v1 Subjects into subjectKeys.
@@ -205,11 +221,25 @@ func subjectsFromRBAC(subjects []rbacv1.Subject) []subjectKey {
 	return out
 }
 
-// The RBAC wildcard matcher rbacStringSliceMatches is defined in
-// cohort_ns_acl.go (a package-local copy of rbac/evaluate.go's
-// stringSliceMatches — cache/ cannot import rbac/ without a cycle). Reused
-// here so the index enrolment predicate stays bit-faithful to the live
-// evaluator.
+// rbacWildcardMatches is the RBAC wildcard rule: "*" matches every
+// value; otherwise exact match. Mirrors rbac/evaluate.go's
+// stringSliceMatches semantics — duplicated here as a package-private
+// helper because cache/ cannot import rbac/ (rbac/ already imports
+// cache/, so an inverse import would create a cycle).
+//
+// Ship 0.30.242 H.c-layered Phase 2b: this helper used to live in
+// cohort_ns_acl.go (deleted in commit 1d93d02) under the name
+// rbacStringSliceMatches. Moved here because bindings_by_gvr.go is the
+// only surviving caller; the move keeps the predicate co-located with
+// the 2 functions that use it.
+func rbacWildcardMatches(allowed []string, want string) bool {
+	for _, a := range allowed {
+		if a == "*" || a == want {
+			return true
+		}
+	}
+	return false
+}
 
 // rulesGrantGetList reports whether any rule in `rules` grants get OR list
 // on the given {group,resource} — mirroring rulesPermit's wildcard
@@ -222,13 +252,13 @@ func rulesGrantGetList(rules []rbacv1.PolicyRule, gr groupResource) bool {
 		if len(rule.ResourceNames) > 0 {
 			continue
 		}
-		if !rbacStringSliceMatches(rule.Verbs, "get") && !rbacStringSliceMatches(rule.Verbs, "list") {
+		if !rbacWildcardMatches(rule.Verbs, "get") && !rbacWildcardMatches(rule.Verbs, "list") {
 			continue
 		}
-		if !rbacStringSliceMatches(rule.APIGroups, gr.Group) {
+		if !rbacWildcardMatches(rule.APIGroups, gr.Group) {
 			continue
 		}
-		if !rbacStringSliceMatches(rule.Resources, gr.Resource) {
+		if !rbacWildcardMatches(rule.Resources, gr.Resource) {
 			continue
 		}
 		return true
@@ -244,7 +274,7 @@ func rulesGrantWildcard(rules []rbacv1.PolicyRule) bool {
 		if len(rule.ResourceNames) > 0 {
 			continue
 		}
-		if (rbacStringSliceMatches(rule.Verbs, "get") || rbacStringSliceMatches(rule.Verbs, "list")) &&
+		if (rbacWildcardMatches(rule.Verbs, "get") || rbacWildcardMatches(rule.Verbs, "list")) &&
 			sliceHasStar(rule.APIGroups) && sliceHasStar(rule.Resources) {
 			return true
 		}
@@ -496,104 +526,22 @@ func parseRoleRefKey(rk string) (string, rbacv1.RoleRef) {
 	return "", rbacv1.RoleRef{}
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// EnumerateResourceCohorts — the seed's cohort source per GVR.
-// ─────────────────────────────────────────────────────────────────────
-
-// EnumerateResourceCohorts returns the Cohort set whose RBAC binding-sets
-// grant get/list on gvr (the per-GVR bucket ∪ the cluster-admin wildcard
-// bucket). Each User subject → a User cohort; each Group subject → a
-// group-only cohort (Username=groupOnlyCohortSentinel, Groups=[group]) —
-// matching what EnumerateBindingSetClasses emits so the seed-time and
-// request-time BindingSetHash converge.
+// EnumerateResourceCohorts was the pre-Ship-0.30.242 seed cohort source
+// per GVR. It returned []Cohort whose subjects were dispatched in a
+// per-cohort fan-out. DELETED in Phase 2b (this commit) — the function
+// is replaced by EnumeratePrewarmTargetsForGVR in prewarm_enumeration.go,
+// which reshapes the per-GVR enumeration around per-binding targets
+// (each binding → one prewarm dispatch keyed by that binding's UID).
+// Design §7.2.
 //
-// The cohort LIST is GVR-scoped; the cohort KEY (BindingSetHash) is NOT —
-// it stays over the subject's FULL matched binding-set (computed by
-// withCohortSeedContext → BindingSetHash at seed time and by the
-// dispatcher at request time). This function only narrows the subjects to
-// seed; correctness flows through the unchanged hash + the per-request
-// EvaluateRBAC gate.
-//
-// Returns nil when the index is not built (the caller falls back to the
-// global EnumerateBindingSetClasses). Deterministic order (sorted by
-// Username then Groups[0]) for stable seed ordering across restarts.
-func EnumerateResourceCohorts(gvr schema.GroupVersionResource) []Cohort {
-	idx := bindingsByGVRSingleton()
-	gr := grFromGVR(gvr)
-
-	idx.mu.RLock()
-	if !idx.built {
-		idx.mu.RUnlock()
-		return nil
-	}
-	// Collect the matching binding ids: per-GVR bucket ∪ wildcard.
-	ids := make(map[bindingID]struct{}, 16)
-	if set := idx.byGVR[gr]; set != nil {
-		for id := range set {
-			ids[id] = struct{}{}
-		}
-	}
-	for id := range idx.wildcard {
-		ids[id] = struct{}{}
-	}
-	// Project the matched bindings' subjects into User / Group cohort sets.
-	// Dedupe by the canonical username so two bindings naming the same user
-	// yield ONE cohort (the hash will union their binding-sets anyway).
-	userSubjects := map[string]struct{}{}
-	groupSubjects := map[string]struct{}{}
-	for id := range ids {
-		entry, ok := idx.entries[id]
-		if !ok {
-			continue
-		}
-		for _, s := range entry.subjects {
-			switch s.Kind {
-			case rbacv1.UserKind:
-				if s.Name != "" {
-					userSubjects[s.Name] = struct{}{}
-				}
-			case rbacv1.GroupKind:
-				// Prune system:authenticated — it is the implicit group
-				// every authenticated request carries (evaluate.go:559);
-				// BindingSetHash injects it. Seeding a cohort whose ONLY
-				// distinguishing group is system:authenticated would seed
-				// the universal authenticated cell, which is the
-				// group-only sentinel cohort emitted below per real group.
-				if s.Name != "" && s.Name != systemAuthenticatedGroup {
-					groupSubjects[s.Name] = struct{}{}
-				}
-			}
-		}
-	}
-	idx.mu.RUnlock()
-
-	var out []Cohort
-	for u := range userSubjects {
-		out = append(out, Cohort{Username: u})
-	}
-	for g := range groupSubjects {
-		// Group-only cohort: sentinel username + the single group — the
-		// SAME shape EnumerateBindingSetClasses emits (binding_set_enumeration.go),
-		// so BindingSetHash(sentinel,[g]) at seed time == the dispatcher's
-		// hash for a real group-only user holding g.
-		out = append(out, Cohort{Username: groupOnlyCohortSentinel, Groups: []string{g}})
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Username != out[j].Username {
-			return out[i].Username < out[j].Username
-		}
-		gi, gj := "", ""
-		if len(out[i].Groups) > 0 {
-			gi = out[i].Groups[0]
-		}
-		if len(out[j].Groups) > 0 {
-			gj = out[j].Groups[0]
-		}
-		return gi < gj
-	})
-	return out
-}
+// The old function's seed-vs-dispatch agreement relied on
+// BindingSetHash(sentinel, [group]) matching the dispatcher-time hash
+// for a group-only user. Under H.c-layered the seed dispatches under a
+// representative SubjectIdentity for each binding (pickRepresentativeFromSubjects
+// in match_subject.go), and the L1 cell key folds BindingUID rather
+// than the cohort hash — so seed-vs-dispatch agreement is now built
+// into the BindingUID itself (both sides call cache.BindingUIDFromCRB/FromRB
+// on the same binding object pointer-equal in the snapshot).
 
 // ResetBindingsByGVRIndexForTest clears the singleton's state. Production
 // MUST NOT call this. Tests (including cross-package dispatcher tests) use

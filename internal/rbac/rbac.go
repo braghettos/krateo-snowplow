@@ -38,7 +38,10 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 			log.Error("rbac.UserCan: unable to extract UserInfo", slog.Any("err", err))
 			return false
 		}
-		allowed, evalErr := EvaluateRBAC(ctx, EvaluateOptions{
+		// Ship 0.30.242 H.c-layered Phase 2 step 2a — EvaluateRBAC returns
+		// (allowed, matchedBindingUID, err). UserCan is a per-item caller;
+		// matchedBindingUID is ignored.
+		allowed, _, evalErr := EvaluateRBAC(ctx, EvaluateOptions{
 			Username:  ui.Username,
 			Groups:    ui.Groups,
 			Verb:      opts.Verb,

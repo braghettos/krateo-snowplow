@@ -34,6 +34,7 @@ import (
 	"github.com/krateoplatformops/plumbing/ptr"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -77,15 +78,36 @@ func raFullListServe(
 
 	ui, err := xcontext.UserInfo(ctx)
 	if err != nil {
-		// No identity — cannot key the per-cohort cell safely. Fall back to
+		// No identity — cannot key the per-binding cell safely. Fall back to
 		// the page-keyed resolve (which itself runs under the request
-		// identity). NEVER serve a cohort cell without an identity.
+		// identity). NEVER serve a binding-keyed cell without an identity.
 		return nil, false, nil
 	}
-	bindingSetHash := cache.BindingSetHash(ui.Username, ui.Groups)
+
+	// Ship 0.30.242 H.c-layered Phase 2b — design §3.3 raFullList row.
+	// The cell folds the WIDGET's GET-permit BindingUID (the same
+	// BindingUID the widgets-class cell would key on). Path B: derive
+	// it via a direct rbac.EvaluateRBAC call rather than threading the
+	// per-request memo. The per-request memo plumbing is a Phase 3
+	// follow-up (Diego ratified 2026-06-03 R3); F3 falsifier validates
+	// that direct calls preserve correctness.
+	//
+	// allowed=false / err yields bindingUID="" (the cell folds the empty
+	// identity — equivalent to the cache=off transparent-fallback row).
+	// Same fail-closed semantics as the pre-ship BindingSetHash path
+	// (which returned 0 on snap=nil — equivalent collapse).
+	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username:  ui.Username,
+		Groups:    ui.Groups,
+		Verb:      "get",
+		Group:     gvr.Group,
+		Resource:  gvr.Resource,
+		Namespace: namespace,
+		Name:      name,
+	})
 
 	keyInputs := cache.RAFullListKeyInputs(gvr.Group, gvr.Version, gvr.Resource,
-		namespace, name, bindingSetHash, extras)
+		namespace, name, bindingUID, extras)
 	raKey := cache.ComputeKey(keyInputs)
 
 	// fullCtx scopes the UNPAGINATED resolves' inner-call dep edges to the

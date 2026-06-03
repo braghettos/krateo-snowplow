@@ -320,9 +320,84 @@ func (h *navWidgetHarvester) snapshot() []navWidgetEntry {
 	return out
 }
 
+// seedTarget is the dispatcher-package equivalent of cache.PrewarmTarget,
+// shaped for the seed loop's per-target dispatch. Carries a representative
+// SubjectIdentity (Username + Groups, k8s-shape) so the cohort ctx setup
+// flow (withCohortSeedContext) can lift it into xcontext.WithUserInfo
+// byte-equivalently to the pre-ship cache.Cohort path.
+//
+// Ship 0.30.242 H.c-layered Phase 2b replacement for the deleted
+// cache.Cohort type. Identical surface (Username + Groups); production
+// callers in this file consume only those two fields. The BindingUID
+// dimension is carried but not used by the seed loop directly — it
+// flows through the cell key at populate time via dispatchCacheLookupKey
+// (helpers.go) per Path B.
+type seedTarget struct {
+	BindingUID string
+	Username   string
+	Groups     []string
+}
+
+// enumerateAggregatePrewarmTargets unions per-GVR prewarm targets across
+// every registered GVR + dedupes by (BindingUID, Username, Groups[0]).
+// One seed dispatch per unique target; each dispatch resolves whatever
+// restactions/widgets its identity authorises (the per-layer BindingUID
+// is derived at populate time, design §7.2 + Path B).
+//
+// Returns nil when the resource watcher is not wired (cache=off / pre-
+// readiness) or when no binding authorises any navigated GVR. The seed
+// loop treats nil as a clean no-op (logs phase1.seed.skipped).
+func enumerateAggregatePrewarmTargets() []seedTarget {
+	rw := cache.Global()
+	if rw == nil {
+		return nil
+	}
+	gvrs := rw.RegisteredGVRs()
+	if len(gvrs) == 0 {
+		return nil
+	}
+	// Dedupe by (BindingUID, Username, first Group) — the seed dispatch's
+	// identity dimensions. Two GVRs sharing the same authorising binding +
+	// representative identity produce ONE seed dispatch.
+	type dedupeKey struct {
+		BindingUID string
+		Username   string
+		Group      string
+	}
+	seen := make(map[dedupeKey]struct{}, 32)
+	out := make([]seedTarget, 0, 32)
+	for _, gvr := range gvrs {
+		// Verb "list" — restactions/widgets nav LIST is the dominant
+		// authz question; matches the BindingsByGVR index's enrolment
+		// criterion (rulesGrantGetList covers both get+list).
+		targets := cache.EnumeratePrewarmTargetsForGVR(gvr, "list")
+		for _, t := range targets {
+			var firstGroup string
+			if len(t.Subject.Groups) > 0 {
+				firstGroup = t.Subject.Groups[0]
+			}
+			k := dedupeKey{
+				BindingUID: t.BindingUID,
+				Username:   t.Subject.Username,
+				Group:      firstGroup,
+			}
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, seedTarget{
+				BindingUID: t.BindingUID,
+				Username:   t.Subject.Username,
+				Groups:     append([]string(nil), t.Subject.Groups...),
+			})
+		}
+	}
+	return out
+}
+
 // runPIPSeed is the Ship PIP Step 7.6 entry point invoked by
-// phase1WarmupWith. Enumerates RBAC cohorts and seeds the per-user
-// resolved-output L1 (restactions + widgets) for every cohort.
+// phase1WarmupWith. Enumerates per-binding targets and seeds the
+// resolved-output L1 (restactions + widgets) for every target.
 //
 // Ship 2 / 0.30.196 — runPIPSeed is invoked on a BACKGROUND goroutine
 // AFTER MarkPhase1Done; its return value is log-only. There is no longer
@@ -340,20 +415,34 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	log := slog.Default()
 	start := time.Now()
 
-	// Ship A.3 / 0.30.179 — binding-set enumeration. The PIP seed now
-	// drives one entry per ENUMERATED BINDING-SET CLASS (a cohort defined
-	// by BindingSetHash equivalence) rather than per-user-string cohort.
-	// Two users whose binding-pointer-set hashes equal share the SAME L1
-	// cell; the seed populates ONE entry per cell. See
-	// internal/cache/binding_set_enumeration.go for the algorithm.
-	cohorts := cache.EnumerateBindingSetClasses()
-	if len(cohorts) == 0 {
+	// Ship 0.30.242 H.c-layered Phase 2b — per-binding seed enumeration.
+	// The PIP seed drives one entry per per-binding target (a binding
+	// authorising get/list on a navigated GVR) derived from the
+	// BindingsByGVR reverse index via cache.EnumeratePrewarmTargetsForGVR.
+	// Replaces the pre-ship EnumerateBindingSetClasses cohort enumerator
+	// (deleted in commit 1d93d02). Cell sharing is now per-binding —
+	// design §7.2.
+	//
+	// Aggregation across GVRs: enumerate targets per navigated GVR, then
+	// dedupe by (BindingUID, Username, Groups[0]) so a binding that
+	// grants multiple GVRs produces ONE seed dispatch (the dispatch
+	// resolves widgets+restactions covering whatever cells its identity
+	// authorises). Path B (Phase 2b deferral): seed dispatch derives its
+	// own per-layer BindingUID at populate time via direct rbac.EvaluateRBAC.
+	targets := enumerateAggregatePrewarmTargets()
+	if len(targets) == 0 {
 		log.Info("phase1.seed.skipped",
 			slog.String("subsystem", "cache"),
-			slog.String("reason", "EnumerateBindingSetClasses returned no classes — RBAC snapshot empty or unpublished"),
+			slog.String("reason", "EnumeratePrewarmTargetsForGVR returned no targets across registered GVRs — RBAC snapshot empty or unpublished, or no bindings authorise the navigated GVRs"),
 		)
 		return nil
 	}
+	// Adapt targets to the legacy cohort dispatch surface. cohorts type
+	// is preserved at the loop level for minimum-churn migration in 2b;
+	// per-binding KEY semantics now flow through the cell-key BindingUID
+	// derived at populate time (helpers.go:dispatchCacheLookupKey via
+	// direct rbac.EvaluateRBAC — Path B).
+	cohorts := targets
 
 	// Ship 2 / 0.30.196 — the cohort cap check is DELETED. There is no
 	// fail-closed-on-cohort-count branch: runPIPSeed runs as a background
@@ -477,7 +566,7 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 // also captured (a recover() in the same defer prevents the goroutine
 // from crashing the errgroup). All instrumentation fields are uniform
 // across cohorts (feedback_no_special_cases): no per-cohort branching.
-func seedCohort(ctx context.Context, cohort cache.Cohort,
+func seedCohort(ctx context.Context, cohort seedTarget,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
 
@@ -699,7 +788,7 @@ func seedCohort(ctx context.Context, cohort cache.Cohort,
 // NOT marked WithApistagePrewarm — the apistage content L1 was already
 // populated in Step 7.5; here we are populating the TOP-LEVEL
 // per-user L1 (restactions + widgets dispatcher classes).
-func withCohortSeedContext(ctx context.Context, cohort cache.Cohort,
+func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
 
 	opts := []xcontext.WithContextFunc{
@@ -1047,7 +1136,7 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 // "alice@example.com"). Group-kind cohort: "group:" + the group name.
 // A cohort with neither (defensive — should never happen post-enum)
 // falls back to "anonymous".
-func cohortLogLabel(c cache.Cohort) string {
+func cohortLogLabel(c seedTarget) string {
 	if c.Username != "" {
 		return c.Username
 	}

@@ -68,17 +68,23 @@ func extrasMinusSlice(extras map[string]any) map[string]any {
 
 // RAFullListKeyInputs builds the canonical page-INDEPENDENT ResolvedKeyInputs
 // for a RAFullList cell. It takes the RESTACTION's OWN identity (gvr/ns/name
-// — NOT the calling widget's), the cohort BindingSetHash, and the request
+// — NOT the calling widget's), the per-layer BindingUID, and the request
 // Extras, and forces PerPage=0/Page=0 + extrasMinusSlice(extras). The result
 // fed to ComputeKey folds ONLY the page-independent material (ComputeKey
 // folds PerPage at resolved.go's PerPage write + Page; both 0 here) so every
-// page of the same (RA × cohort × non-slice-extras) hashes to ONE key.
+// page of the same (RA × binding × non-slice-extras) hashes to ONE key.
 //
-// bindingSetHash is the cohort hash (BindingSetHash(username, groups)) — the
-// SAME per-cohort identity the restactions/widgets classes use; RAFullList is
-// identity-BOUND (RA output is RBAC-narrowed), so ComputeKey folds it.
+// bindingUID is the per-layer first-match binding identity (cache.BindingUIDFromCRB /
+// FromRB on the binding returned by EvaluateRBAC) — the SAME per-binding
+// identity the restactions/widgets classes use; RAFullList is identity-
+// BOUND (RA output is RBAC-narrowed), so ComputeKey folds it.
+//
+// Ship 0.30.242 H.c-layered Phase 2b: signature changed from
+// `bindingSetHash uint64` to `bindingUID string`. The caller (widgets/apiref/
+// ra_full_list.go:85) is migrated in lockstep to derive the BindingUID via
+// rbac.EvaluateRBAC instead of cache.BindingSetHash.
 func RAFullListKeyInputs(group, version, resource, namespace, name string,
-	bindingSetHash uint64, extras map[string]any) ResolvedKeyInputs {
+	bindingUID string, extras map[string]any) ResolvedKeyInputs {
 	return ResolvedKeyInputs{
 		CacheEntryClass: CacheEntryClassRAFullList,
 		Group:           group,
@@ -86,7 +92,7 @@ func RAFullListKeyInputs(group, version, resource, namespace, name string,
 		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
-		BindingSetHash:  bindingSetHash,
+		BindingUID:      bindingUID,
 		// Page-INDEPENDENT: slice folded out of the key.
 		PerPage: 0,
 		Page:    0,

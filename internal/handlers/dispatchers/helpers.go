@@ -179,12 +179,21 @@ func dispatchWidgetContentKey(ctx context.Context, group, version, resource, nam
 // the caller can stash it on the L1 entry. Refresher reuses Inputs to
 // drive a re-resolve on UPDATE/PATCH events.
 //
-// Ship A.3 / 0.30.179 — identity is folded as a single uint64 via
-// cache.BindingSetHash(ui.Username, ui.Groups) — one call per request.
-// The hash is the FNV-64a of the cohort's matched RBAC binding-pointer-
-// set; two users whose binding-set is pointer-equal collapse into ONE
-// L1 cell (per-COHORT keying). The pre-A.3 Username + sorted Groups
-// literal columns are GONE from ResolvedKeyInputs (HG-178.6 falsifier).
+// Ship 0.30.242 H.c-layered Phase 2b — identity is folded as the
+// per-layer BindingUID (the first-match binding's UID that authorised
+// the layer's GET, returned by rbac.EvaluateRBAC). Replaces the v3
+// BindingSetHash uint64 cohort hash. Per-binding sharing (design §1.2):
+// two users granted by the SAME binding share the L1 cell.
+//
+// PATH B (Diego ratified 2026-06-03 R3 deferral): the BindingUID is
+// derived via a DIRECT rbac.EvaluateRBAC call per request, not via the
+// per-request memo. The memo type ships scaffolding-only in 2b; F3
+// falsifier validates this deferral. If F3 reveals per-request memo
+// consistency is load-bearing, plumbing is pulled forward as Phase 2d.
+//
+// FAIL-CLOSED: allowed=false / err yields bindingUID="" (the cell key
+// collapses to the empty-identity row — same shape as cache=off's
+// transparent fallback, project_cache_off_is_transparent_fallback).
 func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle, *cache.ResolvedKeyInputs) {
 	c := cache.ResolvedCache()
 	if c == nil {
@@ -196,6 +205,16 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		// safely. Skip the cache for this request.
 		return "", nil, nil
 	}
+	// Path B direct call — derive BindingUID for the layer's GET-permit.
+	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username:  ui.Username,
+		Groups:    ui.Groups,
+		Verb:      "get",
+		Group:     group,
+		Resource:  resource,
+		Namespace: namespace,
+		Name:      name,
+	})
 	inputs := cache.ResolvedKeyInputs{
 		CacheEntryClass: handlerKind,
 		Group:           group,
@@ -203,12 +222,14 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		Resource:        resource,
 		Namespace:       namespace,
 		Name:            name,
-		BindingSetHash:  cache.BindingSetHash(ui.Username, ui.Groups),
-		// Ship A.3 / 0.30.179 Option A — representative cohort tuple for
-		// the refresher's re-resolve. Carried on Inputs but NOT folded
-		// into ComputeKey (the cell is keyed by BindingSetHash, not by
-		// the literal name). The first writer's identity is the cell's
-		// representative; cohort members produce byte-identical output.
+		BindingUID:      bindingUID,
+		// Representative identity for the refresher's re-resolve.
+		// Carried on Inputs but NOT folded into ComputeKey (the cell
+		// is keyed by BindingUID, not by the literal name). The first
+		// writer's identity is the cell's representative; every member
+		// of the equivalence class authorised by this BindingUID
+		// produces byte-identical output (per-binding sharing — design
+		// §1.2).
 		RepresentativeUsername: ui.Username,
 		RepresentativeGroups:   ui.Groups,
 		PerPage:                perPage,
@@ -276,14 +297,18 @@ func emitResolvedCacheLookup(log *slog.Logger, handlerKind, gvrString, key strin
 // derived from the same snapshot read.
 //
 // NIL-GUARD: a nil `inputs` (cache disabled or identity missing) is
-// permitted; the function still emits with BindingSetHash=0 so the
+// permitted; the function still emits with binding_uid="" so the
 // "why was the lookup skipped" question is greppable. The dispatcher
 // callers MUST still nil-check the handle separately.
 //
-// COST: one slog.Info per /call per site. Volume = O(num_widgets +
-// num_restactions × num_cohorts) at startup (PIP seed) + O(/call rate)
-// at serve time. Acceptable for the diagnostic ship; revert
-// 0.30.189+ once the divergent field is identified.
+// COST: one slog.Info per /call per site.
+//
+// Ship 0.30.242 H.c-layered Phase 2b — the diagnostic field renamed
+// from `binding_set_hash uint64` to `binding_uid string` (the new
+// cell-key identity dimension). Same diagnostic intent (find divergent
+// key components between PIP-seed and dispatcher-get sites); new field
+// shape carries the per-layer first-match binding identity instead of
+// the v3 cohort hash.
 func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context,
 	cacheKey string, inputs *cache.ResolvedKeyInputs,
 	handlerKind, group, version, resource, namespace, name string,
@@ -300,20 +325,29 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 		username = ui.Username
 		groups = ui.Groups
 	}
-	var bindingSetHash uint64
+	var bindingUID string
 	if inputs != nil {
-		bindingSetHash = inputs.BindingSetHash
+		bindingUID = inputs.BindingUID
 	} else {
 		// Compute directly so the field still differentiates — the
 		// cache-disabled / no-identity branch returns nil inputs, but
-		// the architect's diff is interested in the hash value itself.
-		bindingSetHash = cache.BindingSetHash(username, groups)
+		// the diagnostic is interested in the per-layer BindingUID
+		// value itself. Path B direct call (Phase 2b R3 deferral).
+		_, bindingUID, _ = rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+			Username:  username,
+			Groups:    groups,
+			Verb:      "get",
+			Group:     group,
+			Resource:  resource,
+			Namespace: namespace,
+			Name:      name,
+		})
 	}
 	log.Info("dispatch.cache_key.computed",
 		slog.String("subsystem", "cache"),
 		slog.String("site", site),
 		slog.String("key_hash", cacheKey),
-		slog.Uint64("binding_set_hash", bindingSetHash),
+		slog.String("binding_uid", bindingUID),
 		slog.String("username", username),
 		slog.Any("groups", groups),
 		slog.String("handler_kind", handlerKind),
@@ -326,24 +360,13 @@ func emitDispatchCacheKeyDiag(log *slog.Logger, site string, ctx context.Context
 	)
 
 	// Ship 0.30.190 Fix B / 0.30.191 carried-forward — additive
-	// single-line stderr lane. The slog.Info above is the authoritative
-	// emit; the existing call stays ON regardless of this knob. This
-	// extra fmt.Fprintf is a pragmatic robustness fallback for the
-	// 0.30.189 validation gap where the tester could not grep the multi-
-	// line pretty-handler JSON via kubectl logs (candidates: pretty-
-	// handler multi-line formatting, kubelet log rotation, otel
-	// daemonset filter — can't be disambiguated from code alone).
-	// Greppable as a single line with every field inline. Default OFF;
-	// chart values.yaml flips it ON for diagnostic ships and OFF for
-	// steady-state.
-	//
-	// feedback_no_park_broken_behind_flag does NOT apply: this is an
-	// ADDITIVE diagnostic lane, not a correctness fix parked behind a
-	// flag.
+	// single-line stderr lane. Same intent as the pre-ship lane; field
+	// renamed from bsh (binding-set-hash uint64) to buid (binding-UID
+	// string).
 	if env.True("DISPATCH_KEY_DIAG_ENABLED") {
 		fmt.Fprintf(os.Stderr,
-			"DISPATCH_KEY_DIAG site=%s key=%s bsh=%d user=%s groups=%v handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
-			site, cacheKey, bindingSetHash, username, groups,
+			"DISPATCH_KEY_DIAG site=%s key=%s buid=%s user=%s groups=%v handler=%s gvr=%s/%s/%s ns=%s name=%s pp=%d p=%d xlen=%d\n",
+			site, cacheKey, bindingUID, username, groups,
 			handlerKind, group, version, resource, namespace, name, perPage, page, len(extras),
 		)
 	}

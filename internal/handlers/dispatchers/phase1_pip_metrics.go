@@ -184,18 +184,23 @@ func registerPIPMetrics() {
 			return out
 		}))
 
-		// Ship A.3 / 0.30.179 — binding-set enumeration counters.
-		expvar.Publish("snowplow_phase1_bindingset_classes_total", expvar.Func(func() any {
-			return cache.Phase1EnumBindingsetClassesTotal()
-		}))
+		// Ship 0.30.242 H.c-layered Phase 2b — binding-set classes /
+		// powerset-skipped counters DELETED. The underlying functions
+		// (cache.Phase1EnumBindingsetClassesTotal,
+		// cache.Phase1EnumPowersetSkippedTotal) lived in the deleted
+		// binding_set_enumeration.go; their counters incremented from
+		// code paths that no longer exist. Keeping the expvar
+		// registrations would publish always-zero values (misleading
+		// observability — design-gap fix Gap 4).
+		//
+		// The per-target seed resolves / failures counters KEPT (they
+		// now count per-binding-target instead of per-cohort, same shape
+		// — see runPIPSeed for the seedTarget loop).
 		expvar.Publish("snowplow_phase1_bindingset_seed_resolves_total", expvar.Func(func() any {
 			return pipBindingSetSeedResolvesTotal.Load()
 		}))
 		expvar.Publish("snowplow_phase1_bindingset_seed_failures_total", expvar.Func(func() any {
 			return pipBindingSetSeedFailuresTotal.Load()
-		}))
-		expvar.Publish("snowplow_phase1_enum_powerset_skipped", expvar.Func(func() any {
-			return cache.Phase1EnumPowersetSkippedTotal()
 		}))
 
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so
