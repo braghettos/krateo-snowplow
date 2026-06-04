@@ -309,6 +309,42 @@ func DiscoverGroupResources(ctx context.Context, rc *rest.Config, group string) 
 					slog.Int("l1_keys_dirty_marked", marked),
 					slog.String("note", "composition informer spawned via one-shot discovery; stale-negative LIST deps dirty-marked"),
 				)
+
+				// Ship 2 Stage 2 / 0.30.247 — re-prewarm wiring.
+				//
+				// ORDER IS LOAD-BEARING: AddNavigatedGVR MUST run BEFORE
+				// notifyGVRDiscoveredForReprewarm.
+				//
+				// (1) AddNavigatedGVR widens the BindingsByGVR navigated set
+				//     under idx.mu.Lock — SYNCHRONOUSLY enrols every already-
+				//     known non-wildcard binding that grants get/list on the
+				//     new GVR. Without this call, EnumeratePrewarmTargetsForGVR
+				//     at prewarm_enumeration.go:100-109 returns ONLY the
+				//     wildcard bucket — narrow-RBAC cohorts (production
+				//     customer team-members at 1000-user scale per
+				//     project_production_scale.md) are silently skipped and
+				//     their cells stay stale forever. The function is defined
+				//     at bindings_by_gvr.go:455 and had ZERO production callers
+				//     prior to this ship (PM RC-1, P0).
+				//
+				// (2) notifyGVRDiscoveredForReprewarm fires the cache→dispatchers
+				//     hook. The dispatchers-side handler ASYNCHRONOUSLY enqueues
+				//     a scopeKindGVRDiscovered scope into the prewarm engine.
+				//     The engine's rePrewarm then reads the freshly-widened
+				//     BindingsByGVR index → narrow cohorts are now enumerated
+				//     → the re-walk's seedOneRestaction records the dep edge
+				//     missed by the empty-iterator short-circuit
+				//     (resolve.go:377-381 — H4 root cause).
+				//
+				// Gated on PrewarmEnabled() — when PREWARM_ENABLED=false the
+				// engine is inert and the hook has no consumer; the call is
+				// still safe but pointless. Matches the PREWARM_ENABLED
+				// contract per project_single_cache_flag_direction.
+				if PrewarmEnabled() {
+					AddNavigatedGVR(gvr)
+					notifyGVRDiscoveredForReprewarm(gvr)
+				}
+
 				spawned++
 				incDiscoveryGVRsSpawned(group)
 			}
