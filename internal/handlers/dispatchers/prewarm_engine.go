@@ -61,6 +61,7 @@ import (
 	"time"
 
 	"github.com/krateoplatformops/plumbing/env"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // envPrewarmEngineEnabled is the Ship 1 opt-in for the unified dynamic
@@ -131,6 +132,23 @@ const (
 	// sync barrier. Ship 1's only invocation.
 	scopeKindBoot prewarmScopeKind = "boot"
 
+	// scopeKindGVRDiscovered — Ship 2 Stage 2 / 0.30.247. Fires when a
+	// new GVR is first registered post-boot via the synchronous
+	// discovery path (cache.DiscoverGroupResources → EnsureResourceType
+	// added==true). The discovery side wires this via
+	// cache.RegisterGVRDiscoveredHook (gvr_discovered_hook.go); the
+	// dispatchers-side hook handler at prewarm_engine_boot.go enqueues
+	// a scope per discovered GVR. The engine's rePrewarm core then
+	// re-walks the nav tree under each cohort identity (now reading
+	// the freshly-widened BindingsByGVR index) so the iterator that
+	// previously short-circuited at resolve.go:377-381 against
+	// crds.items[] (because the new GVR didn't exist) now yields
+	// non-empty tmp[] — the dep edge against the new GVR is recorded,
+	// and subsequent CR ADD events propagate via the normal
+	// OnAdd→onChange→dirty-mark→refresher path. Closes the canonical
+	// S4 admin-path defect.
+	scopeKindGVRDiscovered prewarmScopeKind = "gvr-discovered"
+
 	// Ship 2 (NOT wired this ship): scopeKindWidgetCR (a widget/RESTAction
 	// CR add/update/delete re-walks that object's subtree) and
 	// scopeKindRBACShift (an RBAC binding shift re-seeds the affected GVRs'
@@ -139,14 +157,34 @@ const (
 )
 
 // prewarmScope is one engine work item.
+//
+// SCOPE-KIND-CARRIED PAYLOAD:
+//   - scopeKindBoot: no payload (gvr left zero); one boot scope per process.
+//   - scopeKindGVRDiscovered: gvr carries the discovered GVR; the engine
+//     dedups on key() so multiple discovery events for the same GVR
+//     coalesce to one queued scope.
 type prewarmScope struct {
 	kind prewarmScopeKind
+
+	// gvr is the discovered GroupVersionResource for scopeKindGVRDiscovered.
+	// Zero value for other scope kinds (carries no semantics). The engine's
+	// rePrewarm core inspects this only when scope.kind == scopeKindGVRDiscovered.
+	gvr schema.GroupVersionResource
 }
 
 // key returns the workqueue dedup key for this scope. Idempotent enqueue
-// of the same key coalesces (refresher dedup semantics). Ship 1 only has
-// the boot key.
+// of the same key coalesces (refresher dedup semantics).
+//
+// KEY DERIVATION (RC-2 PM gate):
+//   - scopeKindBoot: "boot" — single key, all boot enqueues coalesce.
+//   - scopeKindGVRDiscovered: "gvr-discovered|<group>/<version>/<resource>"
+//     — two enqueues for the same GVR coalesce; two enqueues for
+//     different GVRs are DISTINCT and both run. Uses schema.GVR.String()
+//     for stable formatting ("<group>/<version>/<resource>").
 func (s prewarmScope) key() string {
+	if s.kind == scopeKindGVRDiscovered {
+		return string(s.kind) + "|" + s.gvr.String()
+	}
 	return string(s.kind)
 }
 

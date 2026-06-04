@@ -69,14 +69,18 @@ type rePrewarmDeps struct {
 
 // makeBootScopeHandler returns the engine scope handler closure for the
 // boot scope, bound to deps. The engine worker calls it per dequeued
-// scope; Ship 1 enqueues only scopeKindBoot.
+// scope; Ship 1 enqueued only scopeKindBoot. Ship 2 Stage 2 (0.30.247)
+// adds scopeKindGVRDiscovered dispatch.
 func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewarmScope) error {
 	return func(ctx context.Context, s prewarmScope) error {
 		switch s.kind {
 		case scopeKindBoot:
 			return rePrewarmBoot(ctx, deps)
+		case scopeKindGVRDiscovered:
+			return rePrewarmGVRDiscovered(ctx, deps, s.gvr)
 		default:
-			// Ship 2 scopes land here. Ship 1 has none.
+			// Ship 2 future scopes (scopeKindWidgetCR / scopeKindRBACShift)
+			// land here when unwired.
 			slog.Warn("prewarm.engine.unknown_scope",
 				slog.String("subsystem", "cache"),
 				slog.String("scope", s.key()),
@@ -84,6 +88,64 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 			return nil
 		}
 	}
+}
+
+// rePrewarmGVRDiscovered is the Ship 2 Stage 2 sub-handler for
+// scopeKindGVRDiscovered. Invoked once per (distinct) GVR discovered
+// post-boot via the cache→dispatchers hook
+// (cache.RegisterGVRDiscoveredHook). The bounded dedup queue at
+// prewarm_engine.go:213-225 coalesces repeated enqueues for the same
+// GVR within a short window.
+//
+// MECHANISM: invokes the SAME rePrewarmBoot core — no new harvester
+// wiring, no parallel seed mechanism. Per the trace at §5.5 Step F,
+// the rePrewarm core ALREADY:
+//
+//   - Re-walks the nav tree with a fresh visited set (so the iterator
+//     at resolve.go:377-381 re-runs over the now-populated crds.items[]
+//     — the H4 root cause site that previously short-circuited and
+//     skipped dep recording is now non-empty).
+//   - Re-builds + re-reads the BindingsByGVR index (now widened by the
+//     AddNavigatedGVR call in discovery_lookup.go) — narrow-RBAC
+//     cohorts are enumerated.
+//   - Re-seeds each cohort via seedOneRestaction/seedOneWidget under
+//     the cohort's identity → admin's BindingUID-keyed cell (and every
+//     other cohort's cell) is re-resolved with non-empty tmp[] →
+//     dep edge against the new GVR IS recorded → subsequent CR events
+//     match.
+//
+// The discovered GVR is logged but not propagated through ctx today
+// (no per-GVR filtering inside rePrewarmBoot at this point). A future
+// optimisation could narrow the re-walk to roots that template-path
+// against this GVR; until then the broad re-walk is the structurally-
+// correct mechanism.
+//
+// SAFETY (R2 install-burst quantification per §5.3): the dedup keys
+// distinct GVRs as distinct work items. A 10-CRD install burst
+// produces 10 sequential rePrewarms (each yielding to customer /call
+// between cohorts via engineYieldCheckpoint). Each rePrewarmBoot is
+// bounded by ctx + the engine-side timeouts; the per-cohort
+// seedCohort timeout (pipCohortTimeout) caps individual stalls.
+func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.GroupVersionResource) error {
+	slog.Info("prewarm.engine.gvr_discovered.start",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("note", "Ship 2 Stage 2 — re-walk under cohort identities so iterator-empty short-circuit (resolve.go:377-381) no longer skips dep recording for this GVR"),
+	)
+	err := rePrewarmBoot(ctx, deps)
+	if err != nil {
+		slog.Warn("prewarm.engine.gvr_discovered.incomplete",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.Any("err", err),
+		)
+		return err
+	}
+	slog.Info("prewarm.engine.gvr_discovered.complete",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+	)
+	return nil
 }
 
 // rePrewarmBoot runs the boot re-walk + per-target-GVR-scoped seed. The
