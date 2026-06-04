@@ -237,7 +237,8 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 		DeleteFunc: func(obj interface{}) {
 			// DeletedFinalStateUnknown wraps the last-known object when
 			// the watcher missed the explicit DELETE. Unwrap so we still
-			// get the (ns, name) tuple.
+			// get the (ns, name) tuple AND the underlying CRD spec for
+			// Ship L's CRD-DELETE teardown branch below.
 			if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
 				obj = tomb.Obj
 			}
@@ -245,6 +246,15 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			// R3: hand off to the worker — never run the eviction burst
 			// inline on this informer processor goroutine.
 			w.submitDeleteEvent(depDeleteEvent{gvr: gvr, namespace: ns, name: name})
+			// Ship L / 0.30.246 — CRD DELETE lifecycle hook. Tears down
+			// the per-resource informer for every served version of the
+			// deleted CRD via RemoveResourceType + dirty-marks dependent
+			// L1 via OnResourceTypeRemoved. See triggerCRDDelete in
+			// crd_discovery_side_effect.go for the teardown contract +
+			// failure modes (spec §3b + §10.4).
+			if crdSideEffect {
+				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleDelete)
+			}
 		},
 	}
 }

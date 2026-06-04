@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // crdDiscoveryQueueDepth bounds the worker channel. 256 buffered
@@ -193,9 +194,7 @@ func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 	case crdLifecycleAdd, crdLifecycleUpdate:
 		triggerCRDDiscovery(ev.obj, ev.kind)
 	case crdLifecycleDelete:
-		// Wired in commit-4. Until then the DELETE branch is a no-op so
-		// the enum value is structurally valid but produces no side-effect.
-		// This keeps commit-2's blast radius bounded to the ADD fix.
+		triggerCRDDelete(ev.obj)
 	}
 }
 
@@ -366,6 +365,128 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 			slog.Any("err", derr),
 		)
 	}
+}
+
+// triggerCRDDelete handles a CRD DELETE event: derive the GVRs that
+// were served, tear down each per-resource informer via
+// RemoveResourceType, and dirty-mark dependent L1 entries via
+// OnResourceTypeRemoved (Ship L / 0.30.246, spec §3b).
+//
+// IDENTITY INVARIANTS — same shape as triggerCRDDiscovery:
+//   - obj is decoded via decodeBytesObject (H5-aware). Production
+//     delivery shape is *bytesObject; stock fallback is
+//     *unstructured.Unstructured. Anything else soft-skips + WARN.
+//   - spec.group + spec.names.plural + each served spec.versions[].name
+//     produce the GVRs that need teardown — same derivation as
+//     cache_mode.go:310-321.
+//   - RemoveResourceType is idempotent (watcher.go:1292): unknown GVR
+//     is a no-op. Safe under double-fire (DELETE storm).
+//   - OnResourceTypeRemoved is no-op-on-empty (deps.go:716-722).
+//
+// FAILURE MODES (see spec §10.4):
+//   - decodeBytesObject fails -> soft-skip + WARN. The informer keeps
+//     running until it WATCH-404s and the controller-health snapshot
+//     re-establishes via OnResourceTypeRemoved on the next sync.
+//   - spec.versions[] is empty -> no GVR to tear down. Counter + skip.
+//   - cache.Global() returns nil (test path) -> RemoveResourceType is
+//     itself nil-receiver-safe (watcher.go:1318).
+//
+// NOTE: navDiscoveredGroups stays APPEND-ONLY on DELETE (per OQ1
+// ratified — spec §11.2). The set's removable-discriminator predicate
+// at watcher.go:749/:1074 is dead-code under the H5 streaming default
+// in production, but the append-only contract keeps the contract
+// surface bounded. Ship L+1 will retire the dead predicate use under
+// task #196.
+func triggerCRDDelete(obj interface{}) {
+	c := crdDiscoverySingleton()
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			c.panicsRecovered.Add(1)
+			slog.Error("cache.crd_discovery.delete.panic_recovered",
+				slog.String("subsystem", "cache"),
+				slog.Any("panic", rec),
+				slog.String("stack", string(debug.Stack())),
+				slog.String("hint", "triggerCRDDelete panicked on a CRD object — "+
+					"continuing (the worker stays alive). Inspect the stack trace "+
+					"to identify the malformed CRD shape."),
+			)
+		}
+	}()
+
+	u, ok := decodeBytesObject(obj)
+	if !ok || u == nil {
+		c.deleteSkippedNG.Add(1)
+		warnOnceCRDDecodeSkip(obj, crdLifecycleDelete)
+		return
+	}
+
+	group, _, _ := unstructured.NestedString(u.Object, "spec", "group")
+	plural, _, _ := unstructured.NestedString(u.Object, "spec", "names", "plural")
+	if group == "" || plural == "" {
+		c.deleteSkippedNG.Add(1)
+		slog.Warn("cache.crd_discovery.delete.no_group_or_plural",
+			slog.String("subsystem", "cache"),
+			slog.String("group", group),
+			slog.String("plural", plural),
+			slog.String("hint", "CRD DELETE event has empty spec.group or "+
+				"spec.names.plural — cannot derive GVRs to tear down."),
+		)
+		return
+	}
+
+	versions, found, vErr := unstructured.NestedSlice(u.Object, "spec", "versions")
+	if vErr != nil || !found || len(versions) == 0 {
+		c.deleteSkippedNG.Add(1)
+		slog.Warn("cache.crd_discovery.delete.no_versions",
+			slog.String("subsystem", "cache"),
+			slog.String("group", group),
+			slog.String("plural", plural),
+			slog.String("hint", "CRD DELETE event has empty spec.versions[] — "+
+				"nothing to tear down."),
+		)
+		return
+	}
+
+	rw := Global()
+	torn := 0
+	for _, v := range versions {
+		vm, vok := v.(map[string]any)
+		if !vok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(vm, "name")
+		served, _, _ := unstructured.NestedBool(vm, "served")
+		if name == "" || !served {
+			// Not-served versions had no informer wired (per
+			// cache_mode.go:312-316); nothing to tear down.
+			continue
+		}
+		gvr := schema.GroupVersionResource{
+			Group:    group,
+			Version:  name,
+			Resource: plural,
+		}
+		if rw != nil {
+			rw.RemoveResourceType(gvr) // idempotent, nil-safe
+		}
+		Deps().OnResourceTypeRemoved(gvr) // dirty-mark dependent L1
+		torn++
+	}
+
+	c.deletesProcessed.Add(1)
+	slog.Info("cache.crd_discovery.delete.processed",
+		slog.String("subsystem", "cache"),
+		slog.String("group", group),
+		slog.String("plural", plural),
+		slog.Int("gvrs_torn_down", torn),
+	)
+
+	// NOTE: navDiscoveredGroups stays append-only. See doc-comment
+	// above + spec §11.2 OQ1 worked-examples deep-dive — the
+	// predicate's "remove on DELETE" hazard is documentation-preserved
+	// but dead-code under H5 streaming default. Ship L+1 / task #196
+	// addresses the dead predicate.
 }
 
 // warnOnceCRDDecodeSkip emits a single WARN per unique go-type observed

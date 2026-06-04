@@ -312,6 +312,13 @@ func TestCRDDelete_TearsDownInformer_BytesObject(t *testing.T) {
 	rw.informers = map[schema.GroupVersionResource]informers.GenericInformer{}
 	rw.informers[targetGVR] = nil // sentinel: GVR key present in map.
 
+	// triggerCRDDelete consults Global() to reach the ResourceWatcher
+	// it must mutate. Inject the test's rw via SetGlobal so the
+	// teardown actually fires against the test fixture, not a nil /
+	// production singleton. Cleanup restores nil.
+	SetGlobal(rw)
+	t.Cleanup(func() { SetGlobal(nil) })
+
 	// DELETE fires teardown.
 	handlers.DeleteFunc(bo)
 
@@ -392,6 +399,9 @@ func TestCRDDelete_TearsDownInformer_DeletedFinalStateUnknown(t *testing.T) {
 
 	rw.informers = map[schema.GroupVersionResource]informers.GenericInformer{}
 	rw.informers[targetGVR] = nil
+
+	SetGlobal(rw)
+	t.Cleanup(func() { SetGlobal(nil) })
 
 	tomb := clientcache.DeletedFinalStateUnknown{
 		Key: "ghscp.composition.krateo.io",
