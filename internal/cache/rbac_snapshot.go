@@ -792,6 +792,8 @@ func goTypeOf(obj interface{}) string {
 		return "*rbacv1.Role"
 	case *unstructured.Unstructured:
 		return "*unstructured.Unstructured"
+	case *bytesObject:
+		return "*cache.bytesObject"
 	case nil:
 		return "<nil>"
 	default:

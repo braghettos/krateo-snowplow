@@ -64,13 +64,37 @@ import (
 // that group, or the next walker pass, will retry).
 const crdDiscoveryQueueDepth = 256
 
-// crdDiscoveryEvent is one queued CRD-ADD event handed to the
-// discovery worker. The bridge captures the *unstructured.Unstructured
-// at enqueue time so the worker reads spec.group from the snapshot
-// the informer delivered — no late reads against a mutating store.
+// crdDiscoveryEvent is one queued CRD-lifecycle event handed to the
+// discovery worker. The bridge captures the informer-delivered object
+// at enqueue time so the worker reads spec.* from the snapshot the
+// informer delivered — no late reads against a mutating store.
 type crdDiscoveryEvent struct {
-	obj interface{} // *unstructured.Unstructured (or bytesObject — see decode below)
+	// obj is the CRD event payload. Production delivery shape post-Ship-H5
+	// is *bytesObject (streaming-listwatch is the default for every dynamic
+	// informer per watcher.go:1035-1047). The stock-informer fallback path
+	// delivers *unstructured.Unstructured. triggerCRDDiscovery + the §3b
+	// DELETE handler route both through decodeBytesObject
+	// (bytesobject.go:394) — see Ship L / 0.30.246. DELETE events may
+	// arrive wrapped in clientcache.DeletedFinalStateUnknown; the AddFunc/
+	// UpdateFunc/DeleteFunc literal bodies in deps_watch.go unwrap that
+	// shape BEFORE handing obj to submitCRDLifecycleEvent.
+	obj interface{}
+	// kind discriminates ADD vs UPDATE vs DELETE so the worker dispatches
+	// to the right side-effect (Ship L / 0.30.246). UPDATE re-runs
+	// discovery against the new spec; DELETE tears down the per-resource
+	// informer + dirty-marks dependent L1.
+	kind crdLifecycleKind
 }
+
+// crdLifecycleKind discriminates the three CRD events the bridge handles
+// (Ship L / 0.30.246).
+type crdLifecycleKind uint8
+
+const (
+	crdLifecycleAdd    crdLifecycleKind = iota // CRD CREATE
+	crdLifecycleUpdate                         // CRD UPDATE (spec.versions[] / served[] / group changes)
+	crdLifecycleDelete                         // CRD DELETE (group no longer served by the apiserver)
+)
 
 // crdDiscovery is the process-scoped CRD-ADD-side-effect bridge:
 // counters + the worker channel + the worker-goroutine lifecycle.
@@ -156,36 +180,68 @@ func (c *crdDiscovery) startCRDDiscoveryWorker() {
 }
 
 // processEvent is the worker's per-event entry point. Bumps the
-// processed counter then dispatches to triggerCRDDiscovery — the
-// recover wrapper (PM tightening #2) is INSIDE triggerCRDDiscovery
-// so a single bad CRD object cannot crash the worker.
+// processed counter then dispatches on the event kind. The recover
+// wrappers (PM tightening #2) are INSIDE each trigger* function so a
+// single bad CRD object cannot crash the worker.
+//
+// Ship L (0.30.246): dispatches on crdLifecycleKind. ADD + UPDATE
+// share the discovery code path (triggerCRDDiscovery); DELETE branches
+// to triggerCRDDelete (wired in commit-4).
 func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 	c.eventsProcessed.Add(1)
-	triggerCRDDiscovery(ev.obj)
+	switch ev.kind {
+	case crdLifecycleAdd, crdLifecycleUpdate:
+		triggerCRDDiscovery(ev.obj, ev.kind)
+	case crdLifecycleDelete:
+		// Wired in commit-4. Until then the DELETE branch is a no-op so
+		// the enum value is structurally valid but produces no side-effect.
+		// This keeps commit-2's blast radius bounded to the ADD fix.
+	}
 }
 
-// submitCRDDiscoveryEvent enqueues a CRD-ADD event onto the
-// worker queue. Non-blocking with bounded buffer. Called from the
-// deps_watch.go AddFunc when IsCRDGVR(gvr) is true.
+// submitCRDLifecycleEvent enqueues a CRD lifecycle event (ADD / UPDATE
+// / DELETE) onto the worker queue. Non-blocking with bounded buffer.
+// Called from the deps_watch.go AddFunc/UpdateFunc/DeleteFunc when
+// IsCRDGVR(gvr) is true.
 //
 // On full queue: drop + WARN + counter bump. DiscoverGroupResources
 // is per-group singleflighted; a dropped event for an in-flight
 // group is harmless. A dropped event for a NEW group means the
 // next event for that group (or the next walker pass) retries.
-func (c *crdDiscovery) submitCRDDiscoveryEvent(obj interface{}) {
+//
+// Ship L (0.30.246) — renamed from submitCRDDiscoveryEvent. The kind
+// parameter lets the worker dispatch to ADD/UPDATE/DELETE paths.
+func (c *crdDiscovery) submitCRDLifecycleEvent(obj interface{}, kind crdLifecycleKind) {
 	c.startCRDDiscoveryWorker()
 	select {
-	case c.queue <- crdDiscoveryEvent{obj: obj}:
+	case c.queue <- crdDiscoveryEvent{obj: obj, kind: kind}:
 		c.eventsEnqueued.Add(1)
 	default:
 		c.eventsDropped.Add(1)
 		slog.Warn("cache.crd_discovery.event_dropped",
 			slog.String("subsystem", "cache"),
-			slog.String("hint", "CRD-ADD burst outran the discovery worker — "+
+			slog.String("kind", crdLifecycleKindString(kind)),
+			slog.String("hint", "CRD lifecycle burst outran the discovery worker — "+
 				"DiscoverGroupResources is singleflighted per-group so a duplicate "+
 				"for an in-flight group is harmless; a new group will be retried "+
-				"on the next CRD ADD or walker pass."),
+				"on the next CRD event or walker pass."),
 		)
+	}
+}
+
+// crdLifecycleKindString renders the enum as a human-readable label for
+// log lines + WARNs. Closed-set; default falls back to "unknown" rather
+// than panicking on an invalid value.
+func crdLifecycleKindString(k crdLifecycleKind) string {
+	switch k {
+	case crdLifecycleAdd:
+		return "ADD"
+	case crdLifecycleUpdate:
+		return "UPDATE"
+	case crdLifecycleDelete:
+		return "DELETE"
+	default:
+		return "unknown"
 	}
 }
 
@@ -212,10 +268,11 @@ func (c *crdDiscovery) stopCRDDiscoveryWorker() {
 // Identity invariants:
 //   - The SA *rest.Config comes from ProcessSARestConfig (set once
 //     at main.go startup). nil → soft-skip + counter bump.
-//   - The CRD object is *unstructured.Unstructured (the dynamic
-//     informer's standard delivery shape). bytesObject / other
-//     shapes soft-skip (we expect Unstructured for the CRD GVR; a
-//     future routing change would surface here via skip counter).
+//   - The CRD object decodes via decodeBytesObject (bytesobject.go:394).
+//     Production delivery shape post-Ship-H5 is *bytesObject (streaming-
+//     listwatch is the default per watcher.go:1035-1047); the stock-
+//     informer fallback delivers *unstructured.Unstructured. Anything
+//     else (PartialObjectMetadata, nil, etc.) → soft-skip.
 //   - spec.group is read via unstructured.NestedString — empty /
 //     missing / non-string soft-skips.
 //
@@ -226,7 +283,12 @@ func (c *crdDiscovery) stopCRDDiscoveryWorker() {
 // (singleflight inside DiscoverGroupResources serialises per-group
 // anyway; the worker queue serialises across groups too, which is
 // fine for the realistic CRD-CREATE burst rate).
-func triggerCRDDiscovery(obj interface{}) {
+//
+// Ship L (0.30.246): handles both crdLifecycleAdd and crdLifecycleUpdate.
+// AddNavigationDiscoveredGroup is idempotent (discovery_lookup.go:87-102);
+// DiscoverGroupResources is per-group singleflighted, so UPDATE re-firing
+// is cheap when nothing has changed.
+func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	c := crdDiscoverySingleton()
 
 	// PM TIGHTENING #2: panic-recover wrapper. The informer
@@ -238,6 +300,7 @@ func triggerCRDDiscovery(obj interface{}) {
 			c.panicsRecovered.Add(1)
 			slog.Error("cache.crd_discovery.trigger.panic_recovered",
 				slog.String("subsystem", "cache"),
+				slog.String("kind", crdLifecycleKindString(kind)),
 				slog.Any("panic", rec),
 				slog.String("stack", string(debug.Stack())),
 				slog.String("hint", "triggerCRDDiscovery panicked on a CRD object — "+
@@ -247,14 +310,19 @@ func triggerCRDDiscovery(obj interface{}) {
 		}
 	}()
 
-	u, ok := obj.(*unstructured.Unstructured)
+	// Ship L / 0.30.246 — decode-on-access. Post Ship H5 the
+	// streaming-listwatch is the default for every dynamic informer
+	// (watcher.go:1035-1047), so the customresourcedefinitions
+	// informer delivers *bytesObject here, NOT
+	// *unstructured.Unstructured. decodeBytesObject is the established
+	// H5-aware decode dance: *bytesObject → fresh Unstructured via
+	// .Decode(); *unstructured.Unstructured → returned as-is. Anything
+	// else (PartialObjectMetadata, nil, etc.) → (nil, false) and we
+	// soft-skip + one-shot WARN per unique go-type.
+	u, ok := decodeBytesObject(obj)
 	if !ok || u == nil {
-		// bytesObject / PartialObjectMetadata / nil — the CRD
-		// informer is dynamic-full-Unstructured by construction
-		// (see watcher.go addResourceTypeLocked path). A non-
-		// Unstructured arrival means a routing change that future
-		// editors should be aware of.
 		c.discoverySkippedNG.Add(1)
+		warnOnceCRDDecodeSkip(obj, kind)
 		return
 	}
 
@@ -298,6 +366,34 @@ func triggerCRDDiscovery(obj interface{}) {
 			slog.Any("err", derr),
 		)
 	}
+}
+
+// warnOnceCRDDecodeSkip emits a single WARN per unique go-type observed
+// at the decode-skip path. Bounded by a sync.Map keyed on the type name
+// so log volume is bounded by the number of distinct delivery shapes
+// (1-2 in practice). Ship L / 0.30.246.
+//
+// The silent-skip behaviour of the pre-Ship-L bridge is what hid the
+// 0.30.233 bytesObject regression for 13 ships. This WARN is the
+// observability surface so any future routing change surfaces in pod
+// logs the moment the new shape is observed — not 5 months later in a
+// bench failure.
+var crdDecodeSkipWarnedTypes sync.Map // map[string]struct{}
+
+func warnOnceCRDDecodeSkip(obj interface{}, kind crdLifecycleKind) {
+	typeName := goTypeOf(obj)
+	if _, loaded := crdDecodeSkipWarnedTypes.LoadOrStore(typeName, struct{}{}); loaded {
+		return
+	}
+	slog.Warn("cache.crd_discovery.decode_skipped",
+		slog.String("subsystem", "cache"),
+		slog.String("kind", crdLifecycleKindString(kind)),
+		slog.String("got_type", typeName),
+		slog.String("hint", "CRD lifecycle event arrived in an undecodable shape — "+
+			"decodeBytesObject returned (nil,false). If got_type is *bytesObject, "+
+			"the raw bytes are malformed (rare); otherwise decodeBytesObject "+
+			"(bytesobject.go:394) needs a new case for this shape."),
+	)
 }
 
 // CRDDiscoveryStats is a read-only snapshot of the CRD-discovery

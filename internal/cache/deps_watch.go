@@ -215,7 +215,7 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 			// panic-kill the worker or this processor goroutine.
 			// See crd_discovery_side_effect.go.
 			if crdSideEffect {
-				crdDiscoverySingleton().submitCRDDiscoveryEvent(obj)
+				crdDiscoverySingleton().submitCRDLifecycleEvent(obj, crdLifecycleAdd)
 			}
 		},
 		UpdateFunc: func(_, newObj interface{}) {

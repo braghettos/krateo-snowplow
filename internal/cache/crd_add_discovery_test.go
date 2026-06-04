@@ -392,9 +392,9 @@ func TestTriggerCRDDiscovery_RecoverWrapperCatchesPanic(t *testing.T) {
 	c := crdDiscoverySingleton()
 	c.startCRDDiscoveryWorker()
 
-	c.submitCRDDiscoveryEvent(crdObj("a.example.com", "example.com"))
-	c.submitCRDDiscoveryEvent(crdObj("b.example.com", "example.com"))
-	c.submitCRDDiscoveryEvent(crdObj("c.example.com", "example.com"))
+	c.submitCRDLifecycleEvent(crdObj("a.example.com", "example.com"), crdLifecycleAdd)
+	c.submitCRDLifecycleEvent(crdObj("b.example.com", "example.com"), crdLifecycleAdd)
+	c.submitCRDLifecycleEvent(crdObj("c.example.com", "example.com"), crdLifecycleAdd)
 
 	if !WaitCRDDiscoveryProcessedForTest(3, 2000) {
 		t.Fatalf("worker died after first event; counters: %s", crdDiscoveryStatsString())
