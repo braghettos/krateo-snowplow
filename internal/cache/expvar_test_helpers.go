@@ -34,4 +34,5 @@ func RegisterExpvarForTest() {
 	registerFallthroughExpvar()
 	registerControllerHealthExpvar()
 	registerRefresherMetrics()
+	registerCRDDiscoveryExpvar()
 }

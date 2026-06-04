@@ -21,6 +21,11 @@
 package cache
 
 import (
+	"encoding/json"
+	"expvar"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -434,4 +439,140 @@ func TestCRDDelete_TearsDownInformer_DeletedFinalStateUnknown(t *testing.T) {
 		t.Fatalf("Ship L FAIL (DELETE tombstone): DeletesProcessed=%d want >=1",
 			s.DeletesProcessed)
 	}
+}
+
+// --- Commit-5 — expvar /debug/vars exposure ----------------------------------
+
+// TestCRDDiscoveryExpvarHandler — Ship L (0.30.246) closes followup #143.
+//
+// Validates the second half of the bridge observability surface: the
+// counters exposed via crd_discovery_expvar.go's expvar.Publish are
+// actually visible through expvar.Handler() (the handler main.go mounts
+// at /debug/vars). Without this test a future expvar-registration
+// regression in init() would silently break the operator surface — the
+// same regression class that hid the Ship 0.30.233 bytesObject defect
+// for 13 ships.
+//
+// Per the published shape (crd_discovery_expvar.go):
+//
+//	snowplow_crd_discovery → map[string]uint64 with 8 keys:
+//	  events_enqueued / events_dropped / events_processed
+//	  discovery_invoked / discovery_skipped_ng
+//	  deletes_processed / delete_skipped_ng
+//	  panics_recovered
+func TestCRDDiscoveryExpvarHandler(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	// CFG-1 (Ship 0.30.163): expvar gauges register only when
+	// CACHE_ENABLED is truthy at package init() time. The `go test`
+	// process boots with the env unset, so init() returned early.
+	// RegisterExpvarForTest re-registers via sync.Once.
+	RegisterExpvarForTest()
+
+	// Drive the bridge once so the counters are non-zero — Enqueued
+	// for the ADD; Processed + Invoked once the worker drains.
+	withCleanCRDDiscovery(t)
+	fake := &fakeDiscoveryForCRD{
+		group:   "expvar.test.io",
+		version: "v1",
+		res:     []metav1.APIResource{{Name: "samples", Kind: "Sample"}},
+	}
+	installFakeDiscoveryForCRD(t, fake)
+	SetProcessSARestConfig(&rest.Config{Host: "https://fake.test"})
+
+	crdGVR := CRDGVRForTest()
+	rw := newGateWatcher()
+	ch := make(chan struct{})
+	close(ch)
+	rw.syncCh[crdGVR] = ch
+	handlers := rw.depEventHandlers(crdGVR)
+
+	handlers.AddFunc(crdBytesObj(t, "samples.expvar.test.io", "expvar.test.io"))
+	if !WaitCRDDiscoveryProcessedForTest(1, 2000) {
+		t.Fatalf("expvar precondition: ADD not processed in 2s; counters: %s",
+			crdDiscoveryStatsString())
+	}
+
+	// Mount expvar.Handler on a test server (the same one-line mount
+	// main.go does at /debug/vars).
+	mux := http.NewServeMux()
+	mux.Handle("/debug/vars", expvar.Handler())
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/debug/vars")
+	if err != nil {
+		t.Fatalf("HTTP GET /debug/vars: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/debug/vars status = %d", resp.StatusCode)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("unmarshal /debug/vars JSON: %v\nbody: %s", err, string(body))
+	}
+
+	rawVal, ok := doc["snowplow_crd_discovery"]
+	if !ok {
+		t.Fatalf("snowplow_crd_discovery key missing from /debug/vars; "+
+			"the Ship-L expvar.Publish never fired. Top-level keys: %v",
+			topLevelKeys(doc))
+	}
+	m, ok := rawVal.(map[string]any)
+	if !ok {
+		t.Fatalf("snowplow_crd_discovery wrong shape: got %T want map[string]any", rawVal)
+	}
+
+	// All 8 keys must be present.
+	wantKeys := []string{
+		"events_enqueued", "events_dropped", "events_processed",
+		"discovery_invoked", "discovery_skipped_ng",
+		"deletes_processed", "delete_skipped_ng",
+		"panics_recovered",
+	}
+	for _, k := range wantKeys {
+		if _, ok := m[k]; !ok {
+			t.Errorf("snowplow_crd_discovery missing key %q; have %v", k, mapKeys(m))
+		}
+	}
+
+	// events_enqueued must be >=1 (the ADD we drove). JSON numbers
+	// decode as float64.
+	enqueued, ok := m["events_enqueued"].(float64)
+	if !ok || uint64(enqueued) < 1 {
+		t.Errorf("events_enqueued = %#v; want >=1", m["events_enqueued"])
+	}
+	discoveryInvoked, ok := m["discovery_invoked"].(float64)
+	if !ok || uint64(discoveryInvoked) < 1 {
+		t.Errorf("discovery_invoked = %#v; want >=1", m["discovery_invoked"])
+	}
+	// New Ship L keys must be present even when DELETE didn't run.
+	if v, ok := m["deletes_processed"].(float64); !ok || uint64(v) != 0 {
+		t.Errorf("deletes_processed = %#v; want 0", m["deletes_processed"])
+	}
+	if v, ok := m["delete_skipped_ng"].(float64); !ok || uint64(v) != 0 {
+		t.Errorf("delete_skipped_ng = %#v; want 0", m["delete_skipped_ng"])
+	}
+}
+
+// topLevelKeys + mapKeys — small test-only helpers for failure messages.
+func topLevelKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func mapKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
