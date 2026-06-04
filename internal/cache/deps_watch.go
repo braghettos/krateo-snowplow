@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
@@ -188,7 +189,7 @@ func (w *depWatch) stopDeleteWorker() {
 //   - syncCh nil (O14) → fail-safe DROP + one-shot WARN. A nil channel
 //     means a registration path bypassed the syncCh allocation; we never
 //     propagate (could storm) and never block (could deadlock).
-func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerFuncs {
+func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) clientcache.ResourceEventHandlerDetailedFuncs {
 	w := depWatchSingleton()
 	// Ship 0.30.233 — pre-compute the CRD-meta-GVR predicate once
 	// per handler-set construction, NOT per-event. The predicate is
@@ -197,8 +198,54 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 	// GVR-comparison cost for the 99% case where gvr is NOT the
 	// CRD meta-GVR.
 	crdSideEffect := IsCRDGVR(gvr)
-	return clientcache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+	// 0.30.247-pre1 — instrumentation-only. Capture per-handler-set
+	// registration timestamp via closure (no new lock surface, no new
+	// map). The AddFunc instrumentation block reads this to discriminate
+	// initial-replay events (small elapsed) from stable post-WATCH events
+	// (large elapsed) when the (syncch_closed, has_synced, is_in_initial_list)
+	// triple is ambiguous.
+	registeredAt := time.Now()
+	// 0.30.247-pre1 — Detailed-funcs migration per architect §11
+	// reflector trace + Diego's Option-a ratification.
+	// clientcache.ResourceEventHandlerDetailedFuncs (vendored at
+	// client-go@v0.33.0/tools/cache/controller.go:278-282) plumbs
+	// isInInitialList through OnAdd(obj, isInInitialList bool). This
+	// is the ONLY safe-ship discriminator for "initial-replay event"
+	// vs "post-sync WATCH event": HasSynced cannot distinguish replay-
+	// tail from post-sync (DeltaFIFO.Pop captures isInInitialList
+	// BEFORE decrementing initialPopulationCount, so the last replay
+	// item observes HasSynced=true at AddFunc entry). pre1 does NOT
+	// change the gate behaviour — it captures isInInitialList as the
+	// 4th log field so the next ship's A-fix gates on the SAME
+	// mechanism the diagnostic captures (no mechanism gap per
+	// feedback_check_k8s_clientgo_prior_art).
+	return clientcache.ResourceEventHandlerDetailedFuncs{
+		AddFunc: func(obj interface{}, isInInitialList bool) {
+			// 0.30.247-pre1 — AddFunc HANDLER-ENTRY instrumentation.
+			// MUST fire for EVERY ADD event (no sampling). Captures
+			// state at handler-entry time so the four fields together
+			// produce the safe-ship empirical artifact for the
+			// proposed A-fix.
+			rw.mu.RLock()
+			ch := rw.syncCh[gvr]
+			rw.mu.RUnlock()
+			syncChClosed := false
+			if ch != nil {
+				select {
+				case <-ch:
+					syncChClosed = true
+				default:
+				}
+			}
+			slog.Debug("addfunc.entry",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.Bool("syncch_closed", syncChClosed),
+				slog.Bool("has_synced", rw.IsSynced(gvr)),
+				slog.Bool("is_in_initial_list", isInInitialList),
+				slog.Int64("elapsed_since_register_ms", time.Since(registeredAt).Milliseconds()),
+			)
+
 			if !rw.addEventPostSync(gvr, w) {
 				w.counters.addDroppedPreSync.Add(1)
 				return

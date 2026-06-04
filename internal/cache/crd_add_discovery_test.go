@@ -191,8 +191,12 @@ func TestCRDAdd_TriggersGroupDiscovery(t *testing.T) {
 	handlers := rw.depEventHandlers(crdGVR)
 
 	// Fire a synthetic CRD ADD with spec.group="composition.krateo.io".
+	// 0.30.247-pre1: AddFunc is now Detailed-funcs — passes isInInitialList.
+	// Existing tests model "post-sync" by closing rw.syncCh; the gate code
+	// path is unchanged in pre1, so isInInitialList value is irrelevant
+	// for these assertions. Use false (= post-WATCH event).
 	handlers.AddFunc(crdObj("githubscaffoldingwithcompositionpages.composition.krateo.io",
-		"composition.krateo.io"))
+		"composition.krateo.io"), false)
 
 	// The worker is async — wait for it to drain.
 	if !WaitCRDDiscoveryProcessedForTest(1, 2000) {
@@ -253,8 +257,10 @@ func TestCRDAdd_NonCRDGVR_NoDiscovery(t *testing.T) {
 	handlers := rw.depEventHandlers(gvr)
 
 	// Fire 3 ADDs — none should enqueue a CRD-discovery event.
+	// 0.30.247-pre1: isInInitialList=false (post-WATCH; identical drop
+	// semantics in pre1).
 	for i := 0; i < 3; i++ {
-		handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "obj-"+string(rune('a'+i))))
+		handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "obj-"+string(rune('a'+i))), false)
 	}
 
 	// Brief drain window to ensure the worker is idle.
@@ -305,17 +311,18 @@ func TestCRDAdd_RecoversFromMalformedObject(t *testing.T) {
 	handlers := rw.depEventHandlers(crdGVR)
 
 	// FIRST: a CRD with no spec.group — should soft-skip (no panic).
-	handlers.AddFunc(crdObjNoSpecGroup("malformed.example.com"))
+	// 0.30.247-pre1 — Detailed-funcs second arg isInInitialList=false.
+	handlers.AddFunc(crdObjNoSpecGroup("malformed.example.com"), false)
 	// SECOND: a CRD with an empty spec.group string — soft-skip path.
 	handlers.AddFunc(&unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apiextensions.k8s.io/v1",
 		"kind":       "CustomResourceDefinition",
 		"metadata":   map[string]any{"name": "empty-group.example.com"},
 		"spec":       map[string]any{"group": ""},
-	}})
+	}}, false)
 	// THIRD: a well-formed CRD — must still succeed; proves the
 	// worker stayed alive after the two malformed inputs.
-	handlers.AddFunc(crdObj("good.composition.krateo.io", "composition.krateo.io"))
+	handlers.AddFunc(crdObj("good.composition.krateo.io", "composition.krateo.io"), false)
 
 	// Wait for 3 events processed (two soft-skips + one good).
 	if !WaitCRDDiscoveryProcessedForTest(3, 2000) {
@@ -454,8 +461,9 @@ func TestCRDAdd_WorkerNotBlockedByDiscoveryHop(t *testing.T) {
 	const N = 5
 	start := time.Now()
 	for i := 0; i < N; i++ {
+		// 0.30.247-pre1 — Detailed-funcs second arg isInInitialList=false.
 		handlers.AddFunc(crdObj("crd-"+string(rune('a'+i))+".composition.krateo.io",
-			"composition.krateo.io"))
+			"composition.krateo.io"), false)
 	}
 	enqueueElapsed := time.Since(start)
 

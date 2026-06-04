@@ -143,9 +143,10 @@ func TestCRDAdd_TriggersGroupDiscovery_BytesObject(t *testing.T) {
 	handlers := rw.depEventHandlers(crdGVR)
 
 	// PRODUCTION SHAPE: *bytesObject (not *unstructured.Unstructured).
+	// 0.30.247-pre1 — Detailed-funcs second arg isInInitialList=false.
 	handlers.AddFunc(crdBytesObj(t,
 		"githubscaffoldingwithcompositionpages.composition.krateo.io",
-		"composition.krateo.io"))
+		"composition.krateo.io"), false)
 
 	if !WaitCRDDiscoveryProcessedForTest(1, 2000) {
 		t.Fatalf("worker did not process the bytesObject CRD ADD within 2s; "+
@@ -486,7 +487,8 @@ func TestCRDDiscoveryExpvarHandler(t *testing.T) {
 	rw.syncCh[crdGVR] = ch
 	handlers := rw.depEventHandlers(crdGVR)
 
-	handlers.AddFunc(crdBytesObj(t, "samples.expvar.test.io", "expvar.test.io"))
+	// 0.30.247-pre1 — Detailed-funcs second arg isInInitialList=false.
+	handlers.AddFunc(crdBytesObj(t, "samples.expvar.test.io", "expvar.test.io"), false)
 	if !WaitCRDDiscoveryProcessedForTest(1, 2000) {
 		t.Fatalf("expvar precondition: ADD not processed in 2s; counters: %s",
 			crdDiscoveryStatsString())

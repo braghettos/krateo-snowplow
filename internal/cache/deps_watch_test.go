@@ -65,7 +65,10 @@ func TestACR1b_AddPreSyncDropped(t *testing.T) {
 	d.SetRefreshHook(func(string) { marked++ })
 
 	// Fire an ADD-equivalent through the real handler closure.
-	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "new-obj"))
+	// 0.30.247-pre1 — Detailed-funcs second arg isInInitialList=false.
+	// Pre1 does NOT change drop semantics; the second arg is logged
+	// but not gated on.
+	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "new-obj"), false)
 
 	if got := DepWatchStatsSnapshot().AddDroppedPreSync; got != 1 {
 		t.Fatalf("AC-R1b: addDroppedPreSync=%d want 1", got)
@@ -100,7 +103,8 @@ func TestACR1a_AddPostSyncDirtyMarksListDep(t *testing.T) {
 	var marked []string
 	d.SetRefreshHook(func(k string) { marked = append(marked, k) })
 
-	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-07", "fresh-obj"))
+	// 0.30.247-pre1 — Detailed-funcs second arg isInInitialList=false.
+	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-07", "fresh-obj"), false)
 
 	if got := DepWatchStatsSnapshot().AddPropagated; got != 1 {
 		t.Fatalf("AC-R1a: addPropagated=%d want 1", got)
@@ -132,8 +136,9 @@ func TestACO14_NilSyncChDrops(t *testing.T) {
 	d.SetRefreshHook(func(string) { marked++ })
 
 	// Two ADDs — the WARN must fire at most once, both must drop.
-	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "a"))
-	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "b"))
+	// 0.30.247-pre1 — Detailed-funcs second arg isInInitialList=false.
+	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "a"), false)
+	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "b"), false)
 
 	s := DepWatchStatsSnapshot()
 	if s.AddNilSyncCh != 2 {
