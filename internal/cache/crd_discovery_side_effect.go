@@ -87,12 +87,14 @@ type crdDiscovery struct {
 
 	// Counters — observability for the falsifier + ops dashboards.
 	// All atomic for lock-free reads.
-	eventsEnqueued     atomic.Uint64 // ADD events accepted into the queue
-	eventsDropped      atomic.Uint64 // ADD events dropped (queue full)
-	eventsProcessed    atomic.Uint64 // ADD events drained by the worker
-	discoveryInvoked   atomic.Uint64 // triggerCRDDiscovery calls that reached DiscoverGroupResources
-	discoverySkippedNG atomic.Uint64 // triggerCRDDiscovery calls skipped (no group / decode-fail / no SA rc)
-	panicsRecovered    atomic.Uint64 // triggerCRDDiscovery panics caught by the recover wrapper
+	eventsEnqueued     atomic.Uint64 // lifecycle events accepted into the queue (ADD + UPDATE + DELETE)
+	eventsDropped      atomic.Uint64 // lifecycle events dropped (queue full)
+	eventsProcessed    atomic.Uint64 // lifecycle events drained by the worker
+	discoveryInvoked   atomic.Uint64 // ADD+UPDATE calls that reached DiscoverGroupResources
+	discoverySkippedNG atomic.Uint64 // ADD+UPDATE calls skipped (no group / decode-fail / no SA rc)
+	deletesProcessed   atomic.Uint64 // Ship L — DELETE calls that completed teardown (>=1 GVR torn down)
+	deleteSkippedNG    atomic.Uint64 // Ship L — DELETE calls skipped (decode-fail / no plural / no served versions)
+	panicsRecovered    atomic.Uint64 // recover-wrapper panic catches across all lifecycle handlers
 }
 
 var (
@@ -301,12 +303,18 @@ func triggerCRDDiscovery(obj interface{}) {
 // CRDDiscoveryStats is a read-only snapshot of the CRD-discovery
 // bridge counters. Consumed by the Ship 0.30.233 falsifier and the
 // /debug/vars surface (followup #143).
+//
+// Ship L (0.30.246) added DeletesProcessed + DeleteSkippedNG for the
+// CRD DELETE lifecycle path. Both fields stay zero in test fixtures
+// that exercise only the ADD/UPDATE paths.
 type CRDDiscoveryStats struct {
 	EventsEnqueued     uint64
 	EventsDropped      uint64
 	EventsProcessed    uint64
-	DiscoveryInvoked   uint64
-	DiscoverySkippedNG uint64
+	DiscoveryInvoked   uint64 // ADD + UPDATE (DiscoverGroupResources calls)
+	DiscoverySkippedNG uint64 // ADD + UPDATE decode-skip / no-group / no-SA-rc
+	DeletesProcessed   uint64 // Ship L — successful DELETE teardowns
+	DeleteSkippedNG    uint64 // Ship L — DELETE decode-skip / no-served-versions / no-plural
 	PanicsRecovered    uint64
 }
 
@@ -319,6 +327,8 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 		EventsProcessed:    c.eventsProcessed.Load(),
 		DiscoveryInvoked:   c.discoveryInvoked.Load(),
 		DiscoverySkippedNG: c.discoverySkippedNG.Load(),
+		DeletesProcessed:   c.deletesProcessed.Load(),
+		DeleteSkippedNG:    c.deleteSkippedNG.Load(),
 		PanicsRecovered:    c.panicsRecovered.Load(),
 	}
 }
