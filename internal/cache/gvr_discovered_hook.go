@@ -105,3 +105,12 @@ func ResetGVRDiscoveredHooksForTest() {
 	gvrDiscoveredHooks.pointers = nil
 	gvrDiscoveredHooks.mu.Unlock()
 }
+
+// NotifyGVRDiscoveredForReprewarmTest is a TEST-ONLY exported shim
+// that fires the unexported notifyGVRDiscoveredForReprewarm. Used by
+// cross-package integration tests in internal/handlers/dispatchers
+// to drive the cache→engine hook chain without standing up the full
+// DiscoverGroupResources path.
+func NotifyGVRDiscoveredForReprewarmTest(gvr schema.GroupVersionResource) {
+	notifyGVRDiscoveredForReprewarm(gvr)
+}
