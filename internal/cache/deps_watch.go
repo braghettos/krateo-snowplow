@@ -221,6 +221,18 @@ func (rw *ResourceWatcher) depEventHandlers(gvr schema.GroupVersionResource) cli
 		UpdateFunc: func(_, newObj interface{}) {
 			ns, name := metaNSName(newObj)
 			Deps().OnUpdate(gvr, ns, name)
+			// Ship L / 0.30.246 — CRD UPDATE lifecycle hook. A CRD
+			// UPDATE may add a new served version, retire one, or
+			// change spec.group. Re-firing discovery on the NEW spec
+			// is cheap (DiscoverGroupResources is per-group
+			// singleflighted at discovery_lookup.go:228+) and
+			// idempotent (AddNavigationDiscoveredGroup at
+			// discovery_lookup.go:87-102 is a no-op for an already-
+			// known group). The worker queue serialises ADD/UPDATE/
+			// DELETE so order is deterministic.
+			if crdSideEffect {
+				crdDiscoverySingleton().submitCRDLifecycleEvent(newObj, crdLifecycleUpdate)
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			// DeletedFinalStateUnknown wraps the last-known object when
