@@ -284,16 +284,38 @@ func (e *prewarmEngine) dequeueScope() (prewarmScope, bool) {
 // scopeDone (nilable) is invoked after each scope is processed — the boot
 // wiring uses it to release the background goroutine the instant the boot
 // scope completes (S2) rather than holding for the full pipGlobalTimeout.
+//
+// Ship 2 Stage 2 / 0.30.247 — wires the cache→engine hook for
+// scopeKindGVRDiscovered. The hook subscribes here BEFORE the worker
+// goroutine spawns so any GVR discovered during boot (lazy registers
+// post-MarkEagerSet) is queued, not dropped. The wiring happens inside
+// startedOnce so it runs exactly once per process.
 func StartPrewarmEngine(ctx context.Context, handler func(ctx context.Context, s prewarmScope) error, scopeDone func(s prewarmScope, err error)) {
 	e := prewarmEngineSingleton()
 	e.startedOnce.Do(func() {
 		e.scopeHandler = handler
 		e.scopeDone = scopeDone
+
+		// Ship 2 Stage 2 — wire the cache→engine hook. The hook fires
+		// from inside cache.DiscoverGroupResources (the `if added`
+		// branch of EnsureResourceType for genuinely-new GVRs). The
+		// callback is non-blocking: enqueueScope is O(1) under a
+		// sync.Mutex + a buffered=1 signal-channel send.
+		//
+		// REGISTRATION ORDER (PM observation 3, R4 startup-storm):
+		// runs BEFORE `go e.runWorker(ctx)` below so a discovery firing
+		// during the same goroutine that called StartPrewarmEngine
+		// (e.g. via subsequent walker calls) IS queued, not dropped.
+		// The registration is idempotent at the cache side (compares
+		// fn pointer) so a future engine re-entry would not double-wire.
+		registerEngineGVRDiscoveredHook(e)
+
 		go e.runWorker(ctx)
 		slog.Info("prewarm.engine.started",
 			slog.String("subsystem", "cache"),
 			slog.String("queue", "bounded-dedup"),
 			slog.String("customer_priority", "yield-on-inflight"),
+			slog.String("gvr_discovered_hook", "wired"),
 		)
 	})
 }

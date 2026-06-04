@@ -90,6 +90,34 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 	}
 }
 
+// registerEngineGVRDiscoveredHook subscribes the engine to the
+// cache-side GVR-discovered hook. Called once per process from
+// StartPrewarmEngine inside startedOnce — BEFORE the engine worker
+// spawns — so a GVR discovery firing during boot is queued, not
+// dropped.
+//
+// The hook callback is intentionally TINY: it builds a prewarmScope
+// and calls enqueueScope. The enqueue is O(1) (sync.Mutex critical
+// section + buffered=1 channel send) and never blocks. The actual
+// re-prewarm work runs on the engine worker goroutine, scoped through
+// the customer-priority yield + bounded queue.
+//
+// CONTRACT: the cache fires this hook synchronously inside its
+// discovery goroutine. Keep the callback non-blocking — see the
+// RegisterGVRDiscoveredHook doc-comment for the cache-side guarantee
+// that hook handlers must not block.
+//
+// Per task-194-ship-2-stage-2-empirical-trace-2026-06-04.md §5.2
+// commit-4.
+func registerEngineGVRDiscoveredHook(e *prewarmEngine) {
+	cache.RegisterGVRDiscoveredHook(func(gvr schema.GroupVersionResource) {
+		e.enqueueScope(prewarmScope{
+			kind: scopeKindGVRDiscovered,
+			gvr:  gvr,
+		})
+	})
+}
+
 // rePrewarmGVRDiscovered is the Ship 2 Stage 2 sub-handler for
 // scopeKindGVRDiscovered. Invoked once per (distinct) GVR discovered
 // post-boot via the cache→dispatchers hook
