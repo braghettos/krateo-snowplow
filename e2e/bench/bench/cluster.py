@@ -277,10 +277,9 @@ def k8s_delete_rolebinding(ns, name):
 def k8s_create_namespaced_role(ns, name, api_groups, resources, verbs):
     """Create a namespaced Role with a SINGLE PolicyRule.
 
-    Idempotent on AlreadyExists (HTTP 409 → True). Returns False when the
-    kubernetes client is unavailable OR a non-409 error fires. The Role
-    shape matches the portal chart's `devs-create-get-list-any-...` Role
-    pattern: one rule per `(api_groups, resources, verbs)` triplet.
+    Idempotent on AlreadyExists (HTTP 409 → True). The Role shape matches
+    the portal chart's `devs-create-get-list-any-...` Role pattern: one
+    rule per `(api_groups, resources, verbs)` triplet.
 
     Args:
         ns:         namespace to create the Role in (str).
@@ -290,10 +289,22 @@ def k8s_create_namespaced_role(ns, name, api_groups, resources, verbs):
         verbs:      list[str] — e.g. ["get", "list"].
 
     Returns:
-        True on success or AlreadyExists; False on transient failure.
+        (ok, diag) — ok=True on success or AlreadyExists; ok=False with
+        a descriptive `diag` string on any failure path (client unavailable,
+        ApiException, AttributeError on SDK-symbol drift, ...). Stage
+        proofs surface `diag` verbatim so SDK / RBAC drift is
+        diagnosable from the proof body alone.
+
+    Re-gate v2 hardening (Task #250 Block 2b re-gate v2 / 2026-06-05):
+    return shape changed `bool → (bool, str)` so the empirical
+    `AttributeError: V1Subject not in kubernetes.client` failure mode is
+    captured in the proof body (was silently swallowed under
+    `except ApiException` only). All callers (phases.py S8 runner +
+    tests) updated in the same commit.
     """
     if not _k8s_init():
-        return False
+        return False, ("rbac_create_failed: k8s client unavailable "
+                       "(_k8s_init returned False)")
     try:
         body = _k8s_client_mod.V1Role(
             metadata=_k8s_client_mod.V1ObjectMeta(name=name),
@@ -305,19 +316,28 @@ def k8s_create_namespaced_role(ns, name, api_groups, resources, verbs):
         )
         _k8s_rbac.create_namespaced_role(
             namespace=ns, body=body, _request_timeout=30)
-        return True
+        return True, ""
     except Exception as e:
+        # ApiException — 409 (AlreadyExists) is success; anything else
+        # surfaces with status+reason for diagnostic.
         if _K8S_LIB_AVAILABLE and isinstance(
                 e, _k8s_client_mod.exceptions.ApiException):
-            return getattr(e, "status", None) in (200, 201, 409)
-        return False
+            status = getattr(e, "status", None)
+            if status in (200, 201, 409):
+                return True, ""
+            reason = getattr(e, "reason", "") or ""
+            return False, (f"rbac_create_failed: api_exception "
+                           f"status={status} reason={reason}")
+        # Non-ApiException (e.g. AttributeError on SDK-symbol drift,
+        # connection errors not yet wrapped in ApiException) — surface
+        # the type + message so the proof body diagnoses what broke.
+        return False, f"rbac_create_failed: {type(e).__name__}: {e}"
 
 
 def k8s_create_namespaced_role_binding(ns, name, role_ref, subjects):
     """Create a namespaced RoleBinding pointing at `role_ref`.
 
-    Idempotent on AlreadyExists (HTTP 409 → True). Returns False when the
-    kubernetes client is unavailable OR a non-409 error fires.
+    Idempotent on AlreadyExists (HTTP 409 → True).
 
     Args:
         ns:        namespace to create the RoleBinding in (str).
@@ -332,10 +352,20 @@ def k8s_create_namespaced_role_binding(ns, name, role_ref, subjects):
                      namespace str  — optional; required for SA kind only
 
     Returns:
-        True on success or AlreadyExists; False on transient failure.
+        (ok, diag) — same shape as `k8s_create_namespaced_role` above.
+
+    Re-gate v2 (2026-06-05):
+      - kubernetes==35.0.0 ships `RbacV1Subject`, NOT bare `V1Subject`
+        (per empirical `dir(kubernetes.client)` probe — the earlier code
+        raised AttributeError before any HTTP call). Fixed at the
+        construction site.
+      - Return shape `bool → (bool, str)` so the smoke-test outcome that
+        flagged the `V1Subject` bug shows up in the proof body next
+        time.
     """
     if not _k8s_init():
-        return False
+        return False, ("rbac_create_failed: k8s client unavailable "
+                       "(_k8s_init returned False)")
     try:
         kind, role_name = role_ref
         rb_subjects = []
@@ -350,7 +380,11 @@ def k8s_create_namespaced_role_binding(ns, name, role_ref, subjects):
             )
             sub_apigroup = s.get("api_group", default_apigroup)
             sub_namespace = s.get("namespace")
-            rb_subjects.append(_k8s_client_mod.V1Subject(
+            # Re-gate v2 fix: use RbacV1Subject (NOT V1Subject — that
+            # symbol does not exist in kubernetes>=27.0.0). Empirically
+            # falsified against kubernetes==35.0.0 on 2026-06-05 during
+            # the live S8 tester run.
+            rb_subjects.append(_k8s_client_mod.RbacV1Subject(
                 kind=sub_kind,
                 name=sub_name,
                 api_group=sub_apigroup,
@@ -367,12 +401,73 @@ def k8s_create_namespaced_role_binding(ns, name, role_ref, subjects):
         )
         _k8s_rbac.create_namespaced_role_binding(
             namespace=ns, body=body, _request_timeout=30)
-        return True
+        return True, ""
     except Exception as e:
         if _K8S_LIB_AVAILABLE and isinstance(
                 e, _k8s_client_mod.exceptions.ApiException):
-            return getattr(e, "status", None) in (200, 201, 409)
-        return False
+            status = getattr(e, "status", None)
+            if status in (200, 201, 409):
+                return True, ""
+            reason = getattr(e, "reason", "") or ""
+            return False, (f"rbac_create_failed: api_exception "
+                           f"status={status} reason={reason}")
+        return False, f"rbac_create_failed: {type(e).__name__}: {e}"
+
+
+# ── Pre-check: can the bench actually create RBAC in target_ns? ───────────
+#
+# Defence-in-depth per re-gate v2: if the bench's kubeconfig identity
+# lacks permission to create rolebindings in `target_ns`, the create
+# would fail with a 403 ApiException — but the descriptive message
+# wouldn't be obvious to a tester reading the proof. A pre-check via
+# SelfSubjectAccessReview surfaces the misconfiguration BEFORE the
+# create attempt, so the proof body says "rbac_precheck_denied" rather
+# than "rbac_create_failed: api_exception status=403".
+
+def k8s_can_i_create_rolebinding(target_ns):
+    """Check if the bench's kubeconfig identity can create RoleBindings
+    in `target_ns` via Kubernetes SelfSubjectAccessReview.
+
+    Returns:
+        (allowed, diag) — allowed=True when the apiserver answers
+        `status.allowed == True`. allowed=False with a diagnostic
+        string otherwise (client unavailable, transport error, or
+        explicit deny).
+
+    Idempotent + read-only — safe to call before any mutation.
+    """
+    if not _k8s_init():
+        return False, ("rbac_precheck_unavailable: k8s client unavailable")
+    try:
+        authz = _k8s_client_mod.AuthorizationV1Api()
+        review = _k8s_client_mod.V1SelfSubjectAccessReview(
+            spec=_k8s_client_mod.V1SelfSubjectAccessReviewSpec(
+                resource_attributes=_k8s_client_mod.V1ResourceAttributes(
+                    namespace=target_ns,
+                    verb="create",
+                    group="rbac.authorization.k8s.io",
+                    resource="rolebindings",
+                ),
+            ),
+        )
+        resp = authz.create_self_subject_access_review(
+            body=review, _request_timeout=30)
+        status = getattr(resp, "status", None)
+        allowed = bool(getattr(status, "allowed", False)) if status else False
+        if allowed:
+            return True, ""
+        reason = getattr(status, "reason", "") if status else ""
+        return False, (f"rbac_precheck_denied: "
+                       f"create rolebindings in {target_ns!r} not "
+                       f"allowed for bench identity; reason={reason!r}")
+    except Exception as e:
+        if _K8S_LIB_AVAILABLE and isinstance(
+                e, _k8s_client_mod.exceptions.ApiException):
+            status_code = getattr(e, "status", None)
+            reason = getattr(e, "reason", "") or ""
+            return False, (f"rbac_precheck_error: api_exception "
+                           f"status={status_code} reason={reason}")
+        return False, f"rbac_precheck_error: {type(e).__name__}: {e}"
 
 
 def k8s_read_namespaced_role_binding(ns, name):
@@ -994,6 +1089,7 @@ __all__ = [
     "k8s_create_namespaced_role",
     "k8s_create_namespaced_role_binding",
     "k8s_read_namespaced_role_binding",
+    "k8s_can_i_create_rolebinding",
     "k8s_list_namespaces_by_prefix",
     "k8s_delete_namespace",
     "k8s_create_namespace",

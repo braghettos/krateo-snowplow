@@ -274,19 +274,20 @@ def test_composition_yaml_contains_required_fields():
 def test_k8s_create_namespaced_role_returns_false_when_init_fails(
         reset_k8s_state, monkeypatch):
     """When `_k8s_init` returns False (lib missing / cluster unreachable),
-    `k8s_create_namespaced_role` returns False — does NOT crash, does NOT
-    contact a real cluster.
+    `k8s_create_namespaced_role` returns (False, diag) — does NOT crash,
+    does NOT contact a real cluster. Re-gate v2: shape is now (ok, diag).
     """
     cluster_mod = reset_k8s_state
     monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", False)
     cluster_mod.K8S_CLIENT_AVAILABLE = False
-    result = cluster_mod.k8s_create_namespaced_role(
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
         "bench-ns-01", "test-role",
         api_groups=["composition.krateo.io"],
         resources=["*"],
         verbs=["get"],
     )
-    assert result is False
+    assert ok is False
+    assert "k8s client unavailable" in diag
 
 
 def test_k8s_create_namespaced_role_uses_client_when_available(
@@ -334,13 +335,14 @@ def test_k8s_create_namespaced_role_uses_client_when_available(
     monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
     cluster_mod._k8s_rbac = _FakeRbacAPI()
 
-    ok = cluster_mod.k8s_create_namespaced_role(
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
         "bench-ns-01", "test-role",
         api_groups=["composition.krateo.io"],
         resources=["*"],
         verbs=["get", "list"],
     )
     assert ok is True
+    assert diag == ""
     assert captured["namespace"] == "bench-ns-01"
     body = captured["body"]
     assert body.metadata.name == "test-role"
@@ -380,13 +382,14 @@ def test_k8s_create_namespaced_role_swallows_409(
             raise _FakeAPIException(status=409)
 
     cluster_mod._k8s_rbac = _FakeRbacAPI()
-    ok = cluster_mod.k8s_create_namespaced_role(
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
         "bench-ns-01", "test-role",
         api_groups=["composition.krateo.io"],
         resources=["*"],
         verbs=["get"],
     )
     assert ok is True
+    assert diag == ""
 
 
 def test_k8s_create_namespaced_role_binding_constructs_subject_list(
@@ -418,7 +421,9 @@ def test_k8s_create_namespaced_role_binding_constructs_subject_list(
             self.kind = kind
             self.name = name
 
-    class _FakeV1Subject:
+    class _FakeRbacV1Subject:
+        # Re-gate v2: production now uses `RbacV1Subject` (NOT bare
+        # `V1Subject` — that symbol was removed from kubernetes>=27).
         def __init__(self, kind=None, name=None, api_group=None,
                      namespace=None):
             self.kind = kind
@@ -433,7 +438,7 @@ def test_k8s_create_namespaced_role_binding_constructs_subject_list(
     class _FakeClientMod:
         V1RoleBinding = _FakeV1RoleBinding
         V1RoleRef = _FakeV1RoleRef
-        V1Subject = _FakeV1Subject
+        RbacV1Subject = _FakeRbacV1Subject
         V1ObjectMeta = _FakeV1ObjectMeta
 
         class exceptions:
@@ -444,7 +449,7 @@ def test_k8s_create_namespaced_role_binding_constructs_subject_list(
     monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
     cluster_mod._k8s_rbac = _FakeRbacAPI()
 
-    ok = cluster_mod.k8s_create_namespaced_role_binding(
+    ok, diag = cluster_mod.k8s_create_namespaced_role_binding(
         "bench-ns-01", "test-rb",
         role_ref=("Role", "test-role"),
         subjects=[
@@ -454,6 +459,7 @@ def test_k8s_create_namespaced_role_binding_constructs_subject_list(
         ],
     )
     assert ok is True
+    assert diag == ""
     body = captured["body"]
     assert body.metadata.name == "test-rb"
     assert body.role_ref.kind == "Role"
@@ -538,10 +544,14 @@ def test_k8s_create_helpers_never_touch_real_cluster_when_lib_unavailable(
 
     monkeypatch.setattr(subprocess, "run", _tripwire)
 
-    assert cluster_mod.k8s_create_namespaced_role(
-        "ns", "name", api_groups=[], resources=[], verbs=[]) is False
-    assert cluster_mod.k8s_create_namespaced_role_binding(
-        "ns", "name", role_ref=("Role", "r"), subjects=[]) is False
+    # Re-gate v2: create helpers now return (ok, diag) — destructure
+    # and assert ok=False without consuming the diagnostic.
+    role_ok, _ = cluster_mod.k8s_create_namespaced_role(
+        "ns", "name", api_groups=[], resources=[], verbs=[])
+    assert role_ok is False
+    rb_ok, _ = cluster_mod.k8s_create_namespaced_role_binding(
+        "ns", "name", role_ref=("Role", "r"), subjects=[])
+    assert rb_ok is False
     assert cluster_mod.k8s_read_namespaced_role_binding(
         "ns", "name") is None
 
@@ -714,3 +724,272 @@ def test_count_comp_panels_never_touches_subprocess(
         target_ns=None) is None
     assert cluster_mod.count_compositions_with_panels_ready(
         target_ns="bench-ns-01") is None
+
+
+# ─── Task #250 Block 2b re-gate v2 — SDK-symbol presence + (ok, diag) shape ──
+#
+# Why this test exists: the hermetic tests above monkeypatch
+# `_k8s_client_mod` so the production code's references to
+# `_k8s_client_mod.RbacV1Subject`, `_k8s_client_mod.V1Role`, etc. NEVER
+# actually exercise the real `kubernetes.client` module. The re-gate v2
+# tester run surfaced an `AttributeError: V1Subject` against
+# `kubernetes==35.0.0` — a SDK-version-drift bug that the hermetic
+# tests cannot detect by construction.
+#
+# This test exercises the real `kubernetes.client` module dictionary
+# (no HTTP, no subprocess) to confirm every symbol the production code
+# references actually exists. A symbol rename on a kubernetes-client
+# upgrade (e.g. `V1Subject → RbacV1Subject`) now fails here at
+# `pytest e2e/bench/`, NOT during a live tester run.
+
+def test_kubernetes_client_exposes_all_symbols_used_by_create_helpers():
+    """Symbol-presence guard against SDK version drift.
+
+    Production code in `bench/cluster.py:k8s_create_namespaced_role_binding`
+    references the following symbols on `kubernetes.client`. If any of
+    them disappear from the installed `kubernetes` package (as
+    `V1Subject` did in v27+), the live RB-create raises AttributeError
+    BEFORE any HTTP call.
+
+    This test only reads `kubernetes.client.<symbol>` — NO HTTP, NO
+    subprocess, NO real cluster contact. Skips silently when the
+    `kubernetes` lib is absent (running pytest on a stripped venv is
+    valid).
+    """
+    try:
+        import kubernetes.client as _kc  # type: ignore
+    except ImportError:
+        pytest.skip("kubernetes lib not installed; symbol-presence test "
+                    "requires the real module")
+
+    required_symbols = [
+        # Role construction
+        "V1Role",
+        "V1ObjectMeta",
+        "V1PolicyRule",
+        # RoleBinding construction — RbacV1Subject is the post-v27
+        # name (NOT V1Subject). The re-gate v2 fix.
+        "V1RoleBinding",
+        "V1RoleRef",
+        "RbacV1Subject",
+        # Pre-check (SelfSubjectAccessReview)
+        "AuthorizationV1Api",
+        "V1SelfSubjectAccessReview",
+        "V1SelfSubjectAccessReviewSpec",
+        "V1ResourceAttributes",
+        # RBAC API
+        "RbacAuthorizationV1Api",
+        # Custom resources (panels list for the comp-panel count)
+        "CustomObjectsApi",
+    ]
+    missing = [s for s in required_symbols if not hasattr(_kc, s)]
+    assert not missing, (
+        f"kubernetes-client SDK is missing symbols used by bench/"
+        f"cluster.py: {missing}. The installed version may have "
+        f"renamed/removed these (e.g. V1Subject was renamed to "
+        f"RbacV1Subject in kubernetes>=27). Bump the bench's expected "
+        f"symbols or fix the cluster.py reference."
+    )
+
+
+def test_k8s_create_namespaced_role_returns_diag_on_attribute_error(
+        reset_k8s_state, monkeypatch):
+    """When `_k8s_client_mod` is missing a required attribute (SDK drift
+    simulation), the create helper returns (False, diag) with the
+    AttributeError type name in the diag string — NOT a silent swallow.
+    Validates the re-gate v2 broadened exception handler.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    # Simulate SDK drift: V1Role attribute is GONE. Production code
+    # references `_k8s_client_mod.V1Role(...)` which raises
+    # AttributeError. Re-gate v1 swallowed this as a generic False;
+    # re-gate v2 must surface it in the diag.
+    class _FakeBrokenClientMod:
+        # NO V1Role attribute — simulates the V1Subject scenario.
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod",
+                        _FakeBrokenClientMod)
+    cluster_mod._k8s_rbac = object()  # would be touched only after body
+
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role",
+        api_groups=["composition.krateo.io"],
+        resources=["*"],
+        verbs=["get"],
+    )
+    assert ok is False
+    assert "AttributeError" in diag, \
+        f"diag must surface AttributeError, got: {diag!r}"
+    assert "V1Role" in diag, \
+        f"diag must mention the missing symbol, got: {diag!r}"
+
+
+def test_k8s_create_namespaced_role_binding_uses_RbacV1Subject_not_V1Subject(
+        reset_k8s_state, monkeypatch):
+    """Re-gate v2 anchor test: the rolebinding helper MUST construct
+    subjects from `RbacV1Subject`, not from `V1Subject` (which was
+    removed in kubernetes>=27). Asserts the FakeClientMod that lacks
+    V1Subject can still satisfy the helper.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    captured = {}
+
+    class _FakeRbacAPI:
+        def create_namespaced_role_binding(self, namespace, body,
+                                           _request_timeout):
+            captured["subjects"] = body.subjects
+
+    class _FakeRbacV1Subject:
+        def __init__(self, kind=None, name=None, api_group=None,
+                     namespace=None):
+            self.kind = kind
+            self.name = name
+            self.api_group = api_group
+            self.namespace = namespace
+
+    class _FakeV1RoleBinding:
+        def __init__(self, metadata=None, role_ref=None, subjects=None):
+            self.subjects = subjects
+            self.role_ref = role_ref
+            self.metadata = metadata
+
+    class _FakeClientMod:
+        # NO V1Subject attribute — must use RbacV1Subject.
+        RbacV1Subject = _FakeRbacV1Subject
+        V1RoleBinding = _FakeV1RoleBinding
+        V1RoleRef = type("V1RoleRef", (),
+                         {"__init__": lambda s, **kw: None})
+        V1ObjectMeta = type("V1ObjectMeta", (),
+                            {"__init__": lambda s, **kw: None})
+
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+
+    ok, diag = cluster_mod.k8s_create_namespaced_role_binding(
+        "bench-ns-01", "test-rb",
+        role_ref=("Role", "test-role"),
+        subjects=[{"kind": "Group", "name": "devs"}],
+    )
+    assert ok is True
+    assert diag == ""
+    # Confirm RbacV1Subject was used (NOT V1Subject — which we
+    # deliberately did NOT install on _FakeClientMod).
+    assert len(captured["subjects"]) == 1
+    assert isinstance(captured["subjects"][0], _FakeRbacV1Subject)
+
+
+def test_k8s_can_i_create_rolebinding_returns_allowed_on_self_review_true(
+        reset_k8s_state, monkeypatch):
+    """SelfSubjectAccessReview returns status.allowed=True → precheck
+    passes with empty diag.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    class _FakeReviewStatus:
+        allowed = True
+        reason = ""
+
+    class _FakeReviewResponse:
+        status = _FakeReviewStatus()
+
+    class _FakeAuthzAPI:
+        def create_self_subject_access_review(self, body, _request_timeout):
+            return _FakeReviewResponse()
+
+    class _FakeClientMod:
+        AuthorizationV1Api = lambda: _FakeAuthzAPI()
+        V1SelfSubjectAccessReview = type(
+            "V1SelfSubjectAccessReview", (),
+            {"__init__": lambda s, **kw: None})
+        V1SelfSubjectAccessReviewSpec = type(
+            "V1SelfSubjectAccessReviewSpec", (),
+            {"__init__": lambda s, **kw: None})
+        V1ResourceAttributes = type(
+            "V1ResourceAttributes", (),
+            {"__init__": lambda s, **kw: None})
+
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    allowed, diag = cluster_mod.k8s_can_i_create_rolebinding(
+        "bench-ns-01")
+    assert allowed is True
+    assert diag == ""
+
+
+def test_k8s_can_i_create_rolebinding_returns_denied_with_reason(
+        reset_k8s_state, monkeypatch):
+    """SelfSubjectAccessReview returns status.allowed=False → precheck
+    returns (False, descriptive diag with the apiserver reason).
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    class _FakeReviewStatus:
+        allowed = False
+        reason = "RBAC: forbidden — user 'bench' cannot create rolebindings"
+
+    class _FakeReviewResponse:
+        status = _FakeReviewStatus()
+
+    class _FakeAuthzAPI:
+        def create_self_subject_access_review(self, body, _request_timeout):
+            return _FakeReviewResponse()
+
+    class _FakeClientMod:
+        AuthorizationV1Api = lambda: _FakeAuthzAPI()
+        V1SelfSubjectAccessReview = type(
+            "V1SelfSubjectAccessReview", (),
+            {"__init__": lambda s, **kw: None})
+        V1SelfSubjectAccessReviewSpec = type(
+            "V1SelfSubjectAccessReviewSpec", (),
+            {"__init__": lambda s, **kw: None})
+        V1ResourceAttributes = type(
+            "V1ResourceAttributes", (),
+            {"__init__": lambda s, **kw: None})
+
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    allowed, diag = cluster_mod.k8s_can_i_create_rolebinding(
+        "bench-ns-01")
+    assert allowed is False
+    assert "rbac_precheck_denied" in diag
+    assert "bench-ns-01" in diag
+
+
+def test_k8s_can_i_create_rolebinding_returns_unavailable_when_init_fails(
+        reset_k8s_state, monkeypatch):
+    """When `_k8s_init` returns False → (False, 'rbac_precheck_unavailable').
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", False)
+    cluster_mod.K8S_CLIENT_AVAILABLE = False
+    allowed, diag = cluster_mod.k8s_can_i_create_rolebinding(
+        "bench-ns-01")
+    assert allowed is False
+    assert "rbac_precheck_unavailable" in diag

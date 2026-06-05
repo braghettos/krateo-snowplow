@@ -1005,22 +1005,43 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
         comps_in_ns = cluster.count_compositions_in_ns(target_ns)
         _ = _snapshot_l1_ready_ts(c)
 
+        # Pre-check (re-gate v2 defence-in-depth): the bench's
+        # kubeconfig identity MUST be able to create RoleBindings in
+        # target_ns. A 403 here surfaces as `rbac_precheck_denied`
+        # which is far more diagnosable than a generic create failure.
+        precheck_ok, precheck_diag = cluster.k8s_can_i_create_rolebinding(
+            target_ns)
+        if not precheck_ok:
+            return {
+                "subject_user": subject_user,
+                "subject_group": subject_group,
+                "target_ns": target_ns,
+                "error": precheck_diag,
+                "precheck_allowed": False,
+                "__passed__": False,
+            }
+
         # 1. Create the Role with chart-default shape (composition
         # GET/LIST on all resources in the api group).
         role_name = f"bench-{subject_user}-{target_ns}-comp-reader"
         rb_name = f"bench-{subject_user}-{target_ns}-comp-reader-binding"
-        role_ok = cluster.k8s_create_namespaced_role(
+        role_ok, role_diag = cluster.k8s_create_namespaced_role(
             target_ns, role_name,
             api_groups=["composition.krateo.io"],
             resources=["*"],
             verbs=["get", "list"],
         )
-        rb_ok = cluster.k8s_create_namespaced_role_binding(
+        rb_ok, rb_diag = cluster.k8s_create_namespaced_role_binding(
             target_ns, rb_name,
             role_ref=("Role", role_name),
             subjects=[{"kind": "Group", "name": subject_group}],
         )
         if not (role_ok and rb_ok):
+            # Surface the FULL diagnostic from the cluster.py helper
+            # so SDK / RBAC drift is debuggable from the proof body
+            # alone (re-gate v2: previously this said only
+            # `error: rbac_create_failed` and hid the AttributeError
+            # on `V1Subject` for the entire S8 wall-clock).
             return {
                 "subject_user": subject_user,
                 "subject_group": subject_group,
@@ -1029,7 +1050,10 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
                 "rb_name": rb_name,
                 "role_ok": role_ok,
                 "rb_ok": rb_ok,
-                "error": "rbac_create_failed",
+                "role_diag": role_diag,
+                "rb_diag": rb_diag,
+                "precheck_allowed": True,
+                "error": (role_diag if not role_ok else rb_diag),
                 "__passed__": False,
             }
 
