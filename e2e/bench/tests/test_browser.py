@@ -81,7 +81,7 @@ def test_browser_measure_stage_raises_ConvergenceTimeout(monkeypatch, fake_page,
                         lambda page: 0)
     # _expected_calls_lookup returns None so no widget-validation failure.
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: None)
+                        lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     with pytest.raises(ConvergenceTimeout) as exc_info:
@@ -116,7 +116,7 @@ def test_browser_measure_stage_passes_when_api_equals_ui_equals_cluster(
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: 42)
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: None)
+                        lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     result = browser_measure_stage(
@@ -149,7 +149,7 @@ def test_browser_measure_stage_cyber_uses_intra_user_consistency(
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: 10)
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: None)
+                        lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     # NO pytest.raises — must PASS despite cluster=50K vs api/ui=10.
@@ -310,7 +310,7 @@ def test_widget_terminal_state_passes_when_no_skeletons(monkeypatch,
     fake_page._errored_count = 0
 
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: 16)
+                        lambda u, p, **kw: 16)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     v = _validate_widget_terminal_state(fake_page, "/dashboard",
@@ -333,7 +333,7 @@ def test_widget_terminal_state_fails_when_skeletons_persist(monkeypatch,
     fake_page._call_count = 16
 
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: 16)
+                        lambda u, p, **kw: 16)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     v = _validate_widget_terminal_state(fake_page, "/dashboard", "label",
@@ -358,7 +358,7 @@ def test_validate_widget_terminal_state_uses_scoped_selector_not_naked_ant_skele
     fake_page._call_count = 16
 
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: 16)
+                        lambda u, p, **kw: 16)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     v = _validate_widget_terminal_state(fake_page, "/dashboard", "label",
@@ -592,7 +592,7 @@ def test_content_drift_uses_cluster_truth_for_admin(
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: len(truth_names))
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: None)
+                        lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     result = browser_measure_stage(
@@ -635,7 +635,7 @@ def test_content_drift_uses_intra_user_api_for_cyber(
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: len(cj_view))
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: None)
+                        lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     result = browser_measure_stage(
@@ -687,7 +687,7 @@ def test_content_drift_cyber_flags_drift_when_cache_diverges_from_api(
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
                         lambda page: 1000)
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
-                        lambda u, p: None)
+                        lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     result = browser_measure_stage(
@@ -701,3 +701,189 @@ def test_content_drift_cyber_flags_drift_when_cache_diverges_from_api(
     assert dash.get("content_truth_source") == "intra_user_api"
     assert dash.get("content_cached_count") == 900
     assert dash.get("content_api_count") == 1000
+
+
+# ─── Task #250 Block 2 — Phase 6 S8/S9 probes ──────────────────────────────
+
+
+def test_read_snowplow_expvar_int_returns_int_on_200(monkeypatch):
+    """Happy path: /debug/vars returns 200 + JSON dict with int value
+    → integer returned (not float, not None).
+    """
+    import bench.browser as browser_mod
+
+    captured_urls = []
+
+    class _FakeResp:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"snowplow_rbac_publish_seq": 414, "other": "x"}'
+
+    def _fake_urlopen(req, timeout=None):
+        captured_urls.append(req.full_url)
+        return _FakeResp()
+
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen",
+                        _fake_urlopen)
+    out = browser_mod.read_snowplow_expvar_int(
+        "snowplow_rbac_publish_seq", base_url="http://fake:8081")
+    assert out == 414
+    assert captured_urls == ["http://fake:8081/debug/vars"]
+
+
+def test_read_snowplow_expvar_int_returns_none_on_transport_failure(
+        monkeypatch):
+    """Network failure / unreachable host → None (fail closed). Caller
+    interprets None as 'cannot read', NOT as 'value is 0'.
+    """
+    import bench.browser as browser_mod
+
+    def _fake_urlopen(req, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen",
+                        _fake_urlopen)
+    out = browser_mod.read_snowplow_expvar_int(
+        "snowplow_rbac_publish_seq", base_url="http://fake:8081")
+    assert out is None
+
+
+def test_read_snowplow_expvar_int_returns_none_on_missing_key(monkeypatch):
+    """200 + JSON dict without the requested key → None (caller fails
+    closed; do not confuse 'absent' with '0').
+    """
+    import bench.browser as browser_mod
+
+    class _FakeResp:
+        status = 200
+        headers = {}
+
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return b'{"other_key": 1}'
+
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp())
+    out = browser_mod.read_snowplow_expvar_int(
+        "snowplow_rbac_publish_seq", base_url="http://fake:8081")
+    assert out is None
+
+
+def test_read_snowplow_expvar_int_rejects_bool_value(monkeypatch):
+    """True/False at the key (which int() would coerce to 1/0) returns
+    None — a wrong-shape value on the snowplow side surfaces explicitly.
+    """
+    import bench.browser as browser_mod
+
+    class _FakeResp:
+        status = 200
+        headers = {}
+
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return b'{"snowplow_rbac_publish_seq": true}'
+
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp())
+    assert browser_mod.read_snowplow_expvar_int(
+        "snowplow_rbac_publish_seq", base_url="http://fake:8081") is None
+
+
+def test_count_user_compositions_in_ns_returns_minus1_when_no_token():
+    """Missing token / empty ns → -1 sentinel (matches
+    verify_composition_count_api convention)."""
+    import bench.browser as browser_mod
+    assert browser_mod.count_user_compositions_in_ns(
+        "cyberjoker", None, "bench-ns-01") == -1
+    assert browser_mod.count_user_compositions_in_ns(
+        "cyberjoker", "tok", "") == -1
+
+
+def test_count_user_compositions_in_ns_returns_items_len_on_200(monkeypatch):
+    """200 + {"items": [...]} → len(items)."""
+    import bench.browser as browser_mod
+    from bench import cluster as cluster_mod
+
+    captured = {}
+
+    def _fake_http_get_json(path, token, **kw):
+        captured["path"] = path
+        captured["token"] = token
+        return (0, 200, {"items": [{"name": "a"}, {"name": "b"},
+                                   {"name": "c"}]})
+
+    monkeypatch.setattr(browser_mod, "http_get_json", _fake_http_get_json)
+    monkeypatch.setattr(cluster_mod, "call_url",
+                        lambda ns: f"/call?ns={ns}")
+    out = browser_mod.count_user_compositions_in_ns(
+        "cyberjoker", "tok", "bench-ns-01")
+    assert out == 3
+    assert captured["token"] == "tok"
+    assert "bench-ns-01" in captured["path"]
+
+
+def test_count_user_compositions_in_ns_returns_minus1_on_non200(monkeypatch):
+    """Non-200 response → -1 sentinel (poll continues)."""
+    import bench.browser as browser_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(browser_mod, "http_get_json",
+                        lambda path, token, **kw: (0, 401, {}))
+    monkeypatch.setattr(cluster_mod, "call_url", lambda ns: "/call")
+    assert browser_mod.count_user_compositions_in_ns(
+        "cyberjoker", "tok", "bench-ns-01") == -1
+
+
+def test_user_visible_composition_count_returns_none_for_non_compositions(
+        monkeypatch):
+    """The N-aware formula only applies to /compositions; other paths
+    return None so the lookup falls back to BASE.
+    """
+    import bench.browser as browser_mod
+    out = browser_mod._user_visible_composition_count(
+        "admin", "/dashboard", token=None)
+    assert out is None
+
+
+def test_user_visible_composition_count_admin_uses_cluster_count(monkeypatch):
+    """admin path goes through cluster.count_compositions() — cluster-truth."""
+    import bench.browser as browser_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(cluster_mod, "count_compositions", lambda: 49999)
+    out = browser_mod._user_visible_composition_count(
+        "admin", "/compositions", token=None)
+    assert out == 49999
+
+
+def test_user_visible_composition_count_non_admin_uses_piechart_api(monkeypatch):
+    """Non-admin path goes through verify_composition_count_api — the
+    user-narrowed total. -1 / None from the API maps to None (fall
+    back to BASE).
+    """
+    import bench.browser as browser_mod
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: 999)
+    out = browser_mod._user_visible_composition_count(
+        "cyberjoker", "/compositions", token="tok")
+    assert out == 999
+
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: -1)
+    assert browser_mod._user_visible_composition_count(
+        "cyberjoker", "/compositions", token="tok") is None
+
+
+def test_user_visible_composition_count_non_admin_without_token(monkeypatch):
+    """Non-admin without token → None (legacy BASE behaviour)."""
+    import bench.browser as browser_mod
+    assert browser_mod._user_visible_composition_count(
+        "cyberjoker", "/compositions", token=None) is None

@@ -259,3 +259,288 @@ def test_composition_yaml_contains_required_fields():
     assert "kind: GithubScaffoldingWithCompositionPage" in body
     assert "name: bench-app-99-77" in body
     assert "namespace: bench-ns-99" in body
+
+
+# ─── Task #250 Block 2 — new RBAC primitives ────────────────────────────────
+#
+# Hermetic-isolation contract (feedback_bench_tests_hermetic_isolation_all_
+# cluster_paths): every test that touches `k8s_create_*` MUST monkeypatch
+# `_k8s_init` so the test FAILS FAST against a real GKE context. The
+# reset_k8s_state fixture + monkeypatch of _k8s_init satisfies the
+# contract end-to-end (the apiserver client globals are nulled at fixture
+# entry; the test installs fakes; the fixture restores at exit).
+
+
+def test_k8s_create_namespaced_role_returns_false_when_init_fails(
+        reset_k8s_state, monkeypatch):
+    """When `_k8s_init` returns False (lib missing / cluster unreachable),
+    `k8s_create_namespaced_role` returns False — does NOT crash, does NOT
+    contact a real cluster.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", False)
+    cluster_mod.K8S_CLIENT_AVAILABLE = False
+    result = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role",
+        api_groups=["composition.krateo.io"],
+        resources=["*"],
+        verbs=["get"],
+    )
+    assert result is False
+
+
+def test_k8s_create_namespaced_role_uses_client_when_available(
+        reset_k8s_state, monkeypatch):
+    """The create call uses the rbac client's `create_namespaced_role`
+    method with a V1Role body — single REST call, idempotent on 409.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    captured = {}
+
+    class _FakeRbacAPI:
+        def create_namespaced_role(self, namespace, body, _request_timeout):
+            captured["namespace"] = namespace
+            captured["body"] = body
+            captured["timeout"] = _request_timeout
+
+    class _FakeV1Role:
+        def __init__(self, metadata=None, rules=None):
+            self.metadata = metadata
+            self.rules = rules
+
+    class _FakeV1ObjectMeta:
+        def __init__(self, name=None):
+            self.name = name
+
+    class _FakeV1PolicyRule:
+        def __init__(self, api_groups=None, resources=None, verbs=None):
+            self.api_groups = api_groups
+            self.resources = resources
+            self.verbs = verbs
+
+    class _FakeClientMod:
+        V1Role = _FakeV1Role
+        V1ObjectMeta = _FakeV1ObjectMeta
+        V1PolicyRule = _FakeV1PolicyRule
+
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+
+    ok = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role",
+        api_groups=["composition.krateo.io"],
+        resources=["*"],
+        verbs=["get", "list"],
+    )
+    assert ok is True
+    assert captured["namespace"] == "bench-ns-01"
+    body = captured["body"]
+    assert body.metadata.name == "test-role"
+    assert len(body.rules) == 1
+    assert body.rules[0].api_groups == ["composition.krateo.io"]
+    assert body.rules[0].resources == ["*"]
+    assert body.rules[0].verbs == ["get", "list"]
+
+
+def test_k8s_create_namespaced_role_swallows_409(
+        reset_k8s_state, monkeypatch):
+    """AlreadyExists (HTTP 409) is treated as success — idempotent on
+    re-runs.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    class _FakeAPIException(Exception):
+        def __init__(self, status):
+            self.status = status
+
+    class _FakeClientMod:
+        V1Role = type("V1Role", (), {"__init__": lambda s, **kw: None})
+        V1ObjectMeta = type("V1ObjectMeta", (),
+                            {"__init__": lambda s, **kw: None})
+        V1PolicyRule = type("V1PolicyRule", (),
+                            {"__init__": lambda s, **kw: None})
+
+        class exceptions:
+            ApiException = _FakeAPIException
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+
+    class _FakeRbacAPI:
+        def create_namespaced_role(self, namespace, body, _request_timeout):
+            raise _FakeAPIException(status=409)
+
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+    ok = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role",
+        api_groups=["composition.krateo.io"],
+        resources=["*"],
+        verbs=["get"],
+    )
+    assert ok is True
+
+
+def test_k8s_create_namespaced_role_binding_constructs_subject_list(
+        reset_k8s_state, monkeypatch):
+    """The RoleBinding body carries the role_ref + subjects exactly as
+    threaded — no hardcoded cyberjoker / devs identity participates.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    captured = {}
+
+    class _FakeRbacAPI:
+        def create_namespaced_role_binding(self, namespace, body,
+                                           _request_timeout):
+            captured["namespace"] = namespace
+            captured["body"] = body
+
+    class _FakeV1RoleBinding:
+        def __init__(self, metadata=None, role_ref=None, subjects=None):
+            self.metadata = metadata
+            self.role_ref = role_ref
+            self.subjects = subjects
+
+    class _FakeV1RoleRef:
+        def __init__(self, api_group=None, kind=None, name=None):
+            self.api_group = api_group
+            self.kind = kind
+            self.name = name
+
+    class _FakeV1Subject:
+        def __init__(self, kind=None, name=None, api_group=None,
+                     namespace=None):
+            self.kind = kind
+            self.name = name
+            self.api_group = api_group
+            self.namespace = namespace
+
+    class _FakeV1ObjectMeta:
+        def __init__(self, name=None):
+            self.name = name
+
+    class _FakeClientMod:
+        V1RoleBinding = _FakeV1RoleBinding
+        V1RoleRef = _FakeV1RoleRef
+        V1Subject = _FakeV1Subject
+        V1ObjectMeta = _FakeV1ObjectMeta
+
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+
+    ok = cluster_mod.k8s_create_namespaced_role_binding(
+        "bench-ns-01", "test-rb",
+        role_ref=("Role", "test-role"),
+        subjects=[
+            {"kind": "Group", "name": "devs"},
+            {"kind": "ServiceAccount", "name": "sa1",
+             "namespace": "krateo-system"},
+        ],
+    )
+    assert ok is True
+    body = captured["body"]
+    assert body.metadata.name == "test-rb"
+    assert body.role_ref.kind == "Role"
+    assert body.role_ref.name == "test-role"
+    assert body.role_ref.api_group == "rbac.authorization.k8s.io"
+    assert len(body.subjects) == 2
+    # Group subject: default api_group filled in.
+    assert body.subjects[0].kind == "Group"
+    assert body.subjects[0].name == "devs"
+    assert body.subjects[0].api_group == "rbac.authorization.k8s.io"
+    # SA subject: api_group empty, namespace honoured.
+    assert body.subjects[1].kind == "ServiceAccount"
+    assert body.subjects[1].name == "sa1"
+    assert body.subjects[1].api_group == ""
+    assert body.subjects[1].namespace == "krateo-system"
+
+
+def test_k8s_read_namespaced_role_binding_returns_none_on_404(
+        reset_k8s_state, monkeypatch):
+    """A 404 NotFound is swallowed and returns None (not raise)."""
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    class _FakeAPIException(Exception):
+        def __init__(self, status):
+            self.status = status
+
+    class _FakeClientMod:
+        class exceptions:
+            ApiException = _FakeAPIException
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+
+    class _FakeRbacAPI:
+        def read_namespaced_role_binding(self, name, namespace,
+                                         _request_timeout):
+            raise _FakeAPIException(status=404)
+
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+    out = cluster_mod.k8s_read_namespaced_role_binding(
+        "bench-ns-01", "missing-rb")
+    assert out is None
+
+
+def test_k8s_read_namespaced_role_binding_returns_object_on_200(
+        reset_k8s_state, monkeypatch):
+    """A successful read returns the rb object (not None, not raise)."""
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    sentinel = {"metadata": {"name": "test-rb"}}
+
+    class _FakeRbacAPI:
+        def read_namespaced_role_binding(self, name, namespace,
+                                         _request_timeout):
+            return sentinel
+
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+    out = cluster_mod.k8s_read_namespaced_role_binding(
+        "bench-ns-01", "test-rb")
+    assert out is sentinel
+
+
+def test_k8s_create_helpers_never_touch_real_cluster_when_lib_unavailable(
+        reset_k8s_state, monkeypatch):
+    """Hermetic-isolation contract: with `_K8S_LIB_AVAILABLE=False`, no
+    create/read helper should make any subprocess call OR raise. Returns
+    False (create) / None (read) so the caller falls back deterministically.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", False)
+    cluster_mod.K8S_CLIENT_AVAILABLE = False
+
+    # subprocess.run must NOT be called by these helpers (they go through
+    # the k8s client lib only). Monkeypatch subprocess.run to a tripwire.
+    def _tripwire(*a, **kw):
+        raise AssertionError(
+            "k8s_* helper escaped to subprocess.run — hermetic-isolation "
+            "contract violated")
+
+    monkeypatch.setattr(subprocess, "run", _tripwire)
+
+    assert cluster_mod.k8s_create_namespaced_role(
+        "ns", "name", api_groups=[], resources=[], verbs=[]) is False
+    assert cluster_mod.k8s_create_namespaced_role_binding(
+        "ns", "name", role_ref=("Role", "r"), subjects=[]) is False
+    assert cluster_mod.k8s_read_namespaced_role_binding(
+        "ns", "name") is None

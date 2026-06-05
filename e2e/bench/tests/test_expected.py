@@ -155,3 +155,105 @@ def test_overlay_freshness_raises_when_overlay_missing(tmp_path):
 def test_overlay_age_seconds_returns_inf_when_missing(tmp_path):
     age = overlay_age_seconds(path=str(tmp_path / "nope.json"))
     assert age == float("inf")
+
+
+# ─── Task #250 Block 2 — N-aware EXPECTED_CALLS formula ─────────────────────
+
+
+def test_expected_calls_returns_base_when_n_visible_is_none():
+    """Backward-compat: pre-Block-2 callers (no n_visible kwarg) get the
+    structural BASE value, unchanged from SCHEMA 1.0.0 behaviour.
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/compositions") == 10
+    assert expected_calls("cyberjoker", "/compositions") == 10
+    assert expected_calls("admin", "/dashboard") == 16
+
+
+def test_expected_calls_returns_base_when_n_visible_is_zero():
+    """N=0 → no visible cards → no per-card-widget fan-out → BASE.
+    This preserves S1/S2/S3 PASS shape from the empirical 0.30.248 run.
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/compositions", n_visible=0) == 10
+    assert expected_calls("cyberjoker", "/compositions", n_visible=0) == 10
+
+
+def test_expected_calls_adds_per_card_widgets_term_below_per_page_cap():
+    """N=1 visible card → 10 + 4×1 = 14.
+    Empirical match for S4/S5 admin path where bench-ns-01 has 1
+    composition (S4 deploys 1 per ns, ns-01 only gets one).
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/compositions", n_visible=1) == 14
+    assert expected_calls("cyberjoker", "/compositions", n_visible=1) == 14
+
+
+def test_expected_calls_caps_at_per_page_above_cap():
+    """N=5 → 5 cards visible → 10 + 4×5 = 30.
+    N=50K → cards still capped at per_page=5 → 30 (matches S6 empirical).
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/compositions", n_visible=5) == 30
+    assert expected_calls("admin", "/compositions", n_visible=20) == 30
+    assert expected_calls("admin", "/compositions", n_visible=50000) == 30
+
+
+def test_expected_calls_ignores_n_visible_for_non_compositions_page():
+    """Only /compositions has the per-card fan-out term. /dashboard ignores
+    n_visible (no datagrid).
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/dashboard", n_visible=999) == 16
+    assert expected_calls("cyberjoker", "/dashboard", n_visible=999) == 16
+
+
+def test_expected_calls_unknown_user_falls_back_to_admin_row():
+    """Unknown user → use admin's BASE+formula (safe default).
+    Same fallback applies under the N-aware path.
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("mystery", "/compositions") == 10
+    assert expected_calls("mystery", "/compositions", n_visible=5) == 30
+
+
+def test_expected_calls_unknown_page_returns_none():
+    """Caller treats None as 'skip the gate' — unchanged behaviour."""
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/unknown") is None
+    assert expected_calls("admin", "/unknown", n_visible=100) is None
+
+
+def test_expected_calls_constants_match_spec():
+    """The N-aware formula constants are named for traceability per
+    Task #250 design §5.4. Operators should be able to grep
+    `COMP_DATAGRID_PER_PAGE` and see 5 (frontend datagrid page size).
+    """
+    from bench.expected import (
+        COMP_DATAGRID_PER_PAGE,
+        COMP_PER_CARD_WIDGETS,
+        COMP_BASE_CALLS_STRUCTURAL,
+        DASH_BASE_CALLS_STRUCTURAL,
+    )
+    assert COMP_DATAGRID_PER_PAGE == 5
+    assert COMP_PER_CARD_WIDGETS == 4
+    assert COMP_BASE_CALLS_STRUCTURAL == 10
+    assert DASH_BASE_CALLS_STRUCTURAL == 16
+
+
+def test_expected_calls_base_dict_alias_preserves_overlay_path():
+    """`EXPECTED_CALLS` remains an alias for `EXPECTED_CALLS_BASE` so the
+    overlay-merge path at `load_expected_calls_overlay` and the
+    `gate_overlay_freshness` divergence detector keep working without
+    structural changes.
+    """
+    from bench.expected import EXPECTED_CALLS, EXPECTED_CALLS_BASE
+    assert EXPECTED_CALLS is EXPECTED_CALLS_BASE
+
+
+def test_expected_calls_negative_n_visible_returns_base():
+    """A -1 sentinel from a failed verify_composition_count_api call must
+    NOT bias the gate — fall back to BASE.
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/compositions", n_visible=-1) == 10

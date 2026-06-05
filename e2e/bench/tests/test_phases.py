@@ -34,12 +34,15 @@ from bench.phases import (
 # ─── STAGE_REGISTRY shape ───────────────────────────────────────────────────
 
 
-def test_stage_registry_contains_S0_through_S9():
+def test_stage_registry_contains_S0_through_S11():
+    # Task #250 Block 2 / SCHEMA_VERSION 1.1.0: new S8 (RB-add) +
+    # S9 (RB-remove) inserted after S7; old S8/S9 renamed to S10/S11.
     assert set(STAGE_REGISTRY.keys()) == {
-        "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+        "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7",
+        "S8", "S9", "S10", "S11",
     }
     assert STAGE_ORDER == ["S0", "S1", "S2", "S3", "S4",
-                           "S5", "S6", "S7", "S8", "S9"]
+                           "S5", "S6", "S7", "S8", "S9", "S10", "S11"]
 
 
 # ─── --from-stage / --to-stage semantics ────────────────────────────────────
@@ -49,6 +52,14 @@ def test_from_stage_S5_skips_S1_S2_S3_S4():
     window = _stages_in_window("S5", "S8")
     assert window == ["S5", "S6", "S7", "S8"]
     assert "S1" not in window and "S4" not in window
+
+
+def test_to_stage_S11_includes_S0_through_S11_inclusive():
+    # SCHEMA 1.1.0 — the report stage is now S11. Operators selecting
+    # the full window via --to-stage S11 must see all 12 stages.
+    window = _stages_in_window(None, "S11")
+    assert window == ["S0", "S1", "S2", "S3", "S4",
+                      "S5", "S6", "S7", "S8", "S9", "S10", "S11"]
 
 
 def test_to_stage_S3_stops_after_S3():
@@ -269,8 +280,12 @@ def test_run_state_resume_uses_disk_state_when_present(tmp_path):
 # ─── Schema constant freeze ─────────────────────────────────────────────────
 
 
-def test_schema_version_is_frozen_at_1_0_0():
-    assert SCHEMA_VERSION == "1.0.0"
+def test_schema_version_is_frozen_at_1_1_0():
+    # Task #250 Block 2 minor bump from 1.0.0: additive S8/S9 RBAC
+    # stages + N-aware EXPECTED_CALLS. SCHEMA_MAJOR unchanged at 1,
+    # so resume from 1.0.0 state.json still works (additive fields
+    # are read-by-key, no structural break).
+    assert SCHEMA_VERSION == "1.1.0"
     assert phases.SCHEMA_MAJOR == 1
 
 
@@ -500,3 +515,278 @@ def test_first_stage_label_prefers_first_non_meta_completed_stage(tmp_path):
     ctx = phases.StageContext(tag="t", scale=5000, run_dir=tmp_path,
                               state_path=tmp_path / "state.json")
     assert phases._first_stage_label(ctx) == "S1"
+
+
+# ─── Task #250 Block 2 — _user_group lookup table ──────────────────────────
+
+
+def test_user_group_returns_devs_for_cyberjoker():
+    """The 2-entry lookup mirrors portal-chart provisioning. cyberjoker
+    is in `devs`; admin is provisioned via CRB (Group lookup unused).
+    """
+    from bench.phases import _user_group
+    assert _user_group("cyberjoker") == "devs"
+    assert _user_group("admin") == ""
+    # Unknown user → empty string (caller treats as 'no Group').
+    assert _user_group("mystery") == ""
+
+
+# ─── Task #250 Block 2 — _count_widget_errors aggregation ──────────────────
+
+
+def test_count_widget_errors_sums_validation_errored_count():
+    """`_count_widget_errors` walks (user, page) results and sums
+    `validation.errored_count` across all navigations. Catches the
+    #186-class 'card visible but per-card widget 403' failure mode
+    that R4 mitigation requires `cj_widget_error_count == 0`.
+    """
+    from bench.phases import _count_widget_errors
+
+    # Synthetic results matching the browser_measure_stage output shape.
+    results = [
+        {
+            "user": "cyberjoker",
+            "pages": {
+                "Compositions": {
+                    "navigations": [
+                        {"validation": {"errored_count": 2}},
+                        {"validation": {"errored_count": 1}},
+                        {"validation": {"errored_count": 0}},
+                    ],
+                },
+                "Dashboard": {
+                    "navigations": [
+                        {"validation": {"errored_count": 99}},
+                    ],
+                },
+            },
+        },
+        {
+            "user": "admin",
+            "pages": {
+                "Compositions": {
+                    "navigations": [
+                        {"validation": {"errored_count": 50}},
+                    ],
+                },
+            },
+        },
+    ]
+    # cj + Compositions → 2 + 1 + 0 = 3
+    assert _count_widget_errors(results, user="cyberjoker",
+                                page="Compositions") == 3
+    # cj + Dashboard → 99 (does not bleed across pages)
+    assert _count_widget_errors(results, user="cyberjoker",
+                                page="Dashboard") == 99
+    # admin + Compositions → 50 (does not bleed across users)
+    assert _count_widget_errors(results, user="admin",
+                                page="Compositions") == 50
+    # Unknown user → 0
+    assert _count_widget_errors(results, user="ghost",
+                                page="Compositions") == 0
+
+
+def test_count_widget_errors_empty_results_returns_zero():
+    """An empty results list returns 0 — no FAIL surface from absence."""
+    from bench.phases import _count_widget_errors
+    assert _count_widget_errors([], user="cyberjoker",
+                                page="Compositions") == 0
+    assert _count_widget_errors(None, user="cyberjoker",
+                                page="Compositions") == 0
+
+
+def test_count_widget_errors_tolerates_missing_validation():
+    """Nav entries without a `validation` key contribute 0 (no crash)."""
+    from bench.phases import _count_widget_errors
+    results = [
+        {
+            "user": "cyberjoker",
+            "pages": {
+                "Compositions": {
+                    "navigations": [
+                        {},  # missing validation
+                        {"validation": {}},  # missing errored_count
+                        {"validation": {"errored_count": "garbage"}},
+                        {"validation": {"errored_count": 3}},
+                    ],
+                },
+            },
+        },
+    ]
+    # Only the valid integer 3 contributes.
+    assert _count_widget_errors(results, user="cyberjoker",
+                                page="Compositions") == 3
+
+
+# ─── Task #250 Block 2 — _wait_rbac_propagation_to_snowplow ────────────────
+#
+# Hermetic-isolation contract: ALL probe paths must monkeypatch the
+# browser-side reads so the test fails fast against a real GKE context.
+# We patch `browser.read_snowplow_expvar_int` AND
+# `browser.count_user_compositions_in_ns`, plus inject the subject's
+# token through the ctx.
+
+
+def test_wait_rbac_propagation_succeeds_when_both_probes_agree(
+        tmp_path, monkeypatch):
+    from bench import phases as phases_mod
+    from bench import browser as browser_mod
+
+    # First expvar call (the seq_before snapshot) returns 100; ALL
+    # subsequent calls return 101 (incremented — Probe A passes).
+    # Visible-count returns 999 forever (Probe B passes immediately
+    # after the first poll inside the loop).
+    expvar_call_count = [0]
+
+    def _fake_expvar(key, **kw):
+        expvar_call_count[0] += 1
+        return 100 if expvar_call_count[0] == 1 else 101
+
+    def _fake_count(user, token, ns):
+        return 999
+
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int",
+                        _fake_expvar)
+    monkeypatch.setattr(browser_mod, "count_user_compositions_in_ns",
+                        _fake_count)
+
+    ctx = phases_mod.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        tokens={"cyberjoker": "fake-token"},
+    )
+    ok, ms, diag = phases_mod._wait_rbac_propagation_to_snowplow(
+        ctx, "cyberjoker", "bench-ns-01",
+        expected_visible=999, timeout_secs=5)
+    assert ok is True
+    assert ms >= 0
+    assert diag["rbac_publish_seq_before"] == 100
+    assert diag["rbac_publish_seq_after"] == 101
+    assert diag["user_visible_count"] == 999
+    assert diag["probe_a_pass"] is True
+    assert diag["probe_b_pass"] is True
+
+
+def test_wait_rbac_propagation_fails_closed_when_expvar_unreadable(
+        tmp_path, monkeypatch):
+    """Probe A reads return None (expvar key absent or transport
+    failure). MUST fail closed — never assume propagation on a missing
+    read.
+    """
+    from bench import phases as phases_mod
+    from bench import browser as browser_mod
+
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int",
+                        lambda key, **kw: None)
+    monkeypatch.setattr(browser_mod, "count_user_compositions_in_ns",
+                        lambda u, t, n: 999)
+
+    ctx = phases_mod.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        tokens={"cyberjoker": "fake-token"},
+    )
+    ok, ms, diag = phases_mod._wait_rbac_propagation_to_snowplow(
+        ctx, "cyberjoker", "bench-ns-01",
+        expected_visible=999, timeout_secs=2)
+    assert ok is False
+    assert diag.get("error") == "expvar_unreadable"
+
+
+def test_wait_rbac_propagation_fails_when_probe_b_disagrees(
+        tmp_path, monkeypatch):
+    """Probe A passes (seq increments) but Probe B never matches —
+    classic #149 evaluator-side regression. propagation_ok = False with
+    probe_a_pass=True, probe_b_pass=False in diag.
+    """
+    from bench import phases as phases_mod
+    from bench import browser as browser_mod
+
+    # seq_before=100; subsequent calls return 101 (incremented), so
+    # Probe A passes. count_user_compositions_in_ns returns 0 forever
+    # though expected_visible=999, so Probe B never matches.
+    seq_calls = [0]
+
+    def _fake_expvar(key, **kw):
+        seq_calls[0] += 1
+        return 100 if seq_calls[0] == 1 else 101
+
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int",
+                        _fake_expvar)
+    monkeypatch.setattr(browser_mod, "count_user_compositions_in_ns",
+                        lambda u, t, n: 0)
+
+    ctx = phases_mod.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        tokens={"cyberjoker": "fake-token"},
+    )
+    ok, ms, diag = phases_mod._wait_rbac_propagation_to_snowplow(
+        ctx, "cyberjoker", "bench-ns-01",
+        expected_visible=999, timeout_secs=2)
+    assert ok is False
+    assert diag["probe_a_pass"] is True   # seq incremented
+    assert diag["probe_b_pass"] is False  # view never converged
+    assert diag["user_visible_count"] == 0
+    assert diag["expected_visible"] == 999
+
+
+def test_wait_rbac_propagation_fails_closed_when_no_token(tmp_path):
+    """Missing token in ctx.tokens → fail closed (no_token diag)."""
+    from bench import phases as phases_mod
+    ctx = phases_mod.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        tokens={},  # no cj token
+    )
+    ok, ms, diag = phases_mod._wait_rbac_propagation_to_snowplow(
+        ctx, "cyberjoker", "bench-ns-01",
+        expected_visible=999, timeout_secs=2)
+    assert ok is False
+    assert diag.get("error") == "no_token"
+
+
+# ─── _pick_visible_composition_name fallback path ──────────────────────────
+
+
+def test_pick_visible_composition_name_returns_conventional_on_kubectl_fail(
+        monkeypatch):
+    """When kubectl returns non-zero, fall back to the conventional
+    `bench-app-01-02` name.
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **kw: (1, "", "err"))
+    assert phases_mod._pick_visible_composition_name("bench-ns-01") == \
+        "bench-app-01-02"
+
+
+def test_pick_visible_composition_name_uses_lex_sort(monkeypatch):
+    """When kubectl returns names, sort lex and return `bench-app-01-02`
+    if present (typically true after S7 deletes -01-01).
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(
+        cluster_mod, "kubectl",
+        lambda *a, **kw: (0,
+                          "bench-app-01-05\nbench-app-01-03\n"
+                          "bench-app-01-02\nbench-app-01-04",
+                          ""))
+    out = phases_mod._pick_visible_composition_name("bench-ns-01")
+    assert out == "bench-app-01-02"
+
+
+def test_pick_visible_composition_name_fallback_when_conventional_absent(
+        monkeypatch):
+    """If `bench-app-01-02` is NOT in the live list (e.g. S7 already
+    deleted that one too), pick the lex-first available name.
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(
+        cluster_mod, "kubectl",
+        lambda *a, **kw: (0, "bench-app-01-07\nbench-app-01-05", ""))
+    out = phases_mod._pick_visible_composition_name("bench-ns-01")
+    assert out == "bench-app-01-05"

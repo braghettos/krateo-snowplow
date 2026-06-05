@@ -59,8 +59,17 @@ __all__ = [
 # ─── Schema constants ───────────────────────────────────────────────────────
 
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 SCHEMA_MAJOR = 1
+#
+# 1.1.0 (Task #250 Block 2 — 2026-06-05): additive S8 / S9 RBAC-mutation
+# stages + N-aware EXPECTED_CALLS overlay. Old S8 (delete 1 ns) and S9
+# (build canonical ledger row) RENAMED to S10 / S11; new S8 / S9 add
+# RoleBinding-add / RoleBinding-remove cells. All new fields on
+# stage_proofs[*].proof are READ-BY-KEY (no positional / structural
+# changes), so a 1.0.0 state.json resumes cleanly into the 1.1.0
+# harness (SCHEMA_MAJOR unchanged). The load_state guard at
+# `major > SCHEMA_MAJOR` continues to allow 1.0.0 → 1.1.0 forward.
 
 
 class IncompatibleStateSchema(Exception):
@@ -451,13 +460,14 @@ def _first_stage_label(ctx: StageContext) -> str:
     completed = state.get("stages_completed") or []
     current = state.get("current_stage")
     if completed:
-        # Prefer the lowest-indexed completed stage that is NOT S0 or S9
+        # Prefer the lowest-indexed completed stage that is NOT S0 or S11
         # (those are meta — preflight + report — and never produce nav
-        # samples).
+        # samples). Pre-1.1.0 the report stage was S9; renamed to S11
+        # by Task #250 Block 2.
         for sid in completed:
-            if sid not in ("S0", "S9"):
+            if sid not in ("S0", "S11"):
                 return sid
-        # Fallback to the first completed entry (S0 / S9 case).
+        # Fallback to the first completed entry (S0 / S11 case).
         return completed[0]
     if current:
         return current
@@ -749,41 +759,464 @@ def stage_s7_delete_one_comp(ctx: StageContext) -> StageProof:
     )
 
 
-# ─── S8: delete 1 namespace ────────────────────────────────────────────────
+# ─── Task #250 Block 2 — RBAC mutation stages S8 (RB-add) + S9 (RB-remove) ──
+#
+# Stage runners are pure helpers — they read RBAC layout from ctx-derived
+# parameters. Production-realistic shape (Diego choice 2 ratified
+# 2026-06-05): the RB-add targets `bench-ns-01`, a pre-populated namespace
+# carrying ~SCALE/50 compositions at S6 entry. This exercises the
+# subject-index propagation path (Probe A on /debug/vars +
+# Probe B on /call view convergence).
+#
+# Parametric per feedback_no_special_cases: subject_user, target_ns,
+# role/RB names, subject group are all named local variables — no
+# cj-hardcoded literal participates in cluster mutations. The single
+# point of "which group is subject_user in" is the `_user_group` lookup
+# table below (data, not policy).
 
 
-def stage_s8_delete_one_ns(ctx: StageContext) -> StageProof:
+def _user_group(subject_user: str) -> str:
+    """Return the primary RBAC Group for a bench user.
+
+    Parametric data table — NOT a special case. Mirrors the portal-chart
+    user provisioning fact: today the portal chart provisions
+    `cyberjoker` into the `devs` group. If portal adds a third user this
+    table grows in ONE place. PM Q2 ratified 2026-06-05.
+
+    Cross-reference: `bench/storm.py:577-590` references `cyberjoker`
+    + `devs` in the CRB-burst harness (defect reproducer, NOT a Phase
+    6 stage). When this table is extended, that site MUST be updated
+    in lockstep — see the doc comment at storm.py:577-590.
+
+    Args:
+        subject_user: bench user identity ("cyberjoker", "admin", ...).
+
+    Returns:
+        Group name string ("devs" for cyberjoker), empty string when
+        the user has no Group-based RBAC entry (admin is provisioned
+        via a ClusterRoleBinding; group lookup is unused for admin).
+    """
+    return {
+        "cyberjoker": "devs",
+        # admin is provisioned via a CRB — Group lookup not used.
+    }.get(subject_user, "")
+
+
+def _pick_visible_composition_name(target_ns: str) -> str:
+    """Return a composition name guaranteed to render on the datagrid's
+    first page (per_page=5) for a viewer with full ns access.
+
+    Convention picks `bench-app-01-02` (lex-second in `bench-ns-01`)
+    because S7 deletes `bench-app-01-01` and the datagrid renders names
+    in lex order. Falls back to live ns enumeration if the conventional
+    name is absent (e.g. running against a cluster shape that does not
+    match the convention).
+
+    Args:
+        target_ns: namespace to scope the live-enumeration fallback to.
+
+    Returns:
+        Composition name string; falls back to the conventional name on
+        kubectl failure (so the caller's `_user_card_text_present` check
+        still has a deterministic input to look for).
+    """
+    conventional = "bench-app-01-02"
+    rc, out, _ = cluster.kubectl(
+        "get", f"{cluster.COMP_RES}.{cluster.COMP_GVR}", "-n", target_ns,
+        "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
+    if rc != 0 or not out.strip():
+        return conventional
+    names = sorted(n.strip() for n in out.splitlines() if n.strip())
+    if conventional in names:
+        return conventional
+    return names[0] if names else conventional
+
+
+def _user_card_text_present(ctx: StageContext,
+                            subject_user: str,
+                            card_name: str) -> bool:
+    """Return True iff `subject_user`'s live Compositions page contains
+    a DOM element whose text matches `card_name`.
+
+    CONTENT-not-status check per feedback_validate_content_not_just_status
+    + Task #250 R4 mitigation: even when call_count matches the formula,
+    a per-card widget rendering empty placeholders (or 403'ing silently)
+    will NOT show the composition name in the DOM. The card-text-present
+    check eliminates that failure mode.
+
+    Args:
+        ctx:          StageContext carrying ctx.user_pages.
+        subject_user: bench user whose Page to inspect.
+        card_name:    composition name to search for in the rendered DOM.
+
+    Returns:
+        True iff `page.locator(text=card_name).count() >= 1`.
+        False on missing card_name, missing user_state, missing page, or
+        any locator exception.
+    """
+    if not card_name:
+        return False
+    u_state = ctx.user_pages.get(subject_user)
+    if not u_state:
+        return False
+    page = u_state.get("page")
+    if page is None:
+        return False
+    try:
+        return page.locator(f"text={card_name}").count() >= 1
+    except Exception:
+        return False
+
+
+def _count_widget_errors(results: list, *, user: str, page: str) -> int:
+    """Sum `validation.errored_count` across nav results for (user, page).
+
+    Task #250 R4 mitigation — load-bearing on S8 `__passed__`. The
+    `errored_count` value is the `.ant-result-error` DOM count captured
+    by `_validate_widget_terminal_state` (browser.py:809). A non-zero
+    value at S8 means per-card widget RESTActions are 403'ing while the
+    composition card is otherwise rendered — exactly the #186-class
+    failure mode that would silently pass a call-count-only gate.
+
+    Args:
+        results: list of nav dicts emitted by `_measure_all_users`.
+        user:    subject to filter on.
+        page:    page_name to filter on (matches `pages` keys, e.g.
+                 "Compositions" / "Dashboard").
+
+    Returns:
+        Sum of errored_count across matching navs. 0 when no match.
+    """
+    out = 0
+    for r in results or []:
+        if r.get("user") != user:
+            continue
+        # The result shape is per-stage (each entry from
+        # browser_measure_stage carries pages_data keyed by page_name).
+        pages_data = r.get("pages") or {}
+        page_entry = pages_data.get(page)
+        if not page_entry:
+            continue
+        for nav in page_entry.get("navigations") or []:
+            v = nav.get("validation") or {}
+            try:
+                out += int(v.get("errored_count") or 0)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _wait_rbac_propagation_to_snowplow(ctx: StageContext,
+                                       subject_user: str,
+                                       target_ns: str,
+                                       expected_visible: int,
+                                       timeout_secs: int = 30
+                                       ) -> tuple[bool, int, dict]:
+    """Wait for BOTH probes to agree before declaring RBAC propagation.
+
+    Probe A (mechanism-independent): snowplow's
+    `snowplow_rbac_publish_seq` expvar must INCREMENT vs the
+    pre-mutation snapshot. The counter is sourced from cache.RBACGen()
+    (snowplow rbac_snapshot.go:251), bumped exactly once per successful
+    rebuildRBACSnapshot publish. Cannot be tricked by a stale `/call`
+    cell — only a real informer event + snapshot rebuild moves it.
+
+    Probe B (UX-side): `count_user_compositions_in_ns(user, token, ns)`
+    must equal `expected_visible` within the same budget. Confirms 'by
+    the time the browser nav fires, the view has caught up'.
+
+    BOTH probes must pass for `propagation_ok=True`. Mismatch surfaces
+    the failure mode in the diag dict — Probe A pass + Probe B fail
+    means snapshot rebuilt but evaluator returned the wrong view
+    (#149-class regression); Probe A fail means no informer event
+    observed OR rebuild stalled.
+
+    Returns:
+        (ok, elapsed_ms, diag) — diag captures pre/post seq + final n.
+    """
+    token = ctx.tokens.get(subject_user)
+    if not token:
+        return (False, 0, {"error": "no_token",
+                           "subject_user": subject_user})
+
+    seq_before = browser.read_snowplow_expvar_int(
+        "snowplow_rbac_publish_seq")
+    if seq_before is None:
+        # Expvar not wired or unreachable — FAIL CLOSED. Block 2a
+        # expvar shim MUST publish the key for the gate to operate.
+        return (False, 0, {
+            "error": "expvar_unreadable",
+            "key": "snowplow_rbac_publish_seq",
+        })
+
+    deadline = time.time() + timeout_secs
+    started = time.time()
+    seq_now = seq_before
+    n = -1
+    probe_a_pass = False
+    probe_b_pass = False
+    while time.time() < deadline:
+        seq_now = browser.read_snowplow_expvar_int(
+            "snowplow_rbac_publish_seq")
+        n = browser.count_user_compositions_in_ns(
+            subject_user, token, target_ns)
+        probe_a_pass = (seq_now is not None and seq_now > seq_before)
+        probe_b_pass = (n == expected_visible)
+        if probe_a_pass and probe_b_pass:
+            return (True, int((time.time() - started) * 1000), {
+                "rbac_publish_seq_before": seq_before,
+                "rbac_publish_seq_after": seq_now,
+                "user_visible_count": n,
+                "expected_visible": expected_visible,
+                "probe_a_pass": True,
+                "probe_b_pass": True,
+            })
+        time.sleep(1)
+    return (False, int((time.time() - started) * 1000), {
+        "rbac_publish_seq_before": seq_before,
+        "rbac_publish_seq_after": seq_now,
+        "user_visible_count": n,
+        "expected_visible": expected_visible,
+        "probe_a_pass": probe_a_pass,
+        "probe_b_pass": probe_b_pass,
+    })
+
+
+def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
+    """RB-add into a pre-populated ns; cj transitions 0 → N visible cards.
+
+    Tests snowplow's subject-index propagation: a RoleBinding ADD in
+    `bench-ns-01` must (a) bump rbac_publish_seq, (b) cause cj's /call
+    view to include the bench-ns-01 compositions, (c) trigger
+    per-card widget RESTAction fan-out on the rendered datagrid.
+
+    Per Task #250 design §3.1. Parametric — no cj-hardcoded path
+    participates in mutation.
+    """
     def _work(c: StageContext) -> dict:
-        if c.scale >= 10000:
-            s5_ns_end = 50
-        else:
-            s5_ns_end = c.scale // 10 if c.scale >= 10 else 1
-        s8_ns = f"bench-ns-{s5_ns_end:02d}"
+        # Diego choice 2 (production-realistic): cj is the only non-admin
+        # bench user today; subject_user parameter would expand to a
+        # stage-arg if a third subject is added.
+        subject_user = "cyberjoker"
+        subject_group = _user_group(subject_user)
+        target_ns = "bench-ns-01"
+
+        # Pre-mutation snapshot for proof bookkeeping.
+        comps_in_ns = cluster.count_compositions_in_ns(target_ns)
         _ = _snapshot_l1_ready_ts(c)
-        lifecycle.delete_one_bench_namespace(s8_ns)
-        lifecycle.wait_for_namespace_gone(s8_ns)
+
+        # 1. Create the Role with chart-default shape (composition
+        # GET/LIST on all resources in the api group).
+        role_name = f"bench-{subject_user}-{target_ns}-comp-reader"
+        rb_name = f"bench-{subject_user}-{target_ns}-comp-reader-binding"
+        role_ok = cluster.k8s_create_namespaced_role(
+            target_ns, role_name,
+            api_groups=["composition.krateo.io"],
+            resources=["*"],
+            verbs=["get", "list"],
+        )
+        rb_ok = cluster.k8s_create_namespaced_role_binding(
+            target_ns, rb_name,
+            role_ref=("Role", role_name),
+            subjects=[{"kind": "Group", "name": subject_group}],
+        )
+        if not (role_ok and rb_ok):
+            return {
+                "subject_user": subject_user,
+                "subject_group": subject_group,
+                "target_ns": target_ns,
+                "role_name": role_name,
+                "rb_name": rb_name,
+                "role_ok": role_ok,
+                "rb_ok": rb_ok,
+                "error": "rbac_create_failed",
+                "__passed__": False,
+            }
+
+        # 2. Two-probe inner gate (mechanism + UX). cj's visible count
+        # should rise from 0 (pre-mutation) to comps_in_ns.
+        prop_ok, prop_ms, prop_diag = _wait_rbac_propagation_to_snowplow(
+            c, subject_user, target_ns,
+            expected_visible=comps_in_ns,
+            timeout_secs=30,
+        )
+
+        # 3. Browser measurement (cj's /compositions cell should now
+        # fan out to per-card widgets — call_count gate verifies this
+        # via the N-aware EXPECTED_CALLS formula).
         _post_mutation_pause(c.cache_mode)
-        results = _measure_all_users(c, 8, "Deleted 1 ns")
+        results = _measure_all_users(c, 8, "RB-add to pre-populated ns")
+
+        # 4. CONTENT-not-status assertion (per R4 mitigation).
+        expected_card_name = _pick_visible_composition_name(target_ns)
+        cj_card_present = _user_card_text_present(
+            c, subject_user, expected_card_name)
+        cj_widget_errors = _count_widget_errors(
+            results, user=subject_user, page="Compositions")
+
         return {
-            "ns": s8_ns,
+            "subject_user": subject_user,
+            "subject_group": subject_group,
+            "target_ns": target_ns,
+            "role_name": role_name,
+            "rb_name": rb_name,
+            "comps_in_ns": comps_in_ns,
+            "propagation_ok": prop_ok,
+            "propagation_ms": prop_ms,
+            "propagation_diag": prop_diag,
+            "expected_card_name": expected_card_name,
+            "content_card_present": cj_card_present,
+            "cj_widget_error_count": cj_widget_errors,
             "measurement_count": len(results),
-            "__passed__": True,
+            "__passed__": (
+                prop_ok
+                and cj_card_present
+                and cj_widget_errors == 0
+            ),
         }
 
     return _run_stage(
         "S8", ctx, _work,
         what_breaks_if_skipped=(
-            "without ns-cascade delete cell, convergence_mass_s8_p99 "
+            "without RB-add into pre-populated ns, the subject-index "
+            "propagation regression of Ship 0.30.235 (#149) cannot be "
+            "detected — cj's narrowed view stays empty even when an "
+            "admin grants ns access mid-session."
+        ),
+    )
+
+
+def stage_s9_remove_rb_from_populated_ns(ctx: StageContext) -> StageProof:
+    """RB-remove from same ns; cj transitions N visible → 0 cards.
+
+    Tests snowplow's RBAC-snapshot revocation path. The bidirectional
+    pair (S8 add + S9 remove) is the falsifier that the #149 defect
+    would have triggered — symmetric add/remove cycles each catch a
+    different end of the regression.
+
+    Reads target ns + role/RB names from S8's proof on disk (parametric
+    flow — no string literal pass-through).
+    """
+    def _work(c: StageContext) -> dict:
+        s8_proof = (load_state(c.run_dir) or {}).get(
+            "stage_proofs", {}).get("S8", {})
+        s8_body = (s8_proof.get("proof") or {})
+        subject_user = s8_body.get("subject_user")
+        target_ns = s8_body.get("target_ns")
+        role_name = s8_body.get("role_name")
+        rb_name = s8_body.get("rb_name")
+        if not (subject_user and target_ns and role_name and rb_name):
+            return {
+                "error": "s8_proof_missing",
+                "subject_user": subject_user,
+                "target_ns": target_ns,
+                "role_name": role_name,
+                "rb_name": rb_name,
+                "__passed__": False,
+            }
+
+        _ = _snapshot_l1_ready_ts(c)
+
+        # 1. Delete the RB. Role is left in place — symmetric add/remove
+        # is "subject access", not "permission inventory"; Role removal
+        # is a separate stage we explicitly do not model here. Cleanup
+        # of the Role happens after the propagation gate so a partial
+        # failure path doesn't leak.
+        rb_gone = cluster.k8s_delete_rolebinding(target_ns, rb_name)
+        if not rb_gone:
+            return {
+                "subject_user": subject_user,
+                "target_ns": target_ns,
+                "role_name": role_name,
+                "rb_name": rb_name,
+                "error": "rb_delete_failed",
+                "__passed__": False,
+            }
+
+        # 2. Wait for revocation propagation. expected_visible=0 means
+        # the user's narrowed view drops back to empty.
+        prop_ok, prop_ms, prop_diag = _wait_rbac_propagation_to_snowplow(
+            c, subject_user, target_ns,
+            expected_visible=0,
+            timeout_secs=30,
+        )
+
+        # 3. Cleanup the Role (test hygiene — not a gate assertion).
+        cluster.k8s_delete_role(target_ns, role_name)
+
+        # 4. Browser measurement (cj's /compositions should drop back
+        # to BASE structural ceiling).
+        _post_mutation_pause(c.cache_mode)
+        results = _measure_all_users(c, 9, "RB-remove from same ns")
+
+        # 5. CONTENT-absent assertion (revocation symmetric to S8).
+        # Reuse S8's expected_card_name so we look for THE SAME row
+        # that S8 confirmed was present.
+        s8_card = (s8_body.get("expected_card_name") or "").strip()
+        cj_card_absent = True
+        if s8_card:
+            cj_card_absent = not _user_card_text_present(
+                c, subject_user, s8_card)
+
+        return {
+            "subject_user": subject_user,
+            "target_ns": target_ns,
+            "role_name": role_name,
+            "rb_name": rb_name,
+            "propagation_ok": prop_ok,
+            "propagation_ms": prop_ms,
+            "propagation_diag": prop_diag,
+            "expected_card_name": s8_card,
+            "content_card_absent": cj_card_absent,
+            "measurement_count": len(results),
+            "__passed__": (prop_ok and cj_card_absent),
+        }
+
+    return _run_stage(
+        "S9", ctx, _work,
+        what_breaks_if_skipped=(
+            "without RB-remove, snowplow's RBAC-snapshot revocation "
+            "path is uncovered — a defect that leaves cj's narrowed "
+            "view populated AFTER the RB is gone would ship undetected."
+        ),
+    )
+
+
+# ─── S10: delete 1 namespace (was S8 pre-1.1.0) ────────────────────────────
+
+
+def stage_s10_delete_one_ns(ctx: StageContext) -> StageProof:
+    def _work(c: StageContext) -> dict:
+        if c.scale >= 10000:
+            s5_ns_end = 50
+        else:
+            s5_ns_end = c.scale // 10 if c.scale >= 10 else 1
+        s10_ns = f"bench-ns-{s5_ns_end:02d}"
+        _ = _snapshot_l1_ready_ts(c)
+        lifecycle.delete_one_bench_namespace(s10_ns)
+        lifecycle.wait_for_namespace_gone(s10_ns)
+        _post_mutation_pause(c.cache_mode)
+        results = _measure_all_users(c, 10, "Deleted 1 ns")
+        return {
+            "ns": s10_ns,
+            "measurement_count": len(results),
+            "__passed__": True,
+        }
+
+    return _run_stage(
+        "S10", ctx, _work,
+        what_breaks_if_skipped=(
+            "without ns-cascade delete cell, convergence_mass_s10_p99 "
             "is null — bulk delete invalidation regression cannot be "
             "detected."
         ),
     )
 
 
-# ─── S9: build canonical ledger row + write bundle ─────────────────────────
+# ─── S11: build canonical ledger row + write bundle (was S9 pre-1.1.0) ─────
 
 
-def stage_s9_report(ctx: StageContext) -> StageProof:
+def stage_s11_report(ctx: StageContext) -> StageProof:
     def _work(c: StageContext) -> dict:
         per_stage_proofs = {}
         state = load_state(c.run_dir) or {}
@@ -802,9 +1235,9 @@ def stage_s9_report(ctx: StageContext) -> StageProof:
         }
 
     return _run_stage(
-        "S9", ctx, _work,
+        "S11", ctx, _work,
         what_breaks_if_skipped=(
-            "S9 emits the canonical ledger row + summary.json bundle — "
+            "S11 emits the canonical ledger row + summary.json bundle — "
             "without it the PM has no scored artifact to compare against "
             "the north-star ledger."
         ),
@@ -823,11 +1256,16 @@ STAGE_REGISTRY: dict[str, Callable[[StageContext], StageProof]] = {
     "S5": stage_s5_scale_ns,
     "S6": stage_s6_scale_compositions,
     "S7": stage_s7_delete_one_comp,
-    "S8": stage_s8_delete_one_ns,
-    "S9": stage_s9_report,
+    # Task #250 Block 2: new RBAC-mutation stages inserted after S7.
+    "S8": stage_s8_add_rb_to_populated_ns,
+    "S9": stage_s9_remove_rb_from_populated_ns,
+    # Renamed from pre-1.1.0 layout (was S8 / S9).
+    "S10": stage_s10_delete_one_ns,
+    "S11": stage_s11_report,
 }
 
-STAGE_ORDER = ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]
+STAGE_ORDER = ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7",
+               "S8", "S9", "S10", "S11"]
 
 
 # ─── --from-stage / --to-stage semantics (per §E.3) ─────────────────────────
@@ -910,9 +1348,32 @@ def _proof_validation_re_runner(state: dict,
                 out[sid] = f"fail:comp_count_{actual}_lt_{int(expected * 0.9)}"
             else:
                 out[sid] = "pass"
+        elif sid == "S8":
+            # S8 created a RoleBinding; verify it still exists at
+            # apiserver. The Role + RB names are stamped on the proof
+            # so the re-runner is parametric (no string literal).
+            rb_name = proof_body.get("rb_name")
+            target_ns = proof_body.get("target_ns")
+            if rb_name and target_ns:
+                rb = cluster.k8s_read_namespaced_role_binding(
+                    target_ns, rb_name)
+                out[sid] = "pass" if rb is not None else "fail:rb_missing"
+            else:
+                out[sid] = "skipped:no_rb_metadata"
+        elif sid == "S9":
+            # S9 deleted the RB; verify it is gone.
+            rb_name = proof_body.get("rb_name")
+            target_ns = proof_body.get("target_ns")
+            if rb_name and target_ns:
+                rb = cluster.k8s_read_namespaced_role_binding(
+                    target_ns, rb_name)
+                out[sid] = ("pass" if rb is None
+                            else "fail:rb_still_present")
+            else:
+                out[sid] = "skipped:no_rb_metadata"
         else:
-            # S0/S1/S7/S8: no live-cluster reverify (S0 is meta,
-            # S1 zero-state, S7/S8 already mutated — can't undo).
+            # S0/S1/S7/S10: no live-cluster reverify (S0 is meta,
+            # S1 zero-state, S7/S10 already mutated — can't undo).
             out[sid] = "skipped:no_live_check"
     return out
 
@@ -990,8 +1451,8 @@ def run_phase6(tag: str,
     )
 
     # Lifecycle: log in (login_all writes to ctx.tokens) only when window
-    # contains a real measurement stage (S1+). Pure S0 / S9 skip login.
-    needs_login = any(s != "S0" and s != "S9" for s in window)
+    # contains a real measurement stage (S1+). Pure S0 / S11 skip login.
+    needs_login = any(s != "S0" and s != "S11" for s in window)
     if needs_login:
         try:
             ctx.tokens = browser.login_all()
@@ -1000,7 +1461,11 @@ def run_phase6(tag: str,
             ctx.tokens = {}
             ctx.admin_token = None
 
-    needs_browser = any(s in ("S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8")
+    # Task #250 Block 2: new S8/S9 stages run measurements via
+    # _measure_all_users, so they share the browser scaffolding. S10
+    # (was S8 — delete 1 ns) keeps the existing measurement footprint.
+    needs_browser = any(s in ("S1", "S2", "S3", "S4", "S5", "S6", "S7",
+                              "S8", "S9", "S10")
                         for s in window)
     if needs_browser and browser.FRONTEND is not None:
         try:

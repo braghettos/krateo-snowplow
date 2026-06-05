@@ -85,6 +85,9 @@ __all__ = [
     "wait_for_compositions",
     "wait_for_l1_ready",
     "wait_for_l1_warmup",
+    # Task #250 Block 2 — Phase 6 S8/S9 probes
+    "read_snowplow_expvar_int",
+    "count_user_compositions_in_ns",
 ]
 
 
@@ -145,13 +148,154 @@ def _pct(data, p):
     return pct(data, p)
 
 
-def _expected_calls_lookup(user, page_path):
+def _expected_calls_lookup(user, page_path, *, n_visible=None):
     """Defer to bench.expected — lazy import to avoid pulling expected.py
     at module load (keeps the import surface lean for tests that only
     exercise the HTTP helpers).
+
+    Block 2 (Task #250): forwards `n_visible` through the N-aware formula.
+    `None` (the default) reproduces the legacy BASE-only behaviour, so
+    callers that have not migrated keep the prior shape.
     """
     from bench.expected import expected_calls  # type: ignore
-    return expected_calls(user, page_path)
+    return expected_calls(user, page_path, n_visible=n_visible)
+
+
+def _user_visible_composition_count(user, page_path, token=None):
+    """Return the per-user count of compositions VISIBLE on `page_path`.
+
+    Used by the EXPECTED_CALLS gate at `_validate_widget_terminal_state`
+    to thread the right `n_visible` argument into the N-aware
+    expected_calls() formula:
+      - admin sees the cluster-wide composition count (full RBAC).
+      - cyberjoker sees the narrow RBAC-scoped count (the piechart count
+        served by the dashboard-compositions-panel-row-piechart widget,
+        which is identical to what cj's datagrid will iterate over).
+
+    Returns None for pages that are not the Compositions page or when no
+    per-user count source applies; callers treat None as 'no narrowing —
+    use BASE expected'.
+
+    The implementation is symmetric between users: both branches use a
+    server-side count, NOT a hardcoded user identity. For admin the
+    server-side count is cluster.count_compositions(); for cj it is the
+    piechart-widget API which returns the cj-narrowed total. Adding a
+    new user requires no change here.
+    """
+    if page_path != "/compositions":
+        return None
+    if user == "admin":
+        return _count_compositions()
+    # Non-admin path: use the piechart-widget API which reports the
+    # user-narrowed composition total. Returns -1 on failure; map that
+    # to None so the caller falls back to BASE.
+    if not token:
+        return None
+    try:
+        n = verify_composition_count_api(token)
+    except Exception:
+        return None
+    if n is None or n < 0:
+        return None
+    return n
+
+
+def read_snowplow_expvar_int(key, *, base_url=None, timeout=10):
+    """Fetch a single integer value from snowplow's /debug/vars.
+
+    Mechanism-independent probe used by the Phase 6 S8/S9 inner gate
+    (Probe A — RBAC publish-seq delta). Mirrors the pattern of
+    http_get_json (single GET, gzip-decompress) but reads /debug/vars
+    UNAUTHENTICATED (the expvar mux at main.go:788 is mounted before any
+    auth middleware so /debug/vars is server-only-reachable).
+
+    Args:
+        key:      JSON top-level key in /debug/vars (e.g.
+                  "snowplow_rbac_publish_seq").
+        base_url: override SNOWPLOW; useful for tests.
+        timeout:  HTTP timeout seconds.
+
+    Returns:
+        int when /debug/vars returns 200 + key is an int.
+        None on any failure path (unreachable, malformed JSON, missing
+        key, non-int value). Caller FAILS CLOSED on None — never assume
+        a missing read is a propagation signal.
+    """
+    base = base_url if base_url is not None else SNOWPLOW
+    url = f"{base.rstrip('/')}/debug/vars"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            body = resp.read()
+            body = _decompress(body, headers=dict(resp.headers))
+            data = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    val = data.get(key)
+    if isinstance(val, bool):
+        # `True/False` would coerce to 1/0 via int(); reject explicitly so
+        # a misshape on the snowplow side surfaces as None.
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        # expvar serializes uint64 as a JSON number; some JSON libraries
+        # may upcast to float for very large values. Round-trip safely.
+        try:
+            return int(val)
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
+def count_user_compositions_in_ns(user, token, ns):
+    """Count compositions VISIBLE to `user` in namespace `ns` via /call.
+
+    Probe B in the Phase 6 S8/S9 two-probe inner gate. Hits the same
+    /call path the browser nav uses; isolates 'snowplow's evaluator
+    serves the right narrowed view' from 'snowplow's RBAC snapshot was
+    rebuilt' (Probe A reads the expvar).
+
+    Args:
+        user:  subject string (metadata only — token carries identity).
+        token: bearer JWT for the user.
+        ns:    namespace to scope the count to.
+
+    Returns:
+        int count on success, -1 on any failure path. Mirrors the
+        verify_composition_count_api convention so the caller can poll
+        with the same sentinel semantics.
+    """
+    if not token or not ns:
+        return -1
+    try:
+        # Reuse the composition GVR via cluster.call_url() so the URL
+        # shape stays in one place. cluster.call_url(ns, name=None)
+        # already returns the namespace-scoped LIST shape used by the
+        # /compositions browser nav.
+        from bench.cluster import call_url as _call_url  # type: ignore
+        path = _call_url(ns)
+        _ms, code, body = http_get_json(path, token)
+        if code != 200:
+            return -1
+        if not isinstance(body, dict):
+            return -1
+        items = body.get("items")
+        if isinstance(items, list):
+            return len(items)
+        # Some /call shapes wrap the array under .status / .spec depending
+        # on the resolver path. Fall back to the top-level "list" key.
+        for candidate in ("list", "data"):
+            v = body.get(candidate)
+            if isinstance(v, list):
+                return len(v)
+        return -1
+    except Exception:
+        return -1
 
 
 def _expected_calls_tolerance():
@@ -775,7 +919,8 @@ def _count_widget_skeletons(page):
             int(result.get("widget_scoped", 0)))
 
 
-def _validate_widget_terminal_state(page, page_path, label, user="admin"):
+def _validate_widget_terminal_state(page, page_path, label, user="admin",
+                                    token=None):
     """Inspect the rendered page after the /call stability poll returns.
 
     The waterfall measurement only tells us when network activity stopped.
@@ -788,16 +933,35 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin"):
     Gates:
       1. widget-scoped .ant-skeleton count == 0 — HARD FAIL.
       2. .ant-result-error count is recorded but NOT a failure: errored
-         widgets are a valid terminal state.
+         widgets are a valid terminal state. The count IS still
+         load-bearing in S8/S9 `__passed__` per Task #250 R4 mitigation —
+         the stage runner reads `errored_count` from the proof and
+         requires `== 0` for the cj/Compositions cell.
       3. /call count must be within EXPECTED_CALLS_TOLERANCE of
-         expected_calls(user, page_path) — HARD FAIL on deviation.
-         Pages with no characterized expectation for the (user, page)
-         pair are skipped silently.
+         expected_calls(user, page_path, n_visible=N) — HARD FAIL on
+         deviation. The N-aware formula (Task #250 Block 2) adds the
+         per-card-widget fan-out term for /compositions when the user
+         has visible cards; admin reads cluster-truth, cj reads the
+         RBAC-narrowed piechart count (parametric per
+         feedback_no_special_cases).
+
+    Args:
+        page:      Playwright Page object.
+        page_path: page URL path used for EXPECTED_CALLS lookup.
+        label:     diagnostic label for log lines.
+        user:      subject the page is logged in as (drives n_visible
+                   sourcing).
+        token:     optional bearer JWT for the same user; used to query
+                   the per-user composition count when narrowing applies.
+                   When None and the user is non-admin, falls back to
+                   BASE expected (the legacy pre-Block-2 behaviour).
 
     Returns a dict with keys:
         skeleton_count, skeleton_count_raw, skeleton_count_widget_scoped,
         errored_count, expected_calls, actual_calls,
-        calls_within_tolerance, terminal_state ("pass" or "fail"), user
+        calls_within_tolerance, terminal_state ("pass" or "fail"), user,
+        n_visible (the value threaded into the formula; None when not
+        applicable).
     """
     try:
         skeleton_count, skeleton_raw, skeleton_widget = _count_widget_skeletons(page)
@@ -818,7 +982,19 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin"):
         _log(f"    [WARN] could not read /call count at {label}: {e}")
         actual_calls = 0
 
-    expected = _expected_calls_lookup(user, page_path)
+    # Source the per-user visible count for the N-aware EXPECTED_CALLS
+    # formula. Returns None for pages where the formula does not apply
+    # (anything other than /compositions today), which makes the lookup
+    # transparently fall back to BASE.
+    try:
+        n_visible = _user_visible_composition_count(user, page_path,
+                                                    token=token)
+    except Exception as e:
+        _log(f"    [WARN] could not source n_visible for {user!r} at "
+             f"{label}: {e}")
+        n_visible = None
+
+    expected = _expected_calls_lookup(user, page_path, n_visible=n_visible)
     tolerance = _expected_calls_tolerance()
     if expected is None:
         calls_within_tolerance = True
@@ -834,8 +1010,10 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin"):
     if errored_count > 0:
         _log(f"    [WARN] errored_widgets={errored_count} at {label}")
     if expected is not None and not calls_within_tolerance:
+        nvis_str = f"n_visible={n_visible}" if n_visible is not None else \
+                   "n_visible=base"
         _log(f"    [FAIL] call_count_mismatch[{user}]: expected={expected}"
-             f"±{tolerance} actual={actual_calls} at {label}")
+             f"±{tolerance} actual={actual_calls} ({nvis_str}) at {label}")
         terminal_state = "fail"
 
     return {
@@ -848,6 +1026,7 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin"):
         "calls_within_tolerance": calls_within_tolerance,
         "terminal_state": terminal_state,
         "user": user,
+        "n_visible": n_visible,
     }
 
 
@@ -899,7 +1078,7 @@ _validate_widget_terminal_state_public = _validate_widget_terminal_state
 
 
 def browser_measure_navigation(page, page_path, label, min_calls=0,
-                               user="admin"):
+                               user="admin", token=None):
     """Navigate to a page; measure the /call API waterfall + widget gates.
 
     Args:
@@ -908,6 +1087,11 @@ def browser_measure_navigation(page, page_path, label, min_calls=0,
             so WARM navigations don't exit early.
         user: Subject the page is logged in as. Forwarded to
             _validate_widget_terminal_state for per-user EXPECTED_CALLS.
+        token: Bearer JWT for the same user. Forwarded to
+            _validate_widget_terminal_state so the N-aware EXPECTED_CALLS
+            formula (Task #250 Block 2) can source the per-user visible
+            composition count for /compositions navs. None reproduces the
+            pre-Block-2 BASE-only lookup (backward-compatible).
 
     Returns a dict with `waterfallMs`, `callCount`, `loadComplete`,
     `levels`, `httpOk/httpErr`, `validation`, and `incomplete` (True when
@@ -967,7 +1151,7 @@ def browser_measure_navigation(page, page_path, label, min_calls=0,
         page.wait_for_timeout(1000)
 
     validation = _validate_widget_terminal_state(page, page_path, label,
-                                                 user=user)
+                                                 user=user, token=token)
 
     # Measure /call waterfall + cluster calls into progressive-rendering levels.
     result = page.evaluate("""() => {
@@ -1239,7 +1423,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                 page, page_path,
                 f"S{stage_num} {cache_mode} nav#{nav_num} {page_name}",
                 min_calls=cold_calls,
-                user=user)
+                user=user, token=token)
             cold_warm = 'COLD' if nav_num == 1 else 'WARM'
             m["nav_num"] = nav_num
             m["cold_warm"] = cold_warm

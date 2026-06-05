@@ -23,9 +23,14 @@ import time
 
 __all__ = [
     "EXPECTED_CALLS",
+    "EXPECTED_CALLS_BASE",
     "EXPECTED_CALLS_DEFAULT_USER",
     "EXPECTED_CALLS_TOLERANCE",
     "EXPECTED_CALLS_OVERLAY_PATH",
+    "COMP_DATAGRID_PER_PAGE",
+    "COMP_PER_CARD_WIDGETS",
+    "COMP_BASE_CALLS_STRUCTURAL",
+    "DASH_BASE_CALLS_STRUCTURAL",
     "OverlayStale",
     "load_expected_calls_overlay",
     "expected_calls",
@@ -36,6 +41,23 @@ __all__ = [
 ]
 
 
+# ─── N-aware EXPECTED_CALLS formula constants (Task #250 Block 2) ──────────
+#
+# arch-task215-extra-calls verdict + empirical 0.30.248 phase6.log
+# (run-20260605-114100) cross-check:
+#   - admin S4 (N=20): actual_calls=14  → 10 + 4×1
+#   - admin S6 (N=50K): actual_calls=30 → 10 + 4×min(50000, 5) = 10 + 4×5
+# Formula derivation: each VISIBLE card on the Compositions datagrid
+# fans out to per-card widget RESTActions (Panel + Markdown + 2 Buttons).
+# Datagrid renders at most `per_page` cards on the first page; the
+# extra-calls term is bounded by `min(n_visible, per_page)`.
+
+COMP_DATAGRID_PER_PAGE = 5      # frontend datagrid page size
+COMP_PER_CARD_WIDGETS = 4       # Panel + Markdown + 2 Buttons per card
+COMP_BASE_CALLS_STRUCTURAL = 10  # /compositions structural ceiling at N=0
+DASH_BASE_CALLS_STRUCTURAL = 16  # /dashboard structural ceiling
+
+
 # ─── Expected /call counts per (user, page) ─────────────────────────────────
 #
 # Calibrated 2026-05-12 against the GKE neon-481711 cluster. Both users sit
@@ -43,18 +65,32 @@ __all__ = [
 # apiserver is not throttling cluster-scoped LISTs. Admin's overload-induced
 # 9/6 floor at 50K compositions is a regression to detect, NOT the
 # expectation. See plan §A.6.
+#
+# Block 2 (Task #250): the BASE row models the N=0 structural ceiling.
+# `expected_calls(user, page, n_visible=N)` adds the per-card-widget
+# fan-out term `COMP_PER_CARD_WIDGETS × min(N, COMP_DATAGRID_PER_PAGE)`
+# for /compositions when N > 0. Backward compat: N=0 (or unspecified)
+# returns the BASE value, preserving S1-S3 PASS shape from prior runs.
 
-EXPECTED_CALLS = {
-    # user -> { page_path -> expected /call count at structural ceiling }
+EXPECTED_CALLS_BASE = {
+    # Structural ceiling baselines. Both users start at the same value
+    # because narrow-RBAC subtracts content but not call structure.
     "admin": {
-        "/dashboard":    16,
-        "/compositions": 10,
+        "/dashboard":    DASH_BASE_CALLS_STRUCTURAL,
+        "/compositions": COMP_BASE_CALLS_STRUCTURAL,
     },
     "cyberjoker": {
-        "/dashboard":    16,
-        "/compositions": 10,
+        "/dashboard":    DASH_BASE_CALLS_STRUCTURAL,
+        "/compositions": COMP_BASE_CALLS_STRUCTURAL,
     },
 }
+
+# Backward-compat alias. Pre-Block-2 callers reference EXPECTED_CALLS
+# directly (overlay merge, gate_overlay_freshness, etc.); the dict
+# remains the structural baseline. The N-aware overlay enters via
+# expected_calls(..., n_visible=...).
+EXPECTED_CALLS = EXPECTED_CALLS_BASE
+
 EXPECTED_CALLS_DEFAULT_USER = "admin"  # fallback for unknown subjects
 
 # Tolerance flipped from 1 → 0 per Diego's hard constraint 2026-06-02.
@@ -108,20 +144,48 @@ def load_expected_calls_overlay():
     return merged
 
 
-def expected_calls(user, page_path):
+def expected_calls(user, page_path, *, n_visible=None):
     """Return the calibrated /call count for a (user, page) pair.
 
-    Looks up the user's row in EXPECTED_CALLS, falling back to
+    Looks up the user's row in EXPECTED_CALLS_BASE, falling back to
     EXPECTED_CALLS_DEFAULT_USER when the subject is unknown (the harness
     should not silently skip the gate just because a new user was added;
     admin's expectations are the safest default). Returns None when the
     page itself is unknown — callers treat None as 'page not characterized
     yet, skip the gate'.
+
+    Args:
+        user:       subject string ("admin", "cyberjoker", ...).
+        page_path:  page URL path ("/dashboard", "/compositions", ...).
+        n_visible:  per-user count of compositions visible on the page
+                    (admin → cluster-wide count; cj → narrowed view).
+                    Only consulted for "/compositions"; other pages return
+                    the BASE value. `None` or `<= 0` returns BASE (the
+                    N=0 baseline path, exercised by S1/S2/S3).
+
+    Returns:
+        int — expected /call count for the (user, page, n_visible) cell.
+        None — page is not characterized; caller treats as 'skip gate'.
+
+    Formula (per Task #250 Block 2 / arch-task215-extra-calls verdict):
+        /compositions(user, N>0) =
+            BASE + COMP_PER_CARD_WIDGETS × min(N, COMP_DATAGRID_PER_PAGE)
     """
-    table = EXPECTED_CALLS.get(user)
+    table = EXPECTED_CALLS_BASE.get(user)
     if table is None:
-        table = EXPECTED_CALLS.get(EXPECTED_CALLS_DEFAULT_USER, {})
-    return table.get(page_path)
+        table = EXPECTED_CALLS_BASE.get(EXPECTED_CALLS_DEFAULT_USER, {})
+    base = table.get(page_path)
+    if base is None:
+        return None
+    # Only /compositions has the per-card-widget fan-out term. Other pages
+    # (e.g. /dashboard) are characterized solely by their structural
+    # ceiling — datagrid fan-out is not on the /dashboard path.
+    if page_path != "/compositions":
+        return base
+    if n_visible is None or n_visible <= 0:
+        return base
+    cards_visible = min(int(n_visible), COMP_DATAGRID_PER_PAGE)
+    return base + COMP_PER_CARD_WIDGETS * cards_visible
 
 
 # ─── Overlay freshness gate ─────────────────────────────────────────────────

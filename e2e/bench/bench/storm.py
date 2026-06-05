@@ -585,6 +585,19 @@ def crb_delete_burst(tokens):
         next portal helm upgrade will restore it. We re-apply at the end
         as a defensive measure to avoid leaving the test cluster in a
         broken state for follow-up runs.
+
+    Cross-reference (Task #250 Block 2 / PM Q2 ratified 2026-06-05):
+    The `user = "cyberjoker"` identity at line 590 and the `subjects: -
+    kind: User name: cyberjoker` block at lines 671-674 hardcode the
+    bench's non-admin user identity. This mirrors a portal-chart
+    provisioning fact (the helm chart provisions `cyberjoker` into the
+    `devs` group). If portal adds a THIRD bench user, this site MUST be
+    updated in lockstep with `bench/phases.py:_user_group` (the 2-entry
+    lookup table used by Phase 6 S8/S9 stage runners) — both must
+    reflect the new (user → group) mapping. The CRB-burst harness
+    references the User-kind subject (its own defect-reproducer
+    semantics); the Phase 6 stages use the Group-kind subject so they
+    do not conflict on apiserver state.
     """
     _section("Scenario: CRB-delete burst (D1/D2/D3 reproduction)")
     user = "cyberjoker"

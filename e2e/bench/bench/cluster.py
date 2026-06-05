@@ -265,6 +265,142 @@ def k8s_delete_rolebinding(ns, name):
         return _k8s_is_404(e)
 
 
+# ── Namespace-scoped RBAC: CREATE / READ (Task #250 Phase 6 S8/S9) ────────
+#
+# Parametric primitives — no cj-hardcoded path per feedback_no_special_cases.
+# Phase 6 stages S8 (RB-add) / S9 (RB-remove) bind into pre-populated
+# namespaces to exercise the snowplow subject-index propagation path
+# (Probe A on /debug/vars/snowplow_rbac_publish_seq + Probe B on the
+# per-user /call view). All callers MUST own RBAC layout choices in the
+# stage runner; this layer only mediates the apiserver call.
+
+def k8s_create_namespaced_role(ns, name, api_groups, resources, verbs):
+    """Create a namespaced Role with a SINGLE PolicyRule.
+
+    Idempotent on AlreadyExists (HTTP 409 → True). Returns False when the
+    kubernetes client is unavailable OR a non-409 error fires. The Role
+    shape matches the portal chart's `devs-create-get-list-any-...` Role
+    pattern: one rule per `(api_groups, resources, verbs)` triplet.
+
+    Args:
+        ns:         namespace to create the Role in (str).
+        name:       Role metadata.name (str).
+        api_groups: list[str] — e.g. ["composition.krateo.io"].
+        resources:  list[str] — e.g. ["*"].
+        verbs:      list[str] — e.g. ["get", "list"].
+
+    Returns:
+        True on success or AlreadyExists; False on transient failure.
+    """
+    if not _k8s_init():
+        return False
+    try:
+        body = _k8s_client_mod.V1Role(
+            metadata=_k8s_client_mod.V1ObjectMeta(name=name),
+            rules=[_k8s_client_mod.V1PolicyRule(
+                api_groups=list(api_groups),
+                resources=list(resources),
+                verbs=list(verbs),
+            )],
+        )
+        _k8s_rbac.create_namespaced_role(
+            namespace=ns, body=body, _request_timeout=30)
+        return True
+    except Exception as e:
+        if _K8S_LIB_AVAILABLE and isinstance(
+                e, _k8s_client_mod.exceptions.ApiException):
+            return getattr(e, "status", None) in (200, 201, 409)
+        return False
+
+
+def k8s_create_namespaced_role_binding(ns, name, role_ref, subjects):
+    """Create a namespaced RoleBinding pointing at `role_ref`.
+
+    Idempotent on AlreadyExists (HTTP 409 → True). Returns False when the
+    kubernetes client is unavailable OR a non-409 error fires.
+
+    Args:
+        ns:        namespace to create the RoleBinding in (str).
+        name:      RoleBinding metadata.name (str).
+        role_ref:  2-tuple (kind, name) — kind in {"Role", "ClusterRole"}.
+        subjects:  list[dict] — each entry has keys:
+                     kind      str  — "Group" / "User" / "ServiceAccount"
+                     name      str  — subject name
+                     api_group str  — optional; defaults to
+                                      "rbac.authorization.k8s.io" for
+                                      User/Group kinds, "" for SA
+                     namespace str  — optional; required for SA kind only
+
+    Returns:
+        True on success or AlreadyExists; False on transient failure.
+    """
+    if not _k8s_init():
+        return False
+    try:
+        kind, role_name = role_ref
+        rb_subjects = []
+        for s in subjects:
+            sub_kind = s["kind"]
+            sub_name = s["name"]
+            # SA subjects use empty api_group; User/Group default to the
+            # rbac.authorization.k8s.io api group per k8s convention.
+            default_apigroup = (
+                "" if sub_kind == "ServiceAccount"
+                else "rbac.authorization.k8s.io"
+            )
+            sub_apigroup = s.get("api_group", default_apigroup)
+            sub_namespace = s.get("namespace")
+            rb_subjects.append(_k8s_client_mod.V1Subject(
+                kind=sub_kind,
+                name=sub_name,
+                api_group=sub_apigroup,
+                namespace=sub_namespace,
+            ))
+        body = _k8s_client_mod.V1RoleBinding(
+            metadata=_k8s_client_mod.V1ObjectMeta(name=name),
+            role_ref=_k8s_client_mod.V1RoleRef(
+                api_group="rbac.authorization.k8s.io",
+                kind=kind,
+                name=role_name,
+            ),
+            subjects=rb_subjects,
+        )
+        _k8s_rbac.create_namespaced_role_binding(
+            namespace=ns, body=body, _request_timeout=30)
+        return True
+    except Exception as e:
+        if _K8S_LIB_AVAILABLE and isinstance(
+                e, _k8s_client_mod.exceptions.ApiException):
+            return getattr(e, "status", None) in (200, 201, 409)
+        return False
+
+
+def k8s_read_namespaced_role_binding(ns, name):
+    """Read a RoleBinding by (ns, name).
+
+    Used by the Phase 6 S8/S9 post-mutation verify loop (R4.1 re-runner)
+    to confirm the RB landed in the apiserver before navigating cj's
+    browser, and to assert the RB is gone after S9's delete.
+
+    Returns:
+        dict on success (apiserver object as returned by the client lib —
+        consumers read it as an object, not by-key).
+        None on NotFound (404) OR client unavailable. Other exceptions
+        propagate (so transport-level failures don't get silently
+        swallowed and read as "absent").
+    """
+    if not _k8s_init():
+        return None
+    try:
+        rb = _k8s_rbac.read_namespaced_role_binding(
+            name=name, namespace=ns, _request_timeout=30)
+        return rb
+    except Exception as e:
+        if _k8s_is_404(e):
+            return None
+        raise
+
+
 # ── Namespaces ────────────────────────────────────────────────────────────
 
 def k8s_list_namespaces_by_prefix(prefix):
@@ -767,6 +903,9 @@ __all__ = [
     "k8s_list_rolebindings_all_ns_by_prefix",
     "k8s_delete_role",
     "k8s_delete_rolebinding",
+    "k8s_create_namespaced_role",
+    "k8s_create_namespaced_role_binding",
+    "k8s_read_namespaced_role_binding",
     "k8s_list_namespaces_by_prefix",
     "k8s_delete_namespace",
     "k8s_create_namespace",
