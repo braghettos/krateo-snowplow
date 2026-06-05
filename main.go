@@ -306,6 +306,22 @@ func main() {
 					// no live per-user token; the widget resolver needs an
 					// apiserver client-config on the context.
 					dispatchers.RegisterRefreshHandlers(rc)
+					// Ship 2 Stage 2.5 / 0.30.248 (Fix v2 engine ctx
+					// decoupling). The prewarm engine worker reads this
+					// ctx as its long-lived runtime — it stops only on
+					// process shutdown, so post-boot
+					// scopeKindGVRDiscovered enqueues (from
+					// cache.DiscoverGroupResources's `if added` branch)
+					// are actually consumed. Pre-Fix-v2 the worker
+					// inherited the boot-seed goroutine's bounded ctx
+					// and died at boot-done, leaving post-boot enqueues
+					// unprocessed (Trace v2 §1.5).
+					//
+					// MUST be wired BEFORE Phase1Warmup runs (line 594
+					// below — Phase1Warmup's engineSeed closure reads
+					// engineProcessCtx). Mirrors cache.StartRefresher's
+					// cacheCtx-as-process-lifetime pattern (line 320).
+					dispatchers.SetEngineProcessContext(cacheCtx)
 					// Ship #98 / 0.30.215 — wire the customer-priority
 					// yield hook BEFORE StartRefresher so the worker pool
 					// sees a populated hook on its first processNext.

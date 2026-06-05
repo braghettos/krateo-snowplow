@@ -290,6 +290,29 @@ func (e *prewarmEngine) dequeueScope() (prewarmScope, bool) {
 // goroutine spawns so any GVR discovered during boot (lazy registers
 // post-MarkEagerSet) is queued, not dropped. The wiring happens inside
 // startedOnce so it runs exactly once per process.
+//
+// Ship 2 Stage 2.5 / 0.30.248 (Fix v2 — engine ctx decoupling). PM-required
+// change #4: re-entry semantics — startedOnce makes the first
+// StartPrewarmEngine(processCtx, ...) call canonical; subsequent calls
+// (e.g. a future re-init) are NO-OPs that do NOT replace ctx/handler/
+// scopeDone. The very first call's processCtx wins for the worker's
+// lifetime; the first call's handler+scopeDone bind too. Re-entry MUST
+// pass a process-lifetime ctx the first time (today: cacheCtx from
+// main.go via dispatchers.SetEngineProcessContext).
+//
+// CTX CONTRACT (Fix v2). `ctx` is the PROCESS-LIFETIME context — typically
+// cacheCtx from main.go. The worker goroutine runs until this context is
+// cancelled (i.e. until process shutdown). It MUST NOT be the boot-seed
+// goroutine's bounded context (which gets cancelled the instant the
+// boot scope completes at engineSeed return, killing the worker
+// 7-12 minutes before post-boot scopeKindGVRDiscovered events arrive at
+// production scale — empirically traced in
+// docs/task-194-s4-defect-trace-v2-2026-06-05.md §1.5).
+//
+// Individual scope executions are bounded by their own per-scope timeout
+// derived inside runWorker via prewarmScopeTimeout(s); the per-scope
+// timeout is anchored to the long-lived process ctx, not to any
+// boot-seed orchestration ctx.
 func StartPrewarmEngine(ctx context.Context, handler func(ctx context.Context, s prewarmScope) error, scopeDone func(s prewarmScope, err error)) {
 	e := prewarmEngineSingleton()
 	e.startedOnce.Do(func() {
@@ -310,20 +333,51 @@ func StartPrewarmEngine(ctx context.Context, handler func(ctx context.Context, s
 		// fn pointer) so a future engine re-entry would not double-wire.
 		registerEngineGVRDiscoveredHook(e)
 
+		// Publish expvar counters — Fix v2 PM Change #1. Inside startedOnce
+		// so initialisation runs exactly once.
+		registerPrewarmEngineMetrics(e)
+
 		go e.runWorker(ctx)
 		slog.Info("prewarm.engine.started",
 			slog.String("subsystem", "cache"),
 			slog.String("queue", "bounded-dedup"),
 			slog.String("customer_priority", "yield-on-inflight"),
 			slog.String("gvr_discovered_hook", "wired"),
+			slog.String("ctx_lifetime", "process"),
 		)
 	})
+}
+
+// prewarmScopeTimeout returns the budget for one scope execution under
+// the worker's per-scope context.WithTimeout. Anchored to the worker's
+// long-lived process ctx — NOT to any boot-seed orchestration ctx
+// (Fix v2 / 0.30.248).
+//
+// Boot scope: pipGlobalTimeout (8m) — matches the pre-Fix-v2
+// boot-seed budget exactly. The boot rePrewarm's wall-clock shape is
+// unchanged (a single coherent pass).
+//
+// gvr-discovered scope: pipGlobalTimeout (8m) — same as boot. The
+// re-walk + per-target seed shape is identical to boot (one full
+// re-walk of the nav tree + cohort seed). Architect Trace v2 §7 OQ-2
+// proposes keeping at 8m uniformly until per-GVR re-walk timing data
+// suggests tightening.
+func prewarmScopeTimeout(s prewarmScope) time.Duration {
+	return pipGlobalTimeout
 }
 
 // runWorker is the engine worker loop. It blocks on the signal channel,
 // drains the pending queue, and runs each scope through the handler —
 // YIELDING to any in-flight customer /call before each scope. Exits on
 // ctx cancel.
+//
+// CTX CONTRACT (Fix v2 / 0.30.248). `ctx` is the worker's process-lifetime
+// context passed from StartPrewarmEngine. The worker exits ONLY on
+// process shutdown. Per-scope wall-clock bounds are derived inside the
+// drain via context.WithTimeout(ctx, prewarmScopeTimeout(s)) so a
+// single misbehaving scope cannot stall the worker indefinitely; the
+// scope ctx cancels the instant the scope returns (deferred
+// scopeCancel) so resources never leak.
 func (e *prewarmEngine) runWorker(ctx context.Context) {
 	for {
 		select {
@@ -349,7 +403,16 @@ func (e *prewarmEngine) runWorker(ctx context.Context) {
 			if e.scopeHandler == nil {
 				continue
 			}
-			err := e.scopeHandler(ctx, s)
+			// Per-scope bound: anchor on the long-lived worker ctx so the
+			// scope shares the worker's lifetime (boot/process), but cap
+			// the scope's own wall-clock at prewarmScopeTimeout(s) so a
+			// single misbehaving scope cannot occupy the worker forever.
+			// scopeCancel is deferred-equivalent (called at the bottom of
+			// this iteration via the explicit invocation) so it fires
+			// promptly whether the scope returns nil or an error.
+			scopeCtx, scopeCancel := context.WithTimeout(ctx, prewarmScopeTimeout(s))
+			err := e.scopeHandler(scopeCtx, s)
+			scopeCancel()
 			if err != nil {
 				slog.Warn("prewarm.engine.scope_incomplete",
 					slog.String("subsystem", "cache"),

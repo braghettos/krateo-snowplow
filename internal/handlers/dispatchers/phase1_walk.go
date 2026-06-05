@@ -214,6 +214,79 @@ type rootResolver func(ctx context.Context, root navigationRoot) error
 //   - launch the per-cohort prewarm seed (Step 7.6) as a bounded
 //     best-effort BACKGROUND warm — outcome log-only, readiness already 200.
 //
+// engineProcessCtx is the PROCESS-LIFETIME context the prewarm engine
+// worker runs under. Set ONCE at main.go startup via
+// SetEngineProcessContext(cacheCtx) BEFORE Phase1Warmup is invoked.
+// Read inside engineSeed (phase1_walk.go:engineSeed closure) where it
+// is plumbed into StartPrewarmEngine as the worker's ctx.
+//
+// LIFETIME CONTRACT (Fix v2 / 0.30.248). The engine worker MUST outlive
+// the boot-seed orchestration goroutine. Pre-Fix-v2 the worker
+// inherited the boot-seed goroutine's bounded ctx and died the instant
+// the boot scope completed (Trace v2 §1.5 + §4). Post-Fix-v2 the worker
+// is bound to cacheCtx — it exits ONLY on process shutdown, so
+// post-boot scopeKindGVRDiscovered enqueues are processed.
+//
+// Single-writer at boot, multiple-readers post-boot. No mutex needed
+// because the write happens BEFORE Phase1Warmup spawns any goroutine
+// that reads it (Go's happens-before guarantees the visibility).
+var engineProcessCtx context.Context
+
+// engineProcessCtxMissingOnce gates the one-time slog.Error emitted by
+// engineSeed when engineProcessCtx is nil at the moment the engine
+// would start. Single-shot so a misconfigured production environment
+// doesn't spam the log; the message itself names the missing wiring
+// (dispatchers.SetEngineProcessContext) so SRE can pinpoint the fix.
+var engineProcessCtxMissingOnce sync.Once
+
+// SetEngineProcessContext wires the process-lifetime context for the
+// prewarm engine worker. MUST be called once at main.go startup,
+// BEFORE Phase1Warmup is invoked, with cacheCtx (the same long-lived
+// context cache.StartRefresher / cache.StartSliceabilityReverifier are
+// bound to — see main.go around the cacheCtx construction).
+//
+// Idempotent — repeated calls overwrite the package var. Production
+// today calls it exactly once. The engine worker reads the SAME ctx
+// the first call wired; subsequent SetEngineProcessContext calls do
+// NOT propagate to an already-running worker (StartPrewarmEngine's
+// startedOnce makes the first ctx canonical for the worker's lifetime).
+//
+// Fix v2 / 0.30.248. Companion to phase1_walk.go's engineSeed closure
+// and prewarm_engine.go's runWorker.
+func SetEngineProcessContext(ctx context.Context) {
+	engineProcessCtx = ctx
+}
+
+// resolveEngineProcessCtx returns the wired engineProcessCtx if set,
+// otherwise context.Background() with a ONE-TIME slog.Error emit. PM
+// Change #3 — separates the nil-check + log-once semantics into a
+// dedicated helper so a unit test can drive it without invoking the
+// whole Phase1Warmup machinery.
+//
+// One-time semantics via engineProcessCtxMissingOnce — sync.Once so
+// repeated nil resolutions emit exactly one error (preserves operator
+// signal without log spam).
+func resolveEngineProcessCtx() context.Context {
+	if engineProcessCtx != nil {
+		return engineProcessCtx
+	}
+	engineProcessCtxMissingOnce.Do(func() {
+		slog.Error("engine.process_ctx.missing — falling back to context.Background()",
+			slog.String("subsystem", "cache"),
+			slog.String("hint", "main.go must call dispatchers.SetEngineProcessContext(cacheCtx) before Phase1Warmup; under unit-test wiring this fallback keeps the engine alive but the production wiring is broken if this fires in production logs"),
+		)
+	})
+	return context.Background()
+}
+
+// ResetEngineProcessCtxForTest clears engineProcessCtx and resets the
+// one-time error gate. TEST-ONLY — production lifecycle is set-once at
+// boot.
+func ResetEngineProcessCtxForTest() {
+	engineProcessCtx = nil
+	engineProcessCtxMissingOnce = sync.Once{}
+}
+
 // ctx bounds the whole walk + sync barrier (main.go gives it the
 // startupProbe budget). On ctx cancellation Phase1Warmup still calls
 // MarkPhase1Done in its caller — a pod that cannot warm in the budget
@@ -349,18 +422,48 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			bootDone := make(chan struct{})
 			var bootErr error
 			var closeOnce sync.Once
-			StartPrewarmEngine(pctx, makeBootScopeHandler(deps), func(s prewarmScope, err error) {
+
+			// Fix v2 / 0.30.248: the engine worker MUST use a process-
+			// lifetime ctx, NOT pctx. pctx is the boot-seed orchestration
+			// goroutine's bounded ctx; the outer `defer seedCancel()` at
+			// the bottom of the runPIPSeed-equivalent goroutine cancels
+			// pctx the instant THIS function returns at <-bootDone, which
+			// would also kill the engine worker — leaving post-boot
+			// scopeKindGVRDiscovered enqueues unprocessed. Trace v2 §1.5
+			// + §4 traces the empirical defect.
+			//
+			// resolveEngineProcessCtx returns the wired engineProcessCtx
+			// (set at main.go boot via SetEngineProcessContext(cacheCtx))
+			// or — soft-fallback — context.Background() with a one-time
+			// slog.Error emit (PM Change #3). Production calls
+			// SetEngineProcessContext at boot so the fallback fires only
+			// under unit tests or misconfigured environments.
+			processCtx := resolveEngineProcessCtx()
+
+			StartPrewarmEngine(processCtx, makeBootScopeHandler(deps), func(s prewarmScope, err error) {
 				if s.kind == scopeKindBoot {
 					bootErr = err
 					closeOnce.Do(func() { close(bootDone) })
 				}
 			})
-			// Ship 1 enqueues only the BOOT scope. Ship 2 wires runtime
-			// triggers (widget/RESTAction CR + RBAC shift) to enqueueScope.
+			// Ship 1 enqueues only the BOOT scope. Ship 2 Stage 2 (0.30.247)
+			// wires scopeKindGVRDiscovered enqueues via the cache→engine
+			// hook fired from discovery_lookup.go; Ship 2 Stage 2.5
+			// (0.30.248, this fix) keeps the worker alive past boot so
+			// those post-boot enqueues actually get processed.
 			prewarmEngineSingleton().enqueueScope(prewarmScope{kind: scopeKindBoot})
-			// Wait for boot completion OR pctx cancel — whichever first. The
-			// engine worker keeps running for any future (Ship 2) enqueues;
-			// this background goroutine's job is done once boot is.
+			// Wait for boot completion OR pctx cancel — whichever first.
+			//
+			// LIFETIME CONTRACT (Fix v2, PM Change #5 — the comment that
+			// caused the 0.30.247 ship regression is now TRUE):
+			// the engine worker IS bound to processCtx (the cacheCtx
+			// plumbed via SetEngineProcessContext above), NOT to pctx.
+			// So when pctx cancels at engineSeed return (via the outer
+			// goroutine's defer seedCancel), the worker survives and
+			// continues draining future scopeKindGVRDiscovered enqueues
+			// for the process lifetime. The engine genuinely "keeps
+			// running for any future Ship 2 enqueues" — under the new
+			// SetEngineProcessContext mechanism wired at main.go.
 			select {
 			case <-bootDone:
 				return bootErr
