@@ -375,6 +375,110 @@ func TestGVRDiscoveredIntegration_DepRecordedThenAddFiresConsumed(t *testing.T) 
 	}
 }
 
+// TestGVRDiscoveredIntegration_AdminPerBindingCellsExceedPreExistingClusterList
+// is the Fix v2 PM Change #2 falsifier at the unit level. The bench-
+// level assertion (l1_keys strictly > 19, where 19 = pre-existing
+// apistage cluster_list cells) is asserted here in the structural
+// shape: when the re-prewarm records edges for N distinct per-binding
+// admin cells AGAINST the same composition GVR, a subsequent OnAdd
+// fan-out MUST dirty-mark ALL N + the cluster_list cell — strictly more
+// than the cluster_list-only baseline.
+//
+// SCENARIO MAPS TO THE EMPIRICAL DEFECT:
+//   - cluster_list cell already existed pre-fix (Trace v2 §1.3 — 19
+//     pre-existing cells dirty-marked by composition CR ADDs).
+//   - Admin's per-binding piechart cell was MISSING its edge because
+//     of the empty-iterator short-circuit (Trace v1 H4 root cause).
+//   - Fix v2 ensures the re-prewarm worker is alive AND runs the
+//     re-walk under the cohort identity, recording the missing edges
+//     for admin's per-binding cell(s).
+//   - This unit test models the post-fix shape: a cluster_list edge
+//     + several per-binding edges → OnAdd matches ALL → l1_keys >
+//     cluster_list-only baseline.
+//
+// This is the ONLY part of the bench-level "l1_keys > 19" assertion
+// that is testable at the unit level. The strict-N comparison against
+// production's actual 19 number is bench-only (assertion shape per
+// Trace v2 §6.2).
+func TestGVRDiscoveredIntegration_AdminPerBindingCellsExceedPreExistingClusterList(t *testing.T) {
+	gvr := schema.GroupVersionResource{
+		Group:    "composition.krateo.io",
+		Version:  "v1-2-2",
+		Resource: "githubscaffoldingwithcompositionpages-pm2-test",
+	}
+	ns := "bench-ns-pm2-test"
+	name := "bench-app-pm2-test-01"
+
+	deps := cache.Deps()
+	if deps == nil {
+		t.Skip("cache.Deps() returned nil — cache off in this test environment")
+	}
+
+	// Step 1: pre-fix baseline — only the cluster_list cell has an edge.
+	// Mirror the Trace v2 §1.3 empirical observation: the 19 events at
+	// l1_keys=19 propagate to the same 19 pre-existing apistage
+	// cluster_list cells.
+	clusterListCellKey := "apistage-cluster-list-pm2-test"
+	deps.RecordList(clusterListCellKey, gvr, "") // cluster-wide LIST
+
+	baseline := deps.OnAdd(gvr, ns, name)
+	if baseline < 1 {
+		t.Fatalf("baseline: expected cluster_list edge to match, got %d", baseline)
+	}
+
+	// Step 2: Fix v2 effect — the re-prewarm records edges for several
+	// per-binding admin cells (one per BindingUID-keyed cohort cell).
+	// Simulate by recording per-binding LIST edges keyed by distinct
+	// admin-piechart cells.
+	adminPerBindingCellKeys := []string{
+		"admin-piechart-binding-c189211163-pm2",
+		"admin-piechart-binding-c1893cb74e-pm2",
+		"admin-piechart-binding-c1894d2b9a-pm2",
+	}
+	for _, k := range adminPerBindingCellKeys {
+		deps.RecordList(k, gvr, ns) // namespaced LIST per cohort
+	}
+
+	// Install a counter to track WHICH cells are dirty-marked.
+	dirtyMarked := map[string]int{}
+	deps.SetRefreshHook(func(key string) {
+		dirtyMarked[key]++
+	})
+	defer deps.SetRefreshHook(nil)
+
+	// Step 3: OnAdd MUST match the cluster_list cell AND the 3
+	// per-binding admin cells. Strictly MORE than the cluster_list-only
+	// baseline.
+	post := deps.OnAdd(gvr, ns, name)
+	if post <= baseline {
+		t.Fatalf("Fix v2 falsifier FAIL: post-record OnAdd matches=%d, "+
+			"baseline (cluster_list only)=%d. Expected strictly greater — "+
+			"admin per-binding cells should now be dirty-marked too.",
+			post, baseline)
+	}
+	if post != baseline+len(adminPerBindingCellKeys) {
+		t.Fatalf("OnAdd matches=%d, want %d (baseline %d + %d per-binding cells)",
+			post, baseline+len(adminPerBindingCellKeys), baseline,
+			len(adminPerBindingCellKeys))
+	}
+
+	// Step 4: every per-binding cell MUST have been dirty-marked. The
+	// PM Change #2 secondary assertion: a subsequent admin /call would
+	// return HIT (not MISS) — at the unit level this maps to the
+	// refresher hook firing for the admin cell.
+	for _, k := range adminPerBindingCellKeys {
+		if dirtyMarked[k] != 1 {
+			t.Fatalf("admin per-binding cell %q dirty-mark count=%d, want 1 "+
+				"(refresher hook MUST fire once per matched cell)",
+				k, dirtyMarked[k])
+		}
+	}
+	if dirtyMarked[clusterListCellKey] != 1 {
+		t.Fatalf("cluster_list cell %q dirty-mark count=%d, want 1",
+			clusterListCellKey, dirtyMarked[clusterListCellKey])
+	}
+}
+
 // intToA renders an int 0..999 as a short string without importing
 // strconv (avoids unrelated coupling). Three-digit decimal.
 func intToA(i int) string {

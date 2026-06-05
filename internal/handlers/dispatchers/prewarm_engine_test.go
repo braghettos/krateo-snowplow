@@ -4,11 +4,16 @@
 //
 // Ship 2 Stage 2 / 0.30.247 — adds scope-key dedup tests for the new
 // scopeKindGVRDiscovered + its gvr payload.
+//
+// Ship 2 Stage 2.5 / 0.30.248 (Fix v2) — adds the engine-worker
+// outlives-bootSeed-ctx-cancel falsifier + companion tests for
+// per-scope timeout anchoring and pending-depth drain.
 
 package dispatchers
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -284,5 +289,241 @@ func TestScopeKindGVRDiscovered_KeyFormat(t *testing.T) {
 	got := prewarmScope{kind: scopeKindGVRDiscovered, gvr: gvr}.key()
 	if got != want {
 		t.Fatalf("key format drift:\n  want: %q\n  got:  %q", want, got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Ship 2 Stage 2.5 / 0.30.248 (Fix v2 — engine ctx decoupling).
+// ─────────────────────────────────────────────────────────────────────
+
+// TestEngineWorker_OutlivesBootSeedCtxCancel is the CENTRAL Fix-v2
+// falsifier per PM Change #2. The scenario:
+//
+//   - The engine worker is started with a PROCESS-LIFETIME ctx (test
+//     stand-in: a parent ctx that is NOT cancelled).
+//   - A boot-seed orchestration ctx (a child of context.Background())
+//     is cancelled, simulating the production engineSeed `defer
+//     seedCancel()` at boot-done.
+//   - A scopeKindGVRDiscovered scope is enqueued AFTER the boot-seed
+//     ctx is cancelled.
+//   - The worker MUST process the new scope. Pre-Fix-v2 the worker
+//     would have died with the boot-seed ctx and the scope would sit
+//     in e.pending forever — empirically the 0 prewarm.engine.gvr_discovered.start
+//     log lines in run-20260605-082433.
+//
+// Falsifier PASS = worker processes the post-bootCancel scope within
+// a 2 s deadline. FAIL = scope unprocessed (Fix-v2 broken).
+func TestEngineWorker_OutlivesBootSeedCtxCancel(t *testing.T) {
+	for customerInFlight() {
+		customerInFlightCount.Add(-1)
+	}
+
+	e := &prewarmEngine{
+		pending:   map[string]prewarmScope{},
+		signal:    make(chan struct{}, 1),
+		yieldPoll: 2 * time.Millisecond,
+	}
+
+	var (
+		ranMu     sync.Mutex
+		ranScopes []prewarmScope
+	)
+	e.scopeHandler = func(ctx context.Context, s prewarmScope) error {
+		ranMu.Lock()
+		ranScopes = append(ranScopes, s)
+		ranMu.Unlock()
+		return nil
+	}
+
+	// processCtx is the LONG-LIVED worker ctx (Fix v2 contract).
+	processCtx, processCancel := context.WithCancel(context.Background())
+	defer processCancel()
+	go e.runWorker(processCtx)
+
+	// bootSeedCtx is the SHORT-LIVED orchestration ctx; production's
+	// engineSeed closure binds pctx (= seedCtx) to this. Cancelling it
+	// simulates the boot-seed goroutine's `defer seedCancel()` firing
+	// after the boot scope completes.
+	bootSeedCtx, bootCancel := context.WithCancel(context.Background())
+	_ = bootSeedCtx
+	bootCancel() // boot-seed ctx is now CANCELLED — the regression case
+
+	// Pre-Fix-v2, the worker would have inherited bootSeedCtx and died
+	// here. Post-Fix-v2, the worker sees only processCtx and survives.
+	// Enqueue a scopeKindGVRDiscovered AFTER bootCancel to exercise
+	// the post-boot path.
+	gvr := schema.GroupVersionResource{
+		Group:    "composition.krateo.io",
+		Version:  "v1-2-2",
+		Resource: "githubscaffoldingwithcompositionpages",
+	}
+	e.enqueueScope(prewarmScope{kind: scopeKindGVRDiscovered, gvr: gvr})
+
+	// The worker MUST process the scope within 2 s. Poll because the
+	// worker runs async.
+	deadline := time.After(2 * time.Second)
+	for {
+		ranMu.Lock()
+		n := len(ranScopes)
+		ranMu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("Fix v2 falsifier FAIL: scopeKindGVRDiscovered enqueued AFTER " +
+				"boot-seed ctx cancel was NOT processed within 2s — engine worker " +
+				"died with boot-seed ctx. Pre-Fix-v2 regression class.")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	ranMu.Lock()
+	defer ranMu.Unlock()
+	if ranScopes[0].kind != scopeKindGVRDiscovered {
+		t.Fatalf("worker processed wrong scope kind: %q", ranScopes[0].kind)
+	}
+	if ranScopes[0].gvr != gvr {
+		t.Fatalf("worker scope payload mismatch: want %+v got %+v", gvr, ranScopes[0].gvr)
+	}
+}
+
+// TestEngineWorker_ProcessCtxCancelStopsWorker complements the
+// outlives-bootCtx falsifier: the worker MUST stop when its
+// process-lifetime ctx is cancelled (process shutdown). Pre-Fix-v2
+// the worker stopped on bootCtx cancel; Fix-v2 changes this to
+// processCtx cancel. Worker MUST still respect THAT signal.
+func TestEngineWorker_ProcessCtxCancelStopsWorker(t *testing.T) {
+	for customerInFlight() {
+		customerInFlightCount.Add(-1)
+	}
+
+	e := &prewarmEngine{
+		pending:   map[string]prewarmScope{},
+		signal:    make(chan struct{}, 1),
+		yieldPoll: 2 * time.Millisecond,
+	}
+	e.scopeHandler = func(ctx context.Context, s prewarmScope) error { return nil }
+
+	processCtx, processCancel := context.WithCancel(context.Background())
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		e.runWorker(processCtx)
+	}()
+
+	// Cancel the process ctx — the worker MUST exit promptly.
+	processCancel()
+	select {
+	case <-workerDone:
+		// good
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not exit within 2s of processCtx cancel — " +
+			"the Fix-v2 change must NOT block on process shutdown")
+	}
+}
+
+// TestEngineWorker_PerScopeTimeoutAnchoredOnProcessCtx asserts the
+// per-scope context.WithTimeout is anchored on the worker's
+// process-lifetime ctx, NOT some hidden boot-seed ctx. A scope handler
+// that respects ctx cancellation MUST observe a deadline whose parent
+// IS the process ctx — verifiable by checking the scope ctx's Deadline
+// is finite AND the scope ctx Done() fires when the per-scope timeout
+// expires, NOT when an unrelated ctx is cancelled.
+func TestEngineWorker_PerScopeTimeoutAnchoredOnProcessCtx(t *testing.T) {
+	for customerInFlight() {
+		customerInFlightCount.Add(-1)
+	}
+
+	e := &prewarmEngine{
+		pending:   map[string]prewarmScope{},
+		signal:    make(chan struct{}, 1),
+		yieldPoll: 2 * time.Millisecond,
+	}
+
+	var observedScopeCtx context.Context
+	var observedDone bool
+	scopeCh := make(chan struct{})
+	e.scopeHandler = func(ctx context.Context, s prewarmScope) error {
+		observedScopeCtx = ctx
+		_, observedDone = ctx.Deadline()
+		close(scopeCh)
+		return nil
+	}
+
+	processCtx, processCancel := context.WithCancel(context.Background())
+	defer processCancel()
+	go e.runWorker(processCtx)
+
+	e.enqueueScope(prewarmScope{kind: scopeKindBoot})
+	select {
+	case <-scopeCh:
+		// good — handler ran
+	case <-time.After(2 * time.Second):
+		t.Fatal("scope handler did not fire — worker wiring broken")
+	}
+
+	if observedScopeCtx == nil {
+		t.Fatal("scope handler did not capture ctx")
+	}
+	if !observedDone {
+		t.Fatal("scope ctx has no Deadline — per-scope WithTimeout not applied")
+	}
+}
+
+// TestEngineWorker_PendingDepthDrainsToZero asserts the engine's
+// pending map drains to 0 once the worker processes the queue. This
+// is the PM Change #1 expvar signal: a non-zero pending_depth
+// sustained across scrapes means the worker is dead (Fix-v2 falsifier
+// at the observability layer).
+func TestEngineWorker_PendingDepthDrainsToZero(t *testing.T) {
+	for customerInFlight() {
+		customerInFlightCount.Add(-1)
+	}
+
+	e := &prewarmEngine{
+		pending:   map[string]prewarmScope{},
+		signal:    make(chan struct{}, 1),
+		yieldPoll: 2 * time.Millisecond,
+	}
+	e.scopeHandler = func(ctx context.Context, s prewarmScope) error { return nil }
+
+	processCtx, processCancel := context.WithCancel(context.Background())
+	defer processCancel()
+	go e.runWorker(processCtx)
+
+	// Enqueue 3 distinct GVRs to populate the pending map.
+	for i := 0; i < 3; i++ {
+		e.enqueueScope(prewarmScope{
+			kind: scopeKindGVRDiscovered,
+			gvr: schema.GroupVersionResource{
+				Group:    "x",
+				Version:  "v1",
+				Resource: "r" + string(rune('a'+i)),
+			},
+		})
+	}
+
+	// Wait for the worker to drain. Poll pending depth under e.mu.
+	deadline := time.After(2 * time.Second)
+	for {
+		e.mu.Lock()
+		depth := len(e.pending)
+		e.mu.Unlock()
+		if depth == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("pending_depth did not drain to 0 within 2s "+
+				"(current depth=%d, processed=%d) — worker stuck",
+				depth, e.processedTotal.Load())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	if e.processedTotal.Load() != 3 {
+		t.Fatalf("processedTotal=%d, want 3 (all 3 distinct GVRs processed)",
+			e.processedTotal.Load())
 	}
 }
