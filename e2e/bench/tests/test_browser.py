@@ -814,45 +814,75 @@ def test_read_snowplow_expvar_int_rejects_bool_value(monkeypatch):
 
 
 def test_count_user_compositions_in_ns_returns_minus1_when_no_token():
-    """Missing token / empty ns → -1 sentinel (matches
-    verify_composition_count_api convention)."""
+    """Missing token → -1 sentinel (re-gate v3: ns argument no longer
+    in the URL, so empty ns is no longer rejected — caller may pass
+    "" as a label-only field).
+    """
     import bench.browser as browser_mod
     assert browser_mod.count_user_compositions_in_ns(
         "cyberjoker", None, "bench-ns-01") == -1
-    assert browser_mod.count_user_compositions_in_ns(
-        "cyberjoker", "tok", "") == -1
 
 
-def test_count_user_compositions_in_ns_returns_items_len_on_200(monkeypatch):
-    """200 + {"items": [...]} → len(items)."""
+def test_count_user_compositions_in_ns_uses_piechart_widget_url(monkeypatch):
+    """Re-gate v3 (2026-06-05): Probe B calls the piechart-widget
+    endpoint `resource=piecharts&name=dashboard-compositions-panel-
+    row-piechart` (NOT the raw composition GVR list which lacks
+    `name=` and returns 400). The shape mirrors
+    verify_composition_count_api so both probes share the same
+    /call path the dashboard piechart already uses.
+
+    Asserts:
+      1. URL includes `name=dashboard-compositions-panel-row-piechart`.
+      2. URL includes `resource=piecharts`.
+      3. URL does NOT include the raw composition GVR (no
+         resource=githubscaffoldingwithcompositionpages).
+      4. Returns int(title) parsed from
+         body.status.widgetData.title (piechart contract).
+    """
     import bench.browser as browser_mod
-    from bench import cluster as cluster_mod
 
     captured = {}
 
     def _fake_http_get_json(path, token, **kw):
         captured["path"] = path
         captured["token"] = token
-        return (0, 200, {"items": [{"name": "a"}, {"name": "b"},
-                                   {"name": "c"}]})
+        return (0, 200, {
+            "status": {"widgetData": {"title": "999"}},
+        })
 
     monkeypatch.setattr(browser_mod, "http_get_json", _fake_http_get_json)
-    monkeypatch.setattr(cluster_mod, "call_url",
-                        lambda ns: f"/call?ns={ns}")
     out = browser_mod.count_user_compositions_in_ns(
         "cyberjoker", "tok", "bench-ns-01")
-    assert out == 3
+    assert out == 999
     assert captured["token"] == "tok"
-    assert "bench-ns-01" in captured["path"]
+    # Falsifier #1: the piechart widget name MUST be in the URL.
+    assert "name=dashboard-compositions-panel-row-piechart" \
+        in captured["path"], \
+        f"Probe B URL must hit the piechart RESTAction by name; " \
+        f"got: {captured['path']!r}"
+    # Falsifier #2: resource is piecharts (widget endpoint), NOT the
+    # raw composition GVR which would 400.
+    assert "resource=piecharts" in captured["path"]
+    assert "githubscaffoldingwithcompositionpages" not in captured["path"]
 
 
 def test_count_user_compositions_in_ns_returns_minus1_on_non200(monkeypatch):
     """Non-200 response → -1 sentinel (poll continues)."""
     import bench.browser as browser_mod
-    from bench import cluster as cluster_mod
     monkeypatch.setattr(browser_mod, "http_get_json",
                         lambda path, token, **kw: (0, 401, {}))
-    monkeypatch.setattr(cluster_mod, "call_url", lambda ns: "/call")
+    assert browser_mod.count_user_compositions_in_ns(
+        "cyberjoker", "tok", "bench-ns-01") == -1
+
+
+def test_count_user_compositions_in_ns_returns_minus1_on_missing_title(
+        monkeypatch):
+    """200 but body lacks status.widgetData.title → -1 (caller falls
+    back / poll continues). Guards against snowplow shape changes.
+    """
+    import bench.browser as browser_mod
+    monkeypatch.setattr(browser_mod, "http_get_json",
+                        lambda path, token, **kw: (0, 200, {"status": {}}))
     assert browser_mod.count_user_compositions_in_ns(
         "cyberjoker", "tok", "bench-ns-01") == -1
 

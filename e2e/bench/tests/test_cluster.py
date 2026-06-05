@@ -808,7 +808,12 @@ def test_k8s_create_namespaced_role_returns_diag_on_attribute_error(
     # AttributeError. Re-gate v1 swallowed this as a generic False;
     # re-gate v2 must surface it in the diag.
     class _FakeBrokenClientMod:
-        # NO V1Role attribute — simulates the V1Subject scenario.
+        # NO V1Role / NO V1PolicyRule — simulates SDK-drift scenarios.
+        # Re-gate v3: production constructs V1PolicyRule before V1Role
+        # (the list comprehension on rules runs first), so the missing
+        # symbol surfaced first is V1PolicyRule. Assertion below
+        # tolerates either symbol-name as long as the AttributeError
+        # surfaces in the diag.
         class exceptions:
             class ApiException(Exception):
                 def __init__(self, status=None):
@@ -827,7 +832,10 @@ def test_k8s_create_namespaced_role_returns_diag_on_attribute_error(
     assert ok is False
     assert "AttributeError" in diag, \
         f"diag must surface AttributeError, got: {diag!r}"
-    assert "V1Role" in diag, \
+    # The diag must reference at least one of the missing symbols
+    # production references on _k8s_client_mod. Accept either V1Role
+    # or V1PolicyRule (order of construction may surface either first).
+    assert ("V1Role" in diag) or ("V1PolicyRule" in diag), \
         f"diag must mention the missing symbol, got: {diag!r}"
 
 
@@ -993,3 +1001,176 @@ def test_k8s_can_i_create_rolebinding_returns_unavailable_when_init_fails(
         "bench-ns-01")
     assert allowed is False
     assert "rbac_precheck_unavailable" in diag
+
+
+# ─── Task #250 Block 2b re-gate v3 — multi-rule k8s_create_namespaced_role ──
+#
+# The S8 stage runner grants cj TWO PolicyRules: composition CR
+# get/list + widget GVR get/list (panels/markdowns/buttons). Closes
+# #186 Option (a) per Diego 2026-06-05.
+
+
+def test_k8s_create_namespaced_role_constructs_one_PolicyRule_per_tuple(
+        reset_k8s_state, monkeypatch):
+    """The new `rules` kwarg accepts a list of (api_groups, resources,
+    verbs) tuples; each tuple becomes ONE V1PolicyRule. Asserts the
+    fan-out wires through correctly — no fan-in collapsing, no
+    out-of-order field swapping.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    captured = {}
+
+    class _FakeRbacAPI:
+        def create_namespaced_role(self, namespace, body, _request_timeout):
+            captured["namespace"] = namespace
+            captured["body"] = body
+
+    class _FakeV1Role:
+        def __init__(self, metadata=None, rules=None):
+            self.metadata = metadata
+            self.rules = rules
+
+    class _FakeV1ObjectMeta:
+        def __init__(self, name=None):
+            self.name = name
+
+    class _FakeV1PolicyRule:
+        def __init__(self, api_groups=None, resources=None, verbs=None):
+            self.api_groups = api_groups
+            self.resources = resources
+            self.verbs = verbs
+
+    class _FakeClientMod:
+        V1Role = _FakeV1Role
+        V1ObjectMeta = _FakeV1ObjectMeta
+        V1PolicyRule = _FakeV1PolicyRule
+
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+
+    # Mirror the S8 runner's two-rule grant.
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role",
+        rules=[
+            (["composition.krateo.io"], ["*"], ["get", "list"]),
+            (["widgets.templates.krateo.io"],
+             ["panels", "markdowns", "buttons"],
+             ["get", "list"]),
+        ],
+    )
+    assert ok is True
+    assert diag == ""
+    body = captured["body"]
+    assert body.metadata.name == "test-role"
+    assert len(body.rules) == 2
+    # Rule 0: composition GVR.
+    r0 = body.rules[0]
+    assert r0.api_groups == ["composition.krateo.io"]
+    assert r0.resources == ["*"]
+    assert r0.verbs == ["get", "list"]
+    # Rule 1: widget GVR — empirically verified group string
+    # `widgets.templates.krateo.io` (kubectl api-resources 2026-06-05).
+    r1 = body.rules[1]
+    assert r1.api_groups == ["widgets.templates.krateo.io"]
+    assert r1.resources == ["panels", "markdowns", "buttons"]
+    assert r1.verbs == ["get", "list"]
+
+
+def test_k8s_create_namespaced_role_legacy_kwargs_still_work(
+        reset_k8s_state, monkeypatch):
+    """Backward-compat: callers passing legacy single-rule kwargs
+    (api_groups=, resources=, verbs=) MUST still work. Re-gate v3
+    preserves the pre-v3 single-rule shape so prior tests + callers
+    don't break.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    captured = {}
+
+    class _FakeRbacAPI:
+        def create_namespaced_role(self, namespace, body, _request_timeout):
+            captured["body"] = body
+
+    class _FakeClientMod:
+        V1Role = type("V1Role", (), {
+            "__init__": lambda s, metadata=None, rules=None: setattr(
+                s, "rules", rules) or setattr(s, "metadata", metadata)})
+        V1ObjectMeta = type("V1ObjectMeta", (),
+                            {"__init__": lambda s, **kw: None})
+        V1PolicyRule = type("V1PolicyRule", (), {
+            "__init__": lambda s, api_groups=None, resources=None,
+            verbs=None: (setattr(s, "api_groups", api_groups),
+                         setattr(s, "resources", resources),
+                         setattr(s, "verbs", verbs)) and None})
+
+        class exceptions:
+            class ApiException(Exception):
+                def __init__(self, status=None):
+                    self.status = status
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    cluster_mod._k8s_rbac = _FakeRbacAPI()
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role",
+        api_groups=["composition.krateo.io"],
+        resources=["*"],
+        verbs=["get", "list"],
+    )
+    assert ok is True
+    body = captured["body"]
+    assert len(body.rules) == 1
+    assert body.rules[0].api_groups == ["composition.krateo.io"]
+
+
+def test_k8s_create_namespaced_role_rejects_empty_rules_list(
+        reset_k8s_state, monkeypatch):
+    """Passing `rules=[]` must surface a clean diagnostic, not create
+    an empty-rules (no-op) Role.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role", rules=[])
+    assert ok is False
+    assert "rules must be a non-empty list" in diag
+
+
+def test_k8s_create_namespaced_role_rejects_malformed_rule_tuple(
+        reset_k8s_state, monkeypatch):
+    """A rule that isn't a 3-tuple must produce a clean diagnostic,
+    not an AttributeError downstream.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+    ok, diag = cluster_mod.k8s_create_namespaced_role(
+        "bench-ns-01", "test-role",
+        rules=[(["x"], ["y"])])  # only 2 elements
+    assert ok is False
+    assert "rule #0 must be a 3-tuple" in diag
+
+
+def test_k8s_create_namespaced_role_rejects_no_args():
+    """Calling without rules OR legacy kwargs is a programmer error —
+    produces a clean diagnostic.
+    """
+    from bench import cluster as cluster_mod
+    # Stub the init check by patching _k8s_init to True; the function
+    # must catch the no-args case BEFORE attempting any client call.
+    import unittest.mock as mock
+    with mock.patch.object(cluster_mod, "_k8s_init", return_value=True):
+        ok, diag = cluster_mod.k8s_create_namespaced_role(
+            "bench-ns-01", "test-role")
+    assert ok is False
+    assert "must pass either" in diag

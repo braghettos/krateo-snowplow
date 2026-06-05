@@ -1021,15 +1021,31 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
                 "__passed__": False,
             }
 
-        # 1. Create the Role with chart-default shape (composition
-        # GET/LIST on all resources in the api group).
+        # 1. Create the Role with TWO PolicyRules (re-gate v3 / Diego
+        # ratified 2026-06-05, closes #186 Option (a)):
+        #   - composition.krateo.io/*: get,list — the composition CRs
+        #     cj's datagrid iterates.
+        #   - widgets.templates.krateo.io: panels,markdowns,buttons:
+        #     get,list — the per-card widget RESTActions the datagrid
+        #     fans out to (task-215 trace: 4 widget GVRs per card on
+        #     the compositions-page datagrid).
+        # The TWO-RULE shape lets cj's S8 Compositions page actually
+        # RENDER cards (not just transit /call), so the call-count
+        # gate observes the real datagrid fan-out signal.
+        # GVR group string empirically verified against the live
+        # cluster 2026-06-05 via
+        # `kubectl api-resources --api-group=widgets.templates.krateo.io`.
         role_name = f"bench-{subject_user}-{target_ns}-comp-reader"
         rb_name = f"bench-{subject_user}-{target_ns}-comp-reader-binding"
         role_ok, role_diag = cluster.k8s_create_namespaced_role(
             target_ns, role_name,
-            api_groups=["composition.krateo.io"],
-            resources=["*"],
-            verbs=["get", "list"],
+            rules=[
+                (["composition.krateo.io"], ["*"],
+                 ["get", "list"]),
+                (["widgets.templates.krateo.io"],
+                 ["panels", "markdowns", "buttons"],
+                 ["get", "list"]),
+            ],
         )
         rb_ok, rb_diag = cluster.k8s_create_namespaced_role_binding(
             target_ns, rb_name,

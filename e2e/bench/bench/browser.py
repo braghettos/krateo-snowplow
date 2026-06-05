@@ -296,47 +296,65 @@ def read_snowplow_expvar_int(key, *, base_url=None, timeout=10):
 
 
 def count_user_compositions_in_ns(user, token, ns):
-    """Count compositions VISIBLE to `user` in namespace `ns` via /call.
+    """Count compositions VISIBLE to `user` via the piechart widget API.
 
     Probe B in the Phase 6 S8/S9 two-probe inner gate. Hits the same
-    /call path the browser nav uses; isolates 'snowplow's evaluator
+    `/call?resource=piecharts&name=dashboard-compositions-panel-row-piechart`
+    path the dashboard piechart uses; isolates 'snowplow's evaluator
     serves the right narrowed view' from 'snowplow's RBAC snapshot was
     rebuilt' (Probe A reads the expvar).
+
+    Re-gate v3 (2026-06-05): renamed mechanism. The pre-v3 implementation
+    hit `cluster.call_url(ns)` which constructs a /call URL WITHOUT a
+    `name=` parameter. Snowplow's /call requires `name=` for composition
+    GVR reads (TRACED: HTTP 400 "missing 'name' query parameter" for
+    both admin AND cj at the diag capture
+    `/tmp/diag-cj-rbac-probe-2026-06-05.log`). The -1 sentinel masked
+    the URL bug, NOT RBAC.
+
+    The piechart-widget endpoint returns `status.widgetData.title` as
+    the user-narrowed composition count (UAF per JWT). Symmetric
+    admin/cj: admin gets cluster-wide total; cj gets the sum across
+    granted namespaces. For the bench's single-ns-grant pattern this
+    equals comps_in_ns; for multi-ns grants it sums.
+
+    The `ns` argument is retained for API stability + log correlation
+    but is NOT threaded into the URL — the piechart RESTAction does
+    its own RBAC narrowing per token. Callers may still pass it for
+    diagnostic record-keeping.
 
     Args:
         user:  subject string (metadata only — token carries identity).
         token: bearer JWT for the user.
-        ns:    namespace to scope the count to.
+        ns:    namespace label (NOT used in URL — see above).
 
     Returns:
         int count on success, -1 on any failure path. Mirrors the
         verify_composition_count_api convention so the caller can poll
         with the same sentinel semantics.
     """
-    if not token or not ns:
+    if not token:
         return -1
     try:
-        # Reuse the composition GVR via cluster.call_url() so the URL
-        # shape stays in one place. cluster.call_url(ns, name=None)
-        # already returns the namespace-scoped LIST shape used by the
-        # /compositions browser nav.
-        from bench.cluster import call_url as _call_url  # type: ignore
-        path = _call_url(ns)
-        _ms, code, body = http_get_json(path, token)
-        if code != 200:
+        # Re-gate v3: the piechart-widget URL — empirically verified
+        # 2026-06-05 against gke_neon-481711:
+        #   admin token → HTTP 200, title='48999' (cluster-wide).
+        #   cj token (no grant) → HTTP 200, title='0' (RBAC-narrowed).
+        # Identical shape to verify_composition_count_api(token) below;
+        # the two paths share the same RESTAction.
+        _ms, code, body = http_get_json(
+            '/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1'
+            '&resource=piecharts'
+            '&name=dashboard-compositions-panel-row-piechart'
+            '&namespace=krateo-system',
+            token,
+        )
+        if code != 200 or not isinstance(body, dict):
             return -1
-        if not isinstance(body, dict):
+        title = (body.get("status") or {}).get("widgetData", {}).get("title")
+        if title is None:
             return -1
-        items = body.get("items")
-        if isinstance(items, list):
-            return len(items)
-        # Some /call shapes wrap the array under .status / .spec depending
-        # on the resolver path. Fall back to the top-level "list" key.
-        for candidate in ("list", "data"):
-            v = body.get(candidate)
-            if isinstance(v, list):
-                return len(v)
-        return -1
+        return int(title)
     except Exception:
         return -1
 

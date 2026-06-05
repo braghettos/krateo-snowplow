@@ -274,45 +274,74 @@ def k8s_delete_rolebinding(ns, name):
 # per-user /call view). All callers MUST own RBAC layout choices in the
 # stage runner; this layer only mediates the apiserver call.
 
-def k8s_create_namespaced_role(ns, name, api_groups, resources, verbs):
-    """Create a namespaced Role with a SINGLE PolicyRule.
+def k8s_create_namespaced_role(ns, name, rules=None, *,
+                               api_groups=None, resources=None,
+                               verbs=None):
+    """Create a namespaced Role with ONE OR MORE PolicyRules.
 
-    Idempotent on AlreadyExists (HTTP 409 → True). The Role shape matches
-    the portal chart's `devs-create-get-list-any-...` Role pattern: one
-    rule per `(api_groups, resources, verbs)` triplet.
+    Idempotent on AlreadyExists (HTTP 409 → True).
 
     Args:
-        ns:         namespace to create the Role in (str).
-        name:       Role metadata.name (str).
-        api_groups: list[str] — e.g. ["composition.krateo.io"].
-        resources:  list[str] — e.g. ["*"].
-        verbs:      list[str] — e.g. ["get", "list"].
+        ns:    namespace to create the Role in (str).
+        name:  Role metadata.name (str).
+        rules: list of (api_groups, resources, verbs) tuples — each
+               triplet becomes one V1PolicyRule. PREFERRED shape.
+        api_groups / resources / verbs (DEPRECATED keyword): legacy
+            single-rule kwargs. When `rules` is None, the function
+            falls back to constructing a single-rule list from these.
+            Kept for callers that pass exactly one rule. New callers
+            MUST pass `rules` (a list).
 
     Returns:
         (ok, diag) — ok=True on success or AlreadyExists; ok=False with
-        a descriptive `diag` string on any failure path (client unavailable,
-        ApiException, AttributeError on SDK-symbol drift, ...). Stage
-        proofs surface `diag` verbatim so SDK / RBAC drift is
-        diagnosable from the proof body alone.
+        a descriptive `diag` string on any failure path (client
+        unavailable, ApiException, AttributeError on SDK-symbol drift,
+        ...). Stage proofs surface `diag` verbatim.
 
-    Re-gate v2 hardening (Task #250 Block 2b re-gate v2 / 2026-06-05):
-    return shape changed `bool → (bool, str)` so the empirical
-    `AttributeError: V1Subject not in kubernetes.client` failure mode is
-    captured in the proof body (was silently swallowed under
-    `except ApiException` only). All callers (phases.py S8 runner +
-    tests) updated in the same commit.
+    Multi-rule shape (Task #250 Block 2b re-gate v3 / 2026-06-05):
+    Phase 6 S8 grants cj BOTH composition GET/LIST and widget GVR
+    GET/LIST (panels/markdowns/buttons) so the compositions-page
+    datagrid renders cards (closes #186 Option (a) per Diego's
+    ratification 2026-06-05). Parametric per
+    feedback_no_special_cases — callers own the rule list, this
+    helper just plumbs to V1PolicyRule.
     """
     if not _k8s_init():
         return False, ("rbac_create_failed: k8s client unavailable "
                        "(_k8s_init returned False)")
+    # Normalize rules input.
+    if rules is None:
+        # Legacy single-rule kwargs path. Reject empty/missing args to
+        # surface a callsite bug rather than create an empty-rules Role.
+        if api_groups is None and resources is None and verbs is None:
+            return False, ("rbac_create_failed: must pass either `rules` "
+                           "or legacy api_groups+resources+verbs kwargs")
+        rules = [(list(api_groups or []), list(resources or []),
+                  list(verbs or []))]
+    else:
+        # Validate the list-of-triplets shape eagerly so a callsite bug
+        # produces a clean diagnostic, not a downstream AttributeError.
+        if not isinstance(rules, (list, tuple)) or len(rules) == 0:
+            return False, (f"rbac_create_failed: rules must be a non-empty "
+                           f"list; got {type(rules).__name__}")
+        for i, rule in enumerate(rules):
+            if not (isinstance(rule, (list, tuple)) and len(rule) == 3):
+                return False, (f"rbac_create_failed: rule #{i} must be a "
+                               f"3-tuple (api_groups, resources, verbs); "
+                               f"got {type(rule).__name__} of len "
+                               f"{len(rule) if hasattr(rule, '__len__') else '?'}")
     try:
+        policy_rules = [
+            _k8s_client_mod.V1PolicyRule(
+                api_groups=list(ag),
+                resources=list(res),
+                verbs=list(vs),
+            )
+            for (ag, res, vs) in rules
+        ]
         body = _k8s_client_mod.V1Role(
             metadata=_k8s_client_mod.V1ObjectMeta(name=name),
-            rules=[_k8s_client_mod.V1PolicyRule(
-                api_groups=list(api_groups),
-                resources=list(resources),
-                verbs=list(verbs),
-            )],
+            rules=policy_rules,
         )
         _k8s_rbac.create_namespaced_role(
             namespace=ns, body=body, _request_timeout=30)
