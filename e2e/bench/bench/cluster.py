@@ -686,6 +686,94 @@ def count_bench_ns():
                 if "bench-ns-" in line and "Terminating" not in line])
 
 
+# ── Compositions-page panel widgets (Task #250 Block 2b / re-gate fix) ────
+#
+# Empirical ground-truth (kubectl probe 2026-06-05 on
+# gke_neon-481711_us-central1-a_cluster-1 at 48,999 compositions):
+#   - `panels.widgets.templates.krateo.io` cluster-wide: 17,654
+#   - filtered by label `krateo.io/portal-page=compositions`: 4,423
+#   - the SAME label-filtered set drives the
+#     `compositions-page-datagrid` (TRACED at
+#     `kubectl get datagrids.widgets.templates.krateo.io
+#     compositions-page-datagrid -n krateo-system -o yaml`:
+#     `resourcesRefsTemplate.iterator: ${.compositionspanels}` from
+#     RESTAction `compositions-panels` which lists panels filtered by
+#     `(.metadata.labels // {})["krateo.io/portal-page"] == "compositions"`).
+#   - per-ns count varies: bench-ns-01 has 143 comp-panels for 999 comps
+#     (ratio 0.14 — controller-dynamic catches up partially).
+#
+# Why this is the right `n_visible` source for the Task #250 N-aware
+# EXPECTED_CALLS formula:
+#   - The /compositions datagrid's per-card fan-out (10 + 4×min(N,5))
+#     is driven by the COMP-PANELS list returned by `compositions-panels`,
+#     NOT the raw compositions LIST. A composition without a corresponding
+#     comp-panel does NOT appear as a card on the datagrid → no per-card
+#     widget calls.
+#   - At small N (S4 with 20 compositions just deployed), the
+#     controller-dynamic has materialized only a handful of comp-panels in
+#     the measurement window. Empirical S4 = 14 = 10+4×1 maps to "1 card
+#     visible" → 1 comp-panel materialized at measure time.
+#   - At large N (S6 with 50K compositions), > per_page=5 comp-panels
+#     exist → the datagrid caps the visible cards at 5 → 30 calls.
+#
+# Caller MUST scope appropriately to user RBAC:
+#   - admin: target_ns=None → cluster-wide count (UAF returns all panels).
+#   - cyberjoker: target_ns=<granted-ns> → narrowed count (UAF returns
+#     only panels in granted namespaces).
+
+COMP_PANEL_GROUP = "widgets.templates.krateo.io"
+COMP_PANEL_VERSION = "v1beta1"
+COMP_PANEL_RESOURCE = "panels"
+COMP_PANEL_LABEL_SELECTOR = "krateo.io/portal-page=compositions"
+
+
+def count_compositions_with_panels_ready(target_ns=None):
+    """Count `panels.widgets.templates.krateo.io` carrying the
+    `krateo.io/portal-page=compositions` label.
+
+    This is the per-ns / cluster-wide count of compositions that have
+    materialized their compositions-page panel widget — i.e. compositions
+    visible on the /compositions datagrid. Used as `n_visible` in the
+    Task #250 N-aware EXPECTED_CALLS formula.
+
+    Args:
+        target_ns: when None, count cluster-wide (admin path); when a
+            string, count only in that namespace (cyberjoker / narrowed
+            RBAC path).
+
+    Returns:
+        int count on success.
+        None on transport / client failure (caller falls back to BASE
+        expected via `expected_calls(..., n_visible=None)`).
+    """
+    if not _k8s_init():
+        return None
+    try:
+        if target_ns:
+            resp = _k8s_custom.list_namespaced_custom_object(
+                group=COMP_PANEL_GROUP,
+                version=COMP_PANEL_VERSION,
+                namespace=target_ns,
+                plural=COMP_PANEL_RESOURCE,
+                label_selector=COMP_PANEL_LABEL_SELECTOR,
+                _request_timeout=300,
+            )
+        else:
+            resp = _k8s_custom.list_cluster_custom_object(
+                group=COMP_PANEL_GROUP,
+                version=COMP_PANEL_VERSION,
+                plural=COMP_PANEL_RESOURCE,
+                label_selector=COMP_PANEL_LABEL_SELECTOR,
+                _request_timeout=300,
+            )
+    except Exception as e:
+        if _k8s_is_404(e):
+            return 0
+        return None
+    items = resp.get("items", []) if isinstance(resp, dict) else []
+    return len(items)
+
+
 def list_composition_names():
     """Return a set of "ns/name" strings for all compositions in the
     cluster via kubectl. Returns None on failure (so callers can
@@ -921,7 +1009,13 @@ __all__ = [
     "count_compositions",
     "count_compositions_in_ns",
     "count_bench_ns",
+    "count_compositions_with_panels_ready",
     "list_composition_names",
+    # Task #250 Block 2b — compositions-page panel widget probe constants
+    "COMP_PANEL_GROUP",
+    "COMP_PANEL_VERSION",
+    "COMP_PANEL_RESOURCE",
+    "COMP_PANEL_LABEL_SELECTOR",
     # Composition + namespace ops
     "deploy_compositiondefinition",
     "composition_yaml",

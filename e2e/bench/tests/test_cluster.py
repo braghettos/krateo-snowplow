@@ -544,3 +544,173 @@ def test_k8s_create_helpers_never_touch_real_cluster_when_lib_unavailable(
         "ns", "name", role_ref=("Role", "r"), subjects=[]) is False
     assert cluster_mod.k8s_read_namespaced_role_binding(
         "ns", "name") is None
+
+
+# ─── Task #250 Block 2b re-gate fix — count_compositions_with_panels_ready ──
+
+
+def test_count_comp_panels_returns_none_when_init_fails(
+        reset_k8s_state, monkeypatch):
+    """When `_k8s_init` returns False, the helper returns None so the
+    caller falls back to BASE expected (does NOT crash, does NOT hit a
+    real cluster).
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", False)
+    cluster_mod.K8S_CLIENT_AVAILABLE = False
+    assert cluster_mod.count_compositions_with_panels_ready(
+        target_ns=None) is None
+    assert cluster_mod.count_compositions_with_panels_ready(
+        target_ns="bench-ns-01") is None
+
+
+def test_count_comp_panels_cluster_wide_uses_list_cluster_custom_object(
+        reset_k8s_state, monkeypatch):
+    """target_ns=None → list_cluster_custom_object with the comp-panel
+    label_selector. Asserts the GVR + label match the empirical
+    ground-truth (probed against gke_neon-481711 at 2026-06-05).
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    captured = {}
+
+    class _FakeCustom:
+        def list_cluster_custom_object(self, group, version, plural,
+                                       label_selector, _request_timeout):
+            captured["group"] = group
+            captured["version"] = version
+            captured["plural"] = plural
+            captured["label_selector"] = label_selector
+            return {"items": [{"i": i} for i in range(4423)]}
+
+        def list_namespaced_custom_object(self, **kw):
+            raise AssertionError(
+                "list_namespaced_custom_object called when target_ns=None")
+
+    cluster_mod._k8s_custom = _FakeCustom()
+    out = cluster_mod.count_compositions_with_panels_ready(target_ns=None)
+    assert out == 4423
+    # Empirical GVR + label match Task #250 design + 2026-06-05 probe.
+    assert captured["group"] == "widgets.templates.krateo.io"
+    assert captured["version"] == "v1beta1"
+    assert captured["plural"] == "panels"
+    assert captured["label_selector"] == "krateo.io/portal-page=compositions"
+
+
+def test_count_comp_panels_namespaced_uses_list_namespaced_custom_object(
+        reset_k8s_state, monkeypatch):
+    """target_ns="bench-ns-01" → list_namespaced_custom_object with same
+    label_selector + namespace. cyberjoker S8 case.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    captured = {}
+
+    class _FakeCustom:
+        def list_namespaced_custom_object(self, group, version, namespace,
+                                          plural, label_selector,
+                                          _request_timeout):
+            captured["group"] = group
+            captured["version"] = version
+            captured["namespace"] = namespace
+            captured["plural"] = plural
+            captured["label_selector"] = label_selector
+            # Empirical 2026-06-05 probe: bench-ns-01 had 143 comp-panels.
+            return {"items": [{"i": i} for i in range(143)]}
+
+        def list_cluster_custom_object(self, **kw):
+            raise AssertionError(
+                "list_cluster_custom_object called when target_ns is set")
+
+    cluster_mod._k8s_custom = _FakeCustom()
+    out = cluster_mod.count_compositions_with_panels_ready(
+        target_ns="bench-ns-01")
+    assert out == 143
+    assert captured["namespace"] == "bench-ns-01"
+    assert captured["plural"] == "panels"
+    assert captured["label_selector"] == "krateo.io/portal-page=compositions"
+
+
+def test_count_comp_panels_returns_zero_on_404(
+        reset_k8s_state, monkeypatch):
+    """A 404 NotFound (panel CRD not installed) → 0 (not None). Caller
+    treats 0 as 'cluster has no comp-panels' which collapses the
+    formula to BASE.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    class _FakeAPIException(Exception):
+        def __init__(self, status):
+            self.status = status
+
+    class _FakeClientMod:
+        class exceptions:
+            ApiException = _FakeAPIException
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+
+    class _FakeCustom:
+        def list_cluster_custom_object(self, group, version, plural,
+                                       label_selector, _request_timeout):
+            raise _FakeAPIException(status=404)
+
+    cluster_mod._k8s_custom = _FakeCustom()
+    out = cluster_mod.count_compositions_with_panels_ready(target_ns=None)
+    assert out == 0
+
+
+def test_count_comp_panels_returns_none_on_transport_failure(
+        reset_k8s_state, monkeypatch):
+    """Non-404 exception (transport / 5xx) → None so caller falls back
+    to BASE. Mirrors the convention of all other k8s_* helpers in this
+    module.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    cluster_mod.K8S_CLIENT_AVAILABLE = True
+
+    class _FakeAPIException(Exception):
+        def __init__(self, status):
+            self.status = status
+
+    class _FakeClientMod:
+        class exceptions:
+            ApiException = _FakeAPIException
+
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+
+    class _FakeCustom:
+        def list_cluster_custom_object(self, group, version, plural,
+                                       label_selector, _request_timeout):
+            raise _FakeAPIException(status=503)
+
+    cluster_mod._k8s_custom = _FakeCustom()
+    out = cluster_mod.count_compositions_with_panels_ready(target_ns=None)
+    assert out is None
+
+
+def test_count_comp_panels_never_touches_subprocess(
+        reset_k8s_state, monkeypatch):
+    """Tripwire: the k8s-client path NEVER escapes to subprocess.run.
+    Mirrors the contract for create/read primitives.
+    """
+    cluster_mod = reset_k8s_state
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", False)
+    cluster_mod.K8S_CLIENT_AVAILABLE = False
+
+    def _tripwire(*a, **kw):
+        raise AssertionError(
+            "count_compositions_with_panels_ready escaped to "
+            "subprocess.run — hermetic-isolation contract violated")
+
+    monkeypatch.setattr(subprocess, "run", _tripwire)
+    assert cluster_mod.count_compositions_with_panels_ready(
+        target_ns=None) is None
+    assert cluster_mod.count_compositions_with_panels_ready(
+        target_ns="bench-ns-01") is None

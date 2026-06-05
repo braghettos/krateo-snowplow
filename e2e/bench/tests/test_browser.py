@@ -47,17 +47,31 @@ from bench.browser import (
 # ─── helpers ────────────────────────────────────────────────────────────────
 
 
-def _patch_cluster_count(monkeypatch, comp_count=0, ns_count=0):
+def _patch_cluster_count(monkeypatch, comp_count=0, ns_count=0,
+                         panel_count=None):
     """Wire the deferred cluster.* probes used by browser_measure_stage.
 
     The browser module's _count_compositions / _count_bench_ns /
     _list_composition_names defer to bench.cluster.* via a lazy import
     inside the helper. We patch the wrapper, not bench.cluster, so the
     test never reaches the real kubectl path.
+
+    Task #250 Block 2b: _validate_widget_terminal_state now also calls
+    `_user_visible_composition_count` which in turn imports
+    `bench.cluster.count_compositions_with_panels_ready`. Patch the
+    cluster module entry so the new admin/cj path stays hermetic.
+    `panel_count` defaults to None (the helper returns None → BASE
+    expected fallback, matching pre-Block-2b behaviour for tests that
+    don't care about the new gate).
     """
     monkeypatch.setattr(browser_mod, "_count_compositions", lambda: comp_count)
     monkeypatch.setattr(browser_mod, "_count_bench_ns", lambda: ns_count)
     monkeypatch.setattr(browser_mod, "_list_composition_names", lambda: set())
+    # Hermetic isolation: prevent _user_visible_composition_count from
+    # escaping to a real apiserver via the new cluster.* probe.
+    from bench import cluster as _cluster_mod
+    monkeypatch.setattr(_cluster_mod, "count_compositions_with_panels_ready",
+                        lambda target_ns=None: panel_count)
 
 
 # ─── Case 1: ConvergenceTimeout via pytest.raises (acceptance (h)) ──────────
@@ -854,20 +868,69 @@ def test_user_visible_composition_count_returns_none_for_non_compositions(
     assert out is None
 
 
-def test_user_visible_composition_count_admin_uses_cluster_count(monkeypatch):
-    """admin path goes through cluster.count_compositions() — cluster-truth."""
+def test_user_visible_composition_count_admin_uses_panel_count(monkeypatch):
+    """admin path goes through cluster.count_compositions_with_panels_ready
+    (Task #250 Block 2b re-gate fix 2026-06-05). The empirical source
+    for n_visible on /compositions is the COMP-PANEL count, not the
+    raw composition CR count — comp-panels are what the /compositions
+    datagrid iterates over (TRACED via the compositions-panels
+    RESTAction at krateo-system). Hermetic isolation: monkeypatch the
+    cluster.* helper so this test NEVER hits a real apiserver.
+    """
     import bench.browser as browser_mod
     from bench import cluster as cluster_mod
-    monkeypatch.setattr(cluster_mod, "count_compositions", lambda: 49999)
+    monkeypatch.setattr(cluster_mod, "count_compositions_with_panels_ready",
+                        lambda target_ns=None: 4423)
     out = browser_mod._user_visible_composition_count(
         "admin", "/compositions", token=None)
-    assert out == 49999
+    assert out == 4423
 
 
-def test_user_visible_composition_count_non_admin_uses_piechart_api(monkeypatch):
-    """Non-admin path goes through verify_composition_count_api — the
-    user-narrowed total. -1 / None from the API maps to None (fall
-    back to BASE).
+def test_user_visible_composition_count_admin_returns_none_on_transport_fail(
+        monkeypatch):
+    """Transport failure inside count_compositions_with_panels_ready →
+    None at this layer → expected_calls falls back to BASE."""
+    import bench.browser as browser_mod
+    from bench import cluster as cluster_mod
+
+    def _raise(target_ns=None):
+        raise RuntimeError("apiserver unreachable")
+
+    monkeypatch.setattr(cluster_mod, "count_compositions_with_panels_ready",
+                        _raise)
+    out = browser_mod._user_visible_composition_count(
+        "admin", "/compositions", token=None)
+    assert out is None
+
+
+def test_user_visible_composition_count_non_admin_with_target_ns(monkeypatch):
+    """Non-admin path WITH target_ns goes through
+    count_compositions_with_panels_ready(target_ns=...) — admin and
+    narrow-RBAC users use the SAME mechanism for /compositions.
+    """
+    import bench.browser as browser_mod
+    from bench import cluster as cluster_mod
+
+    captured = {}
+
+    def _fake_count(target_ns=None):
+        captured["target_ns"] = target_ns
+        return 143  # bench-ns-01 comp-panel count from 2026-06-05 probe
+
+    monkeypatch.setattr(cluster_mod, "count_compositions_with_panels_ready",
+                        _fake_count)
+    out = browser_mod._user_visible_composition_count(
+        "cyberjoker", "/compositions", token="tok",
+        target_ns="bench-ns-01")
+    assert out == 143
+    assert captured["target_ns"] == "bench-ns-01"
+
+
+def test_user_visible_composition_count_non_admin_falls_back_to_piechart(
+        monkeypatch):
+    """Non-admin WITHOUT target_ns falls back to
+    verify_composition_count_api (pre-Block-2b shape; still correct
+    for cj at S1-S7 where no grant means piechart=0 → BASE).
     """
     import bench.browser as browser_mod
     monkeypatch.setattr(browser_mod, "verify_composition_count_api",
@@ -883,7 +946,8 @@ def test_user_visible_composition_count_non_admin_uses_piechart_api(monkeypatch)
 
 
 def test_user_visible_composition_count_non_admin_without_token(monkeypatch):
-    """Non-admin without token → None (legacy BASE behaviour)."""
+    """Non-admin without token AND without target_ns → None (legacy
+    BASE behaviour preserved)."""
     import bench.browser as browser_mod
     assert browser_mod._user_visible_composition_count(
         "cyberjoker", "/compositions", token=None) is None

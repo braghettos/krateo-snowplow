@@ -161,34 +161,77 @@ def _expected_calls_lookup(user, page_path, *, n_visible=None):
     return expected_calls(user, page_path, n_visible=n_visible)
 
 
-def _user_visible_composition_count(user, page_path, token=None):
+def _user_visible_composition_count(user, page_path, token=None,
+                                    target_ns=None):
     """Return the per-user count of compositions VISIBLE on `page_path`.
 
     Used by the EXPECTED_CALLS gate at `_validate_widget_terminal_state`
     to thread the right `n_visible` argument into the N-aware
-    expected_calls() formula:
-      - admin sees the cluster-wide composition count (full RBAC).
-      - cyberjoker sees the narrow RBAC-scoped count (the piechart count
-        served by the dashboard-compositions-panel-row-piechart widget,
-        which is identical to what cj's datagrid will iterate over).
+    expected_calls() formula.
 
-    Returns None for pages that are not the Compositions page or when no
-    per-user count source applies; callers treat None as 'no narrowing —
-    use BASE expected'.
+    Empirical source (Task #250 Block 2b re-gate fix 2026-06-05):
+    the right shape for `n_visible` is the count of
+    `panels.widgets.templates.krateo.io` filtered by
+    `krateo.io/portal-page=compositions` — these are the comp-panels
+    that DRIVE the /compositions datagrid (TRACED via the
+    `compositions-panels` RESTAction at krateo-system, which filters
+    panels by that label and yields the datagrid's iterator). NOT the
+    raw composition CRs:
+      - At small N (S4 with 20 comps just deployed) only a handful of
+        comp-panels have materialized (controller-dynamic race),
+        explaining empirical actual=14 = 10+4×1.
+      - At large N (S6 with 50K comps) > per_page=5 comp-panels exist
+        → datagrid caps at 5 → actual=30 = 10+4×5.
 
-    The implementation is symmetric between users: both branches use a
-    server-side count, NOT a hardcoded user identity. For admin the
-    server-side count is cluster.count_compositions(); for cj it is the
-    piechart-widget API which returns the cj-narrowed total. Adding a
-    new user requires no change here.
+    Per-user RBAC narrowing:
+      - admin: target_ns=None → cluster-wide comp-panel count.
+      - cyberjoker (and any future Group-scoped user): target_ns is
+        the granted namespace → only comp-panels in that ns appear
+        (UAF on the panels resource).
+
+    Returns None for pages that are not the Compositions page or when
+    no per-user count source applies; callers treat None as 'no
+    narrowing — use BASE expected'.
+
+    Args:
+        user:      subject identity ("admin", "cyberjoker", ...).
+        page_path: page URL path; only "/compositions" is currently
+                   formula-relevant.
+        token:     unused at this layer for the comp-panel mechanism
+                   (the k8s client uses the bench's own kubeconfig
+                   identity, not the per-subject JWT). Kept for the
+                   piechart fallback path and future symmetry.
+        target_ns: for narrow-RBAC users, the namespace the user is
+                   granted access to. When None for admin → cluster-
+                   wide; when set for non-admin → ns-scoped count.
     """
     if page_path != "/compositions":
         return None
     if user == "admin":
-        return _count_compositions()
-    # Non-admin path: use the piechart-widget API which reports the
-    # user-narrowed composition total. Returns -1 on failure; map that
-    # to None so the caller falls back to BASE.
+        # Cluster-wide comp-panel count. Returns None on transport
+        # failure → falls back to BASE expected.
+        try:
+            from bench.cluster import (  # type: ignore
+                count_compositions_with_panels_ready)
+            return count_compositions_with_panels_ready(target_ns=None)
+        except Exception:
+            return None
+    # Non-admin path:
+    #   - If caller passed target_ns (Phase 6 S8/S9 context), count
+    #     comp-panels in that ns directly — this is the post-Block-2b
+    #     shape that aligns with the cluster-wide path for admin.
+    #   - Otherwise fall back to the piechart-widget API (composition
+    #     CR count) — pre-Block-2b shape; still useful for callers
+    #     outside the S8/S9 stage runners (e.g. ad-hoc /compositions
+    #     navs in storm scenarios).
+    if target_ns:
+        try:
+            from bench.cluster import (  # type: ignore
+                count_compositions_with_panels_ready)
+            return count_compositions_with_panels_ready(
+                target_ns=target_ns)
+        except Exception:
+            return None
     if not token:
         return None
     try:
