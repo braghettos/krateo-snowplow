@@ -785,6 +785,15 @@ func main() {
 	// observability (the architect's audit confirmed the wrappers WERE
 	// firing; the counter simply wasn't reachable). One-liner alongside
 	// the existing pprof registrations.
+	//
+	// Ship 0.30.249 / Task #250 Block 2a — register
+	// snowplow_rbac_publish_seq (RBAC snapshot publish-sequence counter)
+	// here BEFORE the mux mount accepts scrapes. Unconditionally wired
+	// (cache mode-agnostic) so the Phase 6 #250 bench S8/S9 inner gate
+	// can poll the value under both CACHE_ENABLED=true and =false;
+	// under cache-off the value remains 0 and the bench's
+	// _wait_rbac_propagation_to_snowplow times out as expected.
+	cache.RegisterRBACSnapshotExpvar()
 	mux.Handle("GET /debug/vars", expvar.Handler())
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
