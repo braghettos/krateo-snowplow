@@ -1003,11 +1003,13 @@ def test_k8s_can_i_create_rolebinding_returns_unavailable_when_init_fails(
     assert "rbac_precheck_unavailable" in diag
 
 
-# ─── Task #250 Block 2b re-gate v3 — multi-rule k8s_create_namespaced_role ──
+# ─── Task #250 Block 2b re-gate v3+v4 — multi-rule k8s_create_namespaced_role
 #
 # The S8 stage runner grants cj TWO PolicyRules: composition CR
-# get/list + widget GVR get/list (panels/markdowns/buttons). Closes
-# #186 Option (a) per Diego 2026-06-05.
+# get/list + widget GVR get/list (panels/markdowns/buttons/tablists).
+# Closes #186 Option (a) per Diego 2026-06-05; tablists added in
+# re-gate v4 per architect trace 2026-06-08 (Panel.spec.resourcesRefs[3]
+# is tablists/GET, NOT a second Button as task-215 doc claimed).
 
 
 def test_k8s_create_namespaced_role_constructs_one_PolicyRule_per_tuple(
@@ -1015,7 +1017,8 @@ def test_k8s_create_namespaced_role_constructs_one_PolicyRule_per_tuple(
     """The new `rules` kwarg accepts a list of (api_groups, resources,
     verbs) tuples; each tuple becomes ONE V1PolicyRule. Asserts the
     fan-out wires through correctly — no fan-in collapsing, no
-    out-of-order field swapping.
+    out-of-order field swapping. Mirrors the S8 runner's POST-v4
+    grant (4 widget resources including tablists).
     """
     cluster_mod = reset_k8s_state
     monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
@@ -1056,13 +1059,13 @@ def test_k8s_create_namespaced_role_constructs_one_PolicyRule_per_tuple(
     monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
     cluster_mod._k8s_rbac = _FakeRbacAPI()
 
-    # Mirror the S8 runner's two-rule grant.
+    # Mirror the S8 runner's two-rule grant (post-v4: includes tablists).
     ok, diag = cluster_mod.k8s_create_namespaced_role(
         "bench-ns-01", "test-role",
         rules=[
             (["composition.krateo.io"], ["*"], ["get", "list"]),
             (["widgets.templates.krateo.io"],
-             ["panels", "markdowns", "buttons"],
+             ["panels", "markdowns", "buttons", "tablists"],
              ["get", "list"]),
         ],
     )
@@ -1078,9 +1081,11 @@ def test_k8s_create_namespaced_role_constructs_one_PolicyRule_per_tuple(
     assert r0.verbs == ["get", "list"]
     # Rule 1: widget GVR — empirically verified group string
     # `widgets.templates.krateo.io` (kubectl api-resources 2026-06-05).
+    # Includes tablists per re-gate v4 (architect trace 2026-06-08:
+    # Panel.spec.resourcesRefs[3] is tablists/GET).
     r1 = body.rules[1]
     assert r1.api_groups == ["widgets.templates.krateo.io"]
-    assert r1.resources == ["panels", "markdowns", "buttons"]
+    assert r1.resources == ["panels", "markdowns", "buttons", "tablists"]
     assert r1.verbs == ["get", "list"]
 
 

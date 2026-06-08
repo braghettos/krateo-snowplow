@@ -910,7 +910,7 @@ def _wait_rbac_propagation_to_snowplow(ctx: StageContext,
                                        subject_user: str,
                                        target_ns: str,
                                        expected_visible: int,
-                                       timeout_secs: int = 30
+                                       timeout_secs: int = 180
                                        ) -> tuple[bool, int, dict]:
     """Wait for BOTH probes to agree before declaring RBAC propagation.
 
@@ -930,6 +930,15 @@ def _wait_rbac_propagation_to_snowplow(ctx: StageContext,
     means snapshot rebuilt but evaluator returned the wrong view
     (#149-class regression); Probe A fail means no informer event
     observed OR rebuild stalled.
+
+    Timeout (re-gate v4 / 2026-06-08): bumped 30s → 180s. Tester
+    evidence showed the RB-add cold path needs > 30s for the
+    /compositions view to reach the user; the prior 30s budget
+    surfaced a Probe B miss (uvc=0 at +30s) while the actual browser
+    nav observed convergence at ~260s (api=999, ui=999, converged in
+    23.5s). The mechanism IS propagating — the 30s budget was too
+    tight. 180s leaves 6x headroom over the empirical 30s mid-band
+    and covers cache-OFF S9 (~30s) plus jitter.
 
     Returns:
         (ok, elapsed_ms, diag) — diag captures pre/post seq + final n.
@@ -1022,13 +1031,24 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
             }
 
         # 1. Create the Role with TWO PolicyRules (re-gate v3 / Diego
-        # ratified 2026-06-05, closes #186 Option (a)):
+        # ratified 2026-06-05, closes #186 Option (a); re-gate v4
+        # 2026-06-08 adds tablists per architect trace):
         #   - composition.krateo.io/*: get,list — the composition CRs
         #     cj's datagrid iterates.
-        #   - widgets.templates.krateo.io: panels,markdowns,buttons:
-        #     get,list — the per-card widget RESTActions the datagrid
-        #     fans out to (task-215 trace: 4 widget GVRs per card on
-        #     the compositions-page datagrid).
+        #   - widgets.templates.krateo.io: panels, markdowns, buttons,
+        #     TABLISTS — the per-card widget RESTActions the datagrid
+        #     fans out to. tablists is the 4th widget per card (the
+        #     click-nav target — Panel.spec.resourcesRefs[3] has
+        #     id=composition-tablist). task-215's trace doc was wrong
+        #     about this being "2nd Button"; live `kubectl get panels
+        #     ... -o jsonpath={.spec.resourcesRefs}` against bench-ns-01
+        #     on 2026-06-08 confirms the four resources are:
+        #       [markdowns/GET, buttons/DELETE, buttons/PATCH,
+        #        tablists/GET].
+        #     `kubectl auth can-i list tablists -n bench-ns-01
+        #      --as=cyberjoker --as-group=devs` → "no" pre-fix; this
+        #     was the 403 producing `cj_widget_error_count = 15`
+        #     (5 cards × 1 tablist 403 × 3 navs) in the prior tester run.
         # The TWO-RULE shape lets cj's S8 Compositions page actually
         # RENDER cards (not just transit /call), so the call-count
         # gate observes the real datagrid fan-out signal.
@@ -1042,8 +1062,12 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
             rules=[
                 (["composition.krateo.io"], ["*"],
                  ["get", "list"]),
+                # tablists is the 4th widget per card (the click-nav
+                # target); task-215 doc had this wrong as "2nd Button"
+                # but Panel.spec.resourcesRefs[3] is the tablist
+                # (TRACED 2026-06-08 live cluster).
                 (["widgets.templates.krateo.io"],
-                 ["panels", "markdowns", "buttons"],
+                 ["panels", "markdowns", "buttons", "tablists"],
                  ["get", "list"]),
             ],
         )
@@ -1075,10 +1099,15 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
 
         # 2. Two-probe inner gate (mechanism + UX). cj's visible count
         # should rise from 0 (pre-mutation) to comps_in_ns.
+        # Timeout 180s (re-gate v4 / 2026-06-08): tester evidence
+        # showed the RB-add cold path needs > 30s for Probe B to
+        # observe the cj view; prior 30s budget was too tight while
+        # the real browser nav saw convergence ~260s later. 180s
+        # leaves 6x headroom over the empirical mid-band.
         prop_ok, prop_ms, prop_diag = _wait_rbac_propagation_to_snowplow(
             c, subject_user, target_ns,
             expected_visible=comps_in_ns,
-            timeout_secs=30,
+            timeout_secs=180,
         )
 
         # 3. Browser measurement (cj's /compositions cell should now
@@ -1174,11 +1203,15 @@ def stage_s9_remove_rb_from_populated_ns(ctx: StageContext) -> StageProof:
             }
 
         # 2. Wait for revocation propagation. expected_visible=0 means
-        # the user's narrowed view drops back to empty.
+        # the user's narrowed view drops back to empty. Timeout 180s
+        # for symmetry with S8 (re-gate v4); revocation is typically
+        # faster (cache-ON ~6.5s, cache-OFF ~30s) but the symmetric
+        # budget absorbs jitter without over-provisioning the bench
+        # wall-clock.
         prop_ok, prop_ms, prop_diag = _wait_rbac_propagation_to_snowplow(
             c, subject_user, target_ns,
             expected_visible=0,
-            timeout_secs=30,
+            timeout_secs=180,
         )
 
         # 3. Cleanup the Role (test hygiene — not a gate assertion).
