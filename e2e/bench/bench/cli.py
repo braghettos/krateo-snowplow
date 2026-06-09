@@ -590,13 +590,43 @@ def _default_run_dir(args) -> Path:
     return Path("/tmp/snowplow-runs") / tag / f"run-{ts}"
 
 
+_RUN_LOCK_PATH = "/tmp/snowplow-bench.lock"
+
+
+def _acquire_run_lock():
+    """Acquire an exclusive filesystem lock so two `phase6` invocations
+    cannot mutate the same cluster concurrently.
+
+    Returns the open file handle (keep it alive for the run duration). On
+    contention, prints the PID stored in the lockfile and raises RuntimeError.
+    """
+    import fcntl
+    fh = open(_RUN_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.seek(0)
+        existing = fh.read().strip() or "unknown"
+        fh.close()
+        raise RuntimeError(
+            f"another bench phase6 is already running (lock={_RUN_LOCK_PATH}, "
+            f"pid={existing})"
+        )
+    fh.seek(0)
+    fh.truncate(0)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
 def cmd_phase6(args) -> int:
     """Run Phase 6 with --from-stage / --to-stage / --video / --scale.
 
     On ConvergenceTimeout (raised by any stage runner after persisting
     state.json), exits 4. On other failures, exits 1. On stale overlay
     (>14d, no --allow-stale-overlay), exits 2 with stderr pointing to
-    `python -m bench calibrate`.
+    `python -m bench calibrate`. On lock contention (another phase6 already
+    running on this host), exits 5.
     """
     from bench import phases, browser
     tag = (getattr(args, "tag", None) or
@@ -619,11 +649,18 @@ def cmd_phase6(args) -> int:
         )
         return 2
 
+    try:
+        lock_fh = _acquire_run_lock()
+    except RuntimeError as e:
+        sys.stderr.write(f"{RED}{BOLD}phase6: {e}{RESET}\n")
+        return 5
+
     run_dir_arg = getattr(args, "run_dir", None)
     run_dir = Path(run_dir_arg) if run_dir_arg else _default_run_dir(args)
 
     section(f"phase6 — {tag} scale={scale} from={from_stage} to={to_stage}")
     log(f"run_dir={run_dir}")
+    log(f"run_lock pid={os.getpid()} path={_RUN_LOCK_PATH}")
     try:
         phases.run_phase6(
             tag, scale,
@@ -643,6 +680,11 @@ def cmd_phase6(args) -> int:
         sys.stderr.write(
             f"{RED}{BOLD}phase6 FAILED: {type(e).__name__}: {e}{RESET}\n")
         return 1
+    finally:
+        try:
+            lock_fh.close()
+        except Exception:
+            pass
 
 
 def cmd_phase7(args) -> int:

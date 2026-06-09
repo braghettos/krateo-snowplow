@@ -273,6 +273,40 @@ def test_cmd_phase6_exits_2_on_incompatible_state_schema(tmp_path, monkeypatch):
     assert rc == 2
 
 
+# ─── phase6 run-lock prevents concurrent invocations ───────────────────────
+
+
+def test_cmd_phase6_returns_5_when_lock_already_held(tmp_path, monkeypatch, capsys):
+    """When another phase6 holds /tmp/snowplow-bench.lock, cmd_phase6 exits 5
+    and names the holding PID in stderr. Prevents the cluster-contamination
+    failure mode observed 2026-06-09 (two concurrent bench instances stomped
+    each other's S5/S6)."""
+    import fcntl
+    lock_path = tmp_path / "snowplow-bench.lock"
+    monkeypatch.setattr(cli_mod, "_RUN_LOCK_PATH", str(lock_path))
+    # Hold the lock from a separate fd to simulate the prior bench instance.
+    holder = open(lock_path, "a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    holder.write("99999")
+    holder.flush()
+    try:
+        args = argparse.Namespace(
+            tag="0.30.232", scale=5000,
+            from_stage=None, to_stage="S0",
+            cache_mode="ON", video="none",
+            run_dir=str(tmp_path / "run"),
+            allow_stale_overlay=True,
+        )
+        rc = cli_mod.cmd_phase6(args)
+        assert rc == 5
+        err = capsys.readouterr().err
+        assert "already running" in err
+        assert "99999" in err
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+
+
 # ─── cmd_measure refuses lifecycle stages ──────────────────────────────────
 
 
