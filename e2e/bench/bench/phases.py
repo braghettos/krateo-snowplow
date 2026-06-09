@@ -72,6 +72,47 @@ SCHEMA_MAJOR = 1
 # `major > SCHEMA_MAJOR` continues to allow 1.0.0 → 1.1.0 forward.
 
 
+# S8 Role rules — re-gated through Task #262 (architect doc
+# `docs/task-262-s8-cj-tablist-trace-2026-06-09.md`). v5 / 2026-06-09:
+# adds `templates.krateo.io: restactions` to the prior v4 rules.
+#
+# Why this matters (TRACED in §3.3 of the architect doc): cj's S8
+# Panel-widget render fans out to `panel.spec.apiRef` →
+# `templates.krateo.io: restactions: <…-composition-values>`. Pre-v5,
+# the bench Role granted compositions + the four widget kinds but NOT
+# restactions. Snowplow's `objects.Get(panel.spec.apiRef)` ran under
+# cj's bearer and the apiserver returned a real 403, which then
+# round-tripped through `apiref.Resolve` and surfaced on the SPA wire
+# as `cj_widget_error_count = 15` (5 cards × 1 panel × 3 navs) —
+# matching the proofs/S8.json defect signature exactly.
+#
+# The v5 rule grants cj the minimum apiRef-resolution permission a
+# real customer portal Role would carry. The tablists grant from v4
+# stays in place (cj still needs it for click-nav even though task #262
+# proved it was NOT the cause of the render-time 15-error symptom).
+#
+# Production-realistic shape: every rule in this tuple is what a
+# narrow-RBAC end user (devs group) would get from the portal's
+# composition-reader ClusterRole template, modulo namespace scope.
+# Format: (api_groups, resources, verbs) — exactly what
+# cluster.k8s_create_namespaced_role consumes.
+S8_ROLE_RULES = [
+    (["composition.krateo.io"], ["*"], ["get", "list"]),
+    # The four widget kinds the per-card Panel fans out to.
+    # tablists is the 4th widget per card (click-nav target); see
+    # `Panel.spec.resourcesRefs[3]` live verification 2026-06-08.
+    (["widgets.templates.krateo.io"],
+     ["panels", "markdowns", "buttons", "tablists"],
+     ["get", "list"]),
+    # Task #262 / 2026-06-09: panel.spec.apiRef → restactions.
+    # Without this, widgets.Resolve fails on objects.Get(apiRef) →
+    # apiserver 403 → apiref boundary returns wrapped StatusError →
+    # SPA renders .ant-result-error per card. 5 cards × 3 navs =
+    # 15 errors at S8 (proofs/S8.json signature).
+    (["templates.krateo.io"], ["restactions"], ["get", "list"]),
+]
+
+
 class IncompatibleStateSchema(Exception):
     """Raised when state.json carries a future-major schema version."""
 
@@ -1297,46 +1338,27 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
                 "__passed__": False,
             }
 
-        # 1. Create the Role with TWO PolicyRules (re-gate v3 / Diego
-        # ratified 2026-06-05, closes #186 Option (a); re-gate v4
-        # 2026-06-08 adds tablists per architect trace):
-        #   - composition.krateo.io/*: get,list — the composition CRs
-        #     cj's datagrid iterates.
-        #   - widgets.templates.krateo.io: panels, markdowns, buttons,
-        #     TABLISTS — the per-card widget RESTActions the datagrid
-        #     fans out to. tablists is the 4th widget per card (the
-        #     click-nav target — Panel.spec.resourcesRefs[3] has
-        #     id=composition-tablist). task-215's trace doc was wrong
-        #     about this being "2nd Button"; live `kubectl get panels
-        #     ... -o jsonpath={.spec.resourcesRefs}` against bench-ns-01
-        #     on 2026-06-08 confirms the four resources are:
-        #       [markdowns/GET, buttons/DELETE, buttons/PATCH,
-        #        tablists/GET].
-        #     `kubectl auth can-i list tablists -n bench-ns-01
-        #      --as=cyberjoker --as-group=devs` → "no" pre-fix; this
-        #     was the 403 producing `cj_widget_error_count = 15`
-        #     (5 cards × 1 tablist 403 × 3 navs) in the prior tester run.
-        # The TWO-RULE shape lets cj's S8 Compositions page actually
-        # RENDER cards (not just transit /call), so the call-count
-        # gate observes the real datagrid fan-out signal.
-        # GVR group string empirically verified against the live
-        # cluster 2026-06-05 via
-        # `kubectl api-resources --api-group=widgets.templates.krateo.io`.
+        # 1. Create the Role using the module-level S8_ROLE_RULES
+        # constant (see top-of-module definition). v5 / 2026-06-09
+        # adds the `templates.krateo.io: restactions` rule per
+        # architect trace task-262 (closes Task #272). The full
+        # provenance / rationale block lives next to the constant
+        # so it stays close to the rule data the bench actually
+        # writes to the apiserver.
+        #
+        # Re-gate history (kept here for log-search across stages):
+        #   - v3 / 2026-06-05 (Diego, #186 Option (a)) — composition
+        #     + 3 widget kinds.
+        #   - v4 / 2026-06-08 — adds tablists per task-215 design.
+        #   - v5 / 2026-06-09 — adds restactions per task-262 trace
+        #     (the actual S8 cj_widget_error_count=15 cause).
+        # GVR group strings empirically verified against the live
+        # cluster via `kubectl api-resources --api-group=…`.
         role_name = f"bench-{subject_user}-{target_ns}-comp-reader"
         rb_name = f"bench-{subject_user}-{target_ns}-comp-reader-binding"
         role_ok, role_diag = cluster.k8s_create_namespaced_role(
             target_ns, role_name,
-            rules=[
-                (["composition.krateo.io"], ["*"],
-                 ["get", "list"]),
-                # tablists is the 4th widget per card (the click-nav
-                # target); task-215 doc had this wrong as "2nd Button"
-                # but Panel.spec.resourcesRefs[3] is the tablist
-                # (TRACED 2026-06-08 live cluster).
-                (["widgets.templates.krateo.io"],
-                 ["panels", "markdowns", "buttons", "tablists"],
-                 ["get", "list"]),
-            ],
+            rules=S8_ROLE_RULES,
         )
         rb_ok, rb_diag = cluster.k8s_create_namespaced_role_binding(
             target_ns, rb_name,

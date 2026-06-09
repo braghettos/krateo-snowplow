@@ -3,7 +3,9 @@ package apiref
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
@@ -27,7 +29,45 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 
 	res := objects.Get(ctx, opts.ApiRef)
 	if res.Err != nil {
-		return map[string]any{}, fmt.Errorf("%s", res.Err.Message)
+		// Task #272 / 0.30.251 — error-type preservation. Pre-fix,
+		// the apiref boundary stripped the upstream apiserver status
+		// code with `fmt.Errorf("%s", res.Err.Message)`. The downstream
+		// dispatcher's `errors.As(err, *apierrors.StatusError)` check
+		// (widgets.go:228-234) then failed and ALL apiRef-resolve
+		// errors landed in `response.InternalError` → HTTP 500,
+		// regardless of the apiserver's actual response code.
+		//
+		// Architect trace task-262-s8-cj-tablist-trace-2026-06-09.md
+		// §3.3 documents the symptom: a cj `restactions:get` 403 from
+		// the apiserver became an HTTP 500 on the SPA wire, so the
+		// frontend could not distinguish "you lack permission" from
+		// "snowplow exploded" and rendered .ant-result-error.
+		//
+		// Fix: reconstruct an `*apierrors.StatusError` from the code
+		// already preserved in `res.Err` (objects.Get's apiserver
+		// branch faithfully sets res.Err.Code per apierrors.IsForbidden
+		// / IsNotFound — see internal/objects/get.go:209-214), then
+		// wrap with `%w` so the dispatcher can recover the code via
+		// errors.As. The wrapped chain also preserves the upstream
+		// message + adds a `apiref resolve <group>/<resource>/<name>`
+		// context prefix for log-side observability.
+		statusErr := statusErrorFromResponse(res.Err, opts.ApiRef)
+		wrapped := fmt.Errorf("apiref resolve %s/%s/%s: %w",
+			res.GVR.Group, res.GVR.Resource, opts.ApiRef.Name, statusErr)
+		// Falsifier slog WARN: the runtime artifact tester / observer
+		// uses to verify the StatusError chain is preserved. Single
+		// emission per apiref error — no per-request fan-out.
+		if log := xcontext.Logger(ctx); log != nil {
+			log.Warn("apiref.resolve.error_preserved",
+				slog.Int("upstream_code", res.Err.Code),
+				slog.String("upstream_reason", string(res.Err.Reason)),
+				slog.String("gvr_group", res.GVR.Group),
+				slog.String("gvr_resource", res.GVR.Resource),
+				slog.String("name", opts.ApiRef.Name),
+				slog.String("namespace", opts.ApiRef.Namespace),
+			)
+		}
+		return map[string]any{}, wrapped
 	}
 
 	ra, err := convertToRESTAction(res.Unstructured.Object)

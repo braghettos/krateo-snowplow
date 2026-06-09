@@ -289,6 +289,85 @@ def test_schema_version_is_frozen_at_1_1_0():
     assert phases.SCHEMA_MAJOR == 1
 
 
+# ─── S8 Role rules freeze (Task #262 / #272) ────────────────────────────────
+
+
+def test_s8_role_rules_grants_restactions_get_list():
+    """Task #262 / 2026-06-09 v5 re-gate regression guard.
+
+    The S8 cj_widget_error_count = 15 defect (architect doc
+    docs/task-262-s8-cj-tablist-trace-2026-06-09.md) was caused by a
+    missing `templates.krateo.io: restactions` rule in the bench S8
+    Role: cj's per-card Panel `spec.apiRef` resolution fell through to
+    the apiserver which returned 403, and the apiref boundary
+    surfaced that as `.ant-result-error` on the SPA (5 cards × 3
+    navs = 15 errors).
+
+    This test pins the v5 rule in place. If anyone strips it again
+    the gate fails BEFORE the bench runs Phase 6, surfacing the
+    regression at near-zero cost.
+
+    Rule shape matches what cluster.k8s_create_namespaced_role
+    accepts: (api_groups, resources, verbs).
+    """
+    assert hasattr(phases, "S8_ROLE_RULES"), (
+        "phases.S8_ROLE_RULES must be a module-level constant so the "
+        "bench Role rules are testable without spinning up Phase 6"
+    )
+    rules = phases.S8_ROLE_RULES
+
+    # The restactions rule MUST be present — pre-v5 it was missing.
+    target = (["templates.krateo.io"], ["restactions"], ["get", "list"])
+    assert target in rules, (
+        f"S8_ROLE_RULES missing the templates.krateo.io:restactions grant. "
+        f"This is the Task #262 v5 re-gate fix; removing it re-introduces "
+        f"the cj_widget_error_count=15 defect at S8.\n"
+        f"Current rules: {rules}"
+    )
+
+
+def test_s8_role_rules_keeps_v4_grants_intact():
+    """v5 is additive over v4 — composition + the four widget kinds
+    (incl. tablists) MUST still be present so click-nav + datagrid
+    fan-out work as designed."""
+    rules = phases.S8_ROLE_RULES
+
+    # v3 grant (composition CRs cj's datagrid iterates).
+    assert (["composition.krateo.io"], ["*"], ["get", "list"]) in rules
+
+    # v4 grant (the four widget kinds — panels, markdowns, buttons,
+    # tablists). Same shape the prior re-gates use.
+    widget_rule = (
+        ["widgets.templates.krateo.io"],
+        ["panels", "markdowns", "buttons", "tablists"],
+        ["get", "list"],
+    )
+    assert widget_rule in rules
+
+
+def test_s8_role_rules_shape_is_cluster_helper_compatible():
+    """Every S8_ROLE_RULES entry must be a (groups, resources, verbs)
+    3-tuple of list[str] so cluster.k8s_create_namespaced_role can
+    consume it verbatim. Guards against a future refactor accidentally
+    introducing a dict / object shape that the helper would not
+    recognise."""
+    for entry in phases.S8_ROLE_RULES:
+        assert isinstance(entry, tuple), \
+            f"S8 role rule entry not a tuple: {entry!r}"
+        assert len(entry) == 3, \
+            f"S8 role rule entry must be (groups, resources, verbs): {entry!r}"
+        groups, resources, verbs = entry
+        assert isinstance(groups, list) and all(
+            isinstance(g, str) for g in groups), \
+            f"S8 role rule groups must be list[str]: {groups!r}"
+        assert isinstance(resources, list) and all(
+            isinstance(r, str) for r in resources), \
+            f"S8 role rule resources must be list[str]: {resources!r}"
+        assert isinstance(verbs, list) and all(
+            isinstance(v, str) for v in verbs), \
+            f"S8 role rule verbs must be list[str]: {verbs!r}"
+
+
 # ─── G6 wiring fix: _setup_users honours ctx.video ─────────────────────────
 
 
