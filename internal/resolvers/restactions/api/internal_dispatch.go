@@ -1,4 +1,39 @@
-// internal_dispatch.go — 0.30.104 Phase-1 TLS-CA fix.
+// internal_dispatch.go — 0.30.104 Phase-1 TLS-CA fix +
+// 0.30.250 Task #268 paged-LIST fix.
+//
+// 0.30.250 Task #268 — paged LIST in the internal-REST-config dispatcher.
+//
+//   Symptom (TRACED 2026-06-09 — docs/task-267-s6-admin-2-widget-silent-skip-trace-2026-06-09.md):
+//   under bench S6 admin Dashboard the 2 compositions-panel widgets
+//   (`dashboard-compositions-panel-row-piechart` and `-table`) stayed in
+//   `isLoading` indefinitely. Pod logs: `nri.List(ctx, metav1.ListOptions{})`
+//   at the load-bearing site below issued an UNPAGINATED cluster-wide LIST
+//   of 50K composition CRs, which took 2.9-162 s per /call. Browser nav
+//   cadence (~5 s) cancelled the in-flight body read; client-go returned
+//   `context canceled`; the dispatcher returned HTTP 500; React Query kept
+//   the widget skeleton visible while retrying.
+//
+//   The fix wraps the LIST call in a continue-token paged walk mirroring
+//   the prior art at internal/cache/streaming_list.go (the streaming
+//   ListWatch used by the informer factory since R4/H2a). Per-page
+//   limit = listPageLimit (500) — matches every other LIST in snowplow
+//   and client-go's defaultPageSize. The walk accumulates items into a
+//   single *unstructured.UnstructuredList; the served bytes go through
+//   the SAME `list.UnstructuredContent()` marshal as the pre-0.30.250
+//   path so JQ downstream is byte-equivalent
+//   (feedback_cache_must_not_constrain_jq.md).
+//
+//   Behaviour-neutral for the no-internal-config branch (still served by
+//   plumbing's httpcall.Do unchanged) AND for GET-by-name (the `if name
+//   != ""` branch is untouched — pager.go's "1 page short-circuit"
+//   semantics are already covered by a non-paged Get).
+//
+//   A WARN-level slog event `internal_dispatch.paged_list.completed` is
+//   emitted once per LIST that ran the paged loop, carrying gvr / pages /
+//   items / page_limit / total_ms — the falsifier event required by
+//   feedback_falsifier_first_before_ship.md.
+//
+// 0.30.104 Phase-1 TLS-CA fix (unchanged):
 //
 // THE BUG (0.30.103 flag-ON re-bench, reproduced on every boot):
 //
@@ -72,15 +107,35 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
+
+// internalDispatchListPageLimit is the per-page limit for the paged
+// LIST in dispatchViaInternalRESTConfig. 500 matches client-go's
+// defaultPageSize AND snowplow's global informer-LIST limit
+// (internal/cache/watcher.go:24-28, `listPageLimit`). Centralised so
+// the falsifier test pins the value and a future bench-driven retune
+// is a single-site change.
+//
+// Task #268 / 0.30.250 — picked from the architect's recommendation
+// (docs/task-267-s6-admin-2-widget-silent-skip-trace-2026-06-09.md
+// §10): at 50K compositions / ~500 items per page → ~100 round-trips
+// of ~50-100 ms each → total wall-clock ~8 s (bounded, no `context
+// canceled` body-read failure mode). The bench's nav-cadence is ~5 s
+// so the LIST still spills into the next nav; the downstream cache /
+// prewarm work is what brings the warm /call below the nav budget.
+// Bounding the LIST is the necessary first step (it is no longer a
+// 162 s body-read that the browser cancels).
+const internalDispatchListPageLimit int64 = 500
 
 // internalClientCache memoises the client-go dynamic client built from a
 // given internal *rest.Config. Phase 1's walk fans out many inner api[]
@@ -241,28 +296,166 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		return raw, true, nil
 	}
 
-	list, listErr := nri.List(ctx, metav1.ListOptions{})
-	if listErr != nil {
-		return nil, false, listErr
-	}
-	// CRITICAL — marshal list.UnstructuredContent(), NOT list.Object.
-	// client-go's *unstructured.UnstructuredList keeps the item objects
-	// in the separate typed `Items []Unstructured` field; `list.Object`
-	// carries ONLY the envelope scalars (apiVersion / kind / metadata)
-	// and does NOT contain an `items` key. Marshalling list.Object
-	// therefore yields a LIST envelope with NO items — the resolver's
-	// iterator filter `[.<id>.items[] | ...]` then evaluates against a
-	// null `items` and the walk discovers nothing (0.30.104 first
-	// on-cluster smoke check: the namespace LIST succeeded but
-	// `.namespaces.items` was null, so Phase 1 registered only the 8
-	// infra informers — no composition informer).
+	// Task #268 / 0.30.250 — paged LIST walk.
 	//
-	// UnstructuredContent() shallow-copies the envelope scalars AND
-	// folds the typed Items slice back into an `items` array — the exact
-	// apiserver LIST shape (apiVersion / kind / metadata / items) the JQ
-	// pipeline expects, byte-equivalent to the httpcall.Do path
+	// The pre-0.30.250 code issued ONE call: `nri.List(ctx, ListOptions{})`
+	// — unpaginated. At 50K composition CRs that single call took 2.9-162 s,
+	// the browser cancelled the in-flight body, client-go returned
+	// `context canceled`, the resolver surfaced HTTP 500, React Query
+	// kept the widget skeleton visible (TRACED — task-267 trace doc).
+	//
+	// The paged walk uses the same continue-token contract as client-go's
+	// pager.ListPager (k8s.io/client-go/tools/pager/pager.go:80-167) and
+	// snowplow's existing streaming_list.go (`for { ...; if cont == ""
+	// break; opts.Continue = cont }`). Each iteration:
+	//
+	//   1. issues nri.List with opts.Limit = internalDispatchListPageLimit
+	//      and opts.Continue = previous page's continue token;
+	//   2. accumulates `page.Items` into the result list's Items slice;
+	//   3. CAPTURES the FIRST page's envelope identity (apiVersion / kind /
+	//      metadata.resourceVersion) onto the result list's Object — these
+	//      are RV-pinned by the apiserver at page 1 of a paged walk and
+	//      every subsequent page reports the same snapshot RV (the
+	//      apiserver contract — streaming_list.go BLOCKER 1);
+	//   4. clears opts.ResourceVersion on subsequent pages so the
+	//      apiserver's "specifying resource version is not allowed when
+	//      using continue" error cannot fire (pager.ListPager line 160-164).
+	//
+	// The result list's Object map is built from page 1's Object plus the
+	// accumulated `Items` slice. `list.UnstructuredContent()` then folds
+	// the Items back into an `items` key — IDENTICAL marshal shape to the
+	// pre-0.30.250 single-LIST path. The downstream JQ pipeline sees the
+	// same envelope; the LIST-envelope guard from the 0.30.104 falsifier
+	// (TestInternalRESTConfigDispatch_TrustsClusterCA) still passes.
+	//
+	// nri.List error semantics: client-go returns ALL apiserver errors
+	// (including 410-Gone "Expired") wrapped as `*apierrors.StatusError`.
+	// We surface them verbatim — the dispatcher's existing error path
+	// (resolve.go:784-833) records them with `dispatch=internal-rest-config-error`
+	// and the resolver surfaces an HTTP 500 with the original error. No
+	// `pager.FullListIfExpired`-style fallback — at 50K the unpaginated
+	// fallback is exactly the failure mode the fix exists to remove. A
+	// 410 here is rare (the apiserver compacted between pages) and the
+	// caller (or the prewarm refresher) will retry with a fresh RV.
+	listStart := time.Now()
+	resultList := &unstructured.UnstructuredList{}
+	opts := metav1.ListOptions{Limit: internalDispatchListPageLimit}
+	pages := 0
+	totalItems := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		default:
+		}
+		page, pageErr := nri.List(ctx, opts)
+		if pageErr != nil {
+			return nil, false, pageErr
+		}
+		pages++
+
+		// First page — capture envelope identity (apiVersion / kind /
+		// metadata.resourceVersion) onto the result list. Subsequent
+		// pages report the SAME envelope (apiserver paged-LIST contract),
+		// so we only need page 1. Guard with `== nil` / `== ""` so a
+		// future page that drifts (proxy edge) cannot last-write-wins
+		// overwrite the page-1 snapshot RV.
+		if resultList.Object == nil {
+			// Shallow-copy page 1's Object map onto the result list. We
+			// rebuild `items` below from accumulated Items via
+			// UnstructuredContent(), so dropping page 1's items key (if
+			// any) here is fine — but copy every OTHER envelope scalar
+			// (apiVersion, kind, metadata sub-map, etc.) verbatim.
+			//
+			// R3 — OWNERSHIP NOTE (architect 0.30.250 review): page.Object
+			// is freshly allocated by client-go's UnstructuredList.Unmarshal
+			// on every nri.List call (it is NOT shared with any cache or
+			// reused buffer — client-go builds a new map for each LIST
+			// response). After the shallow-copy below the *map[string]any
+			// values nested under `metadata`/`metadata.continue` are still
+			// the page-1 map's children; the subsequent SetContinue("") /
+			// SetRemainingItemCount(nil) calls mutate THAT map. This is
+			// safe because we own page.Object's tree — page-1 goes out of
+			// scope at the next loop iteration and only this resultList
+			// retains a reference to it.
+			resultList.Object = make(map[string]interface{}, len(page.Object))
+			for k, v := range page.Object {
+				if k == "items" {
+					continue
+				}
+				resultList.Object[k] = v
+			}
+		}
+
+		// Append this page's items into the accumulated list. page.Items
+		// is the typed []Unstructured slice; appending is O(items-in-page)
+		// — at 500-per-page / 50K total, ~100 iterations of 500-element
+		// appends.
+		resultList.Items = append(resultList.Items, page.Items...)
+		totalItems += len(page.Items)
+
+		// Drive the loop on the page's `continue` token. Empty token =>
+		// last page; break out of the loop.
+		cont := page.GetContinue()
+		if cont == "" {
+			break
+		}
+		opts.Continue = cont
+		// Clear ResourceVersion on subsequent pages — same rationale as
+		// pager.ListPager (line 160-164): a continue token fully
+		// determines the page; carrying an RV alongside it errors with
+		// "specifying resource version is not allowed when using continue".
+		opts.ResourceVersion = ""
+		opts.ResourceVersionMatch = ""
+	}
+
+	// CRITICAL — clear page 1's `metadata.continue` and
+	// `metadata.remainingItemCount` on the accumulated list. Page 1's
+	// envelope (copied verbatim into resultList.Object above) carries a
+	// non-empty `continue` token (since the paged walk continues past
+	// page 1); leaking that token into the served LIST would tell
+	// downstream JQ filters and the JS pagination state that the list
+	// is PARTIAL — but it is not, we've accumulated every page. The
+	// unpaginated pre-0.30.250 path returned `continue=""` and no
+	// `remainingItemCount` here; preserve byte-equivalence by clearing
+	// both on the materialised list.
+	resultList.SetContinue("")
+	resultList.SetRemainingItemCount(nil)
+
+	// Falsifier event — proves the paged path executed (per
+	// feedback_falsifier_first_before_ship). WARN level so it is
+	// retained in pod logs at default verbosity; one event per served
+	// LIST, not per page (to keep the log volume bounded at scale).
+	//
+	// R2 — VERBOSITY NOTE (architect 0.30.250 review): WARN deliberately,
+	// NOT INFO. The pod ships with `DEBUG=false` by default which sets
+	// the slog handler level to INFO — at INFO this event would still
+	// fire, but a future log-volume-driven downgrade (e.g. raising the
+	// handler to WARN under high load) would silently lose the
+	// observability handle the ship relies on. WARN keeps the event
+	// available at every level the pod will ever ship with. The event
+	// fires once per served LIST so even at 50K-composition scale the
+	// volume is bounded by the /call rate, not the item count.
+	xcontext.Logger(ctx).Warn("internal_dispatch.paged_list.completed",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("namespace", namespace),
+		slog.Int("pages", pages),
+		slog.Int("items", totalItems),
+		slog.Int64("page_limit", internalDispatchListPageLimit),
+		slog.Int64("total_ms", time.Since(listStart).Milliseconds()),
+		slog.String("note", "Task #268 / 0.30.250 — paged LIST walk replaces unpaginated nri.List"),
+	)
+
+	// CRITICAL — marshal resultList.UnstructuredContent(), NOT
+	// resultList.Object. UnstructuredContent() shallow-copies the
+	// envelope scalars (the page-1 Object map without its `items` key)
+	// AND folds the accumulated typed Items slice back into an `items`
+	// array — the exact apiserver LIST shape (apiVersion / kind /
+	// metadata / items) the JQ pipeline expects, byte-equivalent to the
+	// pre-0.30.250 unpaginated path and to httpcall.Do
 	// (feedback_cache_must_not_constrain_jq.md).
-	raw, mErr := json.Marshal(list.UnstructuredContent())
+	raw, mErr := json.Marshal(resultList.UnstructuredContent())
 	if mErr != nil {
 		return nil, false, mErr
 	}
