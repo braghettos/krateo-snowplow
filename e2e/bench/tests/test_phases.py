@@ -938,6 +938,283 @@ def test_pick_visible_composition_name_invokes_sort_by_creationtimestamp(
     assert "--sort-by=.metadata.creationTimestamp" in captured["args"]
 
 
+# ─── Task #280 / 2026-06-09: any-of-newest-K picker + S8 gate semantics ─────
+#
+# Rationale: docs/task-280-s8-card-absent-trace-2026-06-09.md §6 Option A1.
+# The single-newest assert was structurally racy against snowplow's ratified
+# serve-stale window (dirty-mark-not-evict + customer-priority refresher).
+# The any-of-newest-K gate tolerates that freshness window while STILL
+# failing when ZERO of the K cards render (the #149/#186 breakage classes).
+
+
+def test_pick_visible_composition_names_returns_newest_k_in_ascending_order(
+        monkeypatch):
+    """kubectl --sort-by yields ASCENDING order; the newest K are the
+    LAST k lines, returned newest-LAST (tail slice) for parity with the
+    single-name helper which returns lines[-1].
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(
+        cluster_mod, "kubectl",
+        lambda *a, **kw: (0,
+                          "bench-app-01-01\nbench-app-01-02\n"
+                          "bench-app-01-03\nbench-app-01-04\n"
+                          "bench-app-01-05\nbench-app-01-06\n"
+                          "bench-app-01-07",
+                          ""))
+    out = phases_mod._pick_visible_composition_names("bench-ns-01", k=5)
+    # Newest 5, newest-LAST: 03,04,05,06,07.
+    assert out == [
+        "bench-app-01-03", "bench-app-01-04", "bench-app-01-05",
+        "bench-app-01-06", "bench-app-01-07",
+    ]
+    # The single-name wrapper still returns THE newest (last) element.
+    monkeypatch.setattr(
+        cluster_mod, "kubectl",
+        lambda *a, **kw: (0,
+                          "bench-app-01-03\nbench-app-01-07",
+                          ""))
+    assert phases_mod._pick_visible_composition_name("bench-ns-01") == \
+        "bench-app-01-07"
+
+
+def test_pick_visible_composition_names_skips_none_labels(monkeypatch):
+    """Panels lacking the composition-name label render `<none>` — they
+    must be skipped, not counted toward K.
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(
+        cluster_mod, "kubectl",
+        lambda *a, **kw: (0,
+                          "bench-app-01-10\n<none>\nbench-app-01-11\n"
+                          "<none>\nbench-app-01-12",
+                          ""))
+    out = phases_mod._pick_visible_composition_names("bench-ns-01", k=5)
+    assert out == ["bench-app-01-10", "bench-app-01-11", "bench-app-01-12"]
+    assert "<none>" not in out
+
+
+def test_pick_visible_composition_names_fewer_than_k(monkeypatch):
+    """When fewer than K panels exist, return all of them (no padding)."""
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(
+        cluster_mod, "kubectl",
+        lambda *a, **kw: (0, "bench-app-01-01\nbench-app-01-02", ""))
+    out = phases_mod._pick_visible_composition_names("bench-ns-01", k=5)
+    assert out == ["bench-app-01-01", "bench-app-01-02"]
+
+
+def test_pick_visible_composition_names_fallback_on_kubectl_fail(monkeypatch):
+    """kubectl non-zero → single-element fallback list so callers always
+    have a deterministic non-empty input.
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **kw: (1, "", "err"))
+    assert phases_mod._pick_visible_composition_names("bench-ns-01", k=5) == \
+        ["bench-app-01-39"]
+
+
+def test_pick_visible_composition_names_fallback_on_empty_output(monkeypatch):
+    """kubectl rc=0 but empty stdout → same single-element fallback."""
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **kw: (0, "   \n  ", ""))
+    assert phases_mod._pick_visible_composition_names("bench-ns-01", k=5) == \
+        ["bench-app-01-39"]
+
+
+def test_pick_visible_composition_names_queries_panels_with_label(monkeypatch):
+    """Same kubectl query contract as the single-name helper: panels GVR,
+    portal-page label, composition-name column, sort-by creationTimestamp.
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    captured = {}
+
+    def fake_kubectl(*args, **kwargs):
+        captured["args"] = list(args)
+        return (0, "bench-app-01-40", "")
+
+    monkeypatch.setattr(cluster_mod, "kubectl", fake_kubectl)
+    phases_mod._pick_visible_composition_names("bench-ns-01", k=5)
+    joined = " ".join(captured["args"])
+    assert "panels.widgets.templates.krateo.io" in joined
+    assert "krateo.io/portal-page=compositions" in joined
+    assert "composition-name" in joined
+    assert "--sort-by=.metadata.creationTimestamp" in captured["args"]
+
+
+# ─── Task #280 — any-present helper + S8 gate pass/fail semantics ───────────
+
+
+class _CardLocator:
+    def __init__(self, n):
+        self._n = n
+
+    def count(self):
+        return self._n
+
+
+class _CardPage:
+    """Minimal Playwright Page stand-in: `text=NAME` locators present in
+    `present_names` report count>=1; all others count 0. Records reloads.
+    """
+
+    def __init__(self, present_names):
+        self._present = set(present_names)
+        self.reloaded = 0
+        self.url = "http://fake/compositions"
+
+    def locator(self, selector):
+        name = selector[len("text="):] if selector.startswith("text=") \
+            else selector
+        return _CardLocator(1 if name in self._present else 0)
+
+    def goto(self, url, **kw):
+        self.reloaded += 1
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def _ctx_with_page(tmp_path, present_names):
+    from bench import phases as phases_mod
+    page = _CardPage(present_names)
+    ctx = phases_mod.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        tokens={"cyberjoker": "fake-token"},
+        user_pages={"cyberjoker": {"page": page}},
+    )
+    return ctx, page
+
+
+def test_user_card_any_present_matches_first_present(tmp_path):
+    from bench import phases as phases_mod
+    # Only the 3rd candidate renders.
+    ctx, _ = _ctx_with_page(tmp_path, {"bench-app-01-05"})
+    ok, matched = phases_mod._user_card_any_present(
+        ctx, "cyberjoker",
+        ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05"])
+    assert ok is True
+    assert matched == "bench-app-01-05"
+
+
+def test_user_card_any_present_returns_none_when_no_match(tmp_path):
+    """The #149/#186 detection guard: when NONE of the K cards render,
+    the gate MUST report (False, None) — preserving the gate's power to
+    fail when RBAC propagates but no card is in the DOM.
+    """
+    from bench import phases as phases_mod
+    ctx, _ = _ctx_with_page(tmp_path, set())  # empty DOM
+    ok, matched = phases_mod._user_card_any_present(
+        ctx, "cyberjoker",
+        ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05"])
+    assert ok is False
+    assert matched is None
+
+
+def test_reload_user_compositions_page_reloads(tmp_path, monkeypatch):
+    from bench import phases as phases_mod
+    from bench import browser as browser_mod
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+    ctx, page = _ctx_with_page(tmp_path, set())
+    phases_mod._reload_user_compositions_page(ctx, "cyberjoker")
+    assert page.reloaded == 1
+
+
+def test_s8_gate_passes_when_any_of_k_present(tmp_path, monkeypatch):
+    """S8 __passed__ is True when propagation_ok, ANY-of-K renders, and
+    zero widget errors — even though the single-newest (last) name is
+    absent (inside the serve-stale window).
+    """
+    from bench import phases as phases_mod
+    from bench import browser as browser_mod
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+
+    # Newest-K (newest last): 07 is newest but stale-absent; 05 renders.
+    k_names = ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05",
+               "bench-app-01-06", "bench-app-01-07"]
+    monkeypatch.setattr(phases_mod, "_pick_visible_composition_names",
+                        lambda ns, k=5: list(k_names))
+
+    ctx, _ = _ctx_with_page(tmp_path, {"bench-app-01-05"})
+    expected_card_names = phases_mod._pick_visible_composition_names(
+        "bench-ns-01", k=5)
+    phases_mod._reload_user_compositions_page(ctx, "cyberjoker")
+    present, matched = phases_mod._user_card_any_present(
+        ctx, "cyberjoker", expected_card_names)
+    # Mirror the S8 __passed__ predicate (prop_ok and present and errors==0).
+    passed = (True and present and 0 == 0)
+    assert present is True
+    assert matched == "bench-app-01-05"
+    assert passed is True
+
+
+def test_s8_gate_fails_when_none_of_k_present(tmp_path, monkeypatch):
+    """REGRESSION GUARD (#149/#186): when RBAC propagation works but NO
+    card from the newest-K renders, the gate MUST fail. This is the whole
+    reason the content gate exists — any-of-K must not weaken it to a
+    no-op.
+    """
+    from bench import phases as phases_mod
+    from bench import browser as browser_mod
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+
+    k_names = ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05"]
+    monkeypatch.setattr(phases_mod, "_pick_visible_composition_names",
+                        lambda ns, k=5: list(k_names))
+
+    ctx, _ = _ctx_with_page(tmp_path, set())  # empty DOM, no cards at all
+    expected_card_names = phases_mod._pick_visible_composition_names(
+        "bench-ns-01", k=5)
+    phases_mod._reload_user_compositions_page(ctx, "cyberjoker")
+    present, matched = phases_mod._user_card_any_present(
+        ctx, "cyberjoker", expected_card_names)
+    passed = (True and present and 0 == 0)
+    assert present is False
+    assert matched is None
+    assert passed is False
+
+
+def test_s9_absence_requires_all_k_absent(tmp_path, monkeypatch):
+    """S9 contract (Task #280): revocation removes ALL access, so the
+    whole grid disappears. With any-of-K semantics the absence gate must
+    assert NONE of the K names is present — a revocation that drops only
+    SOME rows still leaves one present and FAILS S9 (stronger, not
+    weaker, than the prior single-name check).
+    """
+    from bench import phases as phases_mod
+    from bench import browser as browser_mod
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+
+    s8_cards = ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05"]
+
+    # Case 1: revocation incomplete — 04 still renders → S9 must FAIL.
+    ctx, _ = _ctx_with_page(tmp_path, {"bench-app-01-04"})
+    phases_mod._reload_user_compositions_page(ctx, "cyberjoker")
+    still_present, present_card = phases_mod._user_card_any_present(
+        ctx, "cyberjoker", s8_cards)
+    cj_card_absent = (not s8_cards) or (not still_present)
+    assert still_present is True
+    assert present_card == "bench-app-01-04"
+    assert cj_card_absent is False  # gate fails — correct
+
+    # Case 2: full revocation — none render → S9 PASSES.
+    ctx2, _ = _ctx_with_page(tmp_path, set())
+    phases_mod._reload_user_compositions_page(ctx2, "cyberjoker")
+    still_present2, _ = phases_mod._user_card_any_present(
+        ctx2, "cyberjoker", s8_cards)
+    cj_card_absent2 = (not s8_cards) or (not still_present2)
+    assert cj_card_absent2 is True
+
+
 # ─── Task #251 / 2026-06-09: per-stage pod log capture ──────────────────────
 #
 # Rationale: agent a16e4da1a29434f24 TRACE on run-20260609-004834-cache-on

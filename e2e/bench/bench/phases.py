@@ -1110,36 +1110,44 @@ def _user_group(subject_user: str) -> str:
     }.get(subject_user, "")
 
 
-def _pick_visible_composition_name(target_ns: str) -> str:
-    """Return a composition name guaranteed to render on the datagrid's
-    first page (per_page=5) for a viewer with full ns access.
+def _pick_visible_composition_names(target_ns: str, k: int = 5) -> list[str]:
+    r"""Return the newest-K composition names that should render on the
+    datagrid's FIRST page (per_page=5) for a viewer with full ns access.
 
-    The live `compositions-panels` RESTAction sorts panels by
-    `creationTimestamp DESC` (newest-first) — that's the customer-visible
-    ordering. We query compositions sorted the same way and return the
-    NEWEST one in target_ns, guaranteed to land in the datagrid's first 5.
-    See docs/task-273-s8-second-defect-trace-2026-06-09.md §5.2.
+    Any-of-newest-K gate (Task #280, docs/task-280-s8-card-absent-trace-
+    2026-06-09.md §6 Option A1). The single-newest panel can sit inside
+    snowplow's serve-stale window (dirty-mark-not-evict + customer-priority
+    refresher are ratified, eventually-consistent design): a panel that was
+    ADDed seconds before cj's nav may not yet be re-resolved into the
+    served RAFullList cell, so the exact-newest assert is structurally
+    racy while panels materialise (~1/75s) faster than the refresher
+    drains under a 50K install storm. The newest K=5 = the datagrid's
+    first-page size; asserting ANY-of-K tolerates the freshness window
+    while still catching the #149/#186 classes (RBAC-narrowing breakage =
+    ZERO of K present, or per-card widget 403s).
 
-    A prior version sorted alphabetically and picked `bench-app-01-02`,
-    which under cj's 999-composition view sits at row ~997 — never in DOM.
-    Falls back to the alphabetical-newest if the timestamp query fails.
+    The live `compositions-panels` RESTAction sorts PANELS by
+    `creationTimestamp DESC` (newest-first) — NOT composition
+    creationTimestamp. With workers=32 parallel deploy + the controller's
+    own panel-creation queue, panel order diverges from composition order
+    (empirically: newest panel = bench-app-01-40 while newest composition
+    = bench-app-01-999 in run-20260609-200710). Query panels with the
+    portal-page label and extract the composition-name label. Label key
+    needs the dot escaped in custom-columns:
+    `.metadata.labels.krateo\.io/composition-name`.
 
     Args:
         target_ns: namespace to scope the lookup to.
+        k:         how many newest names to return (datagrid first page).
 
     Returns:
-        Composition name string; falls back to a synthesised newest-name
-        (`bench-app-01-39`) on kubectl failure so the caller's
-        `_user_card_text_present` check still has a deterministic input.
+        List of composition names, NEWEST-LAST (matching the existing
+        ascending kubectl sort-by output), at most `k` entries with the
+        `<none>` label rows skipped. Falls back to a single-element list
+        of a synthesised newest-name (`bench-app-01-39`) on kubectl
+        failure / empty output so callers always have a deterministic
+        non-empty input.
     """
-    # The datagrid renders PANELS sorted by PANEL creationTimestamp DESC —
-    # NOT composition creationTimestamp. With workers=32 parallel deploy +
-    # the controller's own panel-creation queue, panel order diverges from
-    # composition order (empirically: newest panel = bench-app-01-40 while
-    # newest composition = bench-app-01-999 in run-20260609-200710). Query
-    # panels with the portal-page label and extract the composition-name
-    # label from the newest one. Label key needs the dot escaped in
-    # custom-columns: `.metadata.labels.krateo\.io/composition-name`.
     rc, out, _ = cluster.kubectl(
         "get", "panels.widgets.templates.krateo.io", "-n", target_ns,
         "-l", "krateo.io/portal-page=compositions",
@@ -1150,12 +1158,32 @@ def _pick_visible_composition_name(target_ns: str) -> str:
         lines = [n.strip() for n in out.splitlines()
                  if n.strip() and n.strip() != "<none>"]
         if lines:
-            # kubectl sort-by produces ascending order; the LAST line is the
-            # newest panel — first row of the customer-visible datagrid.
-            return lines[-1]
+            # kubectl sort-by produces ascending order; the LAST k lines are
+            # the newest panels — the first page of the customer datagrid.
+            # Preserve newest-LAST ordering (slice tail) for parity with the
+            # single-name helper which returns lines[-1].
+            return lines[-k:] if k > 0 else lines
     # Fallback when kubectl fails: a name from the architect-observed
     # newest-panel range (bench-app-01-{36..40} in runs 175816 + 200710).
-    return "bench-app-01-39"
+    return ["bench-app-01-39"]
+
+
+def _pick_visible_composition_name(target_ns: str) -> str:
+    """Return THE single newest composition name (datagrid row 1).
+
+    Thin wrapper over `_pick_visible_composition_names` for callers that
+    need a single deterministic name (S9's absence check reuses S8's
+    recorded name). Returns the newest (last) of the newest-K list.
+
+    Args:
+        target_ns: namespace to scope the lookup to.
+
+    Returns:
+        Composition name string; falls back to `bench-app-01-39` on
+        kubectl failure so callers always have a deterministic input.
+    """
+    names = _pick_visible_composition_names(target_ns, k=1)
+    return names[-1] if names else "bench-app-01-39"
 
 
 def _user_card_text_present(ctx: StageContext,
@@ -1192,6 +1220,56 @@ def _user_card_text_present(ctx: StageContext,
         return page.locator(f"text={card_name}").count() >= 1
     except Exception:
         return False
+
+
+def _reload_user_compositions_page(ctx: StageContext,
+                                   subject_user: str) -> None:
+    """Reload `subject_user`'s Compositions page and let it settle.
+
+    Task #280 / Option A reload-after-pick: the S8/S9 picks query the
+    LIVE cluster AFTER the navs already rendered the DOM, so the assert
+    would otherwise compare a `T_pick`-newest name against a stale
+    `T_nav`-rendered DOM. Reloading here makes the inspected DOM reflect
+    the post-pick serve state.
+
+    Uses the existing browser-layer reload+settle idiom (see
+    browser.py:1678-1680 "reload page for fresh data"): a networkidle
+    goto with a 30s budget followed by a short settle wait. No new wait
+    mechanism is introduced. All-best-effort: any exception is swallowed
+    so a reload hiccup degrades to inspecting the pre-reload DOM rather
+    than crashing the stage.
+    """
+    u_state = ctx.user_pages.get(subject_user)
+    if not u_state:
+        return
+    page = u_state.get("page")
+    if page is None:
+        return
+    try:
+        page.goto(f"{browser.FRONTEND}/compositions",
+                  wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(2000)
+    except Exception:
+        pass
+
+
+def _user_card_any_present(ctx: StageContext,
+                           subject_user: str,
+                           card_names: list[str]) -> tuple[bool, str | None]:
+    """Return (any_present, matched_name) over a list of candidate names.
+
+    Any-of-newest-K gate (Task #280). Iterates the candidate names and
+    returns True with the first matched name as soon as one is present in
+    the user's rendered DOM. Returns (False, None) when none match.
+
+    Delegates each per-name check to `_user_card_text_present` so the
+    missing-user / missing-page / locator-exception fallbacks stay
+    single-sourced.
+    """
+    for name in card_names or []:
+        if _user_card_text_present(ctx, subject_user, name):
+            return (True, name)
+    return (False, None)
 
 
 def _count_widget_errors(results: list, *, user: str, page: str) -> int:
@@ -1424,9 +1502,21 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
         results = _measure_all_users(c, 8, "RB-add to pre-populated ns")
 
         # 4. CONTENT-not-status assertion (per R4 mitigation).
-        expected_card_name = _pick_visible_composition_name(target_ns)
-        cj_card_present = _user_card_text_present(
-            c, subject_user, expected_card_name)
+        # Any-of-newest-K gate (Task #280 / Option A1): pick the newest
+        # K=5 panel composition-names (the datagrid first-page size) and
+        # pass S8 if ANY render. The single-newest assert was structurally
+        # racy against snowplow's ratified serve-stale window (dirty-mark-
+        # not-evict + customer-priority refresher); any-of-K tolerates the
+        # freshness window while still failing if ZERO cards render —
+        # which is the #149 (RBAC view stays empty) / #186 (per-card
+        # widget 403) breakage the gate exists to catch.
+        expected_card_names = _pick_visible_composition_names(target_ns, k=5)
+        # Reload-after-pick: the pick queried the live cluster AFTER the
+        # navs rendered the DOM. Reload so the assert inspects post-pick
+        # serve state, not the stale T_nav DOM.
+        _reload_user_compositions_page(c, subject_user)
+        cj_card_present, matched_card_name = _user_card_any_present(
+            c, subject_user, expected_card_names)
         cj_widget_errors = _count_widget_errors(
             results, user=subject_user, page="Compositions")
 
@@ -1440,7 +1530,8 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
             "propagation_ok": prop_ok,
             "propagation_ms": prop_ms,
             "propagation_diag": prop_diag,
-            "expected_card_name": expected_card_name,
+            "expected_card_names": expected_card_names,
+            "matched_card_name": matched_card_name,
             "content_card_present": cj_card_present,
             "cj_widget_error_count": cj_widget_errors,
             "measurement_count": len(results),
@@ -1530,13 +1621,29 @@ def stage_s9_remove_rb_from_populated_ns(ctx: StageContext) -> StageProof:
         results = _measure_all_users(c, 9, "RB-remove from same ns")
 
         # 5. CONTENT-absent assertion (revocation symmetric to S8).
-        # Reuse S8's expected_card_name so we look for THE SAME row
-        # that S8 confirmed was present.
-        s8_card = (s8_body.get("expected_card_name") or "").strip()
-        cj_card_absent = True
-        if s8_card:
-            cj_card_absent = not _user_card_text_present(
-                c, subject_user, s8_card)
+        # S9's contract DIFFERS from S8 (Task #280): revocation removes
+        # ALL access to target_ns, so the WHOLE grid disappears for cj.
+        # Reuse the SAME newest-K names S8 recorded (`expected_card_names`)
+        # and assert NONE of them is present — i.e. ALL K must be absent.
+        # This is strictly stronger than the prior single-name check, not
+        # weaker: with any-of-K add semantics, the symmetric remove gate
+        # must verify the absence of every formerly-visible card, so a
+        # revocation that only drops SOME rows still fails S9.
+        s8_cards = s8_body.get("expected_card_names")
+        if not s8_cards:
+            # Backward-compat with pre-#280 S8 proofs that recorded a
+            # single `expected_card_name`.
+            single = (s8_body.get("expected_card_name") or "").strip()
+            s8_cards = [single] if single else []
+        s8_cards = [n for n in s8_cards if n]
+        # Reload-after so the absence assert inspects post-revocation serve
+        # state rather than the stale pre-revocation nav DOM.
+        _reload_user_compositions_page(c, subject_user)
+        still_present, present_card = _user_card_any_present(
+            c, subject_user, s8_cards)
+        # Absence holds iff NONE of the K names is present. When S8 had no
+        # recorded cards (degenerate), absence is trivially True.
+        cj_card_absent = (not s8_cards) or (not still_present)
 
         return {
             "subject_user": subject_user,
@@ -1546,7 +1653,8 @@ def stage_s9_remove_rb_from_populated_ns(ctx: StageContext) -> StageProof:
             "propagation_ok": prop_ok,
             "propagation_ms": prop_ms,
             "propagation_diag": prop_diag,
-            "expected_card_name": s8_card,
+            "expected_card_names": s8_cards,
+            "still_present_card_name": present_card,
             "content_card_absent": cj_card_absent,
             "measurement_count": len(results),
             "__passed__": (prop_ok and cj_card_absent),
