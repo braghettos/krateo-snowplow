@@ -96,12 +96,25 @@ def gke_context_guard(allow_non_gke: bool | None = None) -> None:
 def kubectl(*args, input_data=None, timeout_secs=120):
     """Run a kubectl invocation. Returns (returncode, stdout, stderr).
 
+    Injects `--context=CANONICAL_GKE_CONTEXT` UNLESS the caller already
+    passed an explicit `--context=...` flag OR `BENCH_ALLOW_NON_GKE=1` is
+    set in the environment. This makes the bench hermetic against the
+    user's kubectl current-context drifting between Bash invocations
+    (per `feedback_bench_tests_hermetic_isolation_all_cluster_paths`).
+
     stdout/stderr are str (decoded). Timeout returns rc=1 and an error
     message in stderr to keep callers' error-handling uniform.
     """
+    arg_list = list(args)
+    allow_non_gke = os.environ.get(
+        "BENCH_ALLOW_NON_GKE", "0").strip().lower() in ("1", "true", "yes")
+    caller_pinned_context = any(
+        isinstance(a, str) and a.startswith("--context") for a in arg_list)
+    if not allow_non_gke and not caller_pinned_context:
+        arg_list = [f"--context={CANONICAL_GKE_CONTEXT}"] + arg_list
     try:
         proc = subprocess.run(
-            ["kubectl"] + list(args),
+            ["kubectl"] + arg_list,
             input=input_data.encode() if input_data else None,
             capture_output=True,
             timeout=timeout_secs,

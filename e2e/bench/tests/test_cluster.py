@@ -125,6 +125,75 @@ def test_kubectl_returns_rc1_on_timeout(monkeypatch):
     assert "5s" in err
 
 
+# ─── kubectl wrapper context-injection (feedback_bench_tests_hermetic_isolation_all_cluster_paths)
+
+def test_kubectl_injects_canonical_context_when_not_pinned(monkeypatch, with_env):
+    """kubectl() pins --context=CANONICAL_GKE_CONTEXT when caller didn't."""
+    with_env(BENCH_ALLOW_NON_GKE=None)
+
+    seen_argv = {}
+
+    class _Fake:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def _run(argv, **kwargs):
+        seen_argv["argv"] = list(argv)
+        return _Fake()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    kubectl("get", "ns")
+    assert seen_argv["argv"][0] == "kubectl"
+    assert f"--context={CANONICAL_GKE_CONTEXT}" in seen_argv["argv"]
+    assert seen_argv["argv"].index(f"--context={CANONICAL_GKE_CONTEXT}") == 1
+
+
+def test_kubectl_no_inject_when_caller_pinned_context(monkeypatch, with_env):
+    """If caller already passes --context=..., no double-injection."""
+    with_env(BENCH_ALLOW_NON_GKE=None)
+
+    seen_argv = {}
+
+    class _Fake:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def _run(argv, **kwargs):
+        seen_argv["argv"] = list(argv)
+        return _Fake()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    kubectl("--context=foo", "get", "ns")
+    # Only the caller's context flag should appear; no canonical injection.
+    contexts = [a for a in seen_argv["argv"]
+                if isinstance(a, str) and a.startswith("--context")]
+    assert contexts == ["--context=foo"]
+
+
+def test_kubectl_no_inject_when_env_bypass_set(monkeypatch, with_env):
+    """BENCH_ALLOW_NON_GKE=1 disables canonical context injection."""
+    with_env(BENCH_ALLOW_NON_GKE="1")
+
+    seen_argv = {}
+
+    class _Fake:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def _run(argv, **kwargs):
+        seen_argv["argv"] = list(argv)
+        return _Fake()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    kubectl("get", "ns")
+    contexts = [a for a in seen_argv["argv"]
+                if isinstance(a, str) and a.startswith("--context")]
+    assert contexts == []
+
+
 # ─── Case 4/5: _k8s_init idempotence + one-shot retry semantics ─────────────
 
 def test_k8s_init_short_circuits_when_lib_missing(reset_k8s_state):
