@@ -790,3 +790,390 @@ def test_pick_visible_composition_name_fallback_when_conventional_absent(
         lambda *a, **kw: (0, "bench-app-01-07\nbench-app-01-05", ""))
     out = phases_mod._pick_visible_composition_name("bench-ns-01")
     assert out == "bench-app-01-05"
+
+
+# ─── Task #251 / 2026-06-09: per-stage pod log capture ──────────────────────
+#
+# Rationale: agent a16e4da1a29434f24 TRACE on run-20260609-004834-cache-on
+# found S8 measurement window (23:30:39 -> 23:35:48 UTC) had ZERO log
+# evidence — full_run.txt covered 23:59:11 -> 00:04:09 UTC across a pod
+# restart, so all 4 cj allCompositions UAF hypotheses were unfalsifiable.
+# These tests pin the per-stage capture contract: stream opens BEFORE
+# work, file is on disk + non-empty BEFORE proof persists, file path is
+# recorded under proof.artifacts, opt-out via BENCH_NO_PER_STAGE_LOGS,
+# reconnect-on-EOF tolerates pod restart.
+
+
+def test_per_stage_streamer_opt_out_via_env(tmp_path, monkeypatch):
+    """BENCH_NO_PER_STAGE_LOGS=1 disables the streamer.
+
+    start() and stop() are no-ops; no file is created; no thread spawned.
+    """
+    from bench.phases import _PerStageLogStreamer
+
+    monkeypatch.setenv("BENCH_NO_PER_STAGE_LOGS", "1")
+    out = tmp_path / "pod_logs" / "S0.txt"
+    s = _PerStageLogStreamer(
+        stage_id="S0",
+        stage_started_utc="2026-06-09T00:00:00+00:00",
+        out_path=out,
+    )
+    assert _PerStageLogStreamer.disabled() is True
+    s.start()
+    assert s._thread is None
+    assert s._fh is None
+    s.stop()
+    assert not out.exists()
+
+
+def test_per_stage_streamer_creates_file_on_start(tmp_path, monkeypatch):
+    """start() opens the output file in append mode BEFORE the
+    supervisor thread reads anything from the subprocess.
+
+    Monkey-patches subprocess.Popen so we don't actually fork kubectl.
+    """
+    import subprocess as subprocess_mod
+    import threading
+    from bench import phases as phases_mod
+    from bench.phases import _PerStageLogStreamer
+
+    monkeypatch.delenv("BENCH_NO_PER_STAGE_LOGS", raising=False)
+
+    # Fake Popen that produces controllable output then exits.
+    class _FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self._exited = threading.Event()
+            self.stdout = self
+            self.returncode = 0
+
+        def read(self, n):
+            # Block until terminate() fires so the supervisor doesn't
+            # spin-respawn during the test.
+            self._exited.wait()
+            return b""
+
+        def close(self): pass
+
+        def terminate(self): self._exited.set()
+        def kill(self): self._exited.set()
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(phases_mod.subprocess, "Popen", _FakePopen)
+
+    out = tmp_path / "pod_logs" / "S5.txt"
+    s = _PerStageLogStreamer(
+        stage_id="S5",
+        stage_started_utc="2026-06-09T00:00:00+00:00",
+        out_path=out,
+    )
+    s.start()
+    # File opened in start(), thread running.
+    assert out.exists()
+    assert s._thread is not None and s._thread.is_alive()
+    s.stop()
+    # Thread cleaned up.
+    assert not s._thread.is_alive()
+
+
+def test_per_stage_streamer_writes_chunks_then_stops(tmp_path, monkeypatch):
+    """Supervisor pipes subprocess stdout into the per-stage file.
+
+    Drives the supervisor with a fake Popen that delivers one chunk
+    then EOFs; checks the chunk lands in the file before stop().
+    """
+    import threading
+    from bench import phases as phases_mod
+    from bench.phases import _PerStageLogStreamer
+
+    monkeypatch.delenv("BENCH_NO_PER_STAGE_LOGS", raising=False)
+
+    chunk_payload = b'{"msg":"stage_event","stage":"S6"}\n'
+    delivered = threading.Event()
+
+    class _FakeStdout:
+        def __init__(self):
+            self._delivered = False
+
+        def read(self, n):
+            if not self._delivered:
+                self._delivered = True
+                delivered.set()
+                return chunk_payload
+            return b""  # EOF — triggers respawn-decision branch
+
+        def close(self): pass
+
+    class _FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdout = _FakeStdout()
+            self.returncode = 0
+
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(phases_mod.subprocess, "Popen", _FakePopen)
+    # Speed up the test — don't wait 1.5s between respawn iterations.
+    monkeypatch.setattr(_PerStageLogStreamer, "_RESPAWN_BACKOFF_S", 0.05)
+
+    out = tmp_path / "pod_logs" / "S6.txt"
+    s = _PerStageLogStreamer(
+        stage_id="S6",
+        stage_started_utc="2026-06-09T00:00:00+00:00",
+        out_path=out,
+    )
+    s.start()
+    # Wait for the first chunk to be delivered.
+    assert delivered.wait(timeout=5.0), "supervisor never read first chunk"
+    # Give the supervisor a beat to write + emit reconnect marker.
+    import time as time_mod
+    time_mod.sleep(0.2)
+    s.stop()
+    # Chunk + at least one reconnect marker should be in the file.
+    content = out.read_bytes()
+    assert chunk_payload in content, \
+        f"chunk not in file; got {content!r}"
+    assert b"STREAM RECONNECT" in content, \
+        f"reconnect marker missing; got {content!r}"
+
+
+def test_per_stage_streamer_appends_on_reconnect(tmp_path, monkeypatch):
+    """Pod-restart simulation: subprocess A produces chunk1 + EOFs,
+    supervisor writes reconnect marker, subprocess B produces chunk2.
+
+    Both chunks must land in the same per-stage file (append mode +
+    same --since-time on respawn).
+    """
+    import threading
+    from bench import phases as phases_mod
+    from bench.phases import _PerStageLogStreamer
+
+    monkeypatch.delenv("BENCH_NO_PER_STAGE_LOGS", raising=False)
+
+    chunk_a = b"chunk-A: pre-restart event\n"
+    chunk_b = b"chunk-B: post-restart event\n"
+    spawn_counter = [0]
+    chunk_b_delivered = threading.Event()
+
+    class _FakeStdout:
+        def __init__(self, which):
+            self._which = which
+            self._delivered = False
+
+        def read(self, n):
+            if not self._delivered:
+                self._delivered = True
+                if self._which == 1:
+                    return chunk_a
+                else:
+                    chunk_b_delivered.set()
+                    return chunk_b
+            return b""  # EOF
+
+        def close(self): pass
+
+    class _FakePopen:
+        def __init__(self, *args, **kwargs):
+            spawn_counter[0] += 1
+            self.stdout = _FakeStdout(spawn_counter[0])
+            self.returncode = 0
+
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(phases_mod.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(_PerStageLogStreamer, "_RESPAWN_BACKOFF_S", 0.05)
+
+    out = tmp_path / "pod_logs" / "S7.txt"
+    s = _PerStageLogStreamer(
+        stage_id="S7",
+        stage_started_utc="2026-06-09T00:00:00+00:00",
+        out_path=out,
+    )
+    s.start()
+    assert chunk_b_delivered.wait(timeout=5.0), \
+        "supervisor never respawned after first subprocess EOF"
+    # Give the supervisor a beat to write chunk_b + the second EOF
+    # detection + the second reconnect marker.
+    import time as time_mod
+    time_mod.sleep(0.2)
+    s.stop()
+
+    content = out.read_bytes()
+    assert chunk_a in content, \
+        f"chunk_a (pre-restart) missing from file: {content!r}"
+    assert chunk_b in content, \
+        f"chunk_b (post-restart) missing from file: {content!r}"
+    assert content.index(chunk_a) < content.index(chunk_b), \
+        "chunks out of order — append-mode broken?"
+    # Both reconnects (after chunk_a EOF, after chunk_b EOF + stop) should
+    # have produced markers. Require at least one between the chunks.
+    between = content[
+        content.index(chunk_a) + len(chunk_a):content.index(chunk_b)]
+    assert b"STREAM RECONNECT" in between, \
+        "no reconnect marker between chunk_a and chunk_b"
+
+
+def test_run_stage_attaches_per_stage_log_to_proof_artifacts(
+        tmp_path, monkeypatch):
+    """_run_stage should attach the per-stage log file path to
+    proof.artifacts on the success path.
+    """
+    import threading
+    from bench import phases as phases_mod
+    from bench.phases import _PerStageLogStreamer, _run_stage
+
+    monkeypatch.delenv("BENCH_NO_PER_STAGE_LOGS", raising=False)
+
+    chunk_payload = b"S2-event-log\n"
+    delivered = threading.Event()
+
+    class _FakeStdout:
+        def __init__(self):
+            self._delivered = False
+
+        def read(self, n):
+            if not self._delivered:
+                self._delivered = True
+                delivered.set()
+                return chunk_payload
+            return b""
+
+        def close(self): pass
+
+    class _FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdout = _FakeStdout()
+            self.returncode = 0
+
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(phases_mod.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(_PerStageLogStreamer, "_RESPAWN_BACKOFF_S", 0.05)
+
+    ctx = StageContext(
+        tag="0.30.248", scale=5000,
+        run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+    )
+
+    def _work(c):
+        # Block until we know the supervisor has at least one chunk in
+        # flight; otherwise the file may be empty and the artifact
+        # attach intentionally skips it.
+        delivered.wait(timeout=5.0)
+        return {"ok": True}
+
+    proof = _run_stage("S2", ctx, _work,
+                       what_breaks_if_skipped="per-stage log capture test")
+    assert proof.passed is True
+    # The proof.artifacts list must include the per-stage log path
+    # (relative to run_dir).
+    assert any(a.endswith("pod_logs/S2.txt") for a in proof.artifacts), \
+        f"per-stage log not attached; artifacts={proof.artifacts}"
+    log_path = tmp_path / "pod_logs" / "S2.txt"
+    assert log_path.exists()
+    assert log_path.stat().st_size > 0
+
+
+def test_run_stage_attaches_per_stage_log_on_convergence_timeout(
+        tmp_path, monkeypatch):
+    """When the stage raises ConvergenceTimeout, the per-stage log
+    must still be flushed + attached BEFORE the proof is persisted.
+
+    This is the failure-mode the agent a16e4da1a29434f24 TRACE
+    specifically needs: S8 timed out with zero log evidence captured.
+    """
+    import threading
+    from bench import phases as phases_mod
+    from bench.phases import _PerStageLogStreamer, _run_stage
+
+    monkeypatch.delenv("BENCH_NO_PER_STAGE_LOGS", raising=False)
+
+    delivered = threading.Event()
+    chunk = b"S8-timeout-evidence\n"
+
+    class _FakeStdout:
+        def __init__(self):
+            self._delivered = False
+
+        def read(self, n):
+            if not self._delivered:
+                self._delivered = True
+                delivered.set()
+                return chunk
+            return b""
+
+        def close(self): pass
+
+    class _FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdout = _FakeStdout()
+            self.returncode = 0
+
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(phases_mod.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(_PerStageLogStreamer, "_RESPAWN_BACKOFF_S", 0.05)
+
+    ctx = StageContext(
+        tag="0.30.248", scale=5000,
+        run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+    )
+
+    def _timing_out_work(c):
+        delivered.wait(timeout=5.0)
+        raise ConvergenceTimeout(
+            stage=8, user="cyberjoker",
+            api=10, ui=15, cluster=20, timeout_secs=300,
+        )
+
+    with pytest.raises(ConvergenceTimeout):
+        _run_stage("S8", ctx, _timing_out_work,
+                   what_breaks_if_skipped="S8 timeout-capture test")
+
+    # Proof on disk; artifact attached; file non-empty.
+    proof_path = tmp_path / "proofs" / "S8.json"
+    assert proof_path.exists()
+    proof_d = json.loads(proof_path.read_text())
+    assert proof_d["passed"] is False
+    assert proof_d["convergence_timeout"] is True
+    assert any(a.endswith("pod_logs/S8.txt")
+               for a in proof_d.get("artifacts", [])), \
+        f"per-stage log NOT attached to ConvergenceTimeout proof: " \
+        f"artifacts={proof_d.get('artifacts')}"
+    log_path = tmp_path / "pod_logs" / "S8.txt"
+    assert log_path.exists()
+    assert log_path.stat().st_size > 0
+
+
+def test_run_stage_skips_log_attach_when_streamer_disabled(
+        tmp_path, monkeypatch):
+    """When BENCH_NO_PER_STAGE_LOGS=1, no per-stage file is created
+    and no artifact is recorded — but the stage proof itself is still
+    persisted normally.
+    """
+    from bench.phases import _run_stage
+
+    monkeypatch.setenv("BENCH_NO_PER_STAGE_LOGS", "1")
+
+    ctx = StageContext(
+        tag="0.30.248", scale=5000,
+        run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+    )
+    proof = _run_stage("S3", ctx, lambda c: {"ok": True},
+                       what_breaks_if_skipped="opt-out test")
+    assert proof.passed is True
+    # No per-stage log file should have been created.
+    assert not (tmp_path / "pod_logs" / "S3.txt").exists()
+    # No artifact entry referencing pod_logs/.
+    assert not any("pod_logs" in a for a in proof.artifacts), \
+        f"unexpected pod_logs artifact when opted out: {proof.artifacts}"

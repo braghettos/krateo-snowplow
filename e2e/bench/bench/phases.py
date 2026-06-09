@@ -233,6 +233,219 @@ def _post_mutation_pause(cache_mode: str) -> None:
         time.sleep(5)
 
 
+# ─── Per-stage pod log streamer (Task #251 — 2026-06-09) ────────────────────
+
+
+class _PerStageLogStreamer:
+    """Stream `kubectl logs -f deployment/snowplow --since-time=<stage_start>`
+    into `pod_logs/S<N>.txt` for the duration of one stage.
+
+    Why this exists
+    ---------------
+    Phase 6 measurement stages produced log evidence only via the
+    aggregate `pod_logs/full_run.txt` capture at run finalise. When a
+    pod restart, stage failure, or long run pushed finalise outside
+    the measurement window (kubectl tail bounded by ring-buffer +
+    restart-boundary), the per-stage diagnostic evidence was lost —
+    the agent a16e4da1a29434f24 TRACE on run-20260609-004834-cache-on
+    found S8 window 23:30:39 -> 23:35:48 UTC but the aggregate log
+    covered 23:59:11 -> 00:04:09 UTC across a pod restart, so the cj
+    `allCompositions` UAF events were unfalsifiable.
+
+    Design contract
+    ---------------
+    - Stream opens BEFORE the stage's measurement loop fires
+    - Stream closes (close + flush + fsync) BEFORE _run_stage persists
+      the proof + state.json, so the file is always present when the
+      ledger records `__passed__`
+    - `--since-time=<stage_started_utc>` ensures the apiserver buffer
+      covers the full measurement window even if the streaming
+      subprocess starts a few hundred ms late
+    - Pod-restart tolerance: when the kubectl subprocess exits, the
+      supervisor thread writes a `--- STREAM RECONNECT @ <utc> ---`
+      marker and re-spawns with the SAME `--since-time`, appending to
+      the file. Caller's `stop()` clears `_running`, the supervisor
+      observes it on the next iteration, and exits without respawning
+    - Uniform across S0-S11 (no per-stage special-cases — fired from
+      _run_stage)
+
+    Opt-out
+    -------
+    `BENCH_NO_PER_STAGE_LOGS=1` disables the streamer (fall back to
+    aggregate full_run.txt only). Matches the existing
+    `BENCH_ALLOW_NON_GKE` env-flag pattern; no CLI plumbing needed.
+    """
+
+    # Per-iteration wait between subprocess restart attempts. The pod
+    # may take several seconds to come up after a restart; a too-tight
+    # loop spams kubectl. 1.5s is the same back-off cadence used by
+    # _grep_pod_logs_for_traces (R7 retry logic).
+    _RESPAWN_BACKOFF_S = 1.5
+
+    # Cap on the stream-supervisor thread's join() during stop(). The
+    # subprocess.terminate() path takes ~100ms; allowing 5s leaves
+    # ample room for the supervisor loop iteration to break out.
+    _STOP_JOIN_TIMEOUT_S = 5.0
+
+    def __init__(self,
+                 stage_id: str,
+                 stage_started_utc: str,
+                 out_path: Path,
+                 *,
+                 deployment: str = "deployment/snowplow",
+                 namespace: str = "krateo-system",
+                 container: str = "snowplow"):
+        self._stage_id = stage_id
+        self._since_time = stage_started_utc
+        self._out_path = Path(out_path)
+        self._deployment = deployment
+        self._namespace = namespace
+        self._container = container
+        self._proc: subprocess.Popen | None = None
+        self._running = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._fh = None  # file handle held by the supervisor
+
+    @classmethod
+    def disabled(cls) -> bool:
+        v = os.environ.get("BENCH_NO_PER_STAGE_LOGS", "0").strip().lower()
+        return v in ("1", "true", "yes")
+
+    def start(self) -> None:
+        if self.disabled():
+            return
+        self._out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Append-mode so reconnect-after-restart preserves earlier output.
+        self._fh = open(self._out_path, "ab", buffering=0)
+        self._running.set()
+        self._thread = threading.Thread(
+            target=self._supervise, daemon=True,
+            name=f"per-stage-logs-{self._stage_id}")
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self.disabled():
+            return
+        self._running.clear()
+        # Terminate the in-flight kubectl subprocess so the supervisor
+        # loop iteration unblocks immediately.
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=self._STOP_JOIN_TIMEOUT_S)
+        # Flush + fsync the file handle so the per-stage log is on disk
+        # BEFORE _run_stage persists the proof + state.json.
+        fh = self._fh
+        if fh is not None:
+            try:
+                fh.flush()
+                os.fsync(fh.fileno())
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+    def _supervise(self) -> None:
+        """Spawn -> stream -> on-exit decide-respawn loop.
+
+        Each iteration:
+          1. Spawn `kubectl logs -f --since-time=<self._since_time>`
+          2. Pipe its stdout straight into the open file handle
+          3. On subprocess exit:
+             - If self._running is clear: stop() initiated; return
+             - Else: write reconnect marker; sleep backoff; respawn
+        """
+        while self._running.is_set():
+            try:
+                proc = subprocess.Popen(
+                    ["kubectl", "logs",
+                     "-n", self._namespace,
+                     self._deployment,
+                     "-c", self._container,
+                     "-f",
+                     f"--since-time={self._since_time}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+            except Exception as e:
+                # Subprocess spawn failed (kubectl missing, etc.).
+                # Log the error inline and back off. Don't crash the bench.
+                try:
+                    self._fh.write(
+                        f"--- STREAM SPAWN FAILED: "
+                        f"{type(e).__name__}: {e} ---\n".encode())
+                except Exception:
+                    pass
+                time.sleep(self._RESPAWN_BACKOFF_S)
+                continue
+            self._proc = proc
+            # Pump stdout into the file. Read in chunks so a very chatty
+            # pod doesn't starve the supervisor loop on per-line work.
+            try:
+                while self._running.is_set():
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break  # subprocess exited or pipe closed
+                    try:
+                        self._fh.write(chunk)
+                    except Exception:
+                        # File handle gone; abort supervision.
+                        self._running.clear()
+                        break
+            except Exception:
+                pass
+            finally:
+                # Drain remaining buffered output before we decide
+                # whether to respawn.
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            # Respawn-decision branch.
+            if not self._running.is_set():
+                return
+            # Subprocess exited but we're still in-stage — likely a pod
+            # restart. Emit a marker and respawn with the SAME
+            # --since-time so the new pod's startup logs land in this
+            # same file with full coverage from stage_started_utc.
+            try:
+                self._fh.write(
+                    f"--- STREAM RECONNECT @ {_now_iso()} "
+                    f"(pod restart / stream EOF) ---\n".encode())
+                self._fh.flush()
+            except Exception:
+                pass
+            time.sleep(self._RESPAWN_BACKOFF_S)
+
+
 # ─── Stage runner wrapper (catches ConvergenceTimeout per R3.2) ─────────────
 
 
@@ -251,56 +464,110 @@ def _run_stage(stage_id: str,
     On any other exception: build a proof with passed=False and the
     error in `proof.error`, persist, then re-raise — the CLI's main
     exits 1.
+
+    Task #251 (2026-06-09): opens a `_PerStageLogStreamer` for the
+    stage's measurement window BEFORE `work(ctx)` fires; closes and
+    flushes it BEFORE the proof is persisted. The streamer is uniform
+    across S0-S11 (no special-cases per stage). Opt-out via the
+    `BENCH_NO_PER_STAGE_LOGS=1` env flag.
     """
     started = _now_iso()
+    # Open per-stage log stream BEFORE work runs so the kubectl --since-time
+    # buffer covers the full measurement window even if the subprocess takes
+    # a few hundred ms to attach.
+    stage_log_path = Path(ctx.run_dir) / "pod_logs" / f"{stage_id}.txt"
+    streamer = _PerStageLogStreamer(
+        stage_id=stage_id,
+        stage_started_utc=started,
+        out_path=stage_log_path,
+    )
+    streamer.start()
     try:
-        proof_dict = work(ctx) or {}
-        passed = bool(proof_dict.pop("__passed__", True))
-        proof = StageProof(
-            stage_id=stage_id,
-            started_at=started,
-            ended_at=_now_iso(),
-            passed=passed,
-            proof=proof_dict,
-            artifacts=list(artifacts or []),
-            what_breaks_if_skipped=what_breaks_if_skipped,
-        )
-    except ConvergenceTimeout as ct:
-        proof = StageProof(
-            stage_id=stage_id,
-            started_at=started,
-            ended_at=_now_iso(),
-            passed=False,
-            proof={
-                "error": "ConvergenceTimeout",
-                "stage": ct.stage, "user": ct.user,
-                "api": ct.api, "ui": ct.ui, "cluster": ct.cluster,
-                "timeout_secs": ct.timeout_secs,
-            },
-            artifacts=list(artifacts or []),
-            what_breaks_if_skipped=what_breaks_if_skipped,
-            convergence_timeout=True,
-        )
-        _write_stage_proof(ctx.run_dir, proof)
-        _record_proof_to_state(ctx, proof)
-        raise  # re-raise AFTER state persisted
-    except Exception as e:
-        proof = StageProof(
-            stage_id=stage_id,
-            started_at=started,
-            ended_at=_now_iso(),
-            passed=False,
-            proof={"error": type(e).__name__, "msg": str(e)[:500]},
-            artifacts=list(artifacts or []),
-            what_breaks_if_skipped=what_breaks_if_skipped,
-        )
-        _write_stage_proof(ctx.run_dir, proof)
-        _record_proof_to_state(ctx, proof)
-        raise
+        try:
+            proof_dict = work(ctx) or {}
+            passed = bool(proof_dict.pop("__passed__", True))
+            proof = StageProof(
+                stage_id=stage_id,
+                started_at=started,
+                ended_at=_now_iso(),
+                passed=passed,
+                proof=proof_dict,
+                artifacts=list(artifacts or []),
+                what_breaks_if_skipped=what_breaks_if_skipped,
+            )
+        except ConvergenceTimeout as ct:
+            proof = StageProof(
+                stage_id=stage_id,
+                started_at=started,
+                ended_at=_now_iso(),
+                passed=False,
+                proof={
+                    "error": "ConvergenceTimeout",
+                    "stage": ct.stage, "user": ct.user,
+                    "api": ct.api, "ui": ct.ui, "cluster": ct.cluster,
+                    "timeout_secs": ct.timeout_secs,
+                },
+                artifacts=list(artifacts or []),
+                what_breaks_if_skipped=what_breaks_if_skipped,
+                convergence_timeout=True,
+            )
+            # Close the streamer BEFORE we persist the proof so the
+            # per-stage log file is on disk + the artifact path attached.
+            streamer.stop()
+            _attach_per_stage_log_artifact(proof, ctx.run_dir, stage_log_path)
+            _write_stage_proof(ctx.run_dir, proof)
+            _record_proof_to_state(ctx, proof)
+            raise  # re-raise AFTER state persisted
+        except Exception as e:
+            proof = StageProof(
+                stage_id=stage_id,
+                started_at=started,
+                ended_at=_now_iso(),
+                passed=False,
+                proof={"error": type(e).__name__, "msg": str(e)[:500]},
+                artifacts=list(artifacts or []),
+                what_breaks_if_skipped=what_breaks_if_skipped,
+            )
+            streamer.stop()
+            _attach_per_stage_log_artifact(proof, ctx.run_dir, stage_log_path)
+            _write_stage_proof(ctx.run_dir, proof)
+            _record_proof_to_state(ctx, proof)
+            raise
 
-    _write_stage_proof(ctx.run_dir, proof)
-    _record_proof_to_state(ctx, proof)
-    return proof
+        # Success path: stop streamer BEFORE persisting proof.
+        streamer.stop()
+        _attach_per_stage_log_artifact(proof, ctx.run_dir, stage_log_path)
+        _write_stage_proof(ctx.run_dir, proof)
+        _record_proof_to_state(ctx, proof)
+        return proof
+    finally:
+        # Defensive: ensure the streamer is never left running even if
+        # _write_stage_proof or _record_proof_to_state raise (which they
+        # don't today, but better safe than orphan).
+        if streamer._running.is_set():
+            streamer.stop()
+
+
+def _attach_per_stage_log_artifact(proof: StageProof,
+                                   run_dir: Path,
+                                   stage_log_path: Path) -> None:
+    """Record the per-stage log file path under proof.artifacts.
+
+    Stored as a path relative to run_dir for portability (matches the
+    convention in _attach_video_artifacts_to_last_measurement_proof).
+    No-op if the streamer was disabled or the file is empty/missing.
+    """
+    try:
+        if not stage_log_path.exists() or stage_log_path.stat().st_size == 0:
+            return
+        rel = stage_log_path.absolute().relative_to(Path(run_dir).absolute())
+        rel_str = str(rel)
+        if rel_str not in proof.artifacts:
+            proof.artifacts.append(rel_str)
+    except Exception:
+        # Artifact attach is best-effort; never let it block proof
+        # persistence.
+        pass
 
 
 def _record_proof_to_state(ctx: StageContext, proof: StageProof) -> None:
