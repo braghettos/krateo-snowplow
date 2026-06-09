@@ -1132,23 +1132,29 @@ def _pick_visible_composition_name(target_ns: str) -> str:
         (`bench-app-01-39`) on kubectl failure so the caller's
         `_user_card_text_present` check still has a deterministic input.
     """
-    # NEWEST first via creationTimestamp DESC — matches the SPA datagrid's
-    # ordering. Output: "<creationTs> <name>" one per line; take the last.
+    # The datagrid renders PANELS sorted by PANEL creationTimestamp DESC —
+    # NOT composition creationTimestamp. With workers=32 parallel deploy +
+    # the controller's own panel-creation queue, panel order diverges from
+    # composition order (empirically: newest panel = bench-app-01-40 while
+    # newest composition = bench-app-01-999 in run-20260609-200710). Query
+    # panels with the portal-page label and extract the composition-name
+    # label from the newest one. Label key needs the dot escaped in
+    # custom-columns: `.metadata.labels.krateo\.io/composition-name`.
     rc, out, _ = cluster.kubectl(
-        "get", f"{cluster.COMP_RES}.{cluster.COMP_GVR}", "-n", target_ns,
+        "get", "panels.widgets.templates.krateo.io", "-n", target_ns,
+        "-l", "krateo.io/portal-page=compositions",
         "--no-headers",
         "--sort-by=.metadata.creationTimestamp",
-        "-o", "custom-columns=NAME:.metadata.name")
+        "-o", r"custom-columns=NAME:.metadata.labels.krateo\.io/composition-name")
     if rc == 0 and out.strip():
-        lines = [n.strip() for n in out.splitlines() if n.strip()]
+        lines = [n.strip() for n in out.splitlines()
+                 if n.strip() and n.strip() != "<none>"]
         if lines:
-            # kubectl sort-by produces ascending order; the LAST line is newest.
+            # kubectl sort-by produces ascending order; the LAST line is the
+            # newest panel — first row of the customer-visible datagrid.
             return lines[-1]
-    # Fallback when kubectl fails: assume the convention bench-app-01-NN with
-    # NN as the highest 2-digit suffix seen during S5/S6 deploy. Last-deployed
-    # for bench-ns-01 in 999-comp shape is bench-app-01-99; the architect
-    # observed 35-39 on the first datagrid page in run-20260609-175816, so
-    # pick a name late enough to land in any reasonable cluster shape.
+    # Fallback when kubectl fails: a name from the architect-observed
+    # newest-panel range (bench-app-01-{36..40} in runs 175816 + 200710).
     return "bench-app-01-39"
 
 

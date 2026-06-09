@@ -843,17 +843,20 @@ def test_pick_visible_composition_name_returns_newest_fallback_on_kubectl_fail(
 
 
 def test_pick_visible_composition_name_picks_newest_by_timestamp(monkeypatch):
-    """The datagrid sorts panels by creationTimestamp DESC. We invoke
-    kubectl --sort-by=.metadata.creationTimestamp (ascending output),
-    then take the LAST line as the newest composition.
+    """The datagrid sorts PANELS by creationTimestamp DESC. We invoke
+    kubectl on panels.widgets.templates.krateo.io with the portal-page
+    label, --sort-by=.metadata.creationTimestamp (ascending output),
+    then take the LAST line's composition-name label as the newest.
 
-    Matches the customer-visible ordering for the compositions-panels
-    RESTAction. Replaces the prior alphabetical-sort behaviour that
-    picked bench-app-01-02 (row ~997 of cj's 999-composition view).
+    Replaces both prior behaviours: the alphabetical sort that picked
+    bench-app-01-02 (row ~997) AND the composition-timestamp sort that
+    picked bench-app-01-999 (whose PANEL isn't on the first page —
+    panel order diverges from composition order under workers=32
+    parallel deploy; empirically observed in run-20260609-200710).
     """
     from bench import phases as phases_mod
     from bench import cluster as cluster_mod
-    # kubectl --sort-by yields ascending; the newest is the last line.
+    # kubectl --sort-by yields ascending; the newest panel is the last line.
     monkeypatch.setattr(
         cluster_mod, "kubectl",
         lambda *a, **kw: (0,
@@ -862,6 +865,43 @@ def test_pick_visible_composition_name_picks_newest_by_timestamp(monkeypatch):
                           ""))
     out = phases_mod._pick_visible_composition_name("bench-ns-01")
     assert out == "bench-app-01-42"
+
+
+def test_pick_visible_composition_name_queries_panels_not_compositions(
+        monkeypatch):
+    """Regression guard for the #273 implementation error: the kubectl
+    query MUST target panels.widgets.templates.krateo.io with the
+    portal-page=compositions label selector and the composition-name
+    label column. Querying compositions sorted by THEIR timestamp picks
+    a name whose panel may not be on the datagrid first page.
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    captured = {}
+
+    def fake_kubectl(*args, **kwargs):
+        captured["args"] = list(args)
+        return (0, "bench-app-01-40", "")
+
+    monkeypatch.setattr(cluster_mod, "kubectl", fake_kubectl)
+    phases_mod._pick_visible_composition_name("bench-ns-01")
+    joined = " ".join(captured["args"])
+    assert "panels.widgets.templates.krateo.io" in joined
+    assert "krateo.io/portal-page=compositions" in joined
+    assert "composition-name" in joined
+
+
+def test_pick_visible_composition_name_skips_none_labels(monkeypatch):
+    """Panels lacking the composition-name label render as `<none>` in
+    custom-columns output — they must be skipped, not returned.
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    monkeypatch.setattr(
+        cluster_mod, "kubectl",
+        lambda *a, **kw: (0, "bench-app-01-39\n<none>", ""))
+    out = phases_mod._pick_visible_composition_name("bench-ns-01")
+    assert out == "bench-app-01-39"
 
 
 def test_pick_visible_composition_name_falls_back_when_output_empty(
