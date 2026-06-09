@@ -828,47 +828,74 @@ def test_wait_rbac_propagation_fails_closed_when_no_token(tmp_path):
 # ─── _pick_visible_composition_name fallback path ──────────────────────────
 
 
-def test_pick_visible_composition_name_returns_conventional_on_kubectl_fail(
+def test_pick_visible_composition_name_returns_newest_fallback_on_kubectl_fail(
         monkeypatch):
-    """When kubectl returns non-zero, fall back to the conventional
-    `bench-app-01-02` name.
+    """When kubectl returns non-zero, fall back to `bench-app-01-39`
+    (a name from the architect-confirmed newest-page range; see
+    docs/task-273-s8-second-defect-trace-2026-06-09.md §5.2).
     """
     from bench import phases as phases_mod
     from bench import cluster as cluster_mod
     monkeypatch.setattr(cluster_mod, "kubectl",
                         lambda *a, **kw: (1, "", "err"))
     assert phases_mod._pick_visible_composition_name("bench-ns-01") == \
-        "bench-app-01-02"
+        "bench-app-01-39"
 
 
-def test_pick_visible_composition_name_uses_lex_sort(monkeypatch):
-    """When kubectl returns names, sort lex and return `bench-app-01-02`
-    if present (typically true after S7 deletes -01-01).
+def test_pick_visible_composition_name_picks_newest_by_timestamp(monkeypatch):
+    """The datagrid sorts panels by creationTimestamp DESC. We invoke
+    kubectl --sort-by=.metadata.creationTimestamp (ascending output),
+    then take the LAST line as the newest composition.
+
+    Matches the customer-visible ordering for the compositions-panels
+    RESTAction. Replaces the prior alphabetical-sort behaviour that
+    picked bench-app-01-02 (row ~997 of cj's 999-composition view).
     """
     from bench import phases as phases_mod
     from bench import cluster as cluster_mod
+    # kubectl --sort-by yields ascending; the newest is the last line.
     monkeypatch.setattr(
         cluster_mod, "kubectl",
         lambda *a, **kw: (0,
-                          "bench-app-01-05\nbench-app-01-03\n"
-                          "bench-app-01-02\nbench-app-01-04",
+                          "bench-app-01-03\nbench-app-01-05\n"
+                          "bench-app-01-39\nbench-app-01-42",
                           ""))
     out = phases_mod._pick_visible_composition_name("bench-ns-01")
-    assert out == "bench-app-01-02"
+    assert out == "bench-app-01-42"
 
 
-def test_pick_visible_composition_name_fallback_when_conventional_absent(
+def test_pick_visible_composition_name_falls_back_when_output_empty(
         monkeypatch):
-    """If `bench-app-01-02` is NOT in the live list (e.g. S7 already
-    deleted that one too), pick the lex-first available name.
+    """kubectl rc=0 but empty stdout (no compositions yet) → fall back
+    to the architect-confirmed default newest-range name.
     """
     from bench import phases as phases_mod
     from bench import cluster as cluster_mod
     monkeypatch.setattr(
         cluster_mod, "kubectl",
-        lambda *a, **kw: (0, "bench-app-01-07\nbench-app-01-05", ""))
+        lambda *a, **kw: (0, "", ""))
     out = phases_mod._pick_visible_composition_name("bench-ns-01")
-    assert out == "bench-app-01-05"
+    assert out == "bench-app-01-39"
+
+
+def test_pick_visible_composition_name_invokes_sort_by_creationtimestamp(
+        monkeypatch):
+    """Regression guard: the kubectl call MUST pass
+    --sort-by=.metadata.creationTimestamp. Without that flag, the
+    output order is undefined and we'd silently regress to an arbitrary
+    name (which is what caused the run-20260609-175816 S8 FAIL).
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    captured = {}
+
+    def fake_kubectl(*args, **kwargs):
+        captured["args"] = list(args)
+        return (0, "bench-app-01-99", "")
+
+    monkeypatch.setattr(cluster_mod, "kubectl", fake_kubectl)
+    phases_mod._pick_visible_composition_name("bench-ns-01")
+    assert "--sort-by=.metadata.creationTimestamp" in captured["args"]
 
 
 # ─── Task #251 / 2026-06-09: per-stage pod log capture ──────────────────────

@@ -1114,30 +1114,42 @@ def _pick_visible_composition_name(target_ns: str) -> str:
     """Return a composition name guaranteed to render on the datagrid's
     first page (per_page=5) for a viewer with full ns access.
 
-    Convention picks `bench-app-01-02` (lex-second in `bench-ns-01`)
-    because S7 deletes `bench-app-01-01` and the datagrid renders names
-    in lex order. Falls back to live ns enumeration if the conventional
-    name is absent (e.g. running against a cluster shape that does not
-    match the convention).
+    The live `compositions-panels` RESTAction sorts panels by
+    `creationTimestamp DESC` (newest-first) — that's the customer-visible
+    ordering. We query compositions sorted the same way and return the
+    NEWEST one in target_ns, guaranteed to land in the datagrid's first 5.
+    See docs/task-273-s8-second-defect-trace-2026-06-09.md §5.2.
+
+    A prior version sorted alphabetically and picked `bench-app-01-02`,
+    which under cj's 999-composition view sits at row ~997 — never in DOM.
+    Falls back to the alphabetical-newest if the timestamp query fails.
 
     Args:
-        target_ns: namespace to scope the live-enumeration fallback to.
+        target_ns: namespace to scope the lookup to.
 
     Returns:
-        Composition name string; falls back to the conventional name on
-        kubectl failure (so the caller's `_user_card_text_present` check
-        still has a deterministic input to look for).
+        Composition name string; falls back to a synthesised newest-name
+        (`bench-app-01-39`) on kubectl failure so the caller's
+        `_user_card_text_present` check still has a deterministic input.
     """
-    conventional = "bench-app-01-02"
+    # NEWEST first via creationTimestamp DESC — matches the SPA datagrid's
+    # ordering. Output: "<creationTs> <name>" one per line; take the last.
     rc, out, _ = cluster.kubectl(
         "get", f"{cluster.COMP_RES}.{cluster.COMP_GVR}", "-n", target_ns,
-        "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
-    if rc != 0 or not out.strip():
-        return conventional
-    names = sorted(n.strip() for n in out.splitlines() if n.strip())
-    if conventional in names:
-        return conventional
-    return names[0] if names else conventional
+        "--no-headers",
+        "--sort-by=.metadata.creationTimestamp",
+        "-o", "custom-columns=NAME:.metadata.name")
+    if rc == 0 and out.strip():
+        lines = [n.strip() for n in out.splitlines() if n.strip()]
+        if lines:
+            # kubectl sort-by produces ascending order; the LAST line is newest.
+            return lines[-1]
+    # Fallback when kubectl fails: assume the convention bench-app-01-NN with
+    # NN as the highest 2-digit suffix seen during S5/S6 deploy. Last-deployed
+    # for bench-ns-01 in 999-comp shape is bench-app-01-99; the architect
+    # observed 35-39 on the first datagrid page in run-20260609-175816, so
+    # pick a name late enough to land in any reasonable cluster shape.
+    return "bench-app-01-39"
 
 
 def _user_card_text_present(ctx: StageContext,

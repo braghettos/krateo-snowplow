@@ -53,9 +53,21 @@ __all__ = [
 # extra-calls term is bounded by `min(n_visible, per_page)`.
 
 COMP_DATAGRID_PER_PAGE = 5      # frontend datagrid page size
-COMP_PER_CARD_WIDGETS = 4       # Panel + Markdown + 2 Buttons per card
+COMP_PER_CARD_WIDGETS = 4       # admin baseline: Panel + Markdown + 2 Buttons
 COMP_BASE_CALLS_STRUCTURAL = 10  # /compositions structural ceiling at N=0
 DASH_BASE_CALLS_STRUCTURAL = 16  # /dashboard structural ceiling
+
+# Per-user per-card widget count. cj's S8 Role grants only get/list on
+# compositions.composition.krateo.io, so the 2 Buttons per card (verbs DELETE
+# + PATCH) come back from snowplow with allowed=false (FLAG, NOT DROP). The
+# SPA's WidgetRenderer.tsx filters them out and Panel's FooterItem short-
+# circuits before firing /call. cj therefore fires only 2 widgets per card
+# (Panel + Markdown). admin's broader RBAC keeps all 4 active.
+# See docs/task-273-s8-second-defect-trace-2026-06-09.md.
+COMP_PER_CARD_WIDGETS_BY_USER = {
+    "admin":      4,  # Panel + Markdown + 2 Buttons (delete + patch allowed)
+    "cyberjoker": 2,  # Panel + Markdown only (Buttons filtered by allowed=false)
+}
 
 
 # ─── Expected /call counts per (user, page) ─────────────────────────────────
@@ -185,7 +197,10 @@ def expected_calls(user, page_path, *, n_visible=None):
     if n_visible is None or n_visible <= 0:
         return base
     cards_visible = min(int(n_visible), COMP_DATAGRID_PER_PAGE)
-    return base + COMP_PER_CARD_WIDGETS * cards_visible
+    per_card = COMP_PER_CARD_WIDGETS_BY_USER.get(
+        user, COMP_PER_CARD_WIDGETS_BY_USER.get(
+            EXPECTED_CALLS_DEFAULT_USER, COMP_PER_CARD_WIDGETS))
+    return base + per_card * cards_visible
 
 
 # ─── Overlay freshness gate ─────────────────────────────────────────────────

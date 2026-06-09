@@ -180,13 +180,14 @@ def test_expected_calls_returns_base_when_n_visible_is_zero():
 
 
 def test_expected_calls_adds_per_card_widgets_term_below_per_page_cap():
-    """N=1 visible card → 10 + 4×1 = 14.
-    Empirical match for S4/S5 admin path where bench-ns-01 has 1
-    composition (S4 deploys 1 per ns, ns-01 only gets one).
+    """N=1 visible card. admin fires 4 widgets/card (10 + 4×1 = 14).
+    cj fires 2 widgets/card (10 + 2×1 = 12) — the 2 Buttons are filtered
+    by snowplow's allowed=false / SPA's WidgetRenderer. See
+    docs/task-273-s8-second-defect-trace-2026-06-09.md.
     """
     from bench.expected import expected_calls
     assert expected_calls("admin", "/compositions", n_visible=1) == 14
-    assert expected_calls("cyberjoker", "/compositions", n_visible=1) == 14
+    assert expected_calls("cyberjoker", "/compositions", n_visible=1) == 12
 
 
 def test_expected_calls_caps_at_per_page_above_cap():
@@ -257,3 +258,45 @@ def test_expected_calls_negative_n_visible_returns_base():
     """
     from bench.expected import expected_calls
     assert expected_calls("admin", "/compositions", n_visible=-1) == 10
+
+
+# ─── Per-user per-card widget count (Task #273) ─────────────────────────────
+
+
+def test_expected_calls_per_user_widget_count_cyberjoker():
+    """cj fires 2 widgets per card (Panel + Markdown). The 2 Buttons get
+    allowed=false from snowplow because cj's S8 Role only grants get/list
+    on compositions.composition.krateo.io. SPA filters allowed=false
+    and Panel's FooterItem short-circuits — no /call fired for buttons.
+
+    n_visible=999 → 5 cards capped → base 10 + 2 widgets × 5 cards = 20.
+    See docs/task-273-s8-second-defect-trace-2026-06-09.md §5.1.
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("cyberjoker", "/compositions", n_visible=999) == 20
+
+
+def test_expected_calls_per_user_widget_count_admin_still_four():
+    """admin's broader RBAC means all 4 widgets per card fire.
+    n_visible=50000 → 5 cards capped → 10 + 4 × 5 = 30. Unchanged behaviour.
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("admin", "/compositions", n_visible=50000) == 30
+
+
+def test_expected_calls_per_user_widget_count_dict_present_and_correct():
+    """Regression guard: the per-user dict must contain admin=4 and
+    cyberjoker=2. A future role-grant change for cj would update cj=4;
+    test will flag the constant update so docs stay in sync.
+    """
+    from bench.expected import COMP_PER_CARD_WIDGETS_BY_USER
+    assert COMP_PER_CARD_WIDGETS_BY_USER["admin"] == 4
+    assert COMP_PER_CARD_WIDGETS_BY_USER["cyberjoker"] == 2
+
+
+def test_expected_calls_unknown_user_widget_count_falls_back_to_admin():
+    """Unknown user → falls back to admin row + admin widget count.
+    /compositions(unknown, N=10) = 10 + 4 × 5 = 30 (same as admin).
+    """
+    from bench.expected import expected_calls
+    assert expected_calls("ghost-user", "/compositions", n_visible=10) == 30
