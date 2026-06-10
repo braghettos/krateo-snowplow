@@ -9,6 +9,7 @@ Per docs/bench-restructure-path-b-plan-2026-06-02.md §C.6.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -297,6 +298,141 @@ def test_write_run_bundle_truncates_oversize_video_bundle(tmp_path,
     assert summary["bundle_truncated"] is True
 
 
+def _compressible_log_bytes(n: int) -> bytes:
+    """A semi-repetitive byte payload that gzip shrinks substantially
+    (models real pod_logs, which are highly compressible text). Pure
+    \\x00 compresses ~1000× which is unrealistic; a repeating line gives a
+    realistic ~10-20× ratio for the drop-order test sizing."""
+    line = b"2026-06-10T00:00:00Z INFO cache.event consumed gvr=panels ns=bench-ns-01\n"
+    return (line * (n // len(line) + 1))[:n]
+
+
+def test_truncate_gzips_pod_logs_retaining_videos_and_logs(tmp_path,
+                                                           monkeypatch):
+    """Task #299 (reworked): pod_logs are gzipped at bundle time, after
+    which BOTH videos AND logs fit the cap — nothing is dropped. The .gz
+    keeps the .txt stem (S6.txt.gz) for discoverability; the original .txt
+    is removed; the gzip saving is recorded in oversize_bundle.json."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    monkeypatch.setattr(ledger, "RUN_BUNDLE_MAX_BYTES", 1_000_000)  # 1 MB cap
+
+    vdir = tmp_path / "videos"
+    vdir.mkdir()
+    # 1 video pair = 500 KB (retained).
+    (vdir / "S6_admin_cold.webm").write_bytes(b"\x00" * 400_000)
+    (vdir / "S6_admin_cold.gif").write_bytes(b"\x00" * 100_000)
+
+    # Raw pod_logs ~5 MB (over the 1 MB cap) but ~10-20× compressible →
+    # after gzip the bundle (videos 0.5 MB + tiny .gz) fits.
+    pdir = tmp_path / "pod_logs"
+    pdir.mkdir()
+    (pdir / "S6.txt").write_bytes(_compressible_log_bytes(5_000_000))
+
+    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
+                            tag="t", scale=5000)
+
+    # Logs are now gzipped with the .txt stem preserved; raw removed.
+    assert (pdir / "S6.txt.gz").exists(), "pod log must be gzipped as S6.txt.gz"
+    assert not (pdir / "S6.txt").exists(), "raw .txt must be removed after gzip"
+    # Videos retained.
+    assert (vdir / "S6_admin_cold.webm").exists()
+    assert (vdir / "S6_admin_cold.gif").exists()
+    # gzip alone fit the cap → NO files dropped → bundle_truncated False.
+    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
+    reasons = [t["reason"] for t in over["trimmed"]]
+    assert "bundle_pod_logs_gzipped" in reasons
+    assert not any(r.startswith("bundle_oversize_truncate") for r in reasons), (
+        f"nothing should be dropped when gzip fits the cap; got {reasons}")
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["bundle_truncated"] is False
+    assert ledger._bundle_size_bytes(tmp_path) <= 1_000_000
+
+
+def test_truncate_drop_order_screenshots_then_videos_then_gz_logs_last(
+        tmp_path, monkeypatch):
+    """Task #299 (reworked): when gzip alone is NOT enough, the drop order
+    is screenshots → oldest videos → gzipped pod_logs LAST. Gzipped logs
+    (irreplaceable trace inputs) are the very last to go and only if the
+    cap still cannot be met. The cap stays a hard ceiling."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    monkeypatch.setattr(ledger, "RUN_BUNDLE_MAX_BYTES", 1_000_000)  # 1 MB cap
+
+    import os as _os
+    # Screenshots 600 KB (dropped first).
+    sdir = tmp_path / "screenshots"
+    sdir.mkdir()
+    (sdir / "S6_admin.png").write_bytes(b"\x00" * 600_000)
+    # 3 video pairs of 500 KB = 1.5 MB incompressible (dropped second,
+    # oldest-first).
+    vdir = tmp_path / "videos"
+    vdir.mkdir()
+    for i in range(3):
+        webm = vdir / f"S{i + 1}_admin_cold.webm"
+        gif = vdir / f"S{i + 1}_admin_cold.gif"
+        webm.write_bytes(b"\x00" * 400_000)
+        gif.write_bytes(b"\x00" * 100_000)
+        _os.utime(webm, (1000 + i, 1000 + i))
+        _os.utime(gif, (1000 + i, 1000 + i))
+    # A pod_log that stays large even gzipped (incompressible \x00 → gzip
+    # is tiny, so to force a log-drop we use random-ish incompressible
+    # bytes large enough to exceed the cap by itself post-gzip).
+    pdir = tmp_path / "pod_logs"
+    pdir.mkdir()
+    (pdir / "S6.txt").write_bytes(os.urandom(2_000_000))  # ~incompressible
+
+    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
+                            tag="t", scale=5000)
+
+    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
+    # Order of drop reasons (gzip summary first, then drops in phase order).
+    drop_reasons = [t["reason"] for t in over["trimmed"]
+                    if t["reason"].startswith("bundle_oversize_truncate")]
+    assert "bundle_pod_logs_gzipped" in [t["reason"] for t in over["trimmed"]]
+    # Screenshots dropped before videos before gz logs.
+    def _first_idx(reason):
+        for i, r in enumerate(drop_reasons):
+            if r == reason:
+                return i
+        return None
+    ss = _first_idx("bundle_oversize_truncate_screenshot")
+    vid = _first_idx("bundle_oversize_truncate_video")
+    gz = _first_idx("bundle_oversize_truncate_podlog_gz")
+    assert ss is not None and ss == 0, (
+        f"screenshots must drop first; drop order={drop_reasons}")
+    if vid is not None and gz is not None:
+        assert vid < gz, "videos must drop before gzipped pod_logs"
+    if ss is not None and vid is not None:
+        assert ss < vid, "screenshots must drop before videos"
+    # Cap honoured as a hard ceiling.
+    assert ledger._bundle_size_bytes(tmp_path) <= 1_000_000
+
+
+def test_truncate_gz_logs_dropped_only_as_last_resort(tmp_path, monkeypatch):
+    """Task #299: gzipped pod_logs are dropped ONLY when screenshots +
+    videos are already gone and the cap still cannot be met. Here a single
+    incompressible 2 MB log alone exceeds the 1 MB cap with no other
+    artifacts → the gz log must be dropped (last resort), cap honoured."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    monkeypatch.setattr(ledger, "RUN_BUNDLE_MAX_BYTES", 1_000_000)
+
+    pdir = tmp_path / "pod_logs"
+    pdir.mkdir()
+    (pdir / "S6.txt").write_bytes(os.urandom(2_000_000))  # gzip ≈ 2 MB still
+
+    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
+                            tag="t", scale=5000)
+
+    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
+    reasons = [t["reason"] for t in over["trimmed"]]
+    assert "bundle_pod_logs_gzipped" in reasons
+    assert "bundle_oversize_truncate_podlog_gz" in reasons, (
+        "the gz log must be dropped as a last resort when it alone exceeds "
+        "the cap")
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["bundle_truncated"] is True  # a file WAS dropped
+    assert ledger._bundle_size_bytes(tmp_path) <= 1_000_000
+
+
 # ─── Task #289: conv tier revision + reporting-clarity fixes ────────────────
 
 
@@ -394,6 +530,61 @@ def test_skeleton_failures_includes_skeleton_pass_without_materializing_flag():
     }}}]
     summary = ledger.aggregate_validation(all_results)
     assert summary["skeleton_failures"] == ["S6 ON nav#2 Dashboard"]
+
+
+# ── #296: S10 churn-demoted navs excluded from call_count_mismatches ────────
+
+
+def _churn_nav(label, *, expected, actual, s10_churn_demoted):
+    """A /compositions nav whose call-count mismatched (actual != expected)
+    but terminal_state passed because the S10 churn demotion fired."""
+    return {
+        "user": "admin", "nav_num": 1, "waterfallMs": 200, "label": label,
+        "validation": {
+            "terminal_state": "pass",
+            "skeleton_count": 0,
+            "errored_count": 5,
+            "expected_calls": expected,
+            "actual_calls": actual,
+            "calls_within_tolerance": False,   # the demotion does NOT flip this
+            "s10_churn_demoted": s10_churn_demoted,
+        },
+    }
+
+
+def test_call_count_mismatches_excludes_s10_churn_demoted_nav():
+    """#296 telemetry fix: a nav whose mismatch was demoted by the S10
+    controller-churn ghost rule (terminal_state='pass' +
+    s10_churn_demoted=True) must NOT appear in call_count_mismatches —
+    otherwise the ledger self-contradicts (navs_terminal_fail==0 alongside
+    a mismatch tuple). Mirrors the #289a skeleton exclusion."""
+    all_results = [{"stage": "10", "cache": "ON", "pages": {"Compositions": {
+        "navigations": [_churn_nav("S10 admin Compositions",
+                                   expected=30, actual=35,
+                                   s10_churn_demoted=True)],
+    }}}]
+    summary = ledger.aggregate_validation(all_results)
+    assert summary["navs_terminal_fail"] == 0
+    assert summary["call_count_mismatches"] == [], (
+        "a churn-demoted nav must not be reported as a call_count_mismatch "
+        "(self-contradictory ledger otherwise)")
+
+
+def test_call_count_mismatches_still_records_genuine_mismatch():
+    """Regression guard: a real mismatch (NOT churn-demoted — e.g.
+    terminal_state='fail') is STILL recorded. The exclusion must not
+    weaken genuine under/over-call detection."""
+    all_results = [{"stage": "6", "cache": "ON", "pages": {"Compositions": {
+        "navigations": [_churn_nav("S6 admin Compositions",
+                                   expected=30, actual=10,
+                                   s10_churn_demoted=False)],
+    }}}]
+    # terminal_state is 'pass' in _churn_nav; force the genuine-fail shape.
+    all_results[0]["pages"]["Compositions"]["navigations"][0][
+        "validation"]["terminal_state"] = "fail"
+    summary = ledger.aggregate_validation(all_results)
+    assert summary["navs_terminal_fail"] == 1
+    assert summary["call_count_mismatches"] == [("S6 admin Compositions", 30, 10)]
 
 
 # ── #289b: failed_gates enumerates latency-tier misses on non-PASS ──────────

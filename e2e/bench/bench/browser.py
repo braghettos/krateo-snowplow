@@ -1069,8 +1069,39 @@ def _count_rendered_comp_cards(page, name_prefix="bench-app-"):
         return 0
 
 
+def _errored_call_namespaces(call_statuses):
+    """Return the set of `namespace` query-params of non-200 /call URLs.
+
+    Task #296: the S10 churn-ghost demotion needs to know WHICH namespaces
+    the errored per-row panel GETs targeted. Each errored panel GET is a
+    `/call?...&name=<panel>&namespace=<ns>` that returned non-200 (snowplow
+    correctly 404s a controller-churned/deleted Panel). The set of those
+    `namespace` params is the evidence the demotion predicate keys on:
+    if EVERY errored ns is OUTSIDE the bench-deleted ns, the errors are
+    controller-churn ghosts (a recorded WARN); if ANY errored ns IS the
+    deleted ns, that is a genuine serve-stale ghost and stays a HARD fail.
+
+    call_statuses is the list of {"url","status"} dicts the response
+    listener captured. Returns a set[str]; empty when nothing errored.
+    """
+    from urllib.parse import urlparse, parse_qs
+    out = set()
+    for s in (call_statuses or []):
+        if s.get("status") == 200:
+            continue
+        try:
+            qs = parse_qs(urlparse(s.get("url", "")).query)
+        except Exception:
+            continue
+        ns = (qs.get("namespace") or [None])[0]
+        if ns:
+            out.add(ns)
+    return out
+
+
 def _validate_widget_terminal_state(page, page_path, label, user="admin",
-                                    token=None):
+                                    token=None, deleted_ns=None,
+                                    call_statuses=None):
     """Inspect the rendered page after the /call stability poll returns.
 
     The waterfall measurement only tells us when network activity stopped.
@@ -1219,7 +1250,54 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin",
             terminal_state = "fail"
     if errored_count > 0:
         _log(f"    [WARN] errored_widgets={errored_count} at {label}")
-    if expected is not None and not calls_within_tolerance:
+
+    # Task #296 — S10 controller-churn ghost demotion (mirrors the efaf1a4
+    # skeleton-demotion pattern: narrow predicate, hard-fail preserved
+    # otherwise). During S10's bulk delete, composition-controller reconcile
+    # churn deletes the Panel CRs backing the newest-5 cluster-wide
+    # compositions; the SPA reads those (still-fresh) composition names from
+    # the datagrid's newest-first page 1 and GETs each per-row Panel, which
+    # snowplow correctly 404s (serving a ghost panel body would be the real
+    # bug). Those ghost 404s inflate actual_calls past expected → a
+    # call_count_mismatch. That is an expected controller-churn input, NOT a
+    # snowplow defect — UNLESS an errored panel is in the bench-DELETED ns,
+    # which WOULD be a genuine serve-stale ghost and stays a HARD fail.
+    #
+    # Demote ONLY when EVERY condition holds:
+    #   1. deleted_ns is set                     (S10 only — None off-S10)
+    #   2. errored_count > 0                     (there are ghost cards)
+    #   3. the ONLY reason this nav would fail is the call_count_mismatch
+    #      (no skeleton fail) AND the mismatch is an OVER-call (actual >
+    #      expected — extra ghost GETs), never an under-call
+    #   4. EVERY errored /call namespace is OUTSIDE deleted_ns
+    # If any errored ns IS the deleted ns, or the mismatch is an under-call,
+    # or a skeleton already failed, the normal hard-fail path runs.
+    s10_churn_errors = None
+    errored_namespaces = sorted(_errored_call_namespaces(call_statuses))
+    churn_demoted = False
+    if (deleted_ns is not None
+            and errored_count > 0
+            and expected is not None
+            and not calls_within_tolerance
+            and actual_calls > expected          # over-call from ghost GETs
+            and terminal_state == "pass"          # no prior (skeleton) fail
+            and errored_namespaces
+            and deleted_ns not in errored_namespaces):
+        churn_demoted = True
+        s10_churn_errors = {
+            "errored_count": errored_count,
+            "errored_namespaces": errored_namespaces,
+            "deleted_ns": deleted_ns,
+            "expected_calls": expected,
+            "actual_calls": actual_calls,
+        }
+        _log(f"    [WARN] s10_churn_errors: {errored_count} errored "
+             f"controller-churn ghost panel(s) at {label} in ns "
+             f"{errored_namespaces} (all OUTSIDE deleted ns {deleted_ns}); "
+             f"actual={actual_calls}>expected={expected} demoted to WARN "
+             f"(transient newest-card ghost, not a serve-stale defect)")
+
+    if expected is not None and not calls_within_tolerance and not churn_demoted:
         nvis_str = f"n_visible={n_visible}" if n_visible is not None else \
                    "n_visible=base"
         _log(f"    [FAIL] call_count_mismatch[{user}]: expected={expected}"
@@ -1237,6 +1315,8 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin",
         "actual_calls": actual_calls,
         "calls_within_tolerance": calls_within_tolerance,
         "terminal_state": terminal_state,
+        "s10_churn_demoted": churn_demoted,
+        "s10_churn_errors": s10_churn_errors,
         "user": user,
         "n_visible": n_visible,
     }
@@ -1290,7 +1370,7 @@ _validate_widget_terminal_state_public = _validate_widget_terminal_state
 
 
 def browser_measure_navigation(page, page_path, label, min_calls=0,
-                               user="admin", token=None):
+                               user="admin", token=None, deleted_ns=None):
     """Navigate to a page; measure the /call API waterfall + widget gates.
 
     Args:
@@ -1363,7 +1443,9 @@ def browser_measure_navigation(page, page_path, label, min_calls=0,
         page.wait_for_timeout(1000)
 
     validation = _validate_widget_terminal_state(page, page_path, label,
-                                                 user=user, token=token)
+                                                 user=user, token=token,
+                                                 deleted_ns=deleted_ns,
+                                                 call_statuses=_call_statuses)
 
     # Measure /call waterfall + cluster calls into progressive-rendering levels.
     result = page.evaluate("""() => {
@@ -1594,7 +1676,8 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                           verify_against_cluster=True,
                           verify_timeout: int = 300,
                           verify_interval: int = 3,
-                          screenshots_dir: Path | None = None):
+                          screenshots_dir: Path | None = None,
+                          deleted_ns=None):
     """Navigate browser to each page num_navs times, return timing data.
 
     Expects an already-logged-in page object and an admin JWT token.
@@ -1635,7 +1718,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                 page, page_path,
                 f"S{stage_num} {cache_mode} nav#{nav_num} {page_name}",
                 min_calls=cold_calls,
-                user=user, token=token)
+                user=user, token=token, deleted_ns=deleted_ns)
             cold_warm = 'COLD' if nav_num == 1 else 'WARM'
             m["nav_num"] = nav_num
             m["cold_warm"] = cold_warm
@@ -1799,30 +1882,44 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                                 m["content_missing"] = len(missing)
                                 m["content_extra"] = len(extra)
                     else:
-                        # RBAC-scoped user (e.g. cj): compare cached
-                        # composition-name count against the api_count /
-                        # ui_count already validated by the VERIFY poll.
-                        # Cluster-truth diff would always falsely flag
-                        # `missing=N` because cj cannot see the cluster's
-                        # full set by design.
+                        # RBAC-scoped user (e.g. cj): the intra-user CONTENT
+                        # comparison is STRUCTURALLY MISMATCHED and is here
+                        # DEMOTED to an explicitly-labeled, non-load-bearing
+                        # DIAGNOSTIC (Task #298, trace
+                        # docs/task-296-298-s10-and-content-trace-2026-06-10.md
+                        # TRACE 2 §"cj intra-user branch").
+                        #
+                        # WHY: `cached` comes from
+                        # list_composition_names_from_cache(token), which
+                        # reads the CLUSTER-WIDE `compositions-list`
+                        # RESTAction. cj has no cluster-scoped LIST
+                        # permission (narrow RoleBinding), so that list is
+                        # LEGITIMATELY ~0 for cj — whereas `api_count` is the
+                        # RBAC-NARROWED piechart aggregate (e.g. 999). Comparing
+                        # cached_count(0) == api_count(999) is therefore
+                        # PERMANENTLY false: it never reflected a real
+                        # correctness signal, only the structural mismatch
+                        # between two different views. A proper RBAC-scoped
+                        # name-list source is not reachable here in a small
+                        # change (the piechart aggregates via a different
+                        # widget path, not a flat name-list endpoint), so per
+                        # the trace we record this as a diagnostic and DO NOT
+                        # set content_match (which reads as a real check).
+                        # The admin cluster-truth CONTENT check above remains
+                        # the load-bearing CONTENT gate
+                        # (feedback_validate_content_not_just_status).
                         if cached is not None:
                             cached_count = len(cached)
-                            if api_count >= 0 and cached_count == api_count:
-                                _log(f"    CONTENT ✓ {cached_count} composition "
-                                     f"names match (vs intra-user api_count "
-                                     f"— RBAC-scoped truth)")
-                                m["content_match"] = True
-                                m["content_truth_source"] = "intra_user_api"
-                            else:
-                                _log(f"    CONTENT ✗ DRIFT (intra-user) — "
-                                     f"cached_names={cached_count} "
-                                     f"api_count={api_count} "
-                                     f"ui_count={ui_count}")
-                                m["content_match"] = False
-                                m["content_truth_source"] = "intra_user_api"
-                                m["content_cached_count"] = cached_count
-                                m["content_api_count"] = api_count
-                                m["content_ui_count"] = ui_count
+                            _log(f"    CONTENT [diagnostic, non-load-bearing] "
+                                 f"cj cluster-wide compositions-list "
+                                 f"cached_names={cached_count} vs RBAC-narrowed "
+                                 f"api_count={api_count} ui_count={ui_count} "
+                                 f"(structurally mismatched by design — Task "
+                                 f"#298; NOT a CONTENT pass/fail)")
+                            m["content_truth_source"] = "cj_diagnostic_non_load_bearing"
+                            m["content_cj_cached_count"] = cached_count
+                            m["content_cj_api_count"] = api_count
+                            m["content_cj_ui_count"] = ui_count
 
                 # Final VERIFY screenshot — reload dashboard for fresh data.
                 try:

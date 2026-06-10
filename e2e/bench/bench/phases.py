@@ -782,10 +782,17 @@ def _first_stage_label(ctx: StageContext) -> str:
     return "S0"
 
 
-def _measure_all_users(ctx: StageContext, stage_num, stage_desc) -> list[dict]:
+def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
+                       deleted_ns=None) -> list[dict]:
     """Run browser_measure_stage on every (user, page); return entries.
 
     Each entry tagged with `user=<u_name>`. ConvergenceTimeout propagates.
+
+    `deleted_ns` (Task #296): the bench-deleted namespace for a bulk-delete
+    stage (S10). Threaded into widget-terminal-state validation so a
+    controller-churn ghost-panel 404 OUTSIDE the deleted ns demotes to a
+    recorded WARN, while a ghost IN the deleted ns stays a HARD fail. None
+    for non-delete stages (no behavioural change).
     """
     out = []
     for u_name, u_state in list(ctx.user_pages.items()):
@@ -794,7 +801,8 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc) -> list[dict]:
         r = browser.browser_measure_stage(
             u_state["page"], stage_num, stage_desc, ctx.cache_mode,
             token=u_state["token"], user=u_name,
-            verify_against_cluster=(u_name == "admin"))
+            verify_against_cluster=(u_name == "admin"),
+            deleted_ns=deleted_ns)
         if r:
             r["user"] = u_name
             out.append(r)
@@ -1701,10 +1709,31 @@ def stage_s10_delete_one_ns(ctx: StageContext) -> StageProof:
         lifecycle.delete_one_bench_namespace(s10_ns)
         lifecycle.wait_for_namespace_gone(s10_ns)
         _post_mutation_pause(c.cache_mode)
-        results = _measure_all_users(c, 10, "Deleted 1 ns")
+        # Task #296: thread the deleted ns so widget-terminal-state
+        # validation can demote controller-churn ghost-panel 404s OUTSIDE
+        # s10_ns to a recorded WARN (a ghost IN s10_ns stays a HARD fail).
+        results = _measure_all_users(c, 10, "Deleted 1 ns",
+                                     deleted_ns=s10_ns)
+        # Surface the demotion in the proof (telemetry, like #289a did for
+        # skeletons): count demoted navs + collect their churn-error detail.
+        churn_demoted_navs = 0
+        churn_errors: list[dict] = []
+        for r in results:
+            for _pg in (r.get("pages") or {}).values():
+                for nav in (_pg.get("navigations") or []):
+                    v = nav.get("validation") or {}
+                    if v.get("s10_churn_demoted"):
+                        churn_demoted_navs += 1
+                        if v.get("s10_churn_errors"):
+                            churn_errors.append({
+                                "label": nav.get("label"),
+                                **v["s10_churn_errors"],
+                            })
         return {
             "ns": s10_ns,
             "measurement_count": len(results),
+            "s10_churn_demoted_navs": churn_demoted_navs,
+            "s10_churn_errors": churn_errors,
             "__passed__": True,
         }
 

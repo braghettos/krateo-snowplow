@@ -697,6 +697,72 @@ def test_count_widget_errors_tolerates_missing_validation():
                                 page="Compositions") == 3
 
 
+# ─── Task #296 — S10 churn-ghost demotion threading + proof telemetry ───────
+
+
+def test_s10_passes_deleted_ns_and_surfaces_churn_telemetry(tmp_path,
+                                                            monkeypatch):
+    """#296: stage_s10_delete_one_ns threads the deleted ns into
+    validation and surfaces the demotion in its proof. We mock
+    _measure_all_users to (a) assert it receives deleted_ns and (b) return
+    synthetic navs carrying churn-demoted validation; the proof must then
+    count the demoted navs + collect their churn-error detail."""
+    from bench import phases as phases_mod
+
+    # Mock the cluster-mutating side effects to no-ops.
+    monkeypatch.setattr(phases_mod.lifecycle, "delete_one_bench_namespace",
+                        lambda ns: None)
+    monkeypatch.setattr(phases_mod.lifecycle, "wait_for_namespace_gone",
+                        lambda ns: None)
+    monkeypatch.setattr(phases_mod, "_post_mutation_pause", lambda mode: None)
+    monkeypatch.setattr(phases_mod, "_snapshot_l1_ready_ts", lambda c: 0)
+
+    captured = {}
+
+    def _fake_measure(ctx, stage_num, stage_desc, deleted_ns=None):
+        captured["deleted_ns"] = deleted_ns
+        return [{
+            "user": "admin",
+            "pages": {
+                "Compositions": {
+                    "navigations": [
+                        {"label": "S10 admin Compositions",
+                         "validation": {
+                             "terminal_state": "pass",
+                             "s10_churn_demoted": True,
+                             "s10_churn_errors": {
+                                 "errored_count": 5,
+                                 "errored_namespaces": ["bench-ns-16"],
+                                 "deleted_ns": deleted_ns,
+                                 "expected_calls": 30,
+                                 "actual_calls": 35,
+                             }}},
+                        {"label": "S10 admin Compositions nav2",
+                         "validation": {"terminal_state": "pass",
+                                        "s10_churn_demoted": False}},
+                    ],
+                },
+            },
+        }]
+
+    monkeypatch.setattr(phases_mod, "_measure_all_users", _fake_measure)
+
+    ctx = StageContext(
+        tag="t", scale=50000, run_dir=tmp_path, cache_mode="ON",
+    )
+    proof = phases_mod.stage_s10_delete_one_ns(ctx)
+
+    # SCALE=50000 → deleted ns is bench-ns-50 (per the stage's formula).
+    assert captured["deleted_ns"] == "bench-ns-50"
+    # StageProof.proof holds the _work() return dict.
+    work = proof.proof
+    assert work.get("ns") == "bench-ns-50"
+    assert work.get("s10_churn_demoted_navs") == 1
+    assert len(work.get("s10_churn_errors") or []) == 1
+    assert work["s10_churn_errors"][0]["errored_count"] == 5
+    assert work["s10_churn_errors"][0]["deleted_ns"] == "bench-ns-50"
+
+
 # ─── Task #250 Block 2 — _wait_rbac_propagation_to_snowplow ────────────────
 #
 # Hermetic-isolation contract: ALL probe paths must monkeypatch the

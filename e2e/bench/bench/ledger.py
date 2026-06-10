@@ -24,8 +24,12 @@ New (Block 4):
   compute_baseline_delta — ±15% gate helper (acceptance (c))
 
 Bundle-truncate logic per R3.1 / tightening #6: ledger row STILL emits with verdict
-intact when video bundle exceeds 200 MB; oldest .webm/.gif pairs by mtime drop until
-under cap; `oversize_bundle.json` lists trimmed files; summary.json.bundle_truncated=True.
+intact when the bundle exceeds 200 MB. Task #299 (team-resolved): pod_logs are
+irreplaceable trace inputs AND videos are a Diego goal requirement, so the bundler
+FIRST gzips every pod_log (S6.txt → S6.txt.gz, ~10-20× smaller) — after which videos
+AND logs typically both fit. If STILL over cap, drop order is screenshots → oldest
+.webm/.gif video pairs → gzipped pod_logs LAST. `oversize_bundle.json` records the
+gzip saving + any drops (reason field); summary.json.bundle_truncated=True when modified.
 
 Per docs/bench-restructure-path-b-plan-2026-06-02.md §A.7 + §F.
 """
@@ -33,8 +37,10 @@ Per docs/bench-restructure-path-b-plan-2026-06-02.md §A.7 + §F.
 from __future__ import annotations
 
 import datetime
+import gzip
 import json
 import os
+import shutil
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -200,8 +206,21 @@ def aggregate_validation(all_results: Iterable[dict]) -> dict:
                     summary["skeleton_failures"].append(label)
                 summary["errored_widgets_total"] += int(
                     v.get("errored_count", 0) or 0)
+                # #296: a nav whose call_count_mismatch was DEMOTED to a
+                # recorded WARN (terminal_state=='pass' AND
+                # s10_churn_demoted==True — S10 controller-churn ghost panels
+                # 404'd OUTSIDE the bench-deleted ns) is NOT a mismatch and
+                # must NOT be appended to call_count_mismatches. Mirrors the
+                # #289a skeleton exclusion above. Without this the ledger is
+                # self-contradictory (navs_terminal_fail==0 alongside
+                # mismatch tuples). Telemetry-only: the verdict already keys
+                # off navs_terminal_fail, which reflects the demotion.
+                churn_demoted = (v.get("terminal_state") == "pass"
+                                 and v.get("s10_churn_demoted") is True)
                 exp = v.get("expected_calls")
-                if exp is not None and not v.get("calls_within_tolerance", True):
+                if (exp is not None
+                        and not v.get("calls_within_tolerance", True)
+                        and not churn_demoted):
                     summary["call_count_mismatches"].append(
                         (label, exp, v.get("actual_calls", 0)))
     return summary
@@ -568,54 +587,175 @@ def _bundle_size_bytes(run_dir: Path) -> int:
     return total
 
 
+def _gzip_pod_logs(run_dir: Path) -> list[dict]:
+    """Gzip every uncompressed pod_logs/*.txt in place: write `<name>.gz`,
+    remove the original. Returns a list of dicts {name, raw_size,
+    gz_size} for the files compressed (empty when none / already gzipped).
+
+    Task #299: pod_logs are the irreplaceable trace inputs (≈196 MB this
+    run) but compress ~10-20× (S6 98 MB → ~5-8 MB). Compressing them at
+    bundle time lets BOTH videos (Diego goal) AND logs fit the cap without
+    dropping either. The .gz keeps the original stem so the trace docs'
+    `S6.txt` references survive as `S6.txt.gz` (discoverable).
+    """
+    pdir = run_dir / "pod_logs"
+    if not pdir.is_dir():
+        return []
+    out: list[dict] = []
+    for p in sorted(pdir.rglob("*.txt")):
+        if not p.is_file():
+            continue
+        gz = p.with_suffix(p.suffix + ".gz")  # S6.txt -> S6.txt.gz
+        if gz.exists():
+            continue
+        try:
+            raw_size = p.stat().st_size
+            with open(p, "rb") as fin, gzip.open(gz, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            gz_size = gz.stat().st_size
+            p.unlink()
+        except OSError:
+            # Best-effort: leave the original in place on any IO error.
+            continue
+        out.append({"name": gz.name, "raw_size": raw_size,
+                    "gz_size": gz_size})
+    return out
+
+
+def _screenshot_victims(run_dir: Path) -> list[Path]:
+    """Screenshots, largest-first — the first artifact dropped under cap
+    pressure (cheapest to lose; videos + gzipped logs are the goal)."""
+    d = run_dir / "screenshots"
+    if not d.is_dir():
+        return []
+    files = [p for p in d.rglob("*") if p.is_file()]
+    return sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+
+
+def _gzipped_pod_log_victims(run_dir: Path) -> list[Path]:
+    """Gzipped pod_logs, largest-first — dropped LAST (after screenshots
+    and videos) because they are irreplaceable trace inputs."""
+    d = run_dir / "pod_logs"
+    if not d.is_dir():
+        return []
+    files = [p for p in d.rglob("*.gz") if p.is_file()]
+    return sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+
+
 def _truncate_bundle(run_dir: Path, *,
                      max_bytes: int | None = None) -> tuple[bool, list[dict]]:
-    """Drop oldest .webm/.gif pairs until bundle <= max_bytes.
+    """Trim the run bundle to <= max_bytes, RETAINING VIDEOS + LOGS.
+
+    Task #299 (team-resolved): pod_logs are irreplaceable trace inputs and
+    videos are a Diego goal requirement, but raw logs alone (~196 MB) can
+    approach the cap. So FIRST gzip all pod_logs (~10-20× smaller) — after
+    which videos AND logs typically both fit. If STILL over cap, the drop
+    order is (cheapest/most-replaceable first):
+      1. gzip pod_logs (always — shrink, do not drop)
+      2. screenshots (largest first)
+      3. oldest .webm/.gif video pairs by mtime
+      4. gzipped pod_logs LAST (largest first) — irreplaceable
+    The cap remains a hard ceiling.
 
     `max_bytes` defaults to the module-level RUN_BUNDLE_MAX_BYTES at
     call time (resolved via the module attr, so tests can monkey-patch
     it without monkey-patching the function default).
 
     Returns (truncated, trimmed_list). trimmed_list has dicts with
-    keys: name, size, mtime, reason. Writes `oversize_bundle.json`
-    alongside ledger_row.json when truncation fired.
+    keys: name, size, mtime, reason. The first entry is the gzip summary
+    (reason `bundle_pod_logs_gzipped`) when any log was compressed; drops
+    follow. Writes `oversize_bundle.json` when truncation or gzip fired.
     """
     if max_bytes is None:
         max_bytes = RUN_BUNDLE_MAX_BYTES
-    if _bundle_size_bytes(run_dir) <= max_bytes:
-        return False, []
+
     trimmed: list[dict] = []
+
+    # Phase 0 — gzip pod_logs (always; shrink, never drop). Records the
+    # before/after so the saving is auditable in oversize_bundle.json.
+    gzipped = _gzip_pod_logs(run_dir)
+    if gzipped:
+        raw_total = sum(g["raw_size"] for g in gzipped)
+        gz_total = sum(g["gz_size"] for g in gzipped)
+        trimmed.append({
+            "reason": "bundle_pod_logs_gzipped",
+            "files": len(gzipped),
+            "raw_bytes": raw_total,
+            "gz_bytes": gz_total,
+            "saved_bytes": raw_total - gz_total,
+            "names": [g["name"] for g in gzipped],
+        })
+
+    # If gzip alone fit the cap, we're done (NO drops). `truncated` keeps
+    # its original DROP semantics (files removed), so gzip-only does NOT set
+    # it True — but we still record the gzip saving in oversize_bundle.json
+    # for the audit. When nothing happened at all, return (False, []).
+    if _bundle_size_bytes(run_dir) <= max_bytes:
+        if trimmed:
+            _write_oversize_bundle(run_dir, max_bytes, trimmed)
+        return False, trimmed  # no files dropped → truncated=False
+
+    def _drop(victim: Path, reason: str) -> None:
+        size = victim.stat().st_size
+        mtime = victim.stat().st_mtime
+        try:
+            victim.unlink()
+        except OSError:
+            return
+        trimmed.append({
+            "name": victim.name, "size": size,
+            "mtime": datetime.datetime.fromtimestamp(
+                mtime, datetime.timezone.utc).isoformat(),
+            "reason": reason,
+        })
+
+    # Phase 1 — drop screenshots first (most replaceable).
+    for victim in _screenshot_victims(run_dir):
+        if _bundle_size_bytes(run_dir) <= max_bytes:
+            break
+        if victim.exists():
+            _drop(victim, "bundle_oversize_truncate_screenshot")
+
+    # Phase 2 — drop oldest video pairs.
     for webm in _video_pairs(run_dir):
         if _bundle_size_bytes(run_dir) <= max_bytes:
             break
         gif = webm.with_suffix(".gif")
         for victim in (webm, gif):
             if victim.exists():
-                size = victim.stat().st_size
-                mtime = victim.stat().st_mtime
-                try:
-                    victim.unlink()
-                except OSError:
-                    continue
-                trimmed.append({
-                    "name": victim.name, "size": size,
-                    "mtime": datetime.datetime.fromtimestamp(
-                        mtime, datetime.timezone.utc).isoformat(),
-                    "reason": "bundle_oversize_truncate",
-                })
+                _drop(victim, "bundle_oversize_truncate_video")
+
+    # Phase 3 — drop gzipped pod_logs LAST (irreplaceable trace inputs).
+    for victim in _gzipped_pod_log_victims(run_dir):
+        if _bundle_size_bytes(run_dir) <= max_bytes:
+            break
+        if victim.exists():
+            _drop(victim, "bundle_oversize_truncate_podlog_gz")
     if trimmed:
-        (run_dir / "oversize_bundle.json").write_text(
-            json.dumps({
-                "max_bytes": max_bytes,
-                "trimmed_count": len(trimmed),
-                "trimmed": trimmed,
-            }, indent=2))
-        n = len(trimmed)
-        mb = sum(t["size"] for t in trimmed) / (1024 * 1024)
-        print(f"  BUNDLE TRUNCATED: dropped {n} files "
-              f"({mb:.1f} MB) to fit "
-              f"{max_bytes // (1024 * 1024)} MB cap", flush=True)
-    return bool(trimmed), trimmed
+        _write_oversize_bundle(run_dir, max_bytes, trimmed)
+    # `truncated` = at least one file was DROPPED (gzip-summary entries have
+    # no `size` key and do not count as truncation).
+    dropped_any = any("size" in t for t in trimmed)
+    return dropped_any, trimmed
+
+
+def _write_oversize_bundle(run_dir: Path, max_bytes: int,
+                           trimmed: list[dict]) -> None:
+    """Write oversize_bundle.json + print the BUNDLE summary line. The
+    gzip-summary entry (no `size` key) is excluded from the dropped-MB
+    total; its saving is reported separately."""
+    (run_dir / "oversize_bundle.json").write_text(
+        json.dumps({
+            "max_bytes": max_bytes,
+            "trimmed_count": len(trimmed),
+            "trimmed": trimmed,
+        }, indent=2))
+    dropped = [t for t in trimmed if "size" in t]
+    dropped_mb = sum(t["size"] for t in dropped) / (1024 * 1024)
+    saved_mb = sum(t.get("saved_bytes", 0) for t in trimmed) / (1024 * 1024)
+    print(f"  BUNDLE TRIMMED: gzip saved {saved_mb:.1f} MB; "
+          f"dropped {len(dropped)} files ({dropped_mb:.1f} MB) to fit "
+          f"{max_bytes // (1024 * 1024)} MB cap", flush=True)
 
 
 def write_run_bundle(run_dir: Path,

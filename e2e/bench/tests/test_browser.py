@@ -42,6 +42,7 @@ from bench.browser import (
     wait_for_compositions,
     _validate_widget_terminal_state,
     _count_rendered_comp_cards,
+    _errored_call_namespaces,
 )
 
 
@@ -517,6 +518,139 @@ def test_terminal_state_genuine_under_call_still_fails(monkeypatch, fake_page):
     assert v["terminal_state"] == "fail"
 
 
+# ─── Task #296 — S10 controller-churn ghost demotion ────────────────────────
+
+
+def _call_status(name, ns, status):
+    return {"url": ("http://fake/call?apiVersion=widgets.templates.krateo.io"
+                    f"%2Fv1beta1&resource=panels&name={name}&namespace={ns}"),
+            "status": status}
+
+
+def test_errored_call_namespaces_extracts_ns_of_non_200():
+    """The helper returns the `namespace` query-param of every non-200
+    /call, and only those."""
+    statuses = [
+        _call_status("p1", "bench-ns-16", 404),
+        _call_status("p2", "bench-ns-01", 404),
+        _call_status("ok", "bench-ns-09", 200),   # 200 → excluded
+    ]
+    assert _errored_call_namespaces(statuses) == {"bench-ns-16", "bench-ns-01"}
+    assert _errored_call_namespaces([]) == set()
+    assert _errored_call_namespaces(None) == set()
+
+
+def test_s10_churn_ghost_outside_deleted_ns_demotes_to_warn(monkeypatch,
+                                                            fake_page):
+    """#296: S10 admin Compositions nav with 5 ghost panel 404s whose
+    namespaces are all OUTSIDE the bench-deleted ns → the over-call
+    call_count_mismatch is DEMOTED to a recorded WARN (terminal_state
+    stays 'pass'), mirroring the efaf1a4 skeleton demotion.
+
+    Shape from the trace: 5 rendered cards (expected=30) but actual=35
+    because the 5 newest cards' Panel CRs were controller-churned and the
+    SPA GETs 404 each → +5 ghost calls. The deleted ns is bench-ns-50;
+    the errored panels are in bench-ns-16/01/28/09/12 (all != 50)."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 5
+    fake_page._call_count = 35          # 30 structural + 5 ghost over-calls
+    fake_page._errored_count = 5
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    call_statuses = [
+        _call_status("bench-app-16-32-composition-panel", "bench-ns-16", 404),
+        _call_status("bench-app-01-34-composition-panel", "bench-ns-01", 404),
+        _call_status("bench-app-28-32-composition-panel", "bench-ns-28", 404),
+        _call_status("bench-app-09-33-composition-panel", "bench-ns-09", 404),
+        _call_status("bench-app-12-31-composition-panel", "bench-ns-12", 404),
+    ]
+    v = _validate_widget_terminal_state(
+        fake_page, "/compositions", "S10 ON nav#1 Compositions",
+        user="admin", deleted_ns="bench-ns-50", call_statuses=call_statuses)
+
+    assert v["expected_calls"] == 30
+    assert v["actual_calls"] == 35
+    assert v["calls_within_tolerance"] is False
+    # Demoted: NOT a terminal fail.
+    assert v["terminal_state"] == "pass", (
+        f"controller-churn ghost outside deleted ns must demote to WARN; "
+        f"got {v['terminal_state']!r}")
+    assert v["s10_churn_demoted"] is True
+    assert v["s10_churn_errors"]["errored_count"] == 5
+    assert v["s10_churn_errors"]["deleted_ns"] == "bench-ns-50"
+    assert "bench-ns-50" not in v["s10_churn_errors"]["errored_namespaces"]
+
+
+def test_s10_churn_ghost_IN_deleted_ns_stays_hard_fail(monkeypatch, fake_page):
+    """#296 counter-falsifier: if ANY errored panel is IN the bench-deleted
+    ns, that is a genuine serve-stale ghost and MUST stay a HARD fail (no
+    demotion)."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 5
+    fake_page._call_count = 35
+    fake_page._errored_count = 5
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    call_statuses = [
+        _call_status("bench-app-16-32-composition-panel", "bench-ns-16", 404),
+        # This one IS in the deleted ns — a real ghost serve.
+        _call_status("bench-app-50-01-composition-panel", "bench-ns-50", 404),
+    ]
+    v = _validate_widget_terminal_state(
+        fake_page, "/compositions", "S10 ON nav#1 Compositions",
+        user="admin", deleted_ns="bench-ns-50", call_statuses=call_statuses)
+
+    assert v["terminal_state"] == "fail", (
+        "an errored panel IN the deleted ns is a genuine serve-stale ghost "
+        "and must stay a HARD fail")
+    assert v["s10_churn_demoted"] is False
+
+
+def test_s10_no_demotion_without_deleted_ns(monkeypatch, fake_page):
+    """Off-S10 (deleted_ns=None), the demotion path is inert: an over-call
+    mismatch fails exactly as before (no behavioural change for the other
+    stages)."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 5
+    fake_page._call_count = 35
+    fake_page._errored_count = 5
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    call_statuses = [
+        _call_status("p", "bench-ns-16", 404),
+    ]
+    v = _validate_widget_terminal_state(
+        fake_page, "/compositions", "S6 ON nav#1 Compositions",
+        user="admin", deleted_ns=None, call_statuses=call_statuses)
+    assert v["terminal_state"] == "fail"
+    assert v["s10_churn_demoted"] is False
+
+
+def test_s10_under_call_not_demoted_even_outside_deleted_ns(monkeypatch,
+                                                            fake_page):
+    """#296 guard: the demotion is for OVER-calls (extra ghost GETs) only.
+    A genuine UNDER-call (actual < expected — real missing per-card
+    widgets) must NOT be demoted even during S10 with errors outside the
+    deleted ns."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 5
+    fake_page._call_count = 12          # under expected=30 → real under-call
+    fake_page._errored_count = 5
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    call_statuses = [
+        _call_status("p", "bench-ns-16", 404),
+    ]
+    v = _validate_widget_terminal_state(
+        fake_page, "/compositions", "S10 ON nav#1 Compositions",
+        user="admin", deleted_ns="bench-ns-50", call_statuses=call_statuses)
+    assert v["actual_calls"] == 12
+    assert v["terminal_state"] == "fail", (
+        "an under-call must stay a hard fail; the churn demotion is "
+        "over-call-only")
+    assert v["s10_churn_demoted"] is False
+
+
 def test_terminal_state_cj_two_widgets_per_card(monkeypatch, fake_page):
     """RBAC parity: cyberjoker fires 2 widgets per card (Buttons filtered
     by allowed=false, Task #273), so 5 rendered cards → 10 + 2×5 = 20.
@@ -875,30 +1009,29 @@ def test_content_drift_uses_cluster_truth_for_admin(
         f"{dash.get('content_truth_source')!r}")
 
 
-def test_content_drift_uses_intra_user_api_for_cyber(
+def test_content_drift_cyber_is_diagnostic_non_load_bearing(
         monkeypatch, fake_page, tmp_path):
-    """When `verify_against_cluster=False` (cyberjoker), CONTENT-DRIFT
-    compares `len(list_composition_names_from_cache(token))` against the
-    intra-user api_count (the same VERIFY-poll value) and sets
-    `content_truth_source = "intra_user_api"`.
+    """Task #298: the cj intra-user CONTENT comparison is STRUCTURALLY
+    MISMATCHED (cj's cluster-wide compositions-list is legitimately ~0
+    because cj has no cluster-scoped LIST perm, vs the RBAC-narrowed
+    api_count). Per the trace it is now an explicitly-labeled
+    NON-LOAD-BEARING diagnostic: cj MUST NOT set `content_match`
+    (true OR false) and MUST emit the labeled diagnostic fields.
 
-    Cluster has 50,000 compositions but cj sees 1,000 (RBAC scoped). The
-    cluster-truth diff would spuriously report `missing=49000`; the
-    RBAC-aware behaviour MUST instead PASS when cached_names == api_count.
-    This is the task #181 regression — pre-fix, cj's CONTENT check always
-    failed at SCALE=50K regardless of cache health.
+    Construct the real-world shape: cached cluster-wide list = 0 names,
+    api/ui = 1000 (RBAC-narrowed). Pre-#298 this set content_match=False
+    (a permanent false positive). Post-#298 it sets neither pass nor fail.
     """
-    cluster_truth = {f"ns{i}/comp{i}" for i in range(50_000)}
-    cj_view = {f"bench-ns-1/bench-app-1-{i}" for i in range(1_000)}
-    _patch_cluster_count(monkeypatch, comp_count=len(cluster_truth), ns_count=500)
+    cj_cached = set()  # cj sees the cluster-wide compositions-list as empty
+    _patch_cluster_count(monkeypatch, comp_count=50_000, ns_count=500)
     monkeypatch.setattr(browser_mod, "_list_composition_names",
-                        lambda: cluster_truth)
+                        lambda: {f"ns/c{i}" for i in range(50_000)})
     monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
-                        lambda token: cj_view)
+                        lambda token: cj_cached)
     monkeypatch.setattr(browser_mod, "verify_composition_count_api",
-                        lambda token: len(cj_view))
+                        lambda token: 1000)
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
-                        lambda page: len(cj_view))
+                        lambda page: 1000)
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
                         lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
@@ -910,62 +1043,54 @@ def test_content_drift_uses_intra_user_api_for_cyber(
         screenshots_dir=tmp_path / "ss",
     )
     dash = result["pages"]["Dashboard"]["navigations"][0]
-    assert dash.get("content_match") is True, (
-        f"cj CONTENT must PASS when cached_names == api_count even though "
-        f"cluster-truth has 50K names; got content_match="
-        f"{dash.get('content_match')!r}")
-    assert dash.get("content_truth_source") == "intra_user_api", (
-        f"cj must compare against intra-user api_count, got "
-        f"{dash.get('content_truth_source')!r}")
-    # No cluster-truth diff fields should appear for cj (regression
-    # guard: pre-fix the symptom was `content_missing=49000` on every cj
-    # CONTENT check).
-    assert "content_missing" not in dash, (
-        "cj must NOT emit `content_missing` (cluster-truth diff field) — "
-        "task #181 regression guard")
-    assert "content_extra" not in dash, (
-        "cj must NOT emit `content_extra` (cluster-truth diff field) — "
-        "task #181 regression guard")
+    # NEITHER pass nor fail — the structurally-mismatched comparison is no
+    # longer treated as a CONTENT check (the false-positive is gone).
+    assert "content_match" not in dash, (
+        f"cj CONTENT comparison must NOT set content_match (it is a "
+        f"structurally-mismatched non-load-bearing diagnostic per #298); "
+        f"got content_match={dash.get('content_match')!r}")
+    assert dash.get("content_truth_source") == "cj_diagnostic_non_load_bearing", (
+        f"cj must label the comparison as a non-load-bearing diagnostic, "
+        f"got {dash.get('content_truth_source')!r}")
+    # The diagnostic fields ARE recorded (post-run inspectable) but are
+    # explicitly labeled and do not gate anything.
+    assert dash.get("content_cj_cached_count") == 0
+    assert dash.get("content_cj_api_count") == 1000
+    # Cluster-truth diff fields must NOT appear for cj.
+    assert "content_missing" not in dash
+    assert "content_extra" not in dash
 
 
-def test_content_drift_cyber_flags_drift_when_cache_diverges_from_api(
+def test_content_drift_admin_cluster_truth_still_load_bearing(
         monkeypatch, fake_page, tmp_path):
-    """Even with the RBAC-aware fix, real cache corruption MUST still
-    flag CONTENT ✗ for cj. Construct a scenario where the cached name
-    set has the WRONG count vs api/ui (the only intra-user signal we
-    can compare against) and assert `content_match=False`.
-
-    Note: api_count and ui_count must still match (otherwise VERIFY
-    raises ConvergenceTimeout BEFORE the CONTENT block runs). Only the
-    cached-name count diverges. This is the residual-defect case the
-    fix MUST still catch.
+    """Regression guard (#298): the ADMIN cluster-truth CONTENT check
+    remains the load-bearing CONTENT gate — only the cj branch was
+    demoted. Admin with matching cached==cluster-truth sets
+    content_match=True / truth_source='cluster'; a divergence sets
+    content_match=False. (feedback_validate_content_not_just_status.)
     """
-    cj_view_cached = {f"bench-ns-1/bench-app-1-{i}" for i in range(900)}  # cache says 900
-    _patch_cluster_count(monkeypatch, comp_count=50_000, ns_count=500)
-    monkeypatch.setattr(browser_mod, "_list_composition_names",
-                        lambda: {f"ns/c{i}" for i in range(50_000)})
+    truth = {f"ns/c{i}" for i in range(42)}
+    _patch_cluster_count(monkeypatch, comp_count=len(truth), ns_count=2)
+    monkeypatch.setattr(browser_mod, "_list_composition_names", lambda: truth)
     monkeypatch.setattr(browser_mod, "list_composition_names_from_cache",
-                        lambda token: cj_view_cached)
-    # api == ui == 1000 (VERIFY passes), but the names endpoint reports 900 → drift
+                        lambda token: set(truth))  # admin cache matches truth
     monkeypatch.setattr(browser_mod, "verify_composition_count_api",
-                        lambda token: 1000)
+                        lambda token: len(truth))
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
-                        lambda page: 1000)
+                        lambda page: len(truth))
     monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
                         lambda u, p, **kw: None)
     monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
 
     result = browser_measure_stage(
-        fake_page, stage_num=6, stage_desc="cj S6 cache drift",
-        cache_mode="ON", token="tok", num_navs=1, user="cyberjoker",
-        verify_against_cluster=False, verify_timeout=5, verify_interval=0,
+        fake_page, stage_num=6, stage_desc="admin S6",
+        cache_mode="ON", token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
         screenshots_dir=tmp_path / "ss",
     )
     dash = result["pages"]["Dashboard"]["navigations"][0]
-    assert dash.get("content_match") is False
-    assert dash.get("content_truth_source") == "intra_user_api"
-    assert dash.get("content_cached_count") == 900
-    assert dash.get("content_api_count") == 1000
+    assert dash.get("content_match") is True
+    assert dash.get("content_truth_source") == "cluster"
 
 
 # ─── Task #250 Block 2 — Phase 6 S8/S9 probes ──────────────────────────────
