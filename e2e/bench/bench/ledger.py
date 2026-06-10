@@ -23,13 +23,16 @@ New (Block 4):
   read_baseline          — read e2e/bench/.baseline.json (acceptance (c))
   compute_baseline_delta — ±15% gate helper (acceptance (c))
 
-Bundle-truncate logic per R3.1 / tightening #6: ledger row STILL emits with verdict
-intact when the bundle exceeds 200 MB. Task #299 (team-resolved): pod_logs are
-irreplaceable trace inputs AND videos are a Diego goal requirement, so the bundler
-FIRST gzips every pod_log (S6.txt → S6.txt.gz, ~10-20× smaller) — after which videos
-AND logs typically both fit. If STILL over cap, drop order is screenshots → oldest
-.webm/.gif video pairs → gzipped pod_logs LAST. `oversize_bundle.json` records the
-gzip saving + any drops (reason field); summary.json.bundle_truncated=True when modified.
+Bundle finalize per Task #121 (Diego, 2026-06-10): the 200 MB bundle cap and the
+artifact-dropping truncation (#299) are REMOVED. NOTHING is ever dropped from the
+run bundle — videos, screenshots, and pod_logs are all retained regardless of total
+size — because the final clean re-run is `--video all` at 50K (~1GB+ of video) and
+the old cap would trim exactly the videos Diego wants. The only retained behaviour
+is the #299 pod_log gzip (S6.txt → S6.txt.gz, ~10-20× smaller): it drops nothing,
+only compresses, saving disk while keeping traceability (zcat/zgrep work on the .gz).
+`oversize_bundle.json` is now a zero-drop size + gzip-saving report
+(`cap_removed: True`, `dropped_count: 0`); summary.json.bundle_truncated is always
+False.
 
 Per docs/bench-restructure-path-b-plan-2026-06-02.md §A.7 + §F.
 """
@@ -67,7 +70,6 @@ __all__ = [
     "emit_ledger_row_schema",
     "read_baseline",
     "compute_baseline_delta",
-    "RUN_BUNDLE_MAX_BYTES",
     "BASELINE_PATH",
 ]
 
@@ -283,7 +285,6 @@ def _load_per_mutation_metric(key: str, *, run_dir: Path | None = None):
 #     i.e. run-variance headroom over the worst clean run.
 #   - cold measured across the same 3 runs = 1196 / 1185 / 1175. Tier 1300 =
 #     ~1.09× worst-observed (1196), same headroom basis.
-#
 #
 # CONV_TIER_MS = 30000 is the 50K-scale REVISED convergence tier (Task #289,
 # Diego-ratified 2026-06-10). The prior 1000ms tier is structurally
@@ -589,20 +590,18 @@ def print_report() -> bool:
 # ─── Run-bundle writer + truncate logic (per R3.1) ──────────────────────────
 
 
-RUN_BUNDLE_MAX_BYTES = 200 * 1024 * 1024  # 200 MB cap
+# Task #121 (Diego, 2026-06-10): the 200 MB RUN_BUNDLE_MAX_BYTES cap is
+# REMOVED. Nothing is ever dropped from the run bundle now (videos +
+# screenshots + pod_logs all retained), so there is no ceiling constant.
 BASELINE_PATH = Path(__file__).resolve().parent.parent / ".baseline.json"
 
 
-def _video_pairs(run_dir: Path) -> list[Path]:
-    """Return .webm files under run_dir/videos/ ordered oldest first."""
-    vdir = run_dir / "videos"
-    if not vdir.is_dir():
-        return []
-    webms = [p for p in vdir.iterdir() if p.suffix.lower() == ".webm"]
-    return sorted(webms, key=lambda p: p.stat().st_mtime)
-
-
 def _bundle_size_bytes(run_dir: Path) -> int:
+    """Total bytes of videos + screenshots + pod_logs under run_dir.
+
+    Reporting-only as of Task #121 (cap removed): used to populate the
+    bundle-size figure in oversize_bundle.json / summary.json. Nothing is
+    ever dropped, so this is no longer compared against a ceiling."""
     total = 0
     for sub in ("videos", "screenshots", "pod_logs"):
         d = run_dir / sub
@@ -622,11 +621,13 @@ def _gzip_pod_logs(run_dir: Path) -> list[dict]:
     remove the original. Returns a list of dicts {name, raw_size,
     gz_size} for the files compressed (empty when none / already gzipped).
 
-    Task #299: pod_logs are the irreplaceable trace inputs (≈196 MB this
-    run) but compress ~10-20× (S6 98 MB → ~5-8 MB). Compressing them at
-    bundle time lets BOTH videos (Diego goal) AND logs fit the cap without
-    dropping either. The .gz keeps the original stem so the trace docs'
-    `S6.txt` references survive as `S6.txt.gz` (discoverable).
+    Task #299 / #121: pod_logs are the irreplaceable trace inputs (≈196 MB
+    this run) but compress ~10-20× (S6 98 MB → ~5-8 MB). Gzip is RETAINED
+    after the Task #121 cap removal because it drops NOTHING — it only
+    compresses, saving disk while keeping traceability (zcat/zgrep work on
+    the .gz; trace primitives confirmed by the architect). The .gz keeps the
+    original stem so the trace docs' `S6.txt` references survive as
+    `S6.txt.gz` (discoverable).
     """
     pdir = run_dir / "pod_logs"
     if not pdir.is_dir():
@@ -652,57 +653,31 @@ def _gzip_pod_logs(run_dir: Path) -> list[dict]:
     return out
 
 
-def _screenshot_victims(run_dir: Path) -> list[Path]:
-    """Screenshots, largest-first — the first artifact dropped under cap
-    pressure (cheapest to lose; videos + gzipped logs are the goal)."""
-    d = run_dir / "screenshots"
-    if not d.is_dir():
-        return []
-    files = [p for p in d.rglob("*") if p.is_file()]
-    return sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+def _finalize_bundle(run_dir: Path) -> tuple[bool, list[dict]]:
+    """Gzip pod_logs; NEVER drop any artifact (Task #121 — cap removed).
 
+    Task #121 (Diego, 2026-06-10): the 200 MB bundle size cap and the
+    artifact-DROPPING truncation it drove are REMOVED, unconditionally and in
+    every video mode. Rationale: the final clean re-run is `--video all` at
+    50K (~1GB+ of all-stage video) and the old cap would trim exactly the
+    videos Diego wants. Nothing is ever removed from the bundle now — videos,
+    screenshots, and pod_logs are all retained regardless of total size.
 
-def _gzipped_pod_log_victims(run_dir: Path) -> list[Path]:
-    """Gzipped pod_logs, largest-first — dropped LAST (after screenshots
-    and videos) because they are irreplaceable trace inputs."""
-    d = run_dir / "pod_logs"
-    if not d.is_dir():
-        return []
-    files = [p for p in d.rglob("*.gz") if p.is_file()]
-    return sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+    The ONLY retained behaviour is the Task #299 pod_log gzip: it drops
+    nothing, it only compresses (~10-20×), saving disk while keeping
+    traceability (zcat/zgrep work on the .gz). The `<name>.txt` → `<name>.txt.gz`
+    stem rename is preserved for discoverability.
 
-
-def _truncate_bundle(run_dir: Path, *,
-                     max_bytes: int | None = None) -> tuple[bool, list[dict]]:
-    """Trim the run bundle to <= max_bytes, RETAINING VIDEOS + LOGS.
-
-    Task #299 (team-resolved): pod_logs are irreplaceable trace inputs and
-    videos are a Diego goal requirement, but raw logs alone (~196 MB) can
-    approach the cap. So FIRST gzip all pod_logs (~10-20× smaller) — after
-    which videos AND logs typically both fit. If STILL over cap, the drop
-    order is (cheapest/most-replaceable first):
-      1. gzip pod_logs (always — shrink, do not drop)
-      2. screenshots (largest first)
-      3. oldest .webm/.gif video pairs by mtime
-      4. gzipped pod_logs LAST (largest first) — irreplaceable
-    The cap remains a hard ceiling.
-
-    `max_bytes` defaults to the module-level RUN_BUNDLE_MAX_BYTES at
-    call time (resolved via the module attr, so tests can monkey-patch
-    it without monkey-patching the function default).
-
-    Returns (truncated, trimmed_list). trimmed_list has dicts with
-    keys: name, size, mtime, reason. The first entry is the gzip summary
-    (reason `bundle_pod_logs_gzipped`) when any log was compressed; drops
-    follow. Writes `oversize_bundle.json` when truncation or gzip fired.
+    Returns (truncated, trimmed_list). `truncated` is now ALWAYS False (no cap,
+    no drops). trimmed_list carries only the gzip summary (reason
+    `bundle_pod_logs_gzipped`) — NO drop entries are ever produced.
+    oversize_bundle.json is written as a zero-drop size + gzip report when any
+    log was compressed (it never reports a dropped file).
     """
-    if max_bytes is None:
-        max_bytes = RUN_BUNDLE_MAX_BYTES
-
     trimmed: list[dict] = []
 
-    # Phase 0 — gzip pod_logs (always; shrink, never drop). Records the
-    # before/after so the saving is auditable in oversize_bundle.json.
+    # Gzip pod_logs (shrink, never drop). Records the before/after so the
+    # saving stays auditable in oversize_bundle.json.
     gzipped = _gzip_pod_logs(run_dir)
     if gzipped:
         raw_total = sum(g["raw_size"] for g in gzipped)
@@ -715,77 +690,41 @@ def _truncate_bundle(run_dir: Path, *,
             "saved_bytes": raw_total - gz_total,
             "names": [g["name"] for g in gzipped],
         })
+        _write_oversize_bundle(run_dir, trimmed)
 
-    # If gzip alone fit the cap, we're done (NO drops). `truncated` keeps
-    # its original DROP semantics (files removed), so gzip-only does NOT set
-    # it True — but we still record the gzip saving in oversize_bundle.json
-    # for the audit. When nothing happened at all, return (False, []).
-    if _bundle_size_bytes(run_dir) <= max_bytes:
-        if trimmed:
-            _write_oversize_bundle(run_dir, max_bytes, trimmed)
-        return False, trimmed  # no files dropped → truncated=False
-
-    def _drop(victim: Path, reason: str) -> None:
-        size = victim.stat().st_size
-        mtime = victim.stat().st_mtime
-        try:
-            victim.unlink()
-        except OSError:
-            return
-        trimmed.append({
-            "name": victim.name, "size": size,
-            "mtime": datetime.datetime.fromtimestamp(
-                mtime, datetime.timezone.utc).isoformat(),
-            "reason": reason,
-        })
-
-    # Phase 1 — drop screenshots first (most replaceable).
-    for victim in _screenshot_victims(run_dir):
-        if _bundle_size_bytes(run_dir) <= max_bytes:
-            break
-        if victim.exists():
-            _drop(victim, "bundle_oversize_truncate_screenshot")
-
-    # Phase 2 — drop oldest video pairs.
-    for webm in _video_pairs(run_dir):
-        if _bundle_size_bytes(run_dir) <= max_bytes:
-            break
-        gif = webm.with_suffix(".gif")
-        for victim in (webm, gif):
-            if victim.exists():
-                _drop(victim, "bundle_oversize_truncate_video")
-
-    # Phase 3 — drop gzipped pod_logs LAST (irreplaceable trace inputs).
-    for victim in _gzipped_pod_log_victims(run_dir):
-        if _bundle_size_bytes(run_dir) <= max_bytes:
-            break
-        if victim.exists():
-            _drop(victim, "bundle_oversize_truncate_podlog_gz")
-    if trimmed:
-        _write_oversize_bundle(run_dir, max_bytes, trimmed)
-    # `truncated` = at least one file was DROPPED (gzip-summary entries have
-    # no `size` key and do not count as truncation).
-    dropped_any = any("size" in t for t in trimmed)
-    return dropped_any, trimmed
+    # No cap, no drops, ever → truncated is always False.
+    return False, trimmed
 
 
-def _write_oversize_bundle(run_dir: Path, max_bytes: int,
-                           trimmed: list[dict]) -> None:
-    """Write oversize_bundle.json + print the BUNDLE summary line. The
-    gzip-summary entry (no `size` key) is excluded from the dropped-MB
-    total; its saving is reported separately."""
+# Back-compat alias: the writer + any external caller referenced
+# `_truncate_bundle` before Task #121 removed the truncation. The function no
+# longer truncates (it gzips + reports), but the name is retained so callers
+# don't break.
+_truncate_bundle = _finalize_bundle
+
+
+def _write_oversize_bundle(run_dir: Path, trimmed: list[dict]) -> None:
+    """Write oversize_bundle.json (zero-drop size + gzip report) + print the
+    BUNDLE summary line.
+
+    Task #121: with the cap removed nothing is ever dropped, so this is now a
+    size/gzip-saving report — `dropped_count` is always 0 and there is no
+    `max_bytes` ceiling. The filename is kept for back-compat with downstream
+    readers; the schema gains `cap_removed: True` and `bundle_size_bytes` and
+    drops the obsolete `max_bytes` field."""
+    bundle_size = _bundle_size_bytes(run_dir)
     (run_dir / "oversize_bundle.json").write_text(
         json.dumps({
-            "max_bytes": max_bytes,
+            "cap_removed": True,
+            "bundle_size_bytes": bundle_size,
+            "dropped_count": 0,
             "trimmed_count": len(trimmed),
             "trimmed": trimmed,
         }, indent=2))
-    dropped = [t for t in trimmed if "size" in t]
-    dropped_mb = sum(t["size"] for t in dropped) / (1024 * 1024)
     saved_mb = sum(t.get("saved_bytes", 0) for t in trimmed) / (1024 * 1024)
-    print(f"  BUNDLE TRIMMED: gzip saved {saved_mb:.1f} MB; "
-          f"dropped {len(dropped)} files ({dropped_mb:.1f} MB) to fit "
-          f"{max_bytes // (1024 * 1024)} MB cap", flush=True)
+    print(f"  BUNDLE: gzip saved {saved_mb:.1f} MB; "
+          f"{bundle_size / (1024 * 1024):.1f} MB retained "
+          f"(cap removed — nothing dropped)", flush=True)
 
 
 def write_run_bundle(run_dir: Path,
@@ -840,8 +779,9 @@ def write_run_bundle(run_dir: Path,
     except Exception:
         pass
 
-    # 5) Bundle-truncate (per R3.1).
-    truncated, trimmed = _truncate_bundle(run_dir)
+    # 5) Bundle finalize: gzip pod_logs only; NEVER drop (Task #121 — cap
+    # removed). `truncated` is always False now.
+    truncated, trimmed = _finalize_bundle(run_dir)
 
     # 6) summary.json — see §F.2.
     baseline_tag, baseline_warm = read_baseline()

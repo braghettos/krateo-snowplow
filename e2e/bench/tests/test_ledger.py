@@ -267,170 +267,149 @@ def test_read_baseline_returns_tag_and_warm_p50(tmp_path, monkeypatch):
     assert ms == 512
 
 
-# ─── Run bundle truncate logic (per R3.1) ───────────────────────────────────
-
-
-def test_write_run_bundle_truncates_oversize_video_bundle(tmp_path,
-                                                         monkeypatch):
-    """When videos+gifs+logs exceed 200 MB, oldest pairs drop and the
-    BUNDLE TRUNCATED log + oversize_bundle.json file appear."""
-    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
-    monkeypatch.setattr(ledger, "RUN_BUNDLE_MAX_BYTES", 1_000_000)  # 1 MB cap
-
-    vdir = tmp_path / "videos"
-    vdir.mkdir()
-    # Write 3 webm/gif pairs of ~500 KB each → 3 MB total
-    for i in range(3):
-        webm = vdir / f"S{i + 1}_admin_cold.webm"
-        gif = vdir / f"S{i + 1}_admin_cold.gif"
-        webm.write_bytes(b"\x00" * 400_000)
-        gif.write_bytes(b"\x00" * 100_000)
-        # Stagger mtimes so the truncator picks oldest first
-        import os as _os
-        _os.utime(webm, (1000 + i, 1000 + i))
-        _os.utime(gif, (1000 + i, 1000 + i))
-
-    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
-                            tag="t", scale=5000)
-    # After truncate, the oversize_bundle.json must list trimmed entries
-    assert (tmp_path / "oversize_bundle.json").exists()
-    summary = json.loads((tmp_path / "summary.json").read_text())
-    assert summary["bundle_truncated"] is True
+# ─── Run bundle: cap REMOVED, nothing dropped (Task #121) ───────────────────
 
 
 def _compressible_log_bytes(n: int) -> bytes:
     """A semi-repetitive byte payload that gzip shrinks substantially
     (models real pod_logs, which are highly compressible text). Pure
     \\x00 compresses ~1000× which is unrealistic; a repeating line gives a
-    realistic ~10-20× ratio for the drop-order test sizing."""
+    realistic ~10-20× ratio."""
     line = b"2026-06-10T00:00:00Z INFO cache.event consumed gvr=panels ns=bench-ns-01\n"
     return (line * (n // len(line) + 1))[:n]
 
 
-def test_truncate_gzips_pod_logs_retaining_videos_and_logs(tmp_path,
-                                                           monkeypatch):
-    """Task #299 (reworked): pod_logs are gzipped at bundle time, after
-    which BOTH videos AND logs fit the cap — nothing is dropped. The .gz
-    keeps the .txt stem (S6.txt.gz) for discoverability; the original .txt
-    is removed; the gzip saving is recorded in oversize_bundle.json."""
+def test_cap_removed_retains_all_artifacts_over_200mb(tmp_path, monkeypatch):
+    """Task #121: the 200 MB cap is REMOVED. A bundle whose videos +
+    screenshots + pod_logs total well over 200 MB keeps EVERY artifact —
+    nothing is dropped, bundle_truncated is False, oversize_bundle.json
+    reports zero drops."""
     monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
-    monkeypatch.setattr(ledger, "RUN_BUNDLE_MAX_BYTES", 1_000_000)  # 1 MB cap
-
-    vdir = tmp_path / "videos"
-    vdir.mkdir()
-    # 1 video pair = 500 KB (retained).
-    (vdir / "S6_admin_cold.webm").write_bytes(b"\x00" * 400_000)
-    (vdir / "S6_admin_cold.gif").write_bytes(b"\x00" * 100_000)
-
-    # Raw pod_logs ~5 MB (over the 1 MB cap) but ~10-20× compressible →
-    # after gzip the bundle (videos 0.5 MB + tiny .gz) fits.
-    pdir = tmp_path / "pod_logs"
-    pdir.mkdir()
-    (pdir / "S6.txt").write_bytes(_compressible_log_bytes(5_000_000))
-
-    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
-                            tag="t", scale=5000)
-
-    # Logs are now gzipped with the .txt stem preserved; raw removed.
-    assert (pdir / "S6.txt.gz").exists(), "pod log must be gzipped as S6.txt.gz"
-    assert not (pdir / "S6.txt").exists(), "raw .txt must be removed after gzip"
-    # Videos retained.
-    assert (vdir / "S6_admin_cold.webm").exists()
-    assert (vdir / "S6_admin_cold.gif").exists()
-    # gzip alone fit the cap → NO files dropped → bundle_truncated False.
-    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
-    reasons = [t["reason"] for t in over["trimmed"]]
-    assert "bundle_pod_logs_gzipped" in reasons
-    assert not any(r.startswith("bundle_oversize_truncate") for r in reasons), (
-        f"nothing should be dropped when gzip fits the cap; got {reasons}")
-    summary = json.loads((tmp_path / "summary.json").read_text())
-    assert summary["bundle_truncated"] is False
-    assert ledger._bundle_size_bytes(tmp_path) <= 1_000_000
-
-
-def test_truncate_drop_order_screenshots_then_videos_then_gz_logs_last(
-        tmp_path, monkeypatch):
-    """Task #299 (reworked): when gzip alone is NOT enough, the drop order
-    is screenshots → oldest videos → gzipped pod_logs LAST. Gzipped logs
-    (irreplaceable trace inputs) are the very last to go and only if the
-    cap still cannot be met. The cap stays a hard ceiling."""
-    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
-    monkeypatch.setattr(ledger, "RUN_BUNDLE_MAX_BYTES", 1_000_000)  # 1 MB cap
+    # No RUN_BUNDLE_MAX_BYTES monkey-patch: the constant no longer exists.
+    assert not hasattr(ledger, "RUN_BUNDLE_MAX_BYTES"), (
+        "Task #121 removed the cap constant; nothing should reference it")
 
     import os as _os
-    # Screenshots 600 KB (dropped first).
-    sdir = tmp_path / "screenshots"
-    sdir.mkdir()
-    (sdir / "S6_admin.png").write_bytes(b"\x00" * 600_000)
-    # 3 video pairs of 500 KB = 1.5 MB incompressible (dropped second,
-    # oldest-first).
     vdir = tmp_path / "videos"
     vdir.mkdir()
-    for i in range(3):
+    sdir = tmp_path / "screenshots"
+    sdir.mkdir()
+    pdir = tmp_path / "pod_logs"
+    pdir.mkdir()
+
+    # 5 video pairs @ ~45 MB = ~225 MB of video alone (incompressible) —
+    # well over the OLD 200 MB cap. Plus a 30 MB screenshot. All must stay.
+    webms, gifs = [], []
+    for i in range(5):
         webm = vdir / f"S{i + 1}_admin_cold.webm"
         gif = vdir / f"S{i + 1}_admin_cold.gif"
-        webm.write_bytes(b"\x00" * 400_000)
-        gif.write_bytes(b"\x00" * 100_000)
+        webm.write_bytes(os.urandom(40_000_000))
+        gif.write_bytes(os.urandom(5_000_000))
         _os.utime(webm, (1000 + i, 1000 + i))
         _os.utime(gif, (1000 + i, 1000 + i))
-    # A pod_log that stays large even gzipped (incompressible \x00 → gzip
-    # is tiny, so to force a log-drop we use random-ish incompressible
-    # bytes large enough to exceed the cap by itself post-gzip).
-    pdir = tmp_path / "pod_logs"
-    pdir.mkdir()
-    (pdir / "S6.txt").write_bytes(os.urandom(2_000_000))  # ~incompressible
+        webms.append(webm)
+        gifs.append(gif)
+    big_shot = sdir / "S6_admin.png"
+    big_shot.write_bytes(os.urandom(30_000_000))
+    # A compressible pod_log (gets gzipped, but NOT dropped).
+    (pdir / "S6.txt").write_bytes(_compressible_log_bytes(20_000_000))
+
+    total_before = ledger._bundle_size_bytes(tmp_path)
+    assert total_before > 200 * 1024 * 1024, "fixture must exceed old cap"
 
     ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
-                            tag="t", scale=5000)
+                            tag="t", scale=50000)
 
-    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
-    # Order of drop reasons (gzip summary first, then drops in phase order).
-    drop_reasons = [t["reason"] for t in over["trimmed"]
-                    if t["reason"].startswith("bundle_oversize_truncate")]
-    assert "bundle_pod_logs_gzipped" in [t["reason"] for t in over["trimmed"]]
-    # Screenshots dropped before videos before gz logs.
-    def _first_idx(reason):
-        for i, r in enumerate(drop_reasons):
-            if r == reason:
-                return i
-        return None
-    ss = _first_idx("bundle_oversize_truncate_screenshot")
-    vid = _first_idx("bundle_oversize_truncate_video")
-    gz = _first_idx("bundle_oversize_truncate_podlog_gz")
-    assert ss is not None and ss == 0, (
-        f"screenshots must drop first; drop order={drop_reasons}")
-    if vid is not None and gz is not None:
-        assert vid < gz, "videos must drop before gzipped pod_logs"
-    if ss is not None and vid is not None:
-        assert ss < vid, "screenshots must drop before videos"
-    # Cap honoured as a hard ceiling.
-    assert ledger._bundle_size_bytes(tmp_path) <= 1_000_000
+    # EVERY video + the screenshot survive (nothing dropped).
+    for p in webms + gifs:
+        assert p.exists(), f"video {p.name} must be retained (cap removed)"
+    assert big_shot.exists(), "screenshot must be retained (cap removed)"
+    # Pod log gzipped (compress, not drop): .gz present, raw removed.
+    assert (pdir / "S6.txt.gz").exists()
+    assert not (pdir / "S6.txt").exists()
 
-
-def test_truncate_gz_logs_dropped_only_as_last_resort(tmp_path, monkeypatch):
-    """Task #299: gzipped pod_logs are dropped ONLY when screenshots +
-    videos are already gone and the cap still cannot be met. Here a single
-    incompressible 2 MB log alone exceeds the 1 MB cap with no other
-    artifacts → the gz log must be dropped (last resort), cap honoured."""
-    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
-    monkeypatch.setattr(ledger, "RUN_BUNDLE_MAX_BYTES", 1_000_000)
-
-    pdir = tmp_path / "pod_logs"
-    pdir.mkdir()
-    (pdir / "S6.txt").write_bytes(os.urandom(2_000_000))  # gzip ≈ 2 MB still
-
-    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
-                            tag="t", scale=5000)
-
-    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
-    reasons = [t["reason"] for t in over["trimmed"]]
-    assert "bundle_pod_logs_gzipped" in reasons
-    assert "bundle_oversize_truncate_podlog_gz" in reasons, (
-        "the gz log must be dropped as a last resort when it alone exceeds "
-        "the cap")
     summary = json.loads((tmp_path / "summary.json").read_text())
-    assert summary["bundle_truncated"] is True  # a file WAS dropped
-    assert ledger._bundle_size_bytes(tmp_path) <= 1_000_000
+    assert summary["bundle_truncated"] is False
+    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
+    assert over["cap_removed"] is True
+    assert over["dropped_count"] == 0
+    reasons = [t["reason"] for t in over["trimmed"]]
+    # The ONLY trimmed entry is the gzip summary — never a drop.
+    assert "bundle_pod_logs_gzipped" in reasons
+    assert not any(r.startswith("bundle_oversize_truncate") for r in reasons), (
+        f"nothing may be dropped after the cap removal; got {reasons}")
+
+
+def test_cap_removed_independent_of_video_mode(tmp_path, monkeypatch):
+    """Task #121: the removal is UNCONDITIONAL — there is no per-video-mode
+    branch. write_run_bundle takes no video arg and never drops, so a
+    >200 MB video set is retained whatever the run's video mode was
+    (representative or all). Verifies no mode-gated dropping remains."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    vdir = tmp_path / "videos"
+    vdir.mkdir()
+    # 6 video pairs @ ~40 MB = ~240 MB (over old cap), incompressible.
+    pairs = []
+    for i in range(6):
+        webm = vdir / f"S{i + 1}_cyber_cold.webm"
+        gif = vdir / f"S{i + 1}_cyber_cold.gif"
+        webm.write_bytes(os.urandom(38_000_000))
+        gif.write_bytes(os.urandom(2_000_000))
+        pairs.extend([webm, gif])
+
+    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
+                            tag="t", scale=50000)
+
+    for p in pairs:
+        assert p.exists(), f"{p.name} retained regardless of video mode"
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["bundle_truncated"] is False
+
+
+def test_gzip_pod_logs_still_runs_and_retains_stem(tmp_path, monkeypatch):
+    """Task #121 keeps the #299 gzip (it drops nothing, only compresses):
+    a pod_log is gzipped to S6.txt.gz, the raw .txt removed, the saving
+    recorded, and zcat/zgrep-style discoverability preserved via the stem."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    pdir = tmp_path / "pod_logs"
+    pdir.mkdir()
+    raw = _compressible_log_bytes(5_000_000)
+    (pdir / "S6.txt").write_bytes(raw)
+
+    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
+                            tag="t", scale=5000)
+
+    gz = pdir / "S6.txt.gz"
+    assert gz.exists(), "pod log must be gzipped as S6.txt.gz"
+    assert not (pdir / "S6.txt").exists(), "raw .txt removed after gzip"
+    # Round-trip: the gzip is readable and byte-identical to the original.
+    import gzip as _gzip
+    assert _gzip.open(gz, "rb").read() == raw
+    over = json.loads((tmp_path / "oversize_bundle.json").read_text())
+    gzentry = next(t for t in over["trimmed"]
+                   if t["reason"] == "bundle_pod_logs_gzipped")
+    assert gzentry["saved_bytes"] > 0
+    assert over["dropped_count"] == 0
+
+
+def test_no_pod_logs_writes_no_oversize_report(tmp_path, monkeypatch):
+    """With no pod_logs to gzip and nothing to drop, the finalize step is a
+    no-op: oversize_bundle.json is NOT written and bundle_truncated is
+    False. (full_run.txt is only written on a live kubectl; mocked here to
+    return nothing.)"""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    vdir = tmp_path / "videos"
+    vdir.mkdir()
+    (vdir / "S6_admin_cold.webm").write_bytes(b"\x00" * 100_000)
+
+    ledger.write_run_bundle(tmp_path, [], per_stage_proofs={},
+                            tag="t", scale=5000)
+
+    assert (vdir / "S6_admin_cold.webm").exists()
+    assert not (tmp_path / "oversize_bundle.json").exists(), (
+        "no gzip + no drop → no oversize report")
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["bundle_truncated"] is False
 
 
 # ─── Task #289: conv tier revision + reporting-clarity fixes ────────────────
