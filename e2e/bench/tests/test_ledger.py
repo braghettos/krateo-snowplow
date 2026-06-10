@@ -295,3 +295,174 @@ def test_write_run_bundle_truncates_oversize_video_bundle(tmp_path,
     assert (tmp_path / "oversize_bundle.json").exists()
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert summary["bundle_truncated"] is True
+
+
+# ─── Task #289: conv tier revision + reporting-clarity fixes ────────────────
+
+
+def _mw(warm, cold):
+    return {"warm_p50_ms": warm, "cold_ms": cold}
+
+
+def test_conv_tier_30s_measured_p99_does_not_miss():
+    """Conv tier revised to 30000ms (Task #289). The measured worst-case
+    s8 p99 ≈ 23.8s (23800ms) is WITHIN tier → no conv miss → PASS when
+    warm/cold are clean."""
+    assert ledger.CONV_TIER_MS == 30000
+    v = ledger.compute_verdict(_mw(400, 900), restarts=0,
+                               conv_s8_p99=23800, cells=None)
+    assert v == "PASS"
+
+
+def test_conv_tier_31s_exceeds_revised_tier_is_a_miss():
+    """31000ms > 30000ms tier → one tier missed → WEAK_PASS (warm/cold
+    clean). Confirms the tier still discriminates above the revised bound."""
+    v = ledger.compute_verdict(_mw(400, 900), restarts=0,
+                               conv_s8_p99=31000, cells=None)
+    assert v == "WEAK_PASS"
+
+
+def test_conv_tier_boundary_exactly_30s_passes():
+    """Boundary: conv == 30000 is NOT > 30000 → not a miss."""
+    v = ledger.compute_verdict(_mw(400, 900), restarts=0,
+                               conv_s8_p99=30000, cells=None)
+    assert v == "PASS"
+
+
+def test_warm_cold_tiers_unchanged_pending_288():
+    """warm_p50 (500) and cold (1000) tiers UNCHANGED — Diego kept them
+    pending #288. warm 914>500 with everything else clean → WEAK_PASS."""
+    assert ledger.WARM_P50_TIER_MS == 500
+    assert ledger.COLD_TIER_MS == 1000
+    v = ledger.compute_verdict(_mw(914, 900), restarts=0,
+                               conv_s8_p99=10000, cells=None)
+    assert v == "WEAK_PASS"
+
+
+# ── #289a: skeleton_failures respects the efaf1a4 demotion ──────────────────
+
+
+def _nav(label, *, terminal_state, skeleton_count, skeleton_materializing,
+         waterfall=200, user="cyberjoker"):
+    return {
+        "user": user, "nav_num": 2, "waterfallMs": waterfall,
+        "label": label,
+        "validation": {
+            "terminal_state": terminal_state,
+            "skeleton_count": skeleton_count,
+            "skeleton_materializing": skeleton_materializing,
+            "errored_count": 0,
+        },
+    }
+
+
+def test_skeleton_failures_excludes_demoted_materializing_nav():
+    """A nav that PASSED with skeleton_materializing=True (the S4 small-N
+    race demoted at efaf1a4) is NOT a skeleton failure — telemetry must
+    not report it."""
+    all_results = [{"stage": "4", "cache": "ON", "pages": {"Compositions": {
+        "navigations": [_nav("S4 ON nav#1 Compositions",
+                              terminal_state="pass", skeleton_count=2,
+                              skeleton_materializing=True)],
+    }}}]
+    summary = ledger.aggregate_validation(all_results)
+    assert summary["skeleton_failures"] == []
+    assert summary["navs_terminal_pass"] == 1
+
+
+def test_skeleton_failures_still_includes_hard_fail_skeleton():
+    """A genuine stuck-widget skeleton (terminal_state=fail, NOT demoted)
+    is STILL recorded — the demotion must not weaken hard-fail detection."""
+    all_results = [{"stage": "6", "cache": "ON", "pages": {"Dashboard": {
+        "navigations": [_nav("S6 ON nav#1 Dashboard",
+                              terminal_state="fail", skeleton_count=1,
+                              skeleton_materializing=False)],
+    }}}]
+    summary = ledger.aggregate_validation(all_results)
+    assert summary["skeleton_failures"] == ["S6 ON nav#1 Dashboard"]
+    assert summary["navs_terminal_fail"] == 1
+
+
+def test_skeleton_failures_includes_skeleton_pass_without_materializing_flag():
+    """Defensive: a skeleton on a nav that did NOT carry the materializing
+    demotion (flag absent/False) is still reported even if terminal_state
+    happens to be 'pass' — only the explicit demotion is excluded."""
+    all_results = [{"stage": "6", "cache": "ON", "pages": {"Dashboard": {
+        "navigations": [_nav("S6 ON nav#2 Dashboard",
+                              terminal_state="pass", skeleton_count=3,
+                              skeleton_materializing=False)],
+    }}}]
+    summary = ledger.aggregate_validation(all_results)
+    assert summary["skeleton_failures"] == ["S6 ON nav#2 Dashboard"]
+
+
+# ── #289b: failed_gates enumerates latency-tier misses on non-PASS ──────────
+
+
+def test_failed_gates_carries_tier_entries_on_fail(tmp_path, monkeypatch):
+    """A FAIL verdict (2 tiers missed) must enumerate the tier misses so
+    failed_gates is never empty on a non-PASS verdict."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    # warm 914>500 AND cold 1500>1000 → 2 misses → FAIL.
+    all_results = [{"stage": "6", "cache": "ON", "pages": {"Dashboard": {
+        "navigations": [
+            {"user": "cyberjoker", "nav_num": 1, "cold_warm": "COLD",
+             "waterfallMs": 1500, "validation": {"terminal_state": "pass"}},
+            {"user": "cyberjoker", "nav_num": 2, "waterfallMs": 914,
+             "validation": {"terminal_state": "pass"}},
+        ],
+    }}}]
+    ledger.write_run_bundle(tmp_path, all_results, per_stage_proofs={},
+                            tag="t", scale=50000)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["verdict"] == "FAIL"
+    fg = summary["failed_gates"]
+    assert any(g.startswith("tier:warm_p50 ") and g.endswith(">500")
+               for g in fg), fg
+    assert any(g.startswith("tier:cold ") and g.endswith(">1000")
+               for g in fg), fg
+    # Sanity: the contradiction the fix targets (FAIL with [] gates) is gone.
+    assert fg != []
+
+
+def test_failed_gates_enumerates_conv_tier_miss(tmp_path, monkeypatch):
+    """conv_s8_p99 above the 30s tier appears as a tier:conv_s8_p99 entry."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    # warm/cold clean; conv 31000>30000 → 1 miss → WEAK_PASS (non-PASS).
+    all_results = [{"stage": "8", "cache": "ON", "pages": {"Compositions": {
+        "navigations": [
+            {"user": "cyberjoker", "nav_num": 1, "cold_warm": "COLD",
+             "waterfallMs": 800, "convergence_ms": 31000,
+             "validation": {"terminal_state": "pass"}},
+            {"user": "cyberjoker", "nav_num": 2, "waterfallMs": 300,
+             "convergence_ms": 31000,
+             "validation": {"terminal_state": "pass"}},
+        ],
+    }}}]
+    ledger.write_run_bundle(tmp_path, all_results, per_stage_proofs={},
+                            tag="t", scale=50000)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["verdict"] in ("WEAK_PASS", "FAIL")
+    assert any(g.startswith("tier:conv_s8_p99 ") and g.endswith(">30000")
+               for g in summary["failed_gates"]), summary["failed_gates"]
+
+
+def test_failed_gates_empty_on_valid_pass(tmp_path, monkeypatch):
+    """A clean PASS leaves failed_gates == [] (no tier entries, no
+    contradiction in the other direction)."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
+    all_results = [{"stage": "8", "cache": "ON", "pages": {"Compositions": {
+        "navigations": [
+            {"user": "cyberjoker", "nav_num": 1, "cold_warm": "COLD",
+             "waterfallMs": 800, "convergence_ms": 10000,
+             "validation": {"terminal_state": "pass"}},
+            {"user": "cyberjoker", "nav_num": 2, "waterfallMs": 300,
+             "convergence_ms": 10000,
+             "validation": {"terminal_state": "pass"}},
+        ],
+    }}}]
+    ledger.write_run_bundle(tmp_path, all_results, per_stage_proofs={},
+                            tag="t", scale=50000)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["verdict"] == "PASS"
+    assert summary["failed_gates"] == []

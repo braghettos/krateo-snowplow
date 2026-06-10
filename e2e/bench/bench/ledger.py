@@ -185,7 +185,18 @@ def aggregate_validation(all_results: Iterable[dict]) -> dict:
                     summary["navs_terminal_pass"] += 1
                 else:
                     summary["navs_terminal_fail"] += 1
-                if v.get("skeleton_count", 0) > 0:
+                # #289a: respect the efaf1a4 skeleton demotion. A skeleton
+                # that was demoted to a benign WARN (terminal_state=='pass'
+                # AND skeleton_materializing==True — the small-N
+                # materialization race) is NOT a failure and must not be
+                # reported as one. A skeleton that is still a HARD FAIL
+                # (terminal_state=='fail', or any skeleton not carrying the
+                # materializing demotion) IS still recorded. Telemetry-only:
+                # this does not change the verdict (that keys off
+                # navs_terminal_fail, which already reflects the demotion).
+                demoted = (v.get("terminal_state") == "pass"
+                           and v.get("skeleton_materializing") is True)
+                if v.get("skeleton_count", 0) > 0 and not demoted:
                     summary["skeleton_failures"].append(label)
                 summary["errored_widgets_total"] += int(
                     v.get("errored_count", 0) or 0)
@@ -224,18 +235,46 @@ def _load_per_mutation_metric(key: str, *, run_dir: Path | None = None):
     return None
 
 
+# ─── Latency tier thresholds (ms) ───────────────────────────────────────────
+#
+# warm_p50 (500) and cold (1000) are UNCHANGED — Diego explicitly kept them
+# pending #288.
+#
+# CONV_TIER_MS = 30000 is the 50K-scale REVISED convergence tier (Task #289,
+# Diego-ratified 2026-06-10). The prior 1000ms tier is structurally
+# unreachable at 50K — proved, not assumed (per feedback_north_star_is_desiderata:
+# "relax only when data proves structural limit"):
+#   - docs/task-282-serve-stale-depth-trace-2026-06-10.md §1: a single
+#     compositions-panels LIST re-resolve costs 11.5s p50 / 52.8s p99 at 50K
+#     (krateo-system/blueprints-panels: n=57, p50=11,535ms, p99=52,753ms), and
+#   - the VERIFY poll cadence imposes a ~22-24s floor observed across every
+#     run: convergence_mass_s8_p99 ≈ 23.8s measured (run-20260609-221611,
+#     run-20260609-234201, and the prior 0.30.248 run-20260605-114100 all sit
+#     in the 22-24s band).
+# 30000ms covers the measured ~23.8s p99 + margin. This is the eventually-
+# consistent serve-stale contract at scale; #286 (fast-lane) may allow
+# tightening this tier later.
+CONV_TIER_MS = 30000
+WARM_P50_TIER_MS = 500   # UNCHANGED pending #288
+COLD_TIER_MS = 1000      # UNCHANGED pending #288
+
+
 # ─── compute_verdict (worktree source 7351-7416) ────────────────────────────
 
 
 def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
     """Verdict per the architect's gates.
 
-    PASS:        warm_p50 < 500ms, cold < 1000ms, conv < 1000ms, 0 restarts
+    PASS:        warm_p50 < 500ms, cold < 1000ms, conv < CONV_TIER_MS, 0 restarts
     WEAK_PASS:   one tier missed by <=20%
-    FAIL:        2+ tiers missed OR conv > 2000ms OR restarts > 0
+    FAIL:        2+ tiers missed OR restarts > 0
     FLOOR:       measurements present, but the deployed chart has no cache
                  toggle (cache_supported=false). Surfaces as structural N/A.
     REJECT:      pod crashed, no usable measurements
+
+    Conv tier is CONV_TIER_MS (30000ms at 50K scale, Task #289) — see the
+    constant's comment for the structural-limit derivation. warm_p50/cold
+    tiers unchanged.
     """
     if not mix_weighted:
         return "REJECT"
@@ -258,11 +297,11 @@ def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
         if on_zero and off_nonzero:
             return "FLOOR"
     misses = 0
-    if wp50 > 500:
+    if wp50 > WARM_P50_TIER_MS:
         misses += 1
-    if cold is None or cold > 1000:
+    if cold is None or cold > COLD_TIER_MS:
         misses += 1
-    if conv_s8_p99 is not None and conv_s8_p99 > 1000:
+    if conv_s8_p99 is not None and conv_s8_p99 > CONV_TIER_MS:
         misses += 1
     if misses == 0:
         return "PASS"
@@ -647,6 +686,23 @@ def write_run_bundle(run_dir: Path,
             failed_gates.append("pod_restarts")
         if any(v is None for v in row["mix_weighted"].values()):
             failed_gates.append("mix_weighted_null")
+        # #289b: enumerate latency-tier misses so a non-PASS verdict never
+        # reads as a contradiction (verdict=FAIL with failed_gates=[]). Each
+        # entry names the tier and the offending value, e.g.
+        # "tier:warm_p50 914>500". Thresholds mirror compute_verdict's tier
+        # logic exactly (same constants) so the two cannot drift.
+        mw = row["mix_weighted"]
+        wp50 = mw.get("warm_p50_ms")
+        cold = mw.get("cold_ms")
+        conv = row.get("convergence_mass_s8_p99")
+        if wp50 is not None and wp50 > WARM_P50_TIER_MS:
+            failed_gates.append(f"tier:warm_p50 {wp50}>{WARM_P50_TIER_MS}")
+        if cold is None or (cold is not None and cold > COLD_TIER_MS):
+            failed_gates.append(
+                f"tier:cold {cold}>{COLD_TIER_MS}" if cold is not None
+                else f"tier:cold null>{COLD_TIER_MS}")
+        if conv is not None and conv not in (-1,) and conv > CONV_TIER_MS:
+            failed_gates.append(f"tier:conv_s8_p99 {conv}>{CONV_TIER_MS}")
 
     summary = {
         "verdict": row["verdict"],
