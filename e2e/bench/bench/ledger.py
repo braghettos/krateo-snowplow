@@ -256,8 +256,34 @@ def _load_per_mutation_metric(key: str, *, run_dir: Path | None = None):
 
 # ─── Latency tier thresholds (ms) ───────────────────────────────────────────
 #
-# warm_p50 (500) and cold (1000) are UNCHANGED — Diego explicitly kept them
-# pending #288.
+# warm_p50 (1000) and cold (1300) are the REVISED verdict tiers (Task #121,
+# Diego-ratified 2026-06-10). They are NOT north-star: 500ms warm / 1000ms cold
+# remain the ASPIRATIONAL frontend-scope target (documented below, NOT deleted).
+# These verdict tiers are set to the measured-achievable floor under the
+# snowplow+chart control surface, because the warm/cold tiers are STRUCTURALLY
+# UNREACHABLE within that scope — proved, not assumed (per
+# feedback_north_star_is_desiderata: "relax ONLY when data proves a structural
+# limit — the data now proves it"; derivation, not a magic number, per
+# feedback_capacity_caps_empirical_per_entry_cost):
+#
+#   STRUCTURAL PROOF (warm/cold are frontend-gated, not server-gated):
+#   - docs/task-288-lane1-measurement-2026-06-10.md: per-call snowplow server
+#     compute is sub-millisecond (warm serve stack <1% CPU; the ~914ms warm
+#     PAGE p50 is the SPA fetch waterfall = wave-count × per-wave browser↔ingress
+#     RTT + render — a FAN-OUT problem on the frontend, NOT server overhead).
+#   - docs/task-300-c1-fanout-collapse-design-2026-06-10.md: C1 (the only chart
+#     lever, /compositions fan-out collapse) is INFEASIBLE without a frontend JS
+#     change (W2+W3 per-card/child fetch is the content-fill mechanism the SPA
+#     insists on issuing; verdict D: "warm floor stands at ~908ms"). The residual
+#     is frontend/ingress, out of the snowplow+chart scope.
+#
+#   TIER DERIVATION (measured-achievable floor × run-variance headroom):
+#   - warm_p50 measured across 3 clean 50K runs = 914 (0.30.251 run3) /
+#     908 (0.30.253) / 890 (0.30.254). Tier 1000 = ~1.09× worst-observed (914),
+#     i.e. run-variance headroom over the worst clean run.
+#   - cold measured across the same 3 runs = 1196 / 1185 / 1175. Tier 1300 =
+#     ~1.09× worst-observed (1196), same headroom basis.
+#
 #
 # CONV_TIER_MS = 30000 is the 50K-scale REVISED convergence tier (Task #289,
 # Diego-ratified 2026-06-10). The prior 1000ms tier is structurally
@@ -274,8 +300,8 @@ def _load_per_mutation_metric(key: str, *, run_dir: Path | None = None):
 # consistent serve-stale contract at scale; #286 (fast-lane) may allow
 # tightening this tier later.
 CONV_TIER_MS = 30000
-WARM_P50_TIER_MS = 500   # UNCHANGED pending #288
-COLD_TIER_MS = 1000      # UNCHANGED pending #288
+WARM_P50_TIER_MS = 1000  # Task #121: 500 -> 1000 (~1.09× worst clean run 914; 500 stays aspirational)
+COLD_TIER_MS = 1300      # Task #121: 1000 -> 1300 (~1.09× worst clean run 1196; 1000 stays aspirational)
 
 
 # ─── compute_verdict (worktree source 7351-7416) ────────────────────────────
@@ -284,16 +310,20 @@ COLD_TIER_MS = 1000      # UNCHANGED pending #288
 def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
     """Verdict per the architect's gates.
 
-    PASS:        warm_p50 < 500ms, cold < 1000ms, conv < CONV_TIER_MS, 0 restarts
-    WEAK_PASS:   one tier missed by <=20%
+    A tier is "missed" only when the value is strictly GREATER than its
+    threshold (the boundary value exactly at the tier is NOT a miss).
+
+    PASS:        warm_p50 <= WARM_P50_TIER_MS, cold <= COLD_TIER_MS,
+                 conv <= CONV_TIER_MS, 0 restarts
+    WEAK_PASS:   one tier missed
     FAIL:        2+ tiers missed OR restarts > 0
     FLOOR:       measurements present, but the deployed chart has no cache
                  toggle (cache_supported=false). Surfaces as structural N/A.
     REJECT:      pod crashed, no usable measurements
 
-    Conv tier is CONV_TIER_MS (30000ms at 50K scale, Task #289) — see the
-    constant's comment for the structural-limit derivation. warm_p50/cold
-    tiers unchanged.
+    Tiers: warm_p50 = WARM_P50_TIER_MS (1000ms), cold = COLD_TIER_MS (1300ms)
+    revised Task #121; conv = CONV_TIER_MS (30000ms at 50K) revised Task #289 —
+    see each constant's comment block for the structural-limit derivation.
     """
     if not mix_weighted:
         return "REJECT"
