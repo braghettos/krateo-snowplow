@@ -979,6 +979,35 @@ def test_pick_visible_composition_names_returns_newest_k_in_ascending_order(
         "bench-app-01-07"
 
 
+def test_pick_visible_composition_names_returns_newest_8_for_s8_k(monkeypatch):
+    """Task #282 Option C: the S8/S9 pick site uses k=8. With >=8 panels
+    present the picker returns exactly the newest 8 (newest-LAST). This is
+    the depth-margin the gate relies on (measured worst-case depth 4 +
+    p99 variance => margin >=3).
+    """
+    from bench import phases as phases_mod
+    from bench import cluster as cluster_mod
+    rows = "\n".join(f"bench-app-01-{i:02d}" for i in range(1, 13))  # 01..12
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **kw: (0, rows, ""))
+    out = phases_mod._pick_visible_composition_names("bench-ns-01", k=8)
+    # Newest 8, newest-LAST: 05..12.
+    assert out == [f"bench-app-01-{i:02d}" for i in range(5, 13)]
+    assert len(out) == 8
+
+
+def test_s8_pick_k_is_at_least_per_page():
+    """K invariant (Task #282): the S8/S9 newest-K MUST stay >= the
+    datagrid per_page so the K-list always covers the full first page.
+    Assert the pick-site k (8) is >= COMP_DATAGRID_PER_PAGE (5).
+    """
+    from bench.expected import COMP_DATAGRID_PER_PAGE
+    S8_PICK_K = 8  # the k passed at the stage_s8/stage_s9 pick site
+    assert S8_PICK_K >= COMP_DATAGRID_PER_PAGE, (
+        f"S8/S9 newest-K ({S8_PICK_K}) must stay >= datagrid per_page "
+        f"({COMP_DATAGRID_PER_PAGE}) so the K-list covers the full first page")
+
+
 def test_pick_visible_composition_names_skips_none_labels(monkeypatch):
     """Panels lacking the composition-name label render `<none>` — they
     must be skipped, not counted toward K.

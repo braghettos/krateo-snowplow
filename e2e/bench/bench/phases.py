@@ -1121,10 +1121,18 @@ def _pick_visible_composition_names(target_ns: str, k: int = 5) -> list[str]:
     ADDed seconds before cj's nav may not yet be re-resolved into the
     served RAFullList cell, so the exact-newest assert is structurally
     racy while panels materialise (~1/75s) faster than the refresher
-    drains under a 50K install storm. The newest K=5 = the datagrid's
-    first-page size; asserting ANY-of-K tolerates the freshness window
-    while still catching the #149/#186 classes (RBAC-narrowing breakage =
-    ZERO of K present, or per-card widget 403s).
+    drains under a 50K install storm. Asserting ANY-of-K tolerates the
+    freshness window while still catching the #149/#186 classes
+    (RBAC-narrowing breakage = ZERO of K present, or per-card widget 403s).
+
+    K invariant: callers MUST pass k >= the datagrid per_page (=5) so the
+    newest-K list always covers the full first page; a k below per_page
+    could pass on a stale older card while the actual first-page newest
+    card is absent. The S8/S9 pick site uses k=8 (Task #282 Option C),
+    derived from the measured worst-case serve-stale depth (4 panels at
+    p50 drain + ~1-2 panels p99 variance => margin >=3). The signature
+    default stays generic (k=5 = per_page floor) for the single-name
+    wrapper and any future caller.
 
     The live `compositions-panels` RESTAction sorts PANELS by
     `creationTimestamp DESC` (newest-first) — NOT composition
@@ -1503,14 +1511,23 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
 
         # 4. CONTENT-not-status assertion (per R4 mitigation).
         # Any-of-newest-K gate (Task #280 / Option A1): pick the newest
-        # K=5 panel composition-names (the datagrid first-page size) and
-        # pass S8 if ANY render. The single-newest assert was structurally
-        # racy against snowplow's ratified serve-stale window (dirty-mark-
-        # not-evict + customer-priority refresher); any-of-K tolerates the
-        # freshness window while still failing if ZERO cards render —
-        # which is the #149 (RBAC view stays empty) / #186 (per-card
-        # widget 403) breakage the gate exists to catch.
-        expected_card_names = _pick_visible_composition_names(target_ns, k=5)
+        # K panel composition-names and pass S8 if ANY render. The single-
+        # newest assert was structurally racy against snowplow's ratified
+        # serve-stale window (dirty-mark-not-evict + customer-priority
+        # refresher); any-of-K tolerates the freshness window while still
+        # failing if ZERO cards render — which is the #149 (RBAC view stays
+        # empty) / #186 (per-card widget 403) breakage the gate exists to
+        # catch.
+        #
+        # K=8 derivation (Task #282 Option C, Diego-ratified — see
+        # docs/task-282-serve-stale-depth-trace-2026-06-10.md): measured
+        # worst-case serve-stale depth = 4 panels at p50 drain; p99
+        # per-resolve 52.8s adds ~1-2 panels of variance. K=8 gives margin
+        # >=3 at the measured worst case while the gate floor (zero-of-K ->
+        # FAIL) is unchanged. K MUST stay >= datagrid per_page=5 so the
+        # K-list always covers the full first page (a K below per_page could
+        # pass while the actual first-page newest card is absent).
+        expected_card_names = _pick_visible_composition_names(target_ns, k=8)
         # Reload-after-pick: the pick queried the live cluster AFTER the
         # navs rendered the DOM. Reload so the assert inspects post-pick
         # serve state, not the stale T_nav DOM.
