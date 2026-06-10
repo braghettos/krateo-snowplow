@@ -417,15 +417,18 @@ def _install_fake_playwright(monkeypatch):
     monkeypatch.setitem(_sys.modules, "playwright.sync_api", fake_mod)
 
 
-def test_setup_users_passes_record_video_dir_when_video_flag_set(
+def test_setup_users_records_credentials_only_when_video_flag_set(
         tmp_path, monkeypatch):
-    """Per team-lead G6 NACK: _setup_users MUST thread ctx.video into
-    browser.make_browser_context(record_video_dir=...) when video !=
-    "none". Without this, Playwright never writes .webm files to disk.
+    """Task #267 PER-STAGE correction (Diego 2026-06-10): in a recording
+    mode, _setup_users must NOT open a long-lived recording context (that
+    would span the whole run → ONE giant .webm). It stores credentials only
+    (record_video=True, pwd, ctx=None) + creates videos/; the per-stage
+    recording contexts are opened later by _measure_all_users so each stage
+    yields its own files.
 
-    Falsifier: monkey-patch browser.make_browser_context to capture
-    kwargs; assert `record_video_dir` was supplied AND points under
-    ctx.run_dir/videos/.
+    Falsifier: monkey-patch browser.make_browser_context to capture calls;
+    assert ZERO calls at setup time, videos/ exists, and each user carries
+    creds for per-stage re-login.
     """
     _install_fake_playwright(monkeypatch)
     captured: list[dict] = []
@@ -436,7 +439,7 @@ def test_setup_users_passes_record_video_dir_when_video_flag_set(
 
     monkeypatch.setattr(phases.browser, "make_browser_context", _capture)
     monkeypatch.setattr(phases.browser, "_ensure_users",
-                        lambda: {"admin": "x", "cyberjoker": "y"})
+                        lambda: {"admin": "pw-a", "cyberjoker": "pw-c"})
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
 
@@ -449,16 +452,18 @@ def test_setup_users_passes_record_video_dir_when_video_flag_set(
     )
     phases._setup_users(ctx)
 
-    assert len(captured) == 2, (
-        f"expected 2 make_browser_context calls (admin + cyberjoker); "
-        f"got {len(captured)}")
-    for cap in captured:
-        assert "record_video_dir" in cap, (
-            f"make_browser_context called WITHOUT record_video_dir: {cap}")
-        rvd = cap["record_video_dir"]
-        assert Path(rvd) == tmp_path / "videos", (
-            f"record_video_dir={rvd!r} not under {tmp_path / 'videos'}")
-    assert (tmp_path / "videos").is_dir()
+    assert captured == [], (
+        f"recording _setup_users must NOT open contexts at setup (per-stage "
+        f"now); got {len(captured)} make_browser_context calls")
+    assert (tmp_path / "videos").is_dir(), "videos/ dir must be created"
+    assert "__stage_videos__" in ctx.user_pages
+    for u, pw_expected in (("admin", "pw-a"), ("cyberjoker", "pw-c")):
+        u_state = ctx.user_pages[u]
+        assert u_state["record_video"] is True
+        assert u_state["pwd"] == pw_expected, (
+            f"{u} must carry its password for per-stage re-login")
+        assert u_state["ctx"] is None and u_state["page"] is None, (
+            f"{u} must hold NO long-lived recording context at setup")
 
 
 def test_setup_users_does_not_record_when_video_none(tmp_path, monkeypatch):
@@ -488,6 +493,43 @@ def test_setup_users_does_not_record_when_video_none(tmp_path, monkeypatch):
     for cap in captured:
         assert cap.get("record_video_dir") is None, (
             f"record_video_dir should be None for video='none'; got {cap}")
+
+
+@pytest.mark.parametrize("video_mode", ["representative", "all"])
+def test_setup_users_credentials_only_in_both_record_modes(
+        tmp_path, monkeypatch, video_mode):
+    """Per-stage recording applies to BOTH `representative` AND `all` (they
+    differ only in intended frequency). In either mode _setup_users opens NO
+    context (per-stage in _measure_all_users) and stores creds-only.
+    """
+    _install_fake_playwright(monkeypatch)
+    captured: list[dict] = []
+
+    def _capture(pw_browser, **kwargs):
+        captured.append(dict(kwargs))
+        return _FakeCtx()
+
+    monkeypatch.setattr(phases.browser, "make_browser_context", _capture)
+    monkeypatch.setattr(phases.browser, "_ensure_users",
+                        lambda: {"admin": "x", "cyberjoker": "y"})
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video=video_mode,
+        user_pages={"__subjects__": ["admin", "cyberjoker"]},
+    )
+    phases._setup_users(ctx)
+
+    assert captured == [], (
+        f"video={video_mode!r}: _setup_users must open NO context at setup "
+        f"(per-stage recording); got {len(captured)}")
+    assert (tmp_path / "videos").is_dir()
+    for u in ("admin", "cyberjoker"):
+        assert ctx.user_pages[u]["record_video"] is True
+        assert ctx.user_pages[u]["pwd"]  # creds present for per-stage re-login
+        assert ctx.user_pages[u]["ctx"] is None
 
 
 def test_run_phase6_threads_video_into_stage_context(tmp_path, monkeypatch):
@@ -523,22 +565,17 @@ def test_run_phase6_threads_video_into_stage_context(tmp_path, monkeypatch):
         f"video flag did not reach _setup_users; saw {seen_video}")
 
 
-def test_attach_video_artifacts_writes_proof_path_relative_to_run_dir(
+def test_attach_video_artifacts_to_last_measurement_proof_is_noop_now(
         tmp_path):
-    """The video-artifact attach hook MUST update the targeted stage's
-    proof to list .webm/.gif paths relative to run_dir, AND must also
-    update state.json's mirror copy."""
-    # Pre-seed state.json + proofs/S1.json (the "first measurement" stage)
+    """Task #267 PER-STAGE correction: the old run-end re-attribution hook is
+    now a DEPRECATED no-op (per-stage attachment in _run_stage supersedes it).
+    It must NOT mutate any proof — doing so would double-attach every stage's
+    video to the first stage.
+    """
     state = {
-        "schema_version": "1.0.0",
-        "tag": "t", "scale": 5000,
+        "schema_version": "1.0.0", "tag": "t", "scale": 5000,
         "stages_completed": ["S0", "S1"],
         "stage_proofs": {
-            "S0": {
-                "stage_id": "S0", "started_at": "x", "ended_at": "y",
-                "passed": True, "proof": {}, "artifacts": [],
-                "what_breaks_if_skipped": "S0 underwrites preflight",
-            },
             "S1": {
                 "stage_id": "S1", "started_at": "x", "ended_at": "y",
                 "passed": True, "proof": {}, "artifacts": [],
@@ -551,28 +588,19 @@ def test_attach_video_artifacts_writes_proof_path_relative_to_run_dir(
     (tmp_path / "proofs" / "S1.json").write_text(json.dumps(
         state["stage_proofs"]["S1"], indent=2))
 
-    # Place fake .webm + .gif under videos/.
-    (tmp_path / "videos").mkdir()
-    webm = tmp_path / "videos" / "S1_admin_cold_dashboard.webm"
-    gif = tmp_path / "videos" / "S1_admin_cold_dashboard.gif"
-    webm.write_bytes(b"\x00")
-    gif.write_bytes(b"\x00")
-
     ctx = phases.StageContext(
         tag="t", scale=5000,
         run_dir=tmp_path, state_path=tmp_path / "state.json",
         video="representative",
-        user_pages={"__video_artifacts__": [str(webm), str(gif)]},  # type: ignore[arg-type]
+        user_pages={"__video_artifacts__": ["videos/whatever.webm"]},  # type: ignore[arg-type]
     )
+    # No-op: must not raise and must not touch the proof.
     phases._attach_video_artifacts_to_last_measurement_proof(ctx)
 
     proof = json.loads((tmp_path / "proofs" / "S1.json").read_text())
-    assert "videos/S1_admin_cold_dashboard.webm" in proof["artifacts"]
-    assert "videos/S1_admin_cold_dashboard.gif" in proof["artifacts"]
-    # state.json mirror updated too
-    state_after = json.loads((tmp_path / "state.json").read_text())
-    assert "videos/S1_admin_cold_dashboard.webm" in \
-        state_after["stage_proofs"]["S1"]["artifacts"]
+    assert proof["artifacts"] == [], (
+        f"deprecated hook must be a no-op; proof.artifacts mutated to "
+        f"{proof['artifacts']!r}")
 
 
 def test_first_stage_label_prefers_first_non_meta_completed_stage(tmp_path):
@@ -594,6 +622,635 @@ def test_first_stage_label_prefers_first_non_meta_completed_stage(tmp_path):
     ctx = phases.StageContext(tag="t", scale=5000, run_dir=tmp_path,
                               state_path=tmp_path / "state.json")
     assert phases._first_stage_label(ctx) == "S1"
+
+
+# ─── Task #267 FIX 2 — film BOTH dashboard AND /compositions per cell ───────
+#
+# Playwright records one .webm per BrowserContext. _setup_users now opens one
+# recording context per (user, page); _teardown_users renames each to
+# {stage}_{user}_{page_slug}.webm and renders a .gif. These cases prove a
+# /compositions video artifact is produced (not just dashboard), that the
+# hardcoded `_cold_dashboard` suffix is gone, and that the #299 truncation
+# behaviour (record_video_to_gif's max_mb/oversize-delete) is preserved.
+
+
+class _FakeVideo:
+    """Playwright page.video stand-in: .path() returns the raw .webm path."""
+    def __init__(self, raw_path):
+        self._raw = str(raw_path)
+
+    def path(self):
+        return self._raw
+
+
+class _FakePageWithVideo:
+    """Page stand-in that exposes `.video.path()` like Playwright does AND
+    enough of the content-gate surface (`locator().count()`, `goto`,
+    `wait_for_timeout`) so the SAME page that 'filmed' the nav can be the one
+    the S8/S9 content asserts inspect (architect Option A). `present_names`
+    is the set of composition names whose `text=NAME` locator reports >=1.
+    """
+    def __init__(self, raw_webm, present_names=None):
+        self.video = _FakeVideo(raw_webm)
+        self.present_names = set(present_names or [])
+        self.reloaded = 0
+        self.url = "http://fake/compositions"
+
+    def locator(self, selector):
+        name = (selector[len("text="):] if selector.startswith("text=")
+                else selector)
+        return _CardLocator(1 if name in self.present_names else 0)
+
+    def goto(self, url, **kw):
+        self.reloaded += 1
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+class _FakeRecordingCtx:
+    """BrowserContext stand-in. On close(), the raw .webm 'finalizes' (we
+    write a small byte blob to disk so record_video_to_gif sees a source).
+    `present_names` is forwarded to the page so the content gate can inspect
+    the live (deferred) Compositions page."""
+    def __init__(self, raw_webm, present_names=None):
+        self._raw = Path(raw_webm)
+        self.closed = False
+        self.page = _FakePageWithVideo(raw_webm, present_names=present_names)
+
+    def new_page(self):
+        return self.page
+
+    def close(self):
+        self.closed = True
+        self._raw.parent.mkdir(parents=True, exist_ok=True)
+        self._raw.write_bytes(b"FAKE_WEBM" * 8)
+
+
+def _stub_video_to_gif(monkeypatch):
+    """Stub record_video_to_gif WITHOUT ffmpeg. Per the Task #267 correction
+    the gif is ALWAYS produced + kept (no size-based drop)."""
+    def _fake(webm_path, gif_path, *, fps=4, max_seconds=60, max_mb=None):
+        webm = Path(webm_path)
+        gif = Path(gif_path)
+        if not webm.exists():
+            return False
+        gif.write_bytes(b"GIF89a" + b"\x00" * 256)
+        return True
+
+    monkeypatch.setattr(phases.browser, "record_video_to_gif", _fake)
+
+
+class _StageRecordingBrowser:
+    """Fake pw_browser whose new_context() returns a fresh recording context
+    each call, mimicking Playwright assigning a unique random .webm path per
+    context under the passed record_video_dir. `present_names` (optional) is
+    forwarded to every page so the content gate can find rendered cards on the
+    subject's deferred Compositions page."""
+    def __init__(self, present_names=None):
+        self._n = 0
+        self.contexts: list[_FakeRecordingCtx] = []
+        self._present_names = present_names
+
+    def new_context(self, **kwargs):
+        rvd = Path(kwargs.get("record_video_dir", "."))
+        self._n += 1
+        raw = rvd / f"raw-{self._n}.webm"
+        c = _FakeRecordingCtx(raw, present_names=self._present_names)
+        self.contexts.append(c)
+        return c
+
+
+def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
+    """Wire browser.make_browser_context / browser_login / browser_measure_stage
+    so _measure_all_users' per-stage recording path runs hermetically.
+
+    Returns the list capturing (stage_num, user, pages_by_name keys) per
+    browser_measure_stage call. `measure_raises` (an exception or None) lets a
+    test force a ConvergenceTimeout-shaped failure to prove the partial video
+    is still finalized.
+    """
+    def _make_ctx(pw_browser, *, record_video_dir=None, **kw):
+        return pw_browser.new_context(record_video_dir=record_video_dir)
+    monkeypatch.setattr(phases.browser, "make_browser_context", _make_ctx)
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+    _stub_video_to_gif(monkeypatch)
+
+    calls: list[dict] = []
+
+    def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
+                      token=None, user="admin", verify_against_cluster=True,
+                      deleted_ns=None, pages_by_name=None):
+        calls.append({"stage_num": stage_num, "user": user,
+                      "pages_by_name_keys": (sorted(pages_by_name)
+                                             if pages_by_name else None)})
+        if measure_raises is not None:
+            raise measure_raises
+        return {"stage": stage_num, "pages": {}}
+
+    monkeypatch.setattr(phases.browser, "browser_measure_stage", _fake_measure)
+    return calls
+
+
+def _recording_ctx(tmp_path, users=("admin",)):
+    """Build a recording-mode StageContext with creds-only user states and a
+    _StageRecordingBrowser, mirroring post-_setup_users recording shape."""
+    pw_browser = _StageRecordingBrowser()
+    (tmp_path / "videos").mkdir(parents=True, exist_ok=True)
+    up: dict = {"__browser__": pw_browser, "__pw__": None,
+                "__stage_videos__": {}}
+    for u in users:
+        up[u] = {"ctx": None, "page": None, "pwd": f"pw-{u}",
+                 "token": f"tok-{u}", "record_video": True}
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video="representative",
+        user_pages=up)
+    return ctx, pw_browser
+
+
+def test_video_page_slug_maps_names():
+    """`_video_page_slug` lowercases + slugifies the page name."""
+    assert phases._video_page_slug("Dashboard") == "dashboard"
+    assert phases._video_page_slug("Compositions") == "compositions"
+    assert phases._video_page_slug("My Page") == "my-page"
+    assert phases._video_page_slug("") == "page"
+
+
+def test_open_stage_recording_pages_closes_context_on_new_page_failure(
+        tmp_path, monkeypatch):
+    """Orphan-leak guard (architect nit): if new_page() raises AFTER the
+    recording context is created, that context MUST be closed — not leaked
+    (closing pw_browser later would otherwise strand an open recording
+    context). The other page still opens normally.
+    """
+    created: list[_FakeRecordingCtx] = []
+
+    class _BrowserWithFlakyNewPage:
+        def __init__(self):
+            self._n = 0
+
+        def new_context(self, **kwargs):
+            self._n += 1
+            c = _FakeRecordingCtx(Path(tmp_path) / f"raw-{self._n}.webm")
+            # First context's new_page raises AFTER context creation.
+            if self._n == 1:
+                def _boom():
+                    raise RuntimeError("new_page failed post-create")
+                c.new_page = _boom  # type: ignore[assignment]
+            created.append(c)
+            return c
+
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, *, record_video_dir=None, **kw:
+                        pw.new_context(record_video_dir=record_video_dir))
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+
+    pages = phases._open_stage_recording_pages(
+        _BrowserWithFlakyNewPage(), tmp_path / "videos", "cyberjoker", "pw")
+
+    # The first (flaky) context was closed (orphan guard), not leaked.
+    assert created[0].closed is True, (
+        "context whose new_page() raised must be closed, not leaked")
+    # The second page opened fine → exactly one BROWSER_SCALING_PAGES entry
+    # survives (the non-flaky one).
+    assert len(pages) == len(phases.browser.BROWSER_SCALING_PAGES) - 1
+
+
+def test_measure_all_users_produces_both_pages_named_by_stage(
+        tmp_path, monkeypatch):
+    """Per-STAGE FIX 2 acceptance: one _measure_all_users(stage=6) run films
+    BOTH pages on their OWN per-page recording contexts and finalizes
+    `S6_admin_dashboard.webm` + `S6_admin_compositions.webm` (named by the
+    LIVE stage number, not _first_stage_label). The /compositions video is
+    produced, the old `_cold_dashboard` suffix is gone, and gifs are kept.
+    """
+    _install_stage_recording_fakes(monkeypatch)
+    ctx, pw_browser = _recording_ctx(tmp_path, users=("admin",))
+
+    phases._measure_all_users(ctx, 6, "S6 desc")
+
+    produced = ctx.user_pages["__stage_videos__"]["S6"]
+    names = {Path(p).name for p in produced}
+    assert "S6_admin_dashboard.webm" in names, names
+    assert "S6_admin_compositions.webm" in names, (
+        f"/compositions video NOT produced per-stage; got {names}")
+    assert "S6_admin_dashboard.gif" in names
+    assert "S6_admin_compositions.gif" in names
+    assert not any("cold_dashboard" in n for n in names)
+    # Every per-page recording context was closed (Playwright finalizes .webm).
+    assert all(c.closed for c in pw_browser.contexts)
+    assert len(pw_browser.contexts) == len(phases.browser.BROWSER_SCALING_PAGES)
+
+
+def test_two_stages_produce_distinctly_named_videos(tmp_path, monkeypatch):
+    """LOAD-BEARING (Diego): separate watchable video per stage. Two
+    _measure_all_users runs at DIFFERENT stage numbers (S1, then S6) must
+    yield DISTINCTLY-named files — S1_admin_dashboard.webm AND
+    S6_admin_dashboard.webm both exist, not one giant whole-run file.
+
+    Falsifier: with whole-run recording (the pre-correction design) only one
+    stage-labeled file would ever appear.
+    """
+    _install_stage_recording_fakes(monkeypatch)
+    ctx, pw_browser = _recording_ctx(tmp_path, users=("admin",))
+
+    phases._measure_all_users(ctx, 1, "S1 zero state")
+    phases._measure_all_users(ctx, 6, "S6 scale")
+
+    sv = ctx.user_pages["__stage_videos__"]
+    assert set(sv.keys()) == {"S1", "S6"}, (
+        f"expected per-stage keys S1 + S6; got {sorted(sv)}")
+    s1_names = {Path(p).name for p in sv["S1"]}
+    s6_names = {Path(p).name for p in sv["S6"]}
+    assert "S1_admin_dashboard.webm" in s1_names
+    assert "S1_admin_compositions.webm" in s1_names
+    assert "S6_admin_dashboard.webm" in s6_names
+    assert "S6_admin_compositions.webm" in s6_names
+    # Distinct stages → disjoint, distinctly-named webm files on disk.
+    videos_dir = tmp_path / "videos"
+    for n in ("S1_admin_dashboard.webm", "S6_admin_dashboard.webm",
+              "S1_admin_compositions.webm", "S6_admin_compositions.webm"):
+        assert (videos_dir / n).exists(), f"{n} not on disk"
+
+
+def test_measure_all_users_per_stage_films_every_user_and_page(
+        tmp_path, monkeypatch):
+    """Production shape (2 users × 2 pages): one stage yields 4 distinctly
+    named videos — admin + cyberjoker each get their own dashboard +
+    compositions .webm, all prefixed by the stage number.
+
+    Architect Option A: the SUBJECT (cyberjoker) Compositions video is
+    DEFERRED past the content asserts, so the full 4-file set is complete only
+    AFTER `_drain_pending_video_finalize` runs (which `_run_stage` does after
+    `_work`). We drain explicitly here to mimic that.
+    """
+    _install_stage_recording_fakes(monkeypatch)
+    ctx, pw_browser = _recording_ctx(tmp_path, users=("admin", "cyberjoker"))
+
+    phases._measure_all_users(ctx, 8, "S8 RB-add")
+
+    # Before drain: subject (cyberjoker) Compositions is still OPEN/deferred
+    # so its context is NOT yet closed and its video not yet stashed.
+    pre = {Path(p).name for p in ctx.user_pages["__stage_videos__"]["S8"]
+           if p.endswith(".webm")}
+    assert "S8_cyberjoker_compositions.webm" not in pre, (
+        f"subject Compositions must be DEFERRED, not finalized in-loop; {pre}")
+    assert ctx.user_pages["cyberjoker"]["page"] is not None, (
+        "subject Compositions live page must be exposed for the content gate")
+
+    # Drain (what _run_stage does after _work) → the 4th video lands.
+    phases._drain_pending_video_finalize(ctx)
+
+    names = {Path(p).name for p in ctx.user_pages["__stage_videos__"]["S8"]
+             if p.endswith(".webm")}
+    assert names == {
+        "S8_admin_dashboard.webm", "S8_admin_compositions.webm",
+        "S8_cyberjoker_dashboard.webm", "S8_cyberjoker_compositions.webm",
+    }, f"expected 4 per-(user,page) videos for S8 after drain; got {names}"
+    # 2 users × 2 pages = 4 recording contexts opened + closed this stage.
+    assert len(pw_browser.contexts) == 4
+    assert all(c.closed for c in pw_browser.contexts)
+    # After drain the deferred live page is cleared back to None.
+    assert ctx.user_pages["cyberjoker"]["page"] is None
+
+
+def test_measure_all_users_finalizes_video_even_on_convergence_timeout(
+        tmp_path, monkeypatch):
+    """The partial stage video must be finalized even when
+    browser_measure_stage raises ConvergenceTimeout (it still shows real work
+    up to the failure). The exception must still propagate so the stage fails.
+    """
+    ct = ConvergenceTimeout(stage=6, user="admin", api=0, ui=0,
+                            cluster=1200, timeout_secs=1)
+    _install_stage_recording_fakes(monkeypatch, measure_raises=ct)
+    ctx, pw_browser = _recording_ctx(tmp_path, users=("admin",))
+
+    with pytest.raises(ConvergenceTimeout):
+        phases._measure_all_users(ctx, 6, "S6 desc")
+
+    # Despite the raise, the stage's videos were finalized + stashed.
+    produced = ctx.user_pages["__stage_videos__"].get("S6") or []
+    names = {Path(p).name for p in produced}
+    assert "S6_admin_dashboard.webm" in names, (
+        f"partial video must be finalized on ConvergenceTimeout; got {names}")
+    assert all(c.closed for c in pw_browser.contexts)
+
+
+def test_subject_deferred_video_finalized_on_convergence_timeout(
+        tmp_path, monkeypatch):
+    """Architect's optional test — the only untested combination: SUBJECT
+    user (deferred Compositions) + ConvergenceTimeout. On raise, the deferred
+    Compositions context must STILL be CLOSED and its partial video land in
+    __stage_videos__["S6"] once `_run_stage`'s drain runs — and the CT must
+    still propagate. Mirrors _run_stage's `try: _work finally: drain` so the
+    deferred-finalize-on-failure path is exercised end-to-end for the subject.
+    """
+    ct = ConvergenceTimeout(stage=6, user="cyberjoker", api=0, ui=0,
+                            cluster=1200, timeout_secs=1)
+    _install_stage_recording_fakes(monkeypatch, measure_raises=ct)
+    ctx, pw_browser = _recording_ctx(tmp_path, users=("cyberjoker",))
+
+    # Mirror _run_stage: drain pending finalize in a finally even when the
+    # measurement raises, then confirm the CT still propagated.
+    with pytest.raises(ConvergenceTimeout):
+        try:
+            phases._measure_all_users(ctx, 6, "S6 desc")
+        finally:
+            phases._drain_pending_video_finalize(ctx)
+
+    # Both the subject's Dashboard (immediate) AND Compositions (deferred)
+    # partial videos are finalized + stashed under S6.
+    names = {Path(p).name
+             for p in ctx.user_pages["__stage_videos__"].get("S6") or []}
+    assert "S6_cyberjoker_dashboard.webm" in names, names
+    assert "S6_cyberjoker_compositions.webm" in names, (
+        f"deferred subject Compositions partial video must be finalized on "
+        f"ConvergenceTimeout; got {names}")
+    # Every recording context (incl. the deferred Compositions one) is closed.
+    assert all(c.closed for c in pw_browser.contexts), (
+        "deferred subject Compositions context must be CLOSED on raise")
+    # Deferred live page cleared after drain.
+    assert ctx.user_pages["cyberjoker"]["page"] is None
+
+
+def test_measure_all_users_non_recording_uses_single_page(tmp_path, monkeypatch):
+    """Non-recording run: NO per-stage contexts opened, pages_by_name=None,
+    measurement runs on the single persistent page (zero behavioural change).
+    """
+    calls = []
+
+    def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
+                      token=None, user="admin", verify_against_cluster=True,
+                      deleted_ns=None, pages_by_name=None):
+        calls.append({"user": user, "pages_by_name": pages_by_name,
+                      "page": page})
+        return {"stage": stage_num, "pages": {}}
+
+    def _boom_ctx(*a, **k):
+        raise AssertionError("non-recording must NOT open recording contexts")
+    monkeypatch.setattr(phases.browser, "make_browser_context", _boom_ctx)
+    monkeypatch.setattr(phases.browser, "browser_measure_stage", _fake_measure)
+
+    persistent_page = object()
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video="none",
+        user_pages={"__browser__": None,
+                    "admin": {"ctx": object(), "page": persistent_page,
+                              "token": "tok", "record_video": False}},
+    )
+    phases._measure_all_users(ctx, 6, "S6 desc")
+    assert calls[0]["pages_by_name"] is None
+    assert calls[0]["page"] is persistent_page
+    assert "__stage_videos__" not in ctx.user_pages
+
+
+def test_run_stage_attaches_this_stages_videos_to_its_own_proof(
+        tmp_path, monkeypatch):
+    """Per-stage attachment: _run_stage attaches the videos
+    _measure_all_users stashed under __stage_videos__[stage_id] to THAT
+    stage's proof (relative to run_dir), mirroring the per-stage log attach.
+    """
+    monkeypatch.setattr(phases, "_PerStageLogStreamer",
+                        _NullStreamer)  # defined below
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    webm = videos_dir / "S6_admin_dashboard.webm"
+    gif = videos_dir / "S6_admin_dashboard.gif"
+    webm.write_bytes(b"\x00")
+    gif.write_bytes(b"\x00")
+
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video="representative",
+        user_pages={"__stage_videos__": {"S6": [str(webm), str(gif)]}},
+    )
+
+    def _work(c):
+        return {"__passed__": True, "ok": 1}
+
+    proof = phases._run_stage("S6", ctx, _work,
+                              what_breaks_if_skipped="S6 fake")
+    assert "videos/S6_admin_dashboard.webm" in proof.artifacts, proof.artifacts
+    assert "videos/S6_admin_dashboard.gif" in proof.artifacts
+    # Persisted proof on disk carries them too.
+    on_disk = json.loads((tmp_path / "proofs" / "S6.json").read_text())
+    assert "videos/S6_admin_dashboard.webm" in on_disk["artifacts"]
+
+
+class _NullStreamer:
+    """No-op _PerStageLogStreamer stand-in for _run_stage unit tests."""
+    def __init__(self, *a, **k):
+        import threading as _t
+        self._running = _t.Event()
+
+    def start(self):
+        self._running.set()
+
+    def stop(self):
+        self._running.clear()
+
+
+# ─── Task #267 architect REWORK — recording-mode S8/S9 content gate ─────────
+#
+# THE missing gate (architect): the per-stage rebuild left recording users
+# with u_state["page"]=None, so the S8/S9 CONTENT asserts (which run in `_work`
+# AFTER _measure_all_users returns) inspected a None page → S8 false-FAILed
+# (#149 broken) and S9 false-PASSed (blind to revocation). These tests build
+# the recording-mode shape (page=None at setup, fake recording browser) and
+# drive the REAL S8/S9 stage `_work` end-to-end through _run_stage, proving
+# the content gate reads the LIVE filmed Compositions page (Option A).
+
+
+def _stub_s8_s9_cluster(monkeypatch, *, comps_in_ns=5):
+    """Stub the cluster/lifecycle/propagation calls S8/S9 `_work` makes so the
+    stage reaches its CONTENT-assert section without a live apiserver."""
+    monkeypatch.setattr(phases, "_PerStageLogStreamer", _NullStreamer)
+    monkeypatch.setattr(phases.browser, "FRONTEND", "http://fake")
+    # Cluster mutation helpers all succeed.
+    monkeypatch.setattr(phases.cluster, "count_compositions_in_ns",
+                        lambda ns: comps_in_ns)
+    monkeypatch.setattr(phases.cluster, "k8s_can_i_create_rolebinding",
+                        lambda ns: (True, "ok"))
+    monkeypatch.setattr(phases.cluster, "k8s_create_namespaced_role",
+                        lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(phases.cluster, "k8s_create_namespaced_role_binding",
+                        lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(phases.cluster, "k8s_delete_rolebinding",
+                        lambda *a, **k: True)
+    monkeypatch.setattr(phases.cluster, "k8s_delete_role",
+                        lambda *a, **k: True)
+    # Propagation gate passes immediately.
+    monkeypatch.setattr(phases, "_wait_rbac_propagation_to_snowplow",
+                        lambda *a, **k: (True, 10, {"ok": True}))
+    monkeypatch.setattr(phases, "_post_mutation_pause", lambda mode: None)
+    monkeypatch.setattr(phases, "_snapshot_l1_ready_ts", lambda c: 0)
+
+
+def test_recording_mode_s8_content_gate_true_against_live_page(
+        tmp_path, monkeypatch):
+    """ARCHITECT FALSIFIER (stands in for proofs/S8.json under --video): in
+    recording mode (subject page=None at setup), S8's real `_work` must report
+    `content_card_present: true` because Option A exposes the LIVE filmed
+    Compositions page for the gate. Pre-fix this was always false (page=None)
+    → S8 false-FAIL.
+
+    The card the pick returns IS present on the subject's (deferred)
+    Compositions page, so prop_ok + card present + 0 widget errors → S8 PASSES.
+    """
+    picked = ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05"]
+    _stub_s8_s9_cluster(monkeypatch, comps_in_ns=5)
+    monkeypatch.setattr(phases, "_pick_visible_composition_names",
+                        lambda ns, k=8: list(picked))
+    # browser_measure_stage no-op (returns clean result, 0 widget errors).
+    monkeypatch.setattr(
+        phases.browser, "browser_measure_stage",
+        lambda page, *a, **k: {"stage": 8, "pages": {}})
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, *, record_video_dir=None, **kw:
+                        pw.new_context(record_video_dir=record_video_dir))
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+    _stub_video_to_gif(monkeypatch)
+
+    # The subject's Compositions page renders the picked card.
+    pw_browser = _StageRecordingBrowser(present_names={"bench-app-01-04"})
+    (tmp_path / "videos").mkdir(parents=True, exist_ok=True)
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video="representative",
+        user_pages={
+            "__browser__": pw_browser, "__pw__": None, "__stage_videos__": {},
+            # RECORDING shape: page=None at setup (the bug's trigger).
+            "admin": {"ctx": None, "page": None, "pwd": "pw-a",
+                      "token": "tok-a", "record_video": True},
+            "cyberjoker": {"ctx": None, "page": None, "pwd": "pw-c",
+                           "token": "tok-c", "record_video": True},
+        },
+    )
+
+    proof = phases.stage_s8_add_rb_to_populated_ns(ctx)
+
+    body = proof.proof
+    assert body["content_card_present"] is True, (
+        f"recording-mode S8 content gate must read the LIVE filmed page; "
+        f"got content_card_present={body.get('content_card_present')!r}, "
+        f"matched={body.get('matched_card_name')!r}")
+    assert body["matched_card_name"] == "bench-app-01-04"
+    assert proof.passed is True, "S8 must PASS in recording mode"
+    # Persisted proof on disk agrees (the --video falsifier surface).
+    on_disk = json.loads((tmp_path / "proofs" / "S8.json").read_text())
+    assert on_disk["proof"]["content_card_present"] is True
+    # Subject Compositions video was finalized (deferred → drained by _run_stage).
+    s8_vids = {Path(p).name
+               for p in ctx.user_pages.get("__stage_videos__", {}).get("S8", [])}
+    assert "S8_cyberjoker_compositions.webm" in s8_vids, s8_vids
+    # Deferred live page cleared after drain.
+    assert ctx.user_pages["cyberjoker"]["page"] is None
+
+
+def test_recording_mode_s8_content_gate_false_when_no_card_renders(
+        tmp_path, monkeypatch):
+    """REGRESSION GUARD: the recording-mode gate must still FAIL (not silently
+    pass) when RBAC propagated but NO picked card renders on the live page —
+    the #149/#186 breakage the gate exists to catch. Proves Option A did not
+    weaken the gate into an always-true.
+    """
+    picked = ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05"]
+    _stub_s8_s9_cluster(monkeypatch, comps_in_ns=5)
+    monkeypatch.setattr(phases, "_pick_visible_composition_names",
+                        lambda ns, k=8: list(picked))
+    monkeypatch.setattr(
+        phases.browser, "browser_measure_stage",
+        lambda page, *a, **k: {"stage": 8, "pages": {}})
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, *, record_video_dir=None, **kw:
+                        pw.new_context(record_video_dir=record_video_dir))
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+    _stub_video_to_gif(monkeypatch)
+
+    # EMPTY DOM — no picked card renders.
+    pw_browser = _StageRecordingBrowser(present_names=set())
+    (tmp_path / "videos").mkdir(parents=True, exist_ok=True)
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video="representative",
+        user_pages={
+            "__browser__": pw_browser, "__pw__": None, "__stage_videos__": {},
+            "admin": {"ctx": None, "page": None, "pwd": "pw-a",
+                      "token": "tok-a", "record_video": True},
+            "cyberjoker": {"ctx": None, "page": None, "pwd": "pw-c",
+                           "token": "tok-c", "record_video": True},
+        },
+    )
+
+    proof = phases.stage_s8_add_rb_to_populated_ns(ctx)
+    assert proof.proof["content_card_present"] is False
+    assert proof.passed is False, (
+        "S8 must still FAIL when no card renders (gate not weakened)")
+
+
+def test_recording_mode_s9_detects_still_present_card_not_blind(
+        tmp_path, monkeypatch):
+    """ARCHITECT FALSIFIER (S9 half): in recording mode, S9 must NOT be blind.
+    With a card from S8's recorded newest-K STILL present on the live page
+    (a revocation that didn't take), S9 must report content_card_absent=False
+    and FAIL — pre-fix page=None forced content_card_absent=True (false PASS).
+    """
+    s8_cards = ["bench-app-01-03", "bench-app-01-04", "bench-app-01-05"]
+    _stub_s8_s9_cluster(monkeypatch)
+    monkeypatch.setattr(
+        phases.browser, "browser_measure_stage",
+        lambda page, *a, **k: {"stage": 9, "pages": {}})
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, *, record_video_dir=None, **kw:
+                        pw.new_context(record_video_dir=record_video_dir))
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+    _stub_video_to_gif(monkeypatch)
+
+    # Seed S8's proof on disk (S9 reads target_ns/role/rb + expected_card_names).
+    s8_state = {
+        "schema_version": "1.0.0", "tag": "t", "scale": 5000,
+        "stages_completed": ["S8"],
+        "stage_proofs": {"S8": {
+            "stage_id": "S8", "started_at": "x", "ended_at": "y",
+            "passed": True, "artifacts": [],
+            "what_breaks_if_skipped": "S8 fake",
+            "proof": {
+                "subject_user": "cyberjoker", "target_ns": "bench-ns-01",
+                "role_name": "r", "rb_name": "rb",
+                "expected_card_names": s8_cards,
+            },
+        }},
+    }
+    phases.save_state(tmp_path, s8_state)
+
+    # A card from S8's K-list is STILL present → revocation incomplete.
+    pw_browser = _StageRecordingBrowser(present_names={"bench-app-01-04"})
+    (tmp_path / "videos").mkdir(parents=True, exist_ok=True)
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video="representative",
+        user_pages={
+            "__browser__": pw_browser, "__pw__": None, "__stage_videos__": {},
+            "admin": {"ctx": None, "page": None, "pwd": "pw-a",
+                      "token": "tok-a", "record_video": True},
+            "cyberjoker": {"ctx": None, "page": None, "pwd": "pw-c",
+                           "token": "tok-c", "record_video": True},
+        },
+    )
+
+    proof = phases.stage_s9_remove_rb_from_populated_ns(ctx)
+    assert proof.proof["content_card_absent"] is False, (
+        "recording-mode S9 must DETECT the still-present card (not be blind); "
+        f"got content_card_absent={proof.proof.get('content_card_absent')!r}")
+    assert proof.proof["still_present_card_name"] == "bench-app-01-04"
+    assert proof.passed is False, "S9 must FAIL when a card is still present"
 
 
 # ─── Task #250 Block 2 — _user_group lookup table ──────────────────────────

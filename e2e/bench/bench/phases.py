@@ -525,7 +525,15 @@ def _run_stage(stage_id: str,
     streamer.start()
     try:
         try:
-            proof_dict = work(ctx) or {}
+            try:
+                proof_dict = work(ctx) or {}
+            finally:
+                # Architect Option A: finalize any subject-user videos that
+                # were deferred PAST the stage's CONTENT asserts (which run
+                # inside `work`). Runs on BOTH success and failure, and BEFORE
+                # the proof's video-artifact attach below, so the deferred
+                # `.webm` is in __stage_videos__ when it is attached.
+                _drain_pending_video_finalize(ctx)
             passed = bool(proof_dict.pop("__passed__", True))
             proof = StageProof(
                 stage_id=stage_id,
@@ -556,6 +564,7 @@ def _run_stage(stage_id: str,
             # per-stage log file is on disk + the artifact path attached.
             streamer.stop()
             _attach_per_stage_log_artifact(proof, ctx.run_dir, stage_log_path)
+            _attach_stage_video_artifacts(proof, ctx)
             _write_stage_proof(ctx.run_dir, proof)
             _record_proof_to_state(ctx, proof)
             raise  # re-raise AFTER state persisted
@@ -571,6 +580,7 @@ def _run_stage(stage_id: str,
             )
             streamer.stop()
             _attach_per_stage_log_artifact(proof, ctx.run_dir, stage_log_path)
+            _attach_stage_video_artifacts(proof, ctx)
             _write_stage_proof(ctx.run_dir, proof)
             _record_proof_to_state(ctx, proof)
             raise
@@ -578,6 +588,7 @@ def _run_stage(stage_id: str,
         # Success path: stop streamer BEFORE persisting proof.
         streamer.stop()
         _attach_per_stage_log_artifact(proof, ctx.run_dir, stage_log_path)
+        _attach_stage_video_artifacts(proof, ctx)
         _write_stage_proof(ctx.run_dir, proof)
         _record_proof_to_state(ctx, proof)
         return proof
@@ -611,6 +622,36 @@ def _attach_per_stage_log_artifact(proof: StageProof,
         pass
 
 
+def _attach_stage_video_artifacts(proof: StageProof,
+                                  ctx: StageContext) -> None:
+    """Attach THIS stage's per-stage videos to its own proof.
+
+    `_measure_all_users` finalized `S{n}_{user}_{slug}.webm`/.gif for this
+    stage and stashed their absolute paths under
+    `ctx.user_pages["__stage_videos__"][proof.stage_id]`. We record them on
+    the stage proof relative to run_dir (mirrors
+    `_attach_per_stage_log_artifact`). Called on BOTH the success and
+    failure/ConvergenceTimeout paths so a failed stage still carries the
+    partial-but-real video it produced. Best-effort; never raises.
+    """
+    try:
+        stage_videos = (ctx.user_pages.get("__stage_videos__") or {})
+        paths = stage_videos.get(proof.stage_id) or []
+        if not paths:
+            return
+        run_dir_abs = Path(ctx.run_dir).absolute()
+        for p in paths:
+            try:
+                rel = str(Path(p).absolute().relative_to(run_dir_abs))
+            except ValueError:
+                rel = str(p)
+            if rel not in proof.artifacts:
+                proof.artifacts.append(rel)
+    except Exception:
+        # Artifact attach is best-effort; never block proof persistence.
+        pass
+
+
 def _record_proof_to_state(ctx: StageContext, proof: StageProof) -> None:
     state = load_state(ctx.run_dir) or {}
     state.setdefault("tag", ctx.tag)
@@ -630,20 +671,38 @@ def _record_proof_to_state(ctx: StageContext, proof: StageProof) -> None:
 # ─── Shared helpers ─────────────────────────────────────────────────────────
 
 
+def _video_page_slug(page_name: str) -> str:
+    """Map a BROWSER_SCALING_PAGES name to a filename slug.
+
+    "Dashboard" -> "dashboard", "Compositions" -> "compositions". Used to
+    name the per-page .webm `{stage}_{user}_{slug}.webm` (Task #267 FIX 2),
+    replacing the old hardcoded `_cold_dashboard` suffix.
+    """
+    return (page_name or "page").strip().lower().replace(" ", "-") or "page"
+
+
 def _setup_users(ctx: StageContext) -> None:
-    """Open one browser context per user_subject; populate ctx.user_pages.
+    """Populate ctx.user_pages per user_subject for the cache_mode loop.
 
-    Mirrors worktree source 6635-6654. Pages stay live for the full
-    cache_mode loop. Per-cell .webm recording is honoured here via
-    `browser.make_browser_context(record_video_dir=...)` when
-    `ctx.video in ("representative", "all")`.
+    Two shapes, by recording mode
+    -----------------------------
+    NOT recording (`ctx.video == "none"`): open ONE persistent browser
+    context + page per user (one login, reused across all stages) — the
+    cheap legacy shape. `pages_by_name` is absent in `_measure_all_users`
+    so `browser_measure_stage` uses the single page exactly as before (zero
+    behavioural change).
 
-    Playwright finalizes the .webm file only when the BrowserContext
-    closes (page.close() alone is insufficient). The .webm lives under
-    `{ctx.run_dir}/videos/` with a Playwright-assigned random filename;
-    `_teardown_users` renames it to the canonical
-    `{stage_label}_{user}_cold_dashboard.webm` shape and post-processes
-    to .gif via `browser.record_video_to_gif`.
+    Recording (`ctx.video in ("representative", "all")`): do NOT open a
+    long-lived recording context here. Playwright records exactly ONE .webm
+    per BrowserContext over that context's WHOLE lifetime, so a context that
+    spanned the entire run would yield ONE giant .webm with every stage's
+    navs concatenated — NOT what Diego needs. Instead we store the user's
+    credentials + token only; `_measure_all_users` opens FRESH per-page
+    recording contexts AT EACH STAGE, films that stage, and closes them so
+    every stage yields its own `S{n}_{user}_{slug}.webm` (per-STAGE
+    segmentation — Task #267 correction, Diego 2026-06-10). This holds for
+    BOTH `representative` and `all` (they differ only in intended capture
+    frequency, not in which pages/stages are filmed).
     """
     from playwright.sync_api import sync_playwright  # local import
 
@@ -658,85 +717,237 @@ def _setup_users(ctx: StageContext) -> None:
     ctx.user_pages["__browser__"] = pw_browser  # type: ignore[assignment]
 
     record_video = (ctx.video or "none").lower() in ("representative", "all")
-    videos_dir: Path | None = None
     if record_video:
-        videos_dir = Path(ctx.run_dir) / "videos"
-        videos_dir.mkdir(parents=True, exist_ok=True)
+        (Path(ctx.run_dir) / "videos").mkdir(parents=True, exist_ok=True)
+        # Per-stage video paths produced by _measure_all_users, keyed by
+        # stage_id ("S6" → [rel paths]); consumed by _run_stage to attach
+        # each stage's videos to THAT stage's proof.
+        ctx.user_pages.setdefault("__stage_videos__", {})  # type: ignore[arg-type]
 
     for user_subject in user_subjects:
         pwd = creds.get(user_subject)
         if not pwd:
             continue
-        u_ctx = browser.make_browser_context(
-            pw_browser, record_video_dir=videos_dir)
-        u_page = u_ctx.new_page()
-        if not browser.browser_login(u_page, user_subject, pwd):
-            u_ctx.close()
-            continue
-        ctx.user_pages[user_subject] = {
-            "ctx": u_ctx, "page": u_page,
-            "token": ctx.tokens.get(user_subject),
-            "record_video": bool(record_video),
-        }
+
+        if record_video:
+            # Credentials-only: per-stage recording contexts are created by
+            # _measure_all_users so each stage yields its own .webm files.
+            ctx.user_pages[user_subject] = {
+                "ctx": None, "page": None,
+                "pwd": pwd,
+                "token": ctx.tokens.get(user_subject),
+                "record_video": True,
+            }
+        else:
+            # No recording: single persistent context + page (cheaper).
+            u_ctx = browser.make_browser_context(
+                pw_browser, record_video_dir=None)
+            u_page = u_ctx.new_page()
+            if not browser.browser_login(u_page, user_subject, pwd):
+                try:
+                    u_ctx.close()
+                except Exception:
+                    pass
+                continue
+            ctx.user_pages[user_subject] = {
+                "ctx": u_ctx, "page": u_page,
+                "token": ctx.tokens.get(user_subject),
+                "record_video": False,
+            }
+
+
+def _finalize_one_video(raw_webm: Path | None, videos_dir: Path,
+                        final_name: str,
+                        produced_artifacts: list[str]) -> None:
+    """Rename a finalized .webm to its canonical name + render the .gif.
+
+    Shared by every video teardown path so the rename→gif pipeline is
+    identical. `final_name` is the canonical `{stage}_{user}_{slug}.webm`
+    basename.
+
+    NO size-based drop (Task #267 correction, Diego 2026-06-10): the .webm
+    is ALWAYS retained (appended to artifacts) regardless of size, and
+    record_video_to_gif no longer deletes the gif for size either — every
+    stage video AND its gif are kept. Best-effort; logs and continues on
+    failure.
+    """
+    if raw_webm is None:
+        return
+    try:
+        final_webm = videos_dir / final_name
+        # Playwright may write under the context's own video dir even though
+        # we passed `videos_dir`; consult the path it actually returned.
+        if raw_webm.exists() and raw_webm != final_webm:
+            final_webm.parent.mkdir(parents=True, exist_ok=True)
+            raw_webm.replace(final_webm)
+        elif raw_webm.exists():
+            final_webm = raw_webm
+        else:
+            return
+        if final_webm.exists():
+            # .webm retained unconditionally (never dropped for size).
+            produced_artifacts.append(str(final_webm))
+            gif_path = final_webm.with_suffix(".gif")
+            # Gif is a convenience preview; max_seconds bounds gif DURATION
+            # (quality), not a drop. The gif is kept regardless of size.
+            if browser.record_video_to_gif(final_webm, gif_path):
+                produced_artifacts.append(str(gif_path))
+    except Exception as e:
+        print(f"  WARN: post-process video {final_name}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
+def _capture_video_path(page) -> Path | None:
+    """Return the Playwright-assigned .webm path for a page, or None.
+
+    MUST be called BEFORE the owning context closes (page.video.path()
+    requires the context alive). Never raises.
+    """
+    try:
+        vid = getattr(page, "video", None)
+        if vid is not None:
+            raw = vid.path()
+            if raw:
+                return Path(raw)
+    except Exception:
+        pass
+    return None
+
+
+def _open_stage_recording_pages(pw_browser, videos_dir: Path,
+                                user: str, pwd: str) -> dict[str, dict]:
+    """Open one FRESH recording BrowserContext per scaling page + log in.
+
+    Used per STAGE so each stage gets its own short-lived recording contexts
+    → one .webm per (stage, user, page). Returns {page_name: {ctx, page,
+    slug}}; a page that fails login is skipped. Never raises (best-effort —
+    a recording failure must not abort the stage measurement).
+    """
+    pages: dict[str, dict] = {}
+    for page_name, _page_path in browser.BROWSER_SCALING_PAGES:
+        p_ctx = None
+        try:
+            p_ctx = browser.make_browser_context(
+                pw_browser, record_video_dir=videos_dir)
+            p_page = p_ctx.new_page()
+            if not browser.browser_login(p_page, user, pwd):
+                try:
+                    p_ctx.close()
+                except Exception:
+                    pass
+                continue
+            pages[page_name] = {
+                "ctx": p_ctx, "page": p_page,
+                "slug": _video_page_slug(page_name),
+            }
+        except Exception as e:
+            # Orphan-leak guard: if new_page()/login raised AFTER the context
+            # was created, close it so no recording context is leaked.
+            if p_ctx is not None:
+                try:
+                    p_ctx.close()
+                except Exception:
+                    pass
+            print(f"  WARN: open stage recording page {user}/{page_name}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+    return pages
+
+
+def _finalize_stage_videos(pages: dict[str, dict], videos_dir: Path,
+                           stage_num, user: str) -> list[str]:
+    """Close per-page recording contexts and finalize one .webm/.gif each.
+
+    Names each file `S{stage_num}_{user}_{slug}.webm` (per-STAGE segmentation)
+    — the stage number is the live `stage_num` passed into _measure_all_users,
+    NOT `_first_stage_label` (which only knew the first stage of the window).
+    Captures every video path while the contexts are still alive, THEN closes
+    + finalizes so no path read races a closed context. Returns the produced
+    absolute paths (.webm + .gif). Never raises.
+    """
+    captured: list[tuple[Path | None, str, object]] = []
+    for page_name, pp in pages.items():
+        raw = _capture_video_path(pp.get("page"))
+        slug = pp.get("slug") or _video_page_slug(page_name)
+        captured.append(
+            (raw, f"S{stage_num}_{user}_{slug}.webm", pp.get("ctx")))
+    produced: list[str] = []
+    for raw, final_name, p_ctx in captured:
+        try:
+            if p_ctx is not None:
+                p_ctx.close()
+        except Exception:
+            pass
+        _finalize_one_video(raw, videos_dir, final_name, produced)
+    return produced
+
+
+def _drain_pending_video_finalize(ctx: StageContext) -> None:
+    """Finalize any subject-user videos deferred past the content asserts.
+
+    Architect Option A: `_measure_all_users` keeps the SUBJECT user's
+    Compositions recording context OPEN (with its live page exposed as
+    `u_state["page"]`) so the stage's S8/S9 CONTENT asserts inspect the page
+    that actually filmed the nav. This drains those deferred finalizes — it
+    is called by `_run_stage` AFTER `_work` returns (and in `_work`'s failure
+    path) so the context closes + the `.webm` is written and stashed into
+    `__stage_videos__[stage_id]`, AND the now-dead page is cleared back to
+    None on the user_state so a later stage never inspects a closed page.
+    Best-effort; never raises.
+    """
+    videos_dir = Path(ctx.run_dir) / "videos"
+    pending = ctx.user_pages.pop("__pending_video_finalize__", None)
+    if not pending:
+        return
+    try:
+        sv = ctx.user_pages.setdefault("__stage_videos__", {})  # type: ignore[union-attr]
+        for item in pending:
+            produced = _finalize_stage_videos(
+                item["pages"], videos_dir,
+                item["stage_num"], item["user"])
+            if produced:
+                sv.setdefault(item["stage_id"], []).extend(produced)
+            # The deferred page's context is now closed; clear the live page
+            # reference so a subsequent stage's content assert can't read it.
+            u_state = ctx.user_pages.get(item["user"])
+            if isinstance(u_state, dict) and u_state.get("page") is not None:
+                u_state["page"] = None
+    except Exception as e:
+        print(f"  WARN: drain pending video finalize: "
+              f"{type(e).__name__}: {e}", flush=True)
 
 
 def _teardown_users(ctx: StageContext) -> None:
-    """Close per-user browser contexts; rename .webm + run ffmpeg → .gif.
+    """Close persistent browser contexts + the Playwright browser/driver.
 
-    Order matters:
-      1. Capture the Playwright-assigned video path BEFORE closing the
-         context (page.video.path() requires the context alive).
-      2. Close the context (Playwright finalizes the .webm on disk).
-      3. Rename random.webm → canonical `{stage_label}_{user}_cold_dashboard.webm`.
-      4. Invoke `browser.record_video_to_gif` per pair.
-      5. Record produced paths into `ctx.user_pages[user]["artifacts"]`
-         so the stage runner can attach them to the StageProof.
+    Per-STAGE videos are finalized inside `_measure_all_users` at each stage
+    (one `S{n}_{user}_{slug}.webm`/.gif per stage), so by the time this runs
+    there are no per-page recording contexts left to drain — each stage
+    already closed its own. This only:
+      - closes the persistent single context for each NON-recording user
+        (the recording path stores `ctx=None`, nothing to close);
+      - tears down the shared pw_browser + sync_playwright driver.
+
+    The flat `__video_artifacts__` list is still published (aggregated from
+    every stage's `__stage_videos__`) for any consumer that wants the whole
+    run's video set; the authoritative per-stage attachment happens on each
+    stage proof via `_attach_stage_video_artifacts`.
     """
-    videos_dir = Path(ctx.run_dir) / "videos"
-    stage_label = _first_stage_label(ctx)
-    produced_artifacts: list[str] = []
+    # Defensive: drain any deferred subject-video finalize that a stage left
+    # pending (normally _run_stage drains per stage, but never close the
+    # pw_browser with a recording context still open).
+    _drain_pending_video_finalize(ctx)
 
     for u_name, v in list(ctx.user_pages.items()):
         if u_name.startswith("__"):
             continue
-        raw_webm: Path | None = None
-        if v.get("record_video"):
+        # Non-recording users hold a persistent context; recording users
+        # hold ctx=None (per-stage contexts already closed in measurement).
+        u_ctx = v.get("ctx")
+        if u_ctx is not None:
             try:
-                page = v.get("page")
-                vid = getattr(page, "video", None)
-                if vid is not None:
-                    raw_webm_path = vid.path()
-                    if raw_webm_path:
-                        raw_webm = Path(raw_webm_path)
+                u_ctx.close()
             except Exception:
-                raw_webm = None
-        try:
-            v["ctx"].close()
-        except Exception:
-            pass
-        # Post-process AFTER context close; .webm finalizes on close.
-        if raw_webm is not None:
-            try:
-                # Playwright may write the file under the new context's
-                # video dir even though we passed `videos_dir`; consult
-                # the actual path it returned.
-                final_webm = (videos_dir /
-                              f"{stage_label}_{u_name}_cold_dashboard.webm")
-                if raw_webm.exists() and raw_webm != final_webm:
-                    final_webm.parent.mkdir(parents=True, exist_ok=True)
-                    raw_webm.replace(final_webm)
-                elif raw_webm.exists():
-                    final_webm = raw_webm
-                else:
-                    final_webm = None  # type: ignore[assignment]
-                if final_webm is not None and final_webm.exists():
-                    produced_artifacts.append(str(final_webm))
-                    gif_path = final_webm.with_suffix(".gif")
-                    if browser.record_video_to_gif(final_webm, gif_path):
-                        produced_artifacts.append(str(gif_path))
-            except Exception as e:
-                print(f"  WARN: post-process video for {u_name}: "
-                      f"{type(e).__name__}: {e}", flush=True)
+                pass
 
     pw_browser = ctx.user_pages.pop("__browser__", None)
     pw = ctx.user_pages.pop("__pw__", None)
@@ -751,9 +962,13 @@ def _teardown_users(ctx: StageContext) -> None:
         except Exception:
             pass
 
-    # Stash the produced paths on the context so the orchestrator can
-    # attach them to the most-recent stage proof (acceptance bundle).
-    ctx.user_pages["__video_artifacts__"] = produced_artifacts  # type: ignore[assignment]
+    # Aggregate every stage's produced video paths into the flat list (kept
+    # for backward-compat consumers; per-stage proofs already carry theirs).
+    stage_videos = ctx.user_pages.get("__stage_videos__") or {}
+    flat: list[str] = []
+    for paths in stage_videos.values():
+        flat.extend(paths)
+    ctx.user_pages["__video_artifacts__"] = flat  # type: ignore[assignment]
 
 
 def _first_stage_label(ctx: StageContext) -> str:
@@ -788,6 +1003,25 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
 
     Each entry tagged with `user=<u_name>`. ConvergenceTimeout propagates.
 
+    Per-STAGE video (Task #267 correction, Diego 2026-06-10): for recording
+    users this opens FRESH per-page recording contexts for THIS stage, films
+    the stage on them, and finalizes one `S{stage_num}_{user}_{slug}.webm`/.gif
+    per page — so EACH stage produces its own separate watchable videos
+    (S0/S1/S6/S8/…), not one whole-run file. Videos are finalized + stashed
+    (under `ctx.user_pages["__stage_videos__"][f"S{stage_num}"]`) even if the
+    measurement raises, so a failed stage still carries its partial-but-real
+    video; `_run_stage` attaches them to that stage's proof. Non-recording
+    users measure on the single persistent page (zero behavioural change).
+
+    Architect Option A (content-gate correctness): the SUBJECT user's (the
+    RBAC-scoped non-admin) Compositions recording context is NOT finalized
+    here — it is kept OPEN and its live Page written into `u_state["page"]`,
+    because the stage's S8/S9 CONTENT asserts run in `_work` AFTER this
+    returns and inspect that exact page. `_run_stage` drains the deferred
+    finalize via `_drain_pending_video_finalize` once `_work` completes/fails.
+    Without this, recording mode left page=None → S8 false-FAILed (#149 gate)
+    and S9 false-PASSed (blind to a revocation defect).
+
     `deleted_ns` (Task #296): the bench-deleted namespace for a bulk-delete
     stage (S10). Threaded into widget-terminal-state validation so a
     controller-churn ghost-panel 404 OUTSIDE the deleted ns demotes to a
@@ -795,18 +1029,100 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
     for non-delete stages (no behavioural change).
     """
     out = []
-    for u_name, u_state in list(ctx.user_pages.items()):
-        if u_name.startswith("__"):
-            continue
-        r = browser.browser_measure_stage(
-            u_state["page"], stage_num, stage_desc, ctx.cache_mode,
-            token=u_state["token"], user=u_name,
-            verify_against_cluster=(u_name == "admin"),
-            deleted_ns=deleted_ns)
-        if r:
-            r["user"] = u_name
-            out.append(r)
-            ctx.all_results.append(r)
+    pw_browser = ctx.user_pages.get("__browser__")
+    videos_dir = Path(ctx.run_dir) / "videos"
+    stage_id = f"S{stage_num}"
+    stage_video_paths: list[str] = []
+
+    try:
+        for u_name, u_state in list(ctx.user_pages.items()):
+            if u_name.startswith("__"):
+                continue
+
+            recording = (bool(u_state.get("record_video"))
+                         and pw_browser is not None)
+
+            # Per-STAGE recording (Task #267 correction): open FRESH per-page
+            # recording contexts for THIS stage so each stage yields its own
+            # S{n}_{user}_{slug}.webm. Each page is measured on its dedicated
+            # context via pages_by_name; the single persistent page is used
+            # only for the non-recording path.
+            stage_pages: dict[str, dict] = {}
+            pages_by_name = None
+            measure_page = u_state.get("page")
+            if recording:
+                stage_pages = _open_stage_recording_pages(
+                    pw_browser, videos_dir, u_name, u_state.get("pwd"))
+                if stage_pages:
+                    pages_by_name = {pn: pp["page"]
+                                     for pn, pp in stage_pages.items()}
+                    # The dashboard page drives the VERIFY/convergence block.
+                    measure_page = next(iter(stage_pages.values()))["page"]
+
+            # Architect Option A (content-gate correctness): the S8/S9
+            # CONTENT asserts run in the stage's `_work` AFTER this function
+            # returns and inspect the SUBJECT user's Compositions Page via
+            # `u_state["page"]`. If we close that recording context here (as
+            # the other pages do) and leave page=None, those asserts read a
+            # dead/None page → S8 false-FAILs (#149 gate broken) and S9
+            # false-PASSes (blind to a revocation defect). So for the subject
+            # user's Compositions page we DEFER the finalize until after
+            # `_work` (drained by _run_stage) and expose the LIVE filmed page
+            # as `u_state["page"]` for the assert window. The page that filmed
+            # the nav is then exactly the page the content gate inspects.
+            #
+            # Subject = the RBAC-scoped non-admin user (verify_against_cluster
+            # is False for it). Admin's content gate compares cached names vs
+            # cluster-truth, never the page DOM, so admin needs no deferral.
+            is_subject = (u_name != "admin")
+            deferred_pages: dict[str, dict] = {}
+            if recording and is_subject and "Compositions" in stage_pages:
+                deferred_pages["Compositions"] = stage_pages["Compositions"]
+
+            try:
+                r = browser.browser_measure_stage(
+                    measure_page, stage_num, stage_desc, ctx.cache_mode,
+                    token=u_state["token"], user=u_name,
+                    verify_against_cluster=(u_name == "admin"),
+                    deleted_ns=deleted_ns,
+                    pages_by_name=pages_by_name)
+                if r:
+                    r["user"] = u_name
+                    out.append(r)
+                    ctx.all_results.append(r)
+            finally:
+                # Finalize NON-deferred pages now (in ALL cases — even on a
+                # ConvergenceTimeout the partial recording is real work).
+                immediate = {pn: pp for pn, pp in stage_pages.items()
+                             if pn not in deferred_pages}
+                if immediate:
+                    stage_video_paths.extend(
+                        _finalize_stage_videos(
+                            immediate, videos_dir, stage_num, u_name))
+                if deferred_pages:
+                    # Expose the LIVE filmed Compositions page for the
+                    # content-gate window, and register the finalize to run
+                    # AFTER `_work` (drained by _run_stage). The context stays
+                    # OPEN so the asserts inspect the post-pick DOM.
+                    u_state["page"] = deferred_pages["Compositions"]["page"]
+                    pending = ctx.user_pages.setdefault(
+                        "__pending_video_finalize__", [])  # type: ignore[union-attr]
+                    pending.append({
+                        "pages": deferred_pages,
+                        "stage_num": stage_num,
+                        "user": u_name,
+                        "stage_id": stage_id,
+                    })
+    finally:
+        # Stash NON-deferred videos under __stage_videos__[stage_id] even when
+        # a user's measurement raised (e.g. ConvergenceTimeout propagating out
+        # of the loop) so _run_stage can attach the partial video to the
+        # failing stage's proof before the exception unwinds. Deferred subject
+        # videos are stashed when _drain_pending_video_finalize runs them.
+        if stage_video_paths:
+            sv = ctx.user_pages.setdefault("__stage_videos__", {})  # type: ignore[union-attr]
+            sv.setdefault(stage_id, []).extend(stage_video_paths)
+
     return out
 
 
@@ -2015,53 +2331,29 @@ def run_phase6(tag: str,
             fn(ctx)  # _run_stage handles persist + raise on ConvergenceTimeout
     finally:
         if needs_browser:
+            # Per-stage videos are attached to each stage's proof inside
+            # _run_stage (via _attach_stage_video_artifacts) at the moment
+            # the stage completes/fails — no run-end re-attribution needed.
             _teardown_users(ctx)
-            _attach_video_artifacts_to_last_measurement_proof(ctx)
 
     return load_state(run_dir) or {}
 
 
 def _attach_video_artifacts_to_last_measurement_proof(ctx: StageContext) -> None:
-    """After _teardown_users produces canonical-named .webm/.gif pairs,
-    attach their paths to the earliest measurement stage proof (matching
-    `_first_stage_label` naming).
+    """DEPRECATED no-op (Task #267 correction — Diego 2026-06-10).
 
-    Why the earliest: the BrowserContext recorded the window's entire
-    lifetime. We name and attribute the artifacts to the first
-    measurement stage so the proof carries them even if a later stage
-    raised ConvergenceTimeout (the .webm file still represents real
-    work done up to that point).
+    Superseded by PER-STAGE attachment: `_measure_all_users` produces one
+    `S{n}_{user}_{slug}.webm`/.gif per stage and `_run_stage` attaches each
+    stage's videos to THAT stage's proof via `_attach_stage_video_artifacts`,
+    at the moment the stage completes or fails. The old behaviour
+    re-attributed the single whole-run .webm to the earliest stage
+    (`_first_stage_label`); now that videos are segmented per stage, doing
+    that here would DOUBLE-attach every stage's video to the first stage.
+
+    Retained as an importable no-op so external callers/tests resolve; it
+    intentionally does nothing.
     """
-    artifacts = ctx.user_pages.pop("__video_artifacts__", None)
-    if not artifacts:
-        return
-    target_sid = _first_stage_label(ctx)
-    proof_path = Path(ctx.run_dir) / "proofs" / f"{target_sid}.json"
-    if not proof_path.exists():
-        return
-    try:
-        proof_d = json.loads(proof_path.read_text())
-        existing = proof_d.get("artifacts") or []
-        # Store paths relative to run_dir for portability (per plan §E.2
-        # StageProof.artifacts description).
-        run_dir_abs = Path(ctx.run_dir).absolute()
-        rel_artifacts: list[str] = list(existing)
-        for a in artifacts:
-            try:
-                rp = Path(a).absolute().relative_to(run_dir_abs)
-                rel_artifacts.append(str(rp))
-            except ValueError:
-                rel_artifacts.append(str(a))
-        proof_d["artifacts"] = rel_artifacts
-        proof_path.write_text(json.dumps(proof_d, indent=2, default=str))
-        # Also update state.json's stage_proofs entry to match.
-        state = load_state(ctx.run_dir) or {}
-        if target_sid in (state.get("stage_proofs") or {}):
-            state["stage_proofs"][target_sid]["artifacts"] = rel_artifacts
-            save_state(ctx.run_dir, state)
-    except Exception as e:
-        print(f"  WARN: attach video artifacts: {type(e).__name__}: {e}",
-              flush=True)
+    return None
 
 
 # ─── Phase 7 / Phase 8 thin wrappers ────────────────────────────────────────

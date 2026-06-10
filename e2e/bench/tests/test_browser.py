@@ -31,6 +31,7 @@ import bench.browser as browser_mod
 from bench.browser import (
     BROWSER_SCALING_PAGES,
     ConvergenceTimeout,
+    browser_measure_navigation,
     browser_measure_stage,
     http_get,
     http_get_json,
@@ -40,6 +41,7 @@ from bench.browser import (
     verify_composition_count_api,
     verify_composition_count_ui,
     wait_for_compositions,
+    _scroll_capture_for_video,
     _validate_widget_terminal_state,
     _count_rendered_comp_cards,
     _errored_call_namespaces,
@@ -231,13 +233,18 @@ def test_record_video_to_gif_returns_false_when_ffmpeg_missing(
     assert not gif.exists()
 
 
-# ─── Case 6: record_video_to_gif rejects oversize output ────────────────────
+# ─── Case 6: record_video_to_gif KEEPS oversize output (no size drop) ───────
 
 
-def test_record_video_to_gif_returns_false_on_oversize_and_unlinks(
+def test_record_video_to_gif_keeps_oversize_gif_no_size_drop(
         monkeypatch, tmp_path):
-    """When the produced .gif exceeds max_mb, the helper unlinks it
-    and returns False (per R3.1 bundle-cap discipline)."""
+    """Task #267 correction (Diego 2026-06-10): the oversize-delete is
+    REMOVED. A large gif (e.g. from a ~25-min S6 install recording) is now
+    KEPT — record_video_to_gif returns True and the file remains on disk.
+    `max_mb` is accepted but a NO-OP. No video/gif is ever dropped for size.
+
+    Falsifier: pre-correction this returned False and unlinked the gif.
+    """
     webm = tmp_path / "big.webm"
     webm.write_bytes(b"WEBM")
     gif = tmp_path / "big.gif"
@@ -247,7 +254,7 @@ def test_record_video_to_gif_returns_false_on_oversize_and_unlinks(
 
     def fake_ffmpeg(cmd, **kwargs):
         out = Path(cmd[-1])
-        out.write_bytes(b"X" * (3 * 1024 * 1024))  # 3 MB
+        out.write_bytes(b"X" * (3 * 1024 * 1024))  # 3 MB — would've been dropped
 
         class _Proc:
             returncode = 0
@@ -257,9 +264,44 @@ def test_record_video_to_gif_returns_false_on_oversize_and_unlinks(
 
     monkeypatch.setattr(subprocess, "run", fake_ffmpeg)
 
-    assert record_video_to_gif(webm, gif, max_mb=2) is False
-    # Must have been deleted by the helper.
-    assert not gif.exists()
+    # max_mb is now inert: the 3 MB gif is KEPT, not deleted.
+    assert record_video_to_gif(webm, gif, max_mb=2) is True
+    assert gif.exists(), "oversize gif must be RETAINED (no size-based drop)"
+    assert gif.stat().st_size == 3 * 1024 * 1024
+
+
+def test_record_video_to_gif_no_unlink_call_for_large_gif(monkeypatch, tmp_path):
+    """Falsifier guard: record_video_to_gif must NOT call Path.unlink on the
+    produced gif for any size — proving the size-delete branch is gone."""
+    webm = tmp_path / "v.webm"
+    webm.write_bytes(b"WEBM")
+    gif = tmp_path / "v.gif"
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ffmpeg"
+                        if name == "ffmpeg" else None)
+
+    def fake_ffmpeg(cmd, **kwargs):
+        Path(cmd[-1]).write_bytes(b"X" * (5 * 1024 * 1024))  # 5 MB
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_ffmpeg)
+
+    unlink_calls = []
+    real_unlink = Path.unlink
+
+    def _tracking_unlink(self, *a, **k):
+        unlink_calls.append(str(self))
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", _tracking_unlink)
+    assert record_video_to_gif(webm, gif) is True
+    assert str(gif) not in unlink_calls, (
+        f"gif was unlinked despite no size cap; unlink_calls={unlink_calls}")
 
 
 # ─── Case 7: make_browser_context passes record_video_dir to Playwright ─────
@@ -1357,3 +1399,181 @@ def test_user_visible_composition_count_non_admin_without_token(monkeypatch):
     import bench.browser as browser_mod
     assert browser_mod._user_visible_composition_count(
         "cyberjoker", "/compositions", token=None) is None
+
+
+# ─── Task #267 FIX 1 — filmed nav scrolls below the fold ────────────────────
+#
+# browser_measure_navigation must run a below-the-fold scroll pass at the END
+# of the filmed nav (after the /call waterfall + nav-timing reads, before
+# return) so the per-cell .webm captures the north-star views. These cases use
+# the FakePage's evaluate_log (every page.evaluate JS string is recorded) to
+# prove the scroll pass ran AND that it ran in the correct order so it cannot
+# perturb the /call waterfall timing capture.
+
+
+def _scroll_js_indices(evaluate_log):
+    """Indices in evaluate_log whose JS performs a page scroll."""
+    return [i for i, js in enumerate(evaluate_log)
+            if ("scrollTo" in js or "scrollIntoView" in js)]
+
+
+def _stub_nav_validation(monkeypatch):
+    """Neutralise widget validation so browser_measure_navigation runs to
+    its scroll pass without a real terminal-state check."""
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+    monkeypatch.setattr(
+        browser_mod, "_validate_widget_terminal_state",
+        lambda page, path, label, **kw: {"terminal_state": "pass"})
+
+
+def test_filmed_nav_scrolls_dashboard_below_the_fold(monkeypatch, fake_page):
+    """FIX 1: the dashboard filmed nav invokes the scroll-capture pass —
+    evaluate_log contains scroll JS that did NOT exist before the fix.
+
+    Falsifier: with the scroll pass removed, _scroll_js_indices is empty.
+    """
+    _stub_nav_validation(monkeypatch)
+    fake_page._call_count = 16
+
+    r = browser_measure_navigation(fake_page, "/dashboard", "S6 ON nav#1",
+                                   min_calls=0, user="admin")
+    assert r["incomplete"] is False
+    scroll_idx = _scroll_js_indices(fake_page.evaluate_log)
+    assert scroll_idx, (
+        "filmed dashboard nav did NOT scroll — evaluate_log has no scrollTo/"
+        f"scrollIntoView JS; log={fake_page.evaluate_log!r}")
+
+
+def test_filmed_nav_scrolls_compositions_datagrid(monkeypatch, fake_page):
+    """FIX 1: the /compositions filmed nav does a stepped datagrid scroll
+    (>=2 scroll steps so multiple panel cards render on camera)."""
+    _stub_nav_validation(monkeypatch)
+    fake_page._call_count = 30
+
+    browser_measure_navigation(fake_page, "/compositions", "S6 ON nav#1",
+                               min_calls=0, user="admin")
+    scroll_idx = _scroll_js_indices(fake_page.evaluate_log)
+    assert len(scroll_idx) >= 2, (
+        "filmed /compositions nav must step-scroll the datagrid (>=2 steps); "
+        f"got {len(scroll_idx)} scroll JS calls in {fake_page.evaluate_log!r}")
+
+
+def test_filmed_nav_scroll_runs_after_waterfall_and_nav_timing_reads(
+        monkeypatch, fake_page):
+    """FIX 1 ordering contract: the scroll pass runs AFTER the /call
+    waterfall read (the `GAP_MS` levels JS) AND after the navigation-timing
+    read (`loadEventEnd`), so it cannot perturb the captured /call timings.
+
+    Falsifier: if the scroll were placed before either read, the first
+    scroll index would precede that read's index.
+    """
+    _stub_nav_validation(monkeypatch)
+    fake_page._call_count = 16
+
+    browser_measure_navigation(fake_page, "/dashboard", "S6 ON nav#1",
+                               min_calls=0, user="admin")
+    log = fake_page.evaluate_log
+    waterfall_idx = next(i for i, js in enumerate(log)
+                         if "GAP_MS" in js and "calls.length" in js)
+    navtiming_idx = next(i for i, js in enumerate(log)
+                         if "navigation" in js and "loadEventEnd" in js)
+    first_scroll_idx = _scroll_js_indices(log)[0]
+    assert first_scroll_idx > waterfall_idx, (
+        f"scroll (idx {first_scroll_idx}) ran BEFORE the /call waterfall read "
+        f"(idx {waterfall_idx}) — would perturb the timing capture")
+    assert first_scroll_idx > navtiming_idx, (
+        f"scroll (idx {first_scroll_idx}) ran BEFORE the navigation-timing "
+        f"read (idx {navtiming_idx})")
+
+
+def test_scroll_capture_gated_off_by_module_flag(monkeypatch, fake_page):
+    """`SCROLL_CAPTURE_FOR_VIDEO=False` → the helper is a no-op (returns 0,
+    records no evaluate calls). Confirms the gate flag works."""
+    monkeypatch.setattr(browser_mod, "SCROLL_CAPTURE_FOR_VIDEO", False)
+    n = _scroll_capture_for_video(fake_page, "/dashboard")
+    assert n == 0
+    assert _scroll_js_indices(fake_page.evaluate_log) == []
+
+
+@pytest.mark.parametrize("page_path", ["/dashboard", "/compositions", "/other"])
+def test_scroll_capture_never_raises_when_evaluate_throws(fake_page, page_path):
+    """The scroll pass is best-effort: a page.evaluate that raises must be
+    swallowed on EVERY page path (the filmed nav must never fail because of
+    the scroll). Covers the dashboard widget-locate evaluate too — that call
+    must be wrapped, not direct."""
+    def _boom(js, *args):
+        fake_page.evaluate_log.append(js)
+        raise RuntimeError("page closed mid-scroll")
+    fake_page.evaluate = _boom
+    # Must not raise on any page path.
+    n = _scroll_capture_for_video(fake_page, page_path)
+    assert isinstance(n, int)
+
+
+def test_both_pages_scrolled_per_stage_via_pages_by_name(monkeypatch, tmp_path):
+    """FIX 1 + FIX 2 under the per-page (representative AND all) recording
+    path: browser_measure_stage with `pages_by_name` measures each page on
+    its OWN page object, and the filmed-nav scroll fires for BOTH — the
+    dashboard page gets the dashboard scroll idiom, the compositions page
+    gets the stepped datagrid scroll. This is the per-stage guarantee the
+    `--video all` clean re-run depends on (every stage's navs, both pages,
+    scrolled), since the scroll is mode-independent and pages_by_name is set
+    for both representative and all.
+
+    Falsifier: if browser_measure_stage ignored pages_by_name (measured both
+    on the single `page`), the compositions FakePage's evaluate_log would be
+    empty — no scroll, no nav.
+    """
+    from tests.conftest import FakePage
+
+    _patch_cluster_count(monkeypatch, comp_count=42, ns_count=2)
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: 42)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
+                        lambda page: 42)
+    monkeypatch.setattr(browser_mod, "_validate_widget_terminal_state",
+                        lambda page, path, label, **kw: {"terminal_state": "pass"})
+
+    dash_page = FakePage(call_count=16, ui_count=42)
+    comp_page = FakePage(call_count=30, ui_count=42)
+    pages_by_name = {"Dashboard": dash_page, "Compositions": comp_page}
+
+    browser_measure_stage(
+        dash_page, stage_num=6, stage_desc="S6 all-mode",
+        cache_mode="ON", token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+        pages_by_name=pages_by_name)
+
+    # Dashboard page filmed-nav scrolled (its own object, not comp_page).
+    dash_scrolls = _scroll_js_indices(dash_page.evaluate_log)
+    assert dash_scrolls, (
+        "dashboard page was not scrolled during the per-page stage measure; "
+        f"log={dash_page.evaluate_log!r}")
+    # Compositions page measured on its OWN object AND step-scrolled.
+    comp_scrolls = _scroll_js_indices(comp_page.evaluate_log)
+    assert len(comp_scrolls) >= 2, (
+        "compositions page (its own recording context) was not step-scrolled "
+        f"— pages_by_name not honoured?; log={comp_page.evaluate_log!r}")
+    # The compositions page issued a /call waterfall read of its OWN (proves it
+    # was actually navigated/measured, not skipped).
+    assert any("GAP_MS" in js for js in comp_page.evaluate_log), (
+        "compositions page was never measured on its own context")
+
+
+def test_scroll_capture_excludes_chrome_nav_idiom(fake_page):
+    """The dashboard scroll JS must apply the shared chrome-exclusion idiom
+    (an `inChrome`/`closest(chromeExclude)` guard) so it never scrolls to a
+    left-nav menu item that shares the 'Compositions' label text. The actual
+    selector string is passed as the JS arg `_VIDEO_SCROLL_CHROME_EXCLUDE`,
+    which carries the proven nav/sidebar/menu/sider exclusion."""
+    _scroll_capture_for_video(fake_page, "/dashboard")
+    joined = "\n".join(fake_page.evaluate_log)
+    assert "inChrome" in joined and "closest(chromeExclude)" in joined, (
+        "dashboard scroll JS missing the chrome-exclusion guard; "
+        f"log={fake_page.evaluate_log!r}")
+    # And the selector arg itself carries the proven exclusion classes.
+    sel = browser_mod._VIDEO_SCROLL_CHROME_EXCLUDE
+    assert all(k in sel for k in ("nav", "sidebar", "menu", "sider")), (
+        f"_VIDEO_SCROLL_CHROME_EXCLUDE missing exclusion classes: {sel!r}")

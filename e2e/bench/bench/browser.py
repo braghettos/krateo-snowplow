@@ -864,24 +864,37 @@ def make_browser_context(playwright_browser, *,
 
 def record_video_to_gif(webm_path: Path, gif_path: Path,
                         *, fps: int = 4, max_seconds: int = 60,
-                        max_mb: int = 2) -> bool:
+                        max_mb: int | None = None) -> bool:
     """Convert a Playwright .webm video to .gif via ffmpeg.
 
     Returns True on success, False when:
       - ffmpeg is not on PATH (operator missing toolchain)
       - the source .webm does not exist
-      - the produced .gif exceeds `max_mb` (caller deletes via R3.1 cap)
-      - ffmpeg returns non-zero exit
+      - ffmpeg returns non-zero exit (or produces no output)
 
-    Per plan §I R3.1 — on bundle-cap exceedance the caller truncates
-    oldest .webm/.gif pairs and emits a `BUNDLE TRUNCATED` log line.
-    This helper itself NEVER raises; the run continues with the .webm
-    only.
+    NO size-based drop (Task #267 correction — Diego 2026-06-10): the gif is
+    KEPT regardless of size, and the source .webm is NEVER deleted for size by
+    this helper. The prior `max_mb` oversize-delete is REMOVED so no stage
+    video/gif is ever dropped for size (a ~25-min S6 install produces a large
+    .webm that MUST be retained). The `max_mb` parameter is kept only for
+    call-site backward-compat and is now a NO-OP (ignored).
 
-    Filter graph: `fps={fps},scale=720:-1:flags=lanczos`. 4 fps × 60s ≈
-    240 frames at 720p ≈ ~1-1.5 MB per video on the canonical dashboard
-    nav.
+    `max_seconds` is retained: it bounds the GIF's *duration* via ffmpeg `-t`
+    (gif quality/length, NOT a drop of any artifact) so a long recording
+    yields a watchable-length gif rather than a multi-minute one. The full
+    .webm is always retained at full length.
+
+    This helper NEVER raises; on any ffmpeg failure the run continues with the
+    .webm only.
+
+    Filter graph: `fps={fps},scale=720:-1:flags=lanczos`.
     """
+    if max_mb is not None:
+        # Deprecated/no-op (kept for call-site compatibility). Surfaced once
+        # at debug volume so a stale caller is visible without changing
+        # behaviour — nothing is dropped for size anymore.
+        _log(f"  record_video_to_gif: max_mb={max_mb} is a no-op "
+             f"(size-based drop removed; gif kept regardless of size)")
     webm = Path(webm_path)
     gif = Path(gif_path)
 
@@ -894,8 +907,8 @@ def record_video_to_gif(webm_path: Path, gif_path: Path,
         return False
 
     gif.parent.mkdir(parents=True, exist_ok=True)
-    # Cap clip length at max_seconds via `-t` so a runaway recording
-    # doesn't produce a 50 MB .gif on a slow-render cell.
+    # Bound the GIF *duration* at max_seconds via `-t` (gif length/quality —
+    # NOT a drop). The .webm itself is recorded + retained at full length.
     cmd = [
         "ffmpeg",
         "-y",                       # overwrite without prompt
@@ -926,16 +939,7 @@ def record_video_to_gif(webm_path: Path, gif_path: Path,
         _log(f"  record_video_to_gif: ffmpeg returned 0 but {gif} missing")
         return False
 
-    size_mb = gif.stat().st_size / (1024.0 * 1024.0)
-    if size_mb > max_mb:
-        _log(f"  record_video_to_gif: {gif.name} is {size_mb:.1f}MB "
-             f"(> {max_mb}MB cap) — deleting")
-        try:
-            gif.unlink()
-        except Exception:
-            pass
-        return False
-
+    # NO size cap: the gif is kept regardless of size (no artifact dropped).
     return True
 
 
@@ -1369,6 +1373,185 @@ _browser_login = browser_login
 _validate_widget_terminal_state_public = _validate_widget_terminal_state
 
 
+# When True (the default), browser_measure_navigation runs a below-the-fold
+# scroll pass at the END of the filmed nav so the per-cell .webm captures the
+# north-star views (dashboard piechart+table, /compositions panel cards) and
+# not just the above-the-fold header. The pass runs AFTER the /call waterfall +
+# navigation-timing reads, so it never perturbs the latency capture. Set to
+# False to skip (e.g. a future pure-latency mode); recording cells still work
+# either way because the scroll is best-effort and never raises.
+SCROLL_CAPTURE_FOR_VIDEO = True
+
+
+# Chrome-exclusion ancestor selector shared with browser_measure_stage's VERIFY
+# scroll (browser.py ~1774 / ~1940). A text node matching a widget title that
+# lives inside the left nav / sidebar / menu is a MENU ITEM, not the on-page
+# widget, so we skip it and keep walking. Single source of truth for the idiom.
+_VIDEO_SCROLL_CHROME_EXCLUDE = (
+    'nav, [class*="sidebar"], [class*="menu"], [class*="sider"]')
+
+
+def _scroll_capture_for_video(page, page_path):
+    """Scroll the page through its content so Playwright films below-the-fold.
+
+    The filmed nav (browser_measure_navigation) otherwise leaves the page at
+    scroll-top, so the per-cell .webm shows only the header — never the
+    compositions piechart + table (dashboard) or the panel cards
+    (/compositions). This pass reveals those north-star views on camera.
+
+    Ordering contract: the caller invokes this AFTER the /call waterfall read
+    and the navigation-timing read, and BEFORE `return`. Scrolling mutates
+    layout/scroll position but does NOT add or alter `resource`/`navigation`
+    PerformanceEntry timings already captured, so the /call latency numbers
+    are unaffected (verified against the read at browser.py ~1451/~1506).
+
+    Behaviour by page:
+      - "/" or "/dashboard": reveal the compositions piechart widget AND the
+        compositions table, then hold on that region. Falls back to a stepped
+        window.scrollTo descent with pauses, ending at scrollHeight, when the
+        widget mounts can't be located.
+      - "/compositions": stepped scroll down the datagrid so multiple panel
+        cards render on camera.
+      - anything else: a generic stepped descent (still useful footage).
+
+    Robustness: does NOT depend on `data-widget-renderer` (the frontend does
+    not emit it — confirmed). Uses the shared chrome-exclusion idiom to avoid
+    scrolling to a left-nav menu item that happens to share a widget's title
+    text. Entirely best-effort: every step is wrapped so it never raises.
+
+    Returns the number of scroll "steps" actually performed (0 when disabled
+    or when the page object can't be scrolled), purely for test assertions.
+    """
+    if not SCROLL_CAPTURE_FOR_VIDEO:
+        return 0
+
+    # Normalise: treat the SPA root and explicit /dashboard the same.
+    pp = (page_path or "").rstrip("/") or "/"
+    is_dashboard = pp in ("/", "/dashboard")
+    is_compositions = pp.startswith("/compositions")
+
+    steps = 0
+
+    def _eval(js, *args):
+        nonlocal steps
+        try:
+            page.evaluate(js, *args)
+            steps += 1
+        except Exception:
+            pass
+
+    def _pause(ms):
+        try:
+            page.wait_for_timeout(ms)
+        except Exception:
+            pass
+
+    if is_dashboard:
+        # 1) Try to scroll the compositions piechart + table into view. We
+        #    locate widget mounts by visible label text ("Compositions",
+        #    "Composition") and by Ant's chart/table container classes,
+        #    EXCLUDING any candidate that sits inside the left nav/sidebar/menu
+        #    (those are navigation entries, not the on-page widgets).
+        #    Wrapped via _eval so a mid-scroll page error never escapes.
+        _eval(
+            """(chromeExclude) => {
+                const inChrome = (el) =>
+                    !!(el && el.closest && el.closest(chromeExclude));
+                // Candidate widget mounts: pie/chart canvases + Ant tables.
+                const widgetSel = [
+                    'canvas',
+                    '[class*="g2"]', '[class*="chart"]', '[class*="Chart"]',
+                    '[class*="pie"]', '[class*="Pie"]',
+                    '.ant-table', '[class*="table"]', '[class*="Table"]',
+                ].join(',');
+                let pieEl = null, tableEl = null;
+                for (const el of document.querySelectorAll(widgetSel)) {
+                    if (inChrome(el)) continue;
+                    const cls = (el.className || '').toString().toLowerCase();
+                    const tag = el.tagName.toLowerCase();
+                    if (!tableEl && (cls.includes('table') ||
+                                     el.matches('.ant-table'))) {
+                        tableEl = el;
+                    } else if (!pieEl && (tag === 'canvas' ||
+                               cls.includes('chart') || cls.includes('pie') ||
+                               cls.includes('g2'))) {
+                        pieEl = el;
+                    }
+                }
+                // Also try a label-text anchor for the compositions widget,
+                // skipping left-nav menu items via the chrome exclusion.
+                if (!pieEl && !tableEl) {
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT, null);
+                    while (walker.nextNode()) {
+                        const node = walker.currentNode;
+                        const t = node.textContent.trim();
+                        if (t === 'Compositions' || t === 'Composition') {
+                            const el = node.parentElement;
+                            if (el && !inChrome(el)) { pieEl = el; break; }
+                        }
+                    }
+                }
+                const target = pieEl || tableEl;
+                if (target) {
+                    target.scrollIntoView(
+                        { block: 'center', behavior: 'instant' });
+                    return true;
+                }
+                return false;
+            }""",
+            _VIDEO_SCROLL_CHROME_EXCLUDE,
+        )
+        _pause(700)
+        # 2) Whether or not we found the mounts, do a stepped descent so the
+        #    camera pans across the whole below-the-fold region (covers the
+        #    piechart AND the table even if only one mount was located).
+        for frac in (0.33, 0.66, 1.0):
+            _eval(
+                "(f) => window.scrollTo({ top: "
+                "document.body.scrollHeight * f, behavior: 'instant' })",
+                frac)
+            _pause(650)
+        # 3) End by holding on the piechart+table region (scroll the located
+        #    widget back to center) so the final frames show the north-star
+        #    views, not the page footer.
+        _eval(
+            """(chromeExclude) => {
+                const inChrome = (el) =>
+                    !!(el && el.closest && el.closest(chromeExclude));
+                let t = null;
+                for (const el of document.querySelectorAll(
+                        'canvas, .ant-table, [class*="chart"], [class*="pie"]')) {
+                    if (!inChrome(el)) { t = el; break; }
+                }
+                if (t) t.scrollIntoView({ block: 'center', behavior: 'instant' });
+                else window.scrollTo({ top: 0, behavior: 'instant' });
+            }""",
+            _VIDEO_SCROLL_CHROME_EXCLUDE)
+        _pause(800)
+
+    elif is_compositions:
+        # Stepped descent through the datagrid so multiple panel cards render
+        # on camera (the cards lazy-mount as they enter the viewport).
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            _eval(
+                "(f) => window.scrollTo({ top: "
+                "document.body.scrollHeight * f, behavior: 'instant' })",
+                frac)
+            _pause(700)
+
+    else:
+        # Generic page: a short stepped descent still yields useful footage.
+        for frac in (0.5, 1.0):
+            _eval(
+                "(f) => window.scrollTo({ top: "
+                "document.body.scrollHeight * f, behavior: 'instant' })",
+                frac)
+            _pause(600)
+
+    return steps
+
+
 def browser_measure_navigation(page, page_path, label, min_calls=0,
                                user="admin", token=None, deleted_ns=None):
     """Navigate to a page; measure the /call API waterfall + widget gates.
@@ -1516,6 +1699,11 @@ def browser_measure_navigation(page, page_path, label, min_calls=0,
         page.remove_listener("response", _on_response)
     except Exception:
         pass
+
+    # Below-the-fold scroll for the per-cell video. Runs LAST — after the
+    # /call waterfall read (~1451) and the navigation-timing read (~1506) —
+    # so it never perturbs the latency capture. Best-effort; never raises.
+    _scroll_capture_for_video(page, page_path)
 
     ok_count = sum(1 for s in _call_statuses if s["status"] == 200)
     err_count = len(_call_statuses) - ok_count
@@ -1677,7 +1865,8 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                           verify_timeout: int = 300,
                           verify_interval: int = 3,
                           screenshots_dir: Path | None = None,
-                          deleted_ns=None):
+                          deleted_ns=None,
+                          pages_by_name: dict | None = None):
     """Navigate browser to each page num_navs times, return timing data.
 
     Expects an already-logged-in page object and an admin JWT token.
@@ -1700,6 +1889,19 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
     6465-6475's silent-skip bug). Block 4's stage runner catches it,
     persists a stage proof with passed=False + convergence_timeout=true,
     then re-raises to abort the run with exit 4.
+
+    `pages_by_name` (Task #267 FIX 2 — film both pages): an optional
+    {page_name: page_object} mapping of per-page Playwright pages, each
+    living in its OWN recording BrowserContext (set up by
+    phases._setup_users). Playwright records exactly one .webm per context,
+    so to film BOTH the dashboard AND a /compositions nav we measure each
+    page on its dedicated page/context — the dashboard context's video then
+    contains only dashboard navs, the compositions context's only
+    compositions navs. When None (every unit test + the no-video path), the
+    single `page` argument is used for every page_name, exactly as before
+    (zero behavioural change). The VERIFY/convergence/content block runs in
+    the Dashboard branch on that page's dedicated object, so its logic is
+    untouched.
     """
     ns_count, comp_count = _count_bench_ns(), _count_compositions()
     _log(f"Cluster: {ns_count} bench ns, {comp_count} compositions")
@@ -1711,11 +1913,14 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
 
     pages_data = {}
     for page_name, page_path in BROWSER_SCALING_PAGES:
+        # Per-page recording context (FIX 2) when provided; else the single
+        # shared page (backward-compatible default).
+        nav_page = (pages_by_name or {}).get(page_name, page)
         navs = []
         cold_calls = 0
         for nav_num in range(1, num_navs + 1):
             m = browser_measure_navigation(
-                page, page_path,
+                nav_page, page_path,
                 f"S{stage_num} {cache_mode} nav#{nav_num} {page_name}",
                 min_calls=cold_calls,
                 user=user, token=token, deleted_ns=deleted_ns)
@@ -1755,7 +1960,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                         last_cluster_check = time.time()
                     api_count = (verify_composition_count_api(token)
                                  if token else -1)
-                    ui_count = verify_composition_count_ui(page)
+                    ui_count = verify_composition_count_ui(nav_page)
                     elapsed_ms = int((time.time() - verify_start) * 1000)
                     api_str_p = f"{api_count}" if api_count >= 0 else "?"
                     ui_str_p = f"{ui_count}" if ui_count >= 0 else "?"
@@ -1763,7 +1968,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                          f"ui={ui_str_p} cluster={fresh_comp_count} ({elapsed_ms}ms)")
 
                     try:
-                        page.evaluate("""() => {
+                        nav_page.evaluate("""() => {
                             const walker = document.createTreeWalker(
                                 document.body, NodeFilter.SHOW_TEXT, null);
                             let target = null;
@@ -1783,7 +1988,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                             window.scrollTo(0, document.body.scrollHeight);
                             return false;
                         }""")
-                        page.wait_for_timeout(500)
+                        nav_page.wait_for_timeout(500)
                     except Exception:
                         pass
                     if SCREENSHOTS:
@@ -1791,7 +1996,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                                    f"{poll_num}_api{api_str_p}_ui{ui_str_p}_"
                                    f"cluster{fresh_comp_count}.png")
                         try:
-                            page.screenshot(path=str(screenshots_dir / ss_name))
+                            nav_page.screenshot(path=str(screenshots_dir / ss_name))
                             _log(f"    screenshot: {ss_name}")
                         except Exception as e:
                             _log(f"    screenshot failed: {e}")
@@ -1923,13 +2128,13 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
 
                 # Final VERIFY screenshot — reload dashboard for fresh data.
                 try:
-                    page.goto(f"{FRONTEND}/dashboard",
-                              wait_until="networkidle", timeout=30000)
-                    page.wait_for_timeout(2000)
+                    nav_page.goto(f"{FRONTEND}/dashboard",
+                                  wait_until="networkidle", timeout=30000)
+                    nav_page.wait_for_timeout(2000)
                 except Exception:
                     pass
                 try:
-                    page.evaluate("""() => {
+                    nav_page.evaluate("""() => {
                         const walker = document.createTreeWalker(
                             document.body, NodeFilter.SHOW_TEXT, null);
                         let target = null;
@@ -1949,14 +2154,14 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                         window.scrollTo(0, document.body.scrollHeight);
                         return false;
                     }""")
-                    page.wait_for_timeout(500)
+                    nav_page.wait_for_timeout(500)
                 except Exception:
                     pass
                 if SCREENSHOTS:
                     ss_final = (f"S{stage_num}_{cache_mode}_{user}_VERIFY_PASS_"
                                 f"api{api_str}_ui{ui_str}_{convergence_ms}ms.png")
                     try:
-                        page.screenshot(path=str(screenshots_dir / ss_final))
+                        nav_page.screenshot(path=str(screenshots_dir / ss_final))
                         _log(f"    screenshot: {ss_final}")
                     except Exception as e:
                         _log(f"    screenshot failed: {e}")
