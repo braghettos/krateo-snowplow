@@ -165,9 +165,14 @@ def _user_visible_composition_count(user, page_path, token=None,
                                     target_ns=None):
     """Return the per-user count of compositions VISIBLE on `page_path`.
 
-    Used by the EXPECTED_CALLS gate at `_validate_widget_terminal_state`
-    to thread the right `n_visible` argument into the N-aware
-    expected_calls() formula.
+    CONTENT-correctness source (cluster-side panel materialization count).
+    As of Task #284 (2026-06-10) this is NO LONGER the EXPECTED_CALLS gate's
+    `n_visible` source — the gate now derives `n_visible` from the rendered
+    DOM cards (`_count_rendered_comp_cards`) per the strategic rule "rendered
+    DOM predicts call-counts; cluster LIST validates content." This helper
+    is retained for content-correctness callers (the S8/S9 card-presence
+    checks and ad-hoc /compositions storm navs) which legitimately want the
+    cluster-truth panel count, not the render-state count.
 
     Empirical source (Task #250 Block 2b re-gate fix 2026-06-05):
     the right shape for `n_visible` is the count of
@@ -364,6 +369,29 @@ def _expected_calls_tolerance():
     through a getter keeps tests that monkeypatch the constant honest)."""
     from bench.expected import EXPECTED_CALLS_TOLERANCE  # type: ignore
     return EXPECTED_CALLS_TOLERANCE
+
+
+def _comp_card_params(user):
+    """Return (base, per_card, per_page) for the /compositions fan-out
+    formula, sourced from bench.expected so the skeleton-materializing
+    consistency check (Task #284 addition) uses the SAME constants the
+    expected_calls() formula uses — no drift between the two.
+
+    `per_card` is the per-user widget plate (admin=4, cj=2), defaulting to
+    the EXPECTED_CALLS_DEFAULT_USER plate for unknown subjects, exactly as
+    expected_calls() resolves it.
+    """
+    from bench.expected import (  # type: ignore
+        COMP_BASE_CALLS_STRUCTURAL,
+        COMP_DATAGRID_PER_PAGE,
+        COMP_PER_CARD_WIDGETS_BY_USER,
+        COMP_PER_CARD_WIDGETS,
+        EXPECTED_CALLS_DEFAULT_USER,
+    )
+    per_card = COMP_PER_CARD_WIDGETS_BY_USER.get(
+        user, COMP_PER_CARD_WIDGETS_BY_USER.get(
+            EXPECTED_CALLS_DEFAULT_USER, COMP_PER_CARD_WIDGETS))
+    return (COMP_BASE_CALLS_STRUCTURAL, per_card, COMP_DATAGRID_PER_PAGE)
 
 
 # ─── User credentials — read from in-cluster secrets at first use ───────────
@@ -980,6 +1008,67 @@ def _count_widget_skeletons(page):
             int(result.get("widget_scoped", 0)))
 
 
+# JS that counts the composition CARDS the datagrid has actually rendered
+# on page 1 at nav-time. This is the DOM-side source of truth for the
+# /compositions per-card fan-out term (Task #284): each rendered card
+# fires COMP_PER_CARD_WIDGETS_BY_USER[user] /call requests, so the gate's
+# expected count must be derived from the cards the page actually painted,
+# NOT from a cluster-wide apiserver LIST that races ahead of the render.
+#
+# A "rendered card" is identified by its composition-name title. Every
+# /compositions card renders its composition name as text (the
+# `compositions-panels` datagrid's per-row Panel title); in Phase 6 those
+# names all carry the `bench-app-` prefix (the bench's own deploy naming,
+# `lifecycle.deploy_compositions_parallel`). We count the INNERMOST element
+# whose trimmed text is exactly a composition name, scoped OUT of the
+# nav/sidebar/menu chrome — the same exclusion idiom the VERIFY scroll-
+# capture uses (browser.py scroll-capture: `nav, [class*="sidebar"],
+# [class*="menu"], [class*="sider"]`). Counting innermost-only de-dups the
+# card-container ancestors that also contain the same text.
+#
+# This deliberately does NOT read the /call performance timeline: deriving
+# `expected` from the page's own /call count would be circular and would
+# mask a genuine under-call (cards rendered but per-card /calls missing).
+# The card count here is a pure render-state signal, independent of the
+# `actual_calls` it is compared against.
+_RENDERED_COMP_CARDS_JS = r"""
+(namePrefix) => {
+    const EXCLUDED_ANCESTORS = 'nav, [class*="sidebar"], [class*="menu"], [class*="sider"]';
+    // A composition name is `<prefix><digits/dashes>`, e.g. bench-app-01-39.
+    const re = new RegExp('^' + namePrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[a-z0-9-]*$', 'i');
+    const matched = new Set();
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+    while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const txt = (node.textContent || '').trim();
+        if (!re.test(txt)) continue;
+        const el = node.parentElement;
+        if (!el) continue;
+        if (el.closest(EXCLUDED_ANCESTORS)) continue;  // skip nav/sidebar chrome
+        matched.add(txt);  // one entry per distinct composition name = one card
+    }
+    return matched.size;
+}
+"""
+
+
+def _count_rendered_comp_cards(page, name_prefix="bench-app-"):
+    """Return the number of composition cards rendered on /compositions
+    page 1 at nav-time, read from the live DOM.
+
+    DOM-side source of truth for Task #284: the per-card /call fan-out is
+    physically realized only by cards the datagrid has painted, so the
+    EXPECTED_CALLS gate's `n_visible` must come from here, not a cluster
+    LIST. Returns 0 on any evaluate failure (caller treats 0 as BASE-only
+    expected, matching a page that rendered no cards yet).
+    """
+    try:
+        n = page.evaluate(_RENDERED_COMP_CARDS_JS, name_prefix)
+        return max(0, int(n))
+    except Exception:
+        return 0
+
+
 def _validate_widget_terminal_state(page, page_path, label, user="admin",
                                     token=None):
     """Inspect the rendered page after the /call stability poll returns.
@@ -1044,15 +1133,35 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin",
         actual_calls = 0
 
     # Source the per-user visible count for the N-aware EXPECTED_CALLS
-    # formula. Returns None for pages where the formula does not apply
-    # (anything other than /compositions today), which makes the lookup
-    # transparently fall back to BASE.
-    try:
-        n_visible = _user_visible_composition_count(user, page_path,
-                                                    token=token)
-    except Exception as e:
-        _log(f"    [WARN] could not source n_visible for {user!r} at "
-             f"{label}: {e}")
+    # formula.
+    #
+    # STRATEGIC RULE (Task #284, Diego-ratified 2026-06-10): the RENDERED
+    # DOM predicts /call-counts; the cluster LIST validates CONTENT. The
+    # per-card fan-out term is physically realized only by cards the
+    # datagrid has painted on page 1 at nav-time, so `n_visible` for the
+    # EXPECTED_CALLS gate MUST be derived from the rendered cards on the
+    # page under validation — NOT from `count_compositions_with_panels_ready`
+    # (a cluster-wide apiserver LIST on a later/faster path that races ahead
+    # of the render at small-N right after a fresh deploy, producing
+    # expected=30 against a page that legitimately issued 10/14). The
+    # cluster-LIST source stays available (and is still used by the S8/S9
+    # content-correctness card-presence checks in phases.py) — it is just
+    # the wrong proxy for call-count prediction. See
+    # docs/task-284-s4s5-admin-callcount-trace-2026-06-10.md §7 Option A.
+    #
+    # Returns None for pages where the formula does not apply (anything
+    # other than /compositions today), which makes the lookup transparently
+    # fall back to BASE.
+    if page_path == "/compositions":
+        # rendered_card_count drives the fan-out term; expected_calls()
+        # clamps to COMP_DATAGRID_PER_PAGE internally, so:
+        #   0 rendered  -> expected = BASE (10)         [S4 fresh deploy]
+        #   1 rendered  -> expected = 10 + per_card×1    [S5 one materialized]
+        #   >=5 rendered -> expected = 10 + per_card×5    [S6 50K saturated]
+        # A page that renders cards but omits their per-card /calls still
+        # mismatches (real under-call detection is preserved).
+        n_visible = _count_rendered_comp_cards(page)
+    else:
         n_visible = None
 
     expected = _expected_calls_lookup(user, page_path, n_visible=n_visible)
@@ -1062,12 +1171,52 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin",
     else:
         calls_within_tolerance = abs(actual_calls - expected) <= tolerance
 
+    # For /compositions the rendered-card count IS n_visible (set above).
+    # rendered_cards is persisted into the result dict (Task #284) so the
+    # materialization-vs-under-call distinction is post-run checkable.
+    rendered_cards = n_visible if page_path == "/compositions" else None
+
     terminal_state = "pass"
+
+    # Skeleton gate (Task #284 addition, architect-specified gated demotion):
+    # an unconditional `skeleton>0 → fail` mis-classifies the small-N
+    # materialization race — at S4 a page-1 card slot is still painting an
+    # .ant-skeleton because its Panel CR hasn't materialized, so the card
+    # has not yet rendered and has not yet issued its per-card /calls. That
+    # is a benign mid-materialization state, NOT a stuck widget. Demote the
+    # skeleton to a recorded WARN (`skeleton_materializing`) ONLY when EVERY
+    # condition holds; if ANY fails it stays a HARD FAIL (real stuck-widget /
+    # premature-stability / under-call detection is preserved):
+    #   1. page_path == "/compositions"            (only the datagrid races)
+    #   2. rendered_cards < per_page                (page-1 not saturated)
+    #   3. errored_count == 0                       (no errored widget)
+    #   4. actual_calls == expected_calls           (call-count gate clean)
+    #   5. (actual_calls - BASE) == per_card×rendered  (/calls issued exactly
+    #      account for the cards that DID render — the consistency check that
+    #      separates "still materializing" from "rendered but didn't fire")
+    skeleton_materializing = False
     if skeleton_count > 0:
-        _log(f"    [FAIL] stability_premature: {skeleton_count} skeletons "
-             f"still visible at {label} (raw={skeleton_raw}, "
-             f"widget_scoped={skeleton_widget})")
-        terminal_state = "fail"
+        base, per_card, per_page = _comp_card_params(user)
+        materializing = (
+            page_path == "/compositions"
+            and rendered_cards is not None
+            and rendered_cards < per_page
+            and errored_count == 0
+            and expected is not None
+            and actual_calls == expected
+            and (actual_calls - base) == per_card * rendered_cards
+        )
+        if materializing:
+            skeleton_materializing = True
+            _log(f"    [WARN] skeleton_materializing: {skeleton_count} "
+                 f"skeleton(s) at {label} while datagrid page-1 is still "
+                 f"materializing (rendered_cards={rendered_cards}<{per_page}, "
+                 f"actual={actual_calls}==expected, errored=0) — benign race")
+        else:
+            _log(f"    [FAIL] stability_premature: {skeleton_count} skeletons "
+                 f"still visible at {label} (raw={skeleton_raw}, "
+                 f"widget_scoped={skeleton_widget})")
+            terminal_state = "fail"
     if errored_count > 0:
         _log(f"    [WARN] errored_widgets={errored_count} at {label}")
     if expected is not None and not calls_within_tolerance:
@@ -1081,6 +1230,8 @@ def _validate_widget_terminal_state(page, page_path, label, user="admin",
         "skeleton_count": skeleton_count,
         "skeleton_count_raw": skeleton_raw,
         "skeleton_count_widget_scoped": skeleton_widget,
+        "skeleton_materializing": skeleton_materializing,
+        "rendered_cards": rendered_cards,
         "errored_count": errored_count,
         "expected_calls": expected,
         "actual_calls": actual_calls,

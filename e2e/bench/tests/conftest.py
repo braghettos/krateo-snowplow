@@ -137,12 +137,16 @@ class FakePage:
                  skeleton_widget: int = 0, call_count: int = 0,
                  errored_count: int = 0, ui_count: int = -1,
                  has_token: bool = True,
+                 rendered_cards: int = 0,
                  nav_timing: dict | None = None,
                  waterfall: dict | None = None,
                  url: str = "http://fake/login"):
         self._skeleton_scoped = skeleton_scoped
         self._skeleton_raw = skeleton_raw
         self._skeleton_widget = skeleton_widget
+        # Task #284: return value for _RENDERED_COMP_CARDS_JS — the count of
+        # composition cards the datagrid rendered on page 1 at nav-time.
+        self._rendered_cards = rendered_cards
         self._call_count = call_count
         self._errored_count = errored_count
         self._ui_count = ui_count
@@ -162,6 +166,13 @@ class FakePage:
         self.evaluate_log.append(js)
         # Match by canonical prefix snippets — keep the heuristic robust
         # to whitespace tweaks in the JS literals.
+        # Task #284 rendered-card count: the JS takes a `namePrefix` arg and
+        # returns matched.size. Match on the distinctive `matched.size` /
+        # `createTreeWalker` shape BEFORE the skeleton branch (the skeleton JS
+        # also uses createTreeWalker-free querySelectorAll, so no overlap, but
+        # be explicit to keep the dispatch order-robust).
+        if "matched.size" in js and "namePrefix" in js:
+            return self._rendered_cards
         if "EXCLUDED_ANCESTORS" in js:
             return {"scoped": self._skeleton_scoped,
                     "raw": self._skeleton_raw,

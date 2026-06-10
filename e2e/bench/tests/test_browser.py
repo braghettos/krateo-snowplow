@@ -41,6 +41,7 @@ from bench.browser import (
     verify_composition_count_ui,
     wait_for_compositions,
     _validate_widget_terminal_state,
+    _count_rendered_comp_cards,
 )
 
 
@@ -383,6 +384,256 @@ def test_validate_widget_terminal_state_uses_scoped_selector_not_naked_ant_skele
     )
     assert v["skeleton_count"] == 0
     assert v["skeleton_count_raw"] == 10
+
+
+# ─── Task #284: DOM-derived n_visible for the /compositions call-count gate ─
+#
+# The EXPECTED_CALLS gate must derive `n_visible` from the cards the datagrid
+# actually rendered on page 1 at nav-time, NOT from a cluster-wide apiserver
+# LIST that races ahead of the render. These cases exercise the real
+# expected_calls() formula (NOT monkeypatched) through the rendered-card
+# count so the three Phase 6 regimes pass and a genuine under-call still fails.
+#
+#   regime              rendered cards   expected (admin, 10 + 4×min(N,5))
+#   S4 fresh deploy     0                10  (BASE only)
+#   S5 one materialized 1                14
+#   S6 50K saturated    5  (or more)     30  (clamped to per_page=5)
+
+
+def test_count_rendered_comp_cards_reads_dom(fake_page):
+    """`_count_rendered_comp_cards` returns the DOM-rendered card count
+    the page reports, clamped to >= 0 on failure."""
+    fake_page._rendered_cards = 3
+    assert _count_rendered_comp_cards(fake_page) == 3
+    fake_page._rendered_cards = 0
+    assert _count_rendered_comp_cards(fake_page) == 0
+
+
+def test_count_rendered_comp_cards_returns_zero_on_evaluate_failure(fake_page):
+    """An evaluate() exception → 0 (treated as BASE-only expected)."""
+    def _boom(js, *args):
+        raise RuntimeError("page closed")
+    fake_page.evaluate = _boom
+    assert _count_rendered_comp_cards(fake_page) == 0
+
+
+def test_terminal_state_s4_zero_rendered_cards_expects_base(monkeypatch,
+                                                            fake_page):
+    """S4 regime: 0 cards rendered on page 1 (panels mid-materialization)
+    → expected = BASE (10). actual=10 → PASS.
+
+    This is the sole Phase 6 INVALID blocker: previously the cluster LIST
+    raced ahead to >=5 panels → expected=30 → false-fail against actual=10.
+    """
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 0
+    fake_page._call_count = 10
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "S4 ON nav#1 Compositions",
+                                        user="admin")
+    assert v["n_visible"] == 0
+    assert v["expected_calls"] == 10
+    assert v["actual_calls"] == 10
+    assert v["calls_within_tolerance"] is True
+    assert v["terminal_state"] == "pass"
+
+
+def test_terminal_state_s5_one_rendered_card_expects_14(monkeypatch,
+                                                        fake_page):
+    """S5 regime: exactly 1 card materialized on page 1 → expected =
+    10 + 4×1 = 14. actual=14 → PASS."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 1
+    fake_page._call_count = 14
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "S5 ON nav#1 Compositions",
+                                        user="admin")
+    assert v["n_visible"] == 1
+    assert v["expected_calls"] == 14
+    assert v["actual_calls"] == 14
+    assert v["terminal_state"] == "pass"
+
+
+def test_terminal_state_s6_five_rendered_cards_expects_30(monkeypatch,
+                                                          fake_page):
+    """S6 50K regime: page 1 saturated at per_page=5 cards → expected =
+    10 + 4×5 = 30. actual=30 → PASS (unchanged from prior behaviour)."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 5
+    fake_page._call_count = 30
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "S6 ON nav#1 Compositions",
+                                        user="admin")
+    assert v["n_visible"] == 5
+    assert v["expected_calls"] == 30
+    assert v["actual_calls"] == 30
+    assert v["terminal_state"] == "pass"
+
+
+def test_terminal_state_more_than_per_page_rendered_clamps_to_30(monkeypatch,
+                                                                 fake_page):
+    """Rendered cards > per_page (e.g. a scrolled/larger viewport) still
+    clamps the fan-out term to min(N,5) → expected=30."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 8
+    fake_page._call_count = 30
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "Compositions", user="admin")
+    assert v["n_visible"] == 8
+    assert v["expected_calls"] == 30
+    assert v["terminal_state"] == "pass"
+
+
+def test_terminal_state_genuine_under_call_still_fails(monkeypatch, fake_page):
+    """Defect-detection preserved: 5 cards rendered (expected=30) but the
+    page issued only 10 /calls (per-card widget RESTActions silently
+    missing) → mismatch → FAIL. This is the real under-call the gate must
+    catch; the DOM-derived source does NOT mask it because the card count
+    is read from render state, independent of the /call timeline."""
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 5     # page painted 5 cards
+    fake_page._call_count = 10        # but only fired BASE /calls
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "Compositions", user="admin")
+    assert v["n_visible"] == 5
+    assert v["expected_calls"] == 30
+    assert v["actual_calls"] == 10
+    assert v["calls_within_tolerance"] is False
+    assert v["terminal_state"] == "fail"
+
+
+def test_terminal_state_cj_two_widgets_per_card(monkeypatch, fake_page):
+    """RBAC parity: cyberjoker fires 2 widgets per card (Buttons filtered
+    by allowed=false, Task #273), so 5 rendered cards → 10 + 2×5 = 20.
+    The DOM-derived n_visible threads through the per-user plate unchanged.
+    """
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 5
+    fake_page._call_count = 20
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "Compositions", user="cyberjoker")
+    assert v["n_visible"] == 5
+    assert v["expected_calls"] == 20
+    assert v["terminal_state"] == "pass"
+
+
+def test_terminal_state_compositions_does_not_call_cluster_list(monkeypatch,
+                                                                fake_page):
+    """The gate must NOT reach the cluster-LIST source for call-count
+    prediction anymore. If `_user_visible_composition_count` is invoked
+    during the /compositions gate, fail loudly — the DOM count is the only
+    n_visible source for the gate (cluster LIST is content-only now)."""
+    def _must_not_call(*a, **kw):
+        raise AssertionError(
+            "gate reached cluster-LIST n_visible source; Task #284 requires "
+            "the DOM-rendered card count to drive call-count prediction")
+    monkeypatch.setattr(browser_mod, "_user_visible_composition_count",
+                        _must_not_call)
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+    fake_page._skeleton_scoped = 0
+    fake_page._rendered_cards = 1
+    fake_page._call_count = 14
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "Compositions", user="admin")
+    assert v["expected_calls"] == 14
+    assert v["terminal_state"] == "pass"
+
+
+# ─── Task #284 addition: gated skeleton demotion (skeleton_materializing) ───
+#
+# An .ant-skeleton at nav-time is demoted from HARD FAIL to a recorded WARN
+# ONLY when ALL five conditions hold (page=/compositions, page-1 not
+# saturated, no errored widget, call-count gate clean, and /calls issued
+# exactly account for rendered cards). If ANY condition fails it stays a
+# HARD FAIL — real stuck-widget / premature-stability / under-call detection
+# is preserved.
+
+
+def test_skeleton_demoted_to_warn_when_materializing_s4(monkeypatch, fake_page):
+    """S4 materializing: rendered=0, skeleton=2, actual=10, expected=10,
+    errored=0 → PASS with skeleton_materializing=True (benign race)."""
+    fake_page._skeleton_scoped = 2
+    fake_page._rendered_cards = 0
+    fake_page._call_count = 10
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "S4 ON nav#1 Compositions",
+                                        user="admin")
+    assert v["terminal_state"] == "pass"
+    assert v["skeleton_materializing"] is True
+    assert v["skeleton_count"] == 2
+    assert v["rendered_cards"] == 0
+
+
+def test_skeleton_stuck_at_saturation_still_fails(monkeypatch, fake_page):
+    """Stuck at saturation: rendered=5 (page-1 full), skeleton=1, actual=30,
+    expected=30, errored=0 → still FAIL (condition 2: not <per_page)."""
+    fake_page._skeleton_scoped = 1
+    fake_page._rendered_cards = 5
+    fake_page._call_count = 30
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "Compositions", user="admin")
+    assert v["terminal_state"] == "fail"
+    assert v["skeleton_materializing"] is False
+
+
+def test_skeleton_rendered_but_didnt_fire_still_fails(monkeypatch, fake_page):
+    """Rendered-but-didn't-fire: rendered=2, skeleton=1, actual=10,
+    expected=18, errored=0 → FAIL (conditions 4 + 5: /calls do not account
+    for the 2 rendered cards). This is the real under-call the gate must
+    catch even though page-1 is unsaturated."""
+    fake_page._skeleton_scoped = 1
+    fake_page._rendered_cards = 2
+    fake_page._call_count = 10       # only BASE fired; expected 10+4×2=18
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/compositions",
+                                        "Compositions", user="admin")
+    assert v["expected_calls"] == 18
+    assert v["terminal_state"] == "fail"
+    assert v["skeleton_materializing"] is False
+
+
+def test_skeleton_on_non_compositions_page_still_fails(monkeypatch, fake_page):
+    """Non-compositions page with a skeleton → FAIL (condition 1).
+    /dashboard stuck-widget detection is unchanged by Task #284."""
+    fake_page._skeleton_scoped = 1
+    fake_page._call_count = 16
+    fake_page._errored_count = 0
+    monkeypatch.setattr(browser_mod, "_expected_calls_lookup",
+                        lambda u, p, **kw: 16)
+    monkeypatch.setattr(browser_mod, "_expected_calls_tolerance", lambda: 0)
+
+    v = _validate_widget_terminal_state(fake_page, "/dashboard",
+                                        "S6 ON nav#1 Dashboard", user="admin")
+    assert v["terminal_state"] == "fail"
+    assert v["skeleton_materializing"] is False
+    assert v["rendered_cards"] is None
 
 
 # ─── Case 11: login_all returns dict keyed by username ──────────────────────
