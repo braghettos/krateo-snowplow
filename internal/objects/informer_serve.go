@@ -258,6 +258,9 @@ func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *
 		Group:     gvr.Group,
 		Resource:  gvr.Resource,
 		Namespace: obj.GetNamespace(),
+		// Ship L1 (0.30.252): per-item caller discards
+		// matchedBindingUID — skip the CRB/RB stable-sort.
+		SkipBindingUID: true,
 	})
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.

@@ -159,6 +159,9 @@ func filterListByRBAC(
 				Group:     gvr.Group,
 				Resource:  gvr.Resource,
 				Namespace: ns,
+				// Ship L1 (0.30.252): per-item caller discards
+				// matchedBindingUID — skip the CRB/RB stable-sort.
+				SkipBindingUID: true,
 			})
 			if err != nil {
 				// FAIL-CLOSED: an evaluator hiccup never permits a leak.
@@ -269,6 +272,9 @@ func filterGetByRBAC(
 		Resource:  gvr.Resource,
 		Namespace: obj.GetNamespace(),
 		Name:      obj.GetName(),
+		// Ship L1 (0.30.252): per-item caller discards
+		// matchedBindingUID — skip the CRB/RB stable-sort.
+		SkipBindingUID: true,
 	})
 	if err != nil {
 		// FAIL-CLOSED: an evaluator hiccup never permits a serve.

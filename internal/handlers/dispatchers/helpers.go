@@ -112,6 +112,9 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 		Group:     gvr.Group,
 		Resource:  gvr.Resource,
 		Namespace: namespace,
+		// Ship L1 (0.30.252): per-item caller discards
+		// matchedBindingUID — skip the CRB/RB stable-sort.
+		SkipBindingUID: true,
 	})
 	if evalErr != nil {
 		log.Error("checkDispatchRBAC: EvaluateRBAC error",

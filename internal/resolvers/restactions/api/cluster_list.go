@@ -229,6 +229,9 @@ func attemptClusterListCollapse(
 		Group:     gvr.Group,
 		Resource:  gvr.Resource,
 		Namespace: "", // cluster-scope check — evaluate.go:213-235
+		// Ship L1 (0.30.252): per-item caller discards
+		// matchedBindingUID — skip the CRB/RB stable-sort.
+		SkipBindingUID: true,
 	}
 	// Ship 0.30.242 H.c-layered Phase 2 step 2a — per-item caller
 	// ignores matchedBindingUID.

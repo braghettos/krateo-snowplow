@@ -84,6 +84,31 @@ type EvaluateOptions struct {
 	// rule NEVER grants a collection verb. See rulesPermit /
 	// resourceNameMatches below.
 	Name string
+
+	// SkipBindingUID, when true, lets the evaluator SKIP the
+	// (Name, UID) stable-sort of the CRB/RB candidate sets
+	// (sortCRBsStable / sortRBsStable). That sort exists ONLY to make
+	// the returned matchedBindingUID deterministic across snapshot
+	// republishes (design §6). The permit/deny VERDICT is
+	// order-independent — EvaluateRBAC early-returns on the FIRST
+	// matching binding and any matching binding permits (RBAC v1 has no
+	// deny rules), so the yes/no answer is identical with or without the
+	// sort. SkipBindingUID=true is therefore safe for callers that
+	// consume `allowed` only and discard matchedBindingUID via `_`.
+	//
+	// DEFAULT (zero value) is false = DO NOT skip = sort runs and the
+	// returned matchedBindingUID is the deterministic first-match UID.
+	// This is the SAFE default: any caller that does not explicitly opt
+	// in keeps the stable UID. Inverted field name (Skip…) is chosen so
+	// the zero-value struct preserves the pre-Ship-L1 behaviour — the
+	// cache-key callers (dispatchCacheLookupKey, ra_full_list, the
+	// helpers.go diagnostic) set NOTHING and keep the deterministic UID.
+	//
+	// Ship L1 (0.30.252): set true from the six per-item call sites
+	// enumerated below that discard matchedBindingUID. On the dominant
+	// 17,929-CRB SA-refilter path this removes the per-item stable-sort
+	// (~43% of pod CPU at 50K scale — task-288 §levers L1).
+	SkipBindingUID bool
 }
 
 // Ship B (0.30.138): the rbac-package GVR vars are dead — the snapshot
@@ -126,11 +151,19 @@ type EvaluateOptions struct {
 // (false, "", err) on internal evaluator error.
 //
 // PER-ITEM CALLERS: 6 sites use the ALLOWED return only and ignore the
-// matchedBindingUID via `_` (helpers.go:104, refilter.go:255,
-// informer_dispatch_rbac.go:153 + :259, cluster_list.go:233,
-// informer_serve.go:252). The signature change is the SINGLE source of
-// truth: cache-key callers consume matchedBindingUID; per-item callers
-// consume allowed. No split API.
+// matchedBindingUID via `_` (helpers.go:checkDispatchRBAC, refilter.go
+// evalSingle, informer_dispatch_rbac.go list-filter + get-filter,
+// cluster_list.go gate, informer_serve.go get-filter). The signature
+// change is the SINGLE source of truth: cache-key callers consume
+// matchedBindingUID; per-item callers consume allowed. No split API.
+//
+// Ship L1 (0.30.252): those 6 per-item sites pass
+// EvaluateOptions.SkipBindingUID=true so the evaluator skips the
+// CRB/RB stable-sort (the sort exists only to make matchedBindingUID
+// deterministic — see EvaluateOptions.SkipBindingUID). The cache-key
+// callers (dispatchCacheLookupKey, ra_full_list, the helpers.go
+// diagnostic) leave SkipBindingUID at its safe zero-value (false) and
+// keep the deterministic UID.
 func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, error) {
 	log := xcontext.Logger(ctx)
 	evaluateRBACCallCount.Add(1)
@@ -240,7 +273,12 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 	//    permits override namespace scope. Sort in stable order
 	//    (design §6) so the first-match BindingUID is deterministic.
 	crbCandidates := selectCRBCandidates(snap, opts)
-	sortCRBsStable(crbCandidates)
+	// The stable sort exists ONLY to make the returned matchedBindingUID
+	// deterministic; the verdict is order-independent (first match wins,
+	// any match permits). Skip it when the caller discards the UID.
+	if !opts.SkipBindingUID {
+		sortCRBsStable(crbCandidates)
+	}
 	for _, crb := range crbCandidates {
 		// Subject prefilter FIRST — skip the entire roleRefPermits
 		// walk when no subject matches. The index already narrowed
@@ -264,7 +302,9 @@ func evaluateAgainstInformerFirstMatch(ctx context.Context, snap *cache.RBACSnap
 	//    (cluster-wide) but the binding's effect is the namespace.
 	if opts.Namespace != "" {
 		rbCandidates := selectRBCandidates(snap, opts.Namespace, opts)
-		sortRBsStable(rbCandidates)
+		if !opts.SkipBindingUID {
+			sortRBsStable(rbCandidates)
+		}
 		for _, rb := range rbCandidates {
 			if !anySubjectMatches(rb.Subjects, opts) {
 				continue

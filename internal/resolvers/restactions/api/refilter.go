@@ -261,6 +261,9 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 			Group:     uaf.Group,
 			Resource:  resource,
 			Namespace: namespace,
+			// Ship L1 (0.30.252): per-item caller discards
+			// matchedBindingUID — skip the CRB/RB stable-sort.
+			SkipBindingUID: true,
 		})
 		if err != nil {
 			log.Warn("userAccessFilter: EvaluateRBAC error; treating resource as denied",
