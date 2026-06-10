@@ -40,34 +40,89 @@ type ctxKeyStageErrorSinkType struct{}
 
 var ctxKeyStageErrorSink = ctxKeyStageErrorSinkType{}
 
+// StageErrorSink counts stage errors observed during a refresh re-resolve
+// AND captures the FIRST stage error's name + message as a diagnostic
+// sample. Ship 0.30.254 / Task #301 (observability): the decline log
+// previously surfaced only the count, so attributing a decline to its
+// failing stage required a cross-grep against the resolver's error lines
+// (two traces). The sample is captured once (first bump wins) so the
+// decline log can name the stage + error inline.
+//
+// Count is the load-bearing gate signal (Count()>0 declines the Put);
+// the sample is observability-only.
+type StageErrorSink struct {
+	count  atomic.Int64
+	sample atomic.Pointer[stageErrSample]
+}
+
+type stageErrSample struct {
+	stage string
+	err   string
+}
+
+// Bump records one stage error: increments the count and, on the FIRST
+// bump only, stores the (stage, err) sample. nil-receiver-safe so the
+// request-path no-op (nil sink) callers can call it unconditionally.
+func (s *StageErrorSink) Bump(stage, err string) {
+	if s == nil {
+		return
+	}
+	s.count.Add(1)
+	// First-sample-wins via CAS from nil. Subsequent bumps leave the
+	// first sample intact (it's the most causally-relevant for the
+	// decline — later stages may fail as a consequence).
+	s.sample.CompareAndSwap(nil, &stageErrSample{stage: stage, err: err})
+}
+
+// Count returns the number of stage errors recorded. nil-receiver-safe
+// (returns 0) so the request path's nil sink reads as "no error".
+func (s *StageErrorSink) Count() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.count.Load()
+}
+
+// Sample returns the first recorded (stage, err) sample, or ("","") when
+// none was recorded. nil-receiver-safe.
+func (s *StageErrorSink) Sample() (stage, err string) {
+	if s == nil {
+		return "", ""
+	}
+	if smp := s.sample.Load(); smp != nil {
+		return smp.stage, smp.err
+	}
+	return "", ""
+}
+
 // WithStageErrorSink returns a child context carrying a fresh
-// *atomic.Int64 stage-error sink, plus the sink itself. The resolver
-// reads the sink via StageErrorSinkFromContext at each dict[ErrorKey]
-// write site and bumps it; the refresh-and-store path reads Load()>0
-// before its Put and declines to overwrite a good entry with a result
-// produced under a stage error.
+// *StageErrorSink, plus the sink itself. The resolver reads the sink via
+// StageErrorSinkFromContext at each dict[ErrorKey] write site and bumps
+// it; the refresh-and-store path reads Count()>0 before its Put and
+// declines to overwrite a good entry with a result produced under a
+// stage error (and logs the sink's Sample() for attribution).
 //
 // Installed ONLY by the background refresher (resolveAndPopulateL1) — a
 // normal request path never calls this, so its resolve carries no sink
 // and the resolver's bump sites are no-ops (the diff is byte-identical
 // to 0.30.119 on the request path).
-func WithStageErrorSink(ctx context.Context) (context.Context, *atomic.Int64) {
-	sink := &atomic.Int64{}
+func WithStageErrorSink(ctx context.Context) (context.Context, *StageErrorSink) {
+	sink := &StageErrorSink{}
 	if ctx == nil {
 		return ctx, sink
 	}
 	return context.WithValue(ctx, ctxKeyStageErrorSink, sink), sink
 }
 
-// StageErrorSinkFromContext returns the *atomic.Int64 stage-error sink
-// attached to ctx by WithStageErrorSink, or nil when none is attached
-// (the normal request path). A nil return MUST be treated by callers as
-// "no sink — do not record"; it is not an error.
-func StageErrorSinkFromContext(ctx context.Context) *atomic.Int64 {
+// StageErrorSinkFromContext returns the *StageErrorSink attached to ctx
+// by WithStageErrorSink, or nil when none is attached (the normal request
+// path). A nil return MUST be treated by callers as "no sink — do not
+// record"; it is not an error. The sink's methods are nil-receiver-safe.
+func StageErrorSinkFromContext(ctx context.Context) *StageErrorSink {
 	if ctx == nil {
 		return nil
 	}
-	v, _ := ctx.Value(ctxKeyStageErrorSink).(*atomic.Int64)
+	v, _ := ctx.Value(ctxKeyStageErrorSink).(*StageErrorSink)
 	return v
 }
 

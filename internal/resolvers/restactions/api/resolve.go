@@ -630,10 +630,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							// Layer (b) backstop (0.30.120): record the stage
 							// error on the refresher's sink (nil on the
 							// request path) so the error-aware Put-gate still
-							// sees a nested-/call failure.
-							if stageErrSink != nil {
-								stageErrSink.Add(1)
-							}
+							// sees a nested-/call failure. #301: Bump captures
+							// stage name + err for the decline-log sample
+							// (nil-receiver-safe).
+							stageErrSink.Bump(id, nerr.Error())
 							if !call.ContinueOnError {
 								return fmt.Errorf("api %s failed: %s", id, nerr.Error())
 							}
@@ -793,9 +793,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						dictMu.Unlock()
 						// Ship 0.30.120 layer (b): record the stage error on
 						// the refresher's sink (nil on the request path).
-						if stageErrSink != nil {
-							stageErrSink.Add(1)
-						}
+						// #301: Bump captures stage name + err for the
+						// decline-log sample (nil-receiver-safe).
+						stageErrSink.Bump(id, ierr.Error())
 						if !call.ContinueOnError {
 							// Cancel gctx so in-flight peers short-circuit —
 							// same contract as the httpcall.Do StatusFailure
@@ -854,9 +854,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					// Ship 0.30.120 layer (b): record the stage error on the
 					// refresher's sink (nil on the request path) — covers both
 					// the asMap and res.Message ErrorKey-write branches above.
-					if stageErrSink != nil {
-						stageErrSink.Add(1)
-					}
+					// #301: Bump captures stage name + err for the decline-log
+					// sample (nil-receiver-safe).
+					stageErrSink.Bump(id, res.Message)
 
 					if !call.ContinueOnError {
 						// Returning a non-nil error cancels gctx so

@@ -239,13 +239,19 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// The gate keys on STAGE-ERROR PRESENCE, never on result emptiness — a
 	// user who legitimately has 0 compositions produces no stage error
 	// (sink == 0) and their empty result IS stored.
-	if stageErrSink.Load() > 0 {
+	if stageErrSink.Count() > 0 {
+		// #301 observability: surface the FIRST failing stage's name + err
+		// inline so a decline can be attributed without a cross-grep
+		// against the resolver's error lines (which cost two traces).
+		sampleStage, sampleErr := stageErrSink.Sample()
 		log.Warn("resolveAndPopulateL1: stage error during refresh; declining to overwrite good entry",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),
 			slog.String("user", refreshUser),
-			slog.Int64("stage_errors", stageErrSink.Load()),
+			slog.Int64("stage_errors", stageErrSink.Count()),
+			slog.String("stage_err_stage", sampleStage),
+			slog.String("stage_err_sample", sampleErr),
 			slog.String("effect", "prior good entry kept; TTL is the outer net"),
 		)
 		cache.BumpRefresherSkippedStageError()

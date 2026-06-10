@@ -593,7 +593,7 @@ func TestF3_NestedCall_AuthorizedResolveNonEmpty(t *testing.T) {
 			"got status=%s", statusBytes)
 	}
 	// Layer (b): a clean resolve records NO stage error.
-	if got := sink.Load(); got != 0 {
+	if got := sink.Count(); got != 0 {
 		t.Fatalf("F3: layer-(b) stage-error sink = %d after a CLEAN nested resolve; "+
 			"want 0 (the error-aware Put-gate must not false-fire on a good resolve)", got)
 	}

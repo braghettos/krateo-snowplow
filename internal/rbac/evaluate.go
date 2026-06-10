@@ -256,15 +256,37 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 		return false, "", err
 	}
 
-	// Store the freshly-walked verdict for this generation. Evaluator
-	// errors are NOT cached (the err early-return above skips this). The
-	// store re-validates the generation internally (currentAuthzShard) so
-	// a republish that landed DURING the walk swaps the shard and this
-	// store lands in the new generation's shard — never poisoning the old.
-	authzMemoStore(snap.PublishSeq, memoKey, snapshotAuthzVerdict{
-		Allowed:           allowed,
-		MatchedBindingUID: matchedBindingUID,
-	})
+	// Store the freshly-walked verdict for this generation — but ONLY
+	// PERMITS (allowed == true). Ship 0.30.254 / Task #301 corrective:
+	// NEVER cache a deny.
+	//
+	// WHY denies must not be cached: a deny can be TRANSIENTLY WRONG under
+	// snapshot churn. EvaluateRBAC is fail-closed per-call — a walk that
+	// runs while the candidate index / ClusterRolesByName resolve is
+	// momentarily not yet coherent during a rebuild can return a wrong
+	// `false` (RecordRBACSnapshotMiss path). Pre-L2 that wrong deny
+	// self-healed on the very next call (the snapshot is coherent a moment
+	// later). Caching it pinned the wrong deny for the whole RBAC
+	// generation on a HOT key (the snowplow SA holds a static wildcard CRB
+	// that can NEVER be correctly denied), starving the RAFullList refresh
+	// and leaving admin compositions-list stuck empty (#301 §G).
+	//
+	// A deny therefore falls back to the walk every call — the same cost
+	// L2 already pays on a miss — and self-heals exactly as pre-L2. This
+	// is safe AND keeps the CPU win: permits dominate the hot population
+	// (the wildcard-SA refresher + admin are permit-dominated; #301 §H:
+	// 160M hits were overwhelmingly permits), so the walk-collapse
+	// survives. A permit is monotone-correct within a generation (a
+	// binding removal bumps PublishSeq and CAS-swaps the shard), so it is
+	// safe to cache; only the deny verdict can be transiently wrong.
+	if allowed {
+		authzMemoStore(snap.PublishSeq, memoKey, snapshotAuthzVerdict{
+			Allowed:           true,
+			MatchedBindingUID: matchedBindingUID,
+		})
+	} else {
+		authzMemoDenyUncached.Add(1)
+	}
 
 	log.Debug("rbac.evaluate",
 		slog.String("path", "in-process"),

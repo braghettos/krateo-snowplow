@@ -122,6 +122,12 @@ var (
 	authzMemoMisses  atomic.Uint64
 	authzMemoSwaps   atomic.Uint64
 	authzMemoRefused atomic.Uint64 // cap-breach refused inserts (F5 / B5)
+	// authzMemoDenyUncached — Ship 0.30.254 / Task #301: count of deny
+	// verdicts deliberately NOT cached (they fall back to the walk every
+	// call so a transiently-wrong fail-closed deny self-heals). > 0 and
+	// rising under load is the #301 falsifier that denies take the walk
+	// path.
+	authzMemoDenyUncached atomic.Uint64
 )
 
 // currentAuthzShard returns the shard valid for gen, swapping in a fresh
@@ -206,6 +212,7 @@ func ResetAuthzMemoForTest() {
 	authzMemoMisses.Store(0)
 	authzMemoSwaps.Store(0)
 	authzMemoRefused.Store(0)
+	authzMemoDenyUncached.Store(0)
 }
 
 // AuthzMemoStatsForTest returns (hits, misses, swaps, refused, entries).
@@ -213,6 +220,13 @@ func ResetAuthzMemoForTest() {
 func AuthzMemoStatsForTest() (hits, misses, swaps, refused uint64, entries int) {
 	return authzMemoHits.Load(), authzMemoMisses.Load(), authzMemoSwaps.Load(),
 		authzMemoRefused.Load(), authzMemoEntriesForExpvar()
+}
+
+// AuthzMemoDenyUncachedForTest returns the count of deny verdicts not
+// cached (Ship 0.30.254 / #301). TEST-ONLY — the deny-not-stored
+// falsifier asserts this increments on a deny.
+func AuthzMemoDenyUncachedForTest() uint64 {
+	return authzMemoDenyUncached.Load()
 }
 
 // authzMemoExpvarFuncs is consumed by RegisterAuthzMemoExpvar; kept here
@@ -224,5 +238,7 @@ func authzMemoExpvarFuncs() map[string]expvar.Func {
 		"snowplow_authz_memo_swaps":   func() any { return authzMemoSwaps.Load() },
 		"snowplow_authz_memo_refused": func() any { return authzMemoRefused.Load() },
 		"snowplow_authz_memo_entries": func() any { return authzMemoEntriesForExpvar() },
+		// Ship 0.30.254 / #301 — denies are never cached; this counts them.
+		"snowplow_authz_memo_deny_uncached_total": func() any { return authzMemoDenyUncached.Load() },
 	}
 }

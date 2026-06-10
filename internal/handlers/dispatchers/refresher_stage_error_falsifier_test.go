@@ -93,7 +93,7 @@ func TestRefresher_StageErrorDoesNotOverwriteGoodEntry(t *testing.T) {
 	// under-served empty result.
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
 		if sink := cache.StageErrorSinkFromContext(ctx); sink != nil {
-			sink.Add(1)
+			sink.Bump("test-stage", "emulated stage error")
 		}
 		return stageErrEmptyEntry, nil
 	})
