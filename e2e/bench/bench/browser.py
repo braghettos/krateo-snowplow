@@ -835,7 +835,8 @@ class ConvergenceTimeout(Exception):
 def make_browser_context(playwright_browser, *,
                          record_video_dir: Path | None = None,
                          viewport=(1280, 900),
-                         ignore_https_errors: bool = True):
+                         ignore_https_errors: bool = True,
+                         storage_state=None):
     """Construct a Playwright BrowserContext with optional video recording.
 
     `record_video_dir` is per cell representative only (n=1 per stage,
@@ -848,6 +849,15 @@ def make_browser_context(playwright_browser, *,
     {"width", "height"} dict at the call site so callers don't depend
     on Playwright's exact dict shape.
 
+    `storage_state` (Task #307 / A1-full): an optional Playwright
+    storage-state (the dict/JSON captured from a prior
+    `context.storage_state()`). When provided it is forwarded to
+    `new_context(storage_state=...)` so the new context starts ALREADY
+    authenticated — its first `goto` lands on the target page directly,
+    with NO `/login` form drive and NO dashboard-landing redirect filmed.
+    This is what lets a per-page recording context's `.webm` begin on its
+    own page instead of the login/dashboard head.
+
     Returns the new BrowserContext object.
     """
     kwargs = {
@@ -858,6 +868,8 @@ def make_browser_context(playwright_browser, *,
         rvd = Path(record_video_dir)
         rvd.mkdir(parents=True, exist_ok=True)
         kwargs["record_video_dir"] = str(rvd)
+    if storage_state is not None:
+        kwargs["storage_state"] = storage_state
 
     return playwright_browser.new_context(**kwargs)
 
@@ -1512,20 +1524,67 @@ def _scroll_capture_for_video(page, page_path):
                 "document.body.scrollHeight * f, behavior: 'instant' })",
                 frac)
             _pause(650)
-        # 3) End by holding on the piechart+table region (scroll the located
-        #    widget back to center) so the final frames show the north-star
-        #    views, not the page footer.
+        # 3) End by holding on the COMPOSITIONS piechart+table region (the
+        #    48,999 donut — the north-star metric), NOT the first chart on the
+        #    page. Task #307 (Diego empirical trace 2026-06-10): the dashboard
+        #    renders the Blueprints donut FIRST in document order, then the
+        #    Compositions donut below it; the prior `break`-on-first-chart hold
+        #    centred the *Blueprints* donut and left the Compositions donut
+        #    ~150px below the framed window. We anchor specifically on the
+        #    Compositions section instead — derived from page STRUCTURE (the
+        #    "Compositions" widget label + DOM order + scrollHeight), no magic
+        #    pixel offset:
+        #      a) find the on-page (non-chrome) "Compositions"/"Composition"
+        #         label text node and, from its widget container, the nearest
+        #         chart/canvas — that is the Compositions donut;
+        #      b) else take the LAST chart/canvas in document order (Compositions
+        #         is below Blueprints, so the last donut is the Compositions one);
+        #      c) else fall back to the page BOTTOM (scrollHeight) so the lowest
+        #         widget — the Compositions donut — is framed (never re-centre
+        #         the first/Blueprints chart, which was the bug).
         _eval(
             """(chromeExclude) => {
                 const inChrome = (el) =>
                     !!(el && el.closest && el.closest(chromeExclude));
-                let t = null;
-                for (const el of document.querySelectorAll(
-                        'canvas, .ant-table, [class*="chart"], [class*="pie"]')) {
-                    if (!inChrome(el)) { t = el; break; }
+                const isChart = (el) => {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    return el.tagName === 'CANVAS' ||
+                        cls.includes('chart') || cls.includes('pie') ||
+                        cls.includes('g2');
+                };
+                // (a) label-anchored Compositions donut.
+                let target = null;
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT, null);
+                while (walker.nextNode()) {
+                    const t = walker.currentNode.textContent.trim();
+                    if (t !== 'Compositions' && t !== 'Composition') continue;
+                    let el = walker.currentNode.parentElement;
+                    if (!el || inChrome(el)) continue;
+                    // Climb to the widget container, then find its chart/canvas.
+                    let scope = el;
+                    for (let i = 0; i < 6 && scope.parentElement; i++) {
+                        const c = scope.querySelector(
+                            'canvas, [class*="chart"], [class*="pie"], [class*="g2"]');
+                        if (c && !inChrome(c)) { target = c; break; }
+                        scope = scope.parentElement;
+                    }
+                    if (target) break;
                 }
-                if (t) t.scrollIntoView({ block: 'center', behavior: 'instant' });
-                else window.scrollTo({ top: 0, behavior: 'instant' });
+                // (b) else the LAST chart/canvas in document order.
+                if (!target) {
+                    const charts = [...document.querySelectorAll(
+                        'canvas, [class*="chart"], [class*="pie"], [class*="g2"]')]
+                        .filter((el) => !inChrome(el) && isChart(el));
+                    if (charts.length) target = charts[charts.length - 1];
+                }
+                if (target) {
+                    target.scrollIntoView({ block: 'center', behavior: 'instant' });
+                } else {
+                    // (c) page bottom — frames the lowest (Compositions) widget.
+                    window.scrollTo(
+                        { top: document.body.scrollHeight, behavior: 'instant' });
+                }
             }""",
             _VIDEO_SCROLL_CHROME_EXCLUDE)
         _pause(800)
@@ -1866,7 +1925,8 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                           verify_interval: int = 3,
                           screenshots_dir: Path | None = None,
                           deleted_ns=None,
-                          pages_by_name: dict | None = None):
+                          pages_by_name: dict | None = None,
+                          page_factories: dict | None = None):
     """Navigate browser to each page num_navs times, return timing data.
 
     Expects an already-logged-in page object and an admin JWT token.
@@ -1916,6 +1976,29 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
         # Per-page recording context (FIX 2) when provided; else the single
         # shared page (backward-compatible default).
         nav_page = (pages_by_name or {}).get(page_name, page)
+
+        # Task #307 / A1-full: a LAZY page (e.g. Compositions) has nav_page
+        # None here and a factory in `page_factories`. Materialise it NOW —
+        # at this page's loop iteration. Because Dashboard is the FIRST
+        # BROWSER_SCALING_PAGES entry and its entire VERIFY/convergence/content
+        # block runs before the loop advances, the Compositions factory fires
+        # strictly AFTER the Dashboard VERIFY poll completes (falsifier F-B):
+        # its recording context — and thus its video clock — does not exist
+        # during that multi-minute poll, so the `.webm` begins on /compositions
+        # rather than on the idle login-landing dashboard. The factory is
+        # best-effort; on failure we fall back to the shared `page` so the
+        # stage still measures (no recording for that page).
+        if nav_page is None and page_factories and page_name in page_factories:
+            try:
+                nav_page = page_factories[page_name]()
+            except Exception as e:
+                _log(f"    WARNING: lazy recording-context create for "
+                     f"{page_name} failed ({type(e).__name__}: {e}); "
+                     f"measuring on shared page")
+                nav_page = page
+        if nav_page is None:
+            nav_page = page
+
         navs = []
         cold_calls = 0
         for nav_num in range(1, num_navs + 1):

@@ -10,6 +10,7 @@ Per docs/bench-restructure-path-b-plan-2026-06-02.md §C.7 + §G Block 4.
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -681,6 +682,10 @@ class _FakeRecordingCtx:
     def new_page(self):
         return self.page
 
+    def storage_state(self, **kw):
+        # Task #307 / A1-full: the throwaway login context captures auth here.
+        return {"cookies": [], "origins": []}
+
     def close(self):
         self.closed = True
         self._raw.parent.mkdir(parents=True, exist_ok=True)
@@ -713,9 +718,17 @@ class _StageRecordingBrowser:
         self._present_names = present_names
 
     def new_context(self, **kwargs):
-        rvd = Path(kwargs.get("record_video_dir", "."))
         self._n += 1
-        raw = rvd / f"raw-{self._n}.webm"
+        rvd_arg = kwargs.get("record_video_dir")
+        if rvd_arg is None:
+            # Task #307 / A1-full: the one-time throwaway login context is
+            # NON-recording (no record_video_dir). It is not appended to
+            # `contexts` (it never produces a stage .webm) so the per-stage
+            # video-count assertions still see exactly the recording contexts.
+            return _FakeRecordingCtx(
+                Path(tempfile.mkdtemp()) / "throwaway.webm",
+                present_names=self._present_names)
+        raw = Path(rvd_arg) / f"raw-{self._n}.webm"
         c = _FakeRecordingCtx(raw, present_names=self._present_names)
         self.contexts.append(c)
         return c
@@ -730,7 +743,8 @@ def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
     test force a ConvergenceTimeout-shaped failure to prove the partial video
     is still finalized.
     """
-    def _make_ctx(pw_browser, *, record_video_dir=None, **kw):
+    def _make_ctx(pw_browser, *, record_video_dir=None, storage_state=None,
+                  **kw):
         return pw_browser.new_context(record_video_dir=record_video_dir)
     monkeypatch.setattr(phases.browser, "make_browser_context", _make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
@@ -741,16 +755,41 @@ def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
 
     def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
                       token=None, user="admin", verify_against_cluster=True,
-                      deleted_ns=None, pages_by_name=None):
+                      deleted_ns=None, pages_by_name=None,
+                      page_factories=None):
+        # Task #307 / A1-full: mirror real browser_measure_stage — materialise
+        # any lazy page (e.g. Compositions) by invoking its factory, so the
+        # deferred-finalize + content-gate path sees the live page (the real
+        # function does this at the page's loop iteration, after VERIFY).
+        materialised_keys = sorted(pages_by_name) if pages_by_name else None
+        if page_factories:
+            for pn, make in page_factories.items():
+                make()
+            if pages_by_name is not None:
+                materialised_keys = sorted(
+                    set(pages_by_name) | set(page_factories))
         calls.append({"stage_num": stage_num, "user": user,
-                      "pages_by_name_keys": (sorted(pages_by_name)
-                                             if pages_by_name else None)})
+                      "pages_by_name_keys": materialised_keys})
         if measure_raises is not None:
             raise measure_raises
         return {"stage": stage_num, "pages": {}}
 
     monkeypatch.setattr(phases.browser, "browser_measure_stage", _fake_measure)
     return calls
+
+
+def _stub_measure_materializing(stage_num):
+    """A `browser_measure_stage` stub that — like the real function under
+    Task #307 / A1-full — materialises any LAZY page by invoking its factory
+    at measure time. Tests whose content gate inspects the subject's deferred
+    Compositions page MUST use this (a bare no-op stub leaves the lazy slot's
+    page None → the gate would falsely see an empty/None page)."""
+    def _measure(page, *a, page_factories=None, **k):
+        if page_factories:
+            for _pn, make in page_factories.items():
+                make()
+        return {"stage": stage_num, "pages": {}}
+    return _measure
 
 
 def _recording_ctx(tmp_path, users=("admin",)):
@@ -780,43 +819,54 @@ def test_video_page_slug_maps_names():
 
 def test_open_stage_recording_pages_closes_context_on_new_page_failure(
         tmp_path, monkeypatch):
-    """Orphan-leak guard (architect nit): if new_page() raises AFTER the
-    recording context is created, that context MUST be closed — not leaked
-    (closing pw_browser later would otherwise strand an open recording
-    context). The other page still opens normally.
+    """Orphan-leak guard (architect nit) under Task #307 / A1-full: if the
+    EAGER (Dashboard) recording context's new_page() raises AFTER the context
+    is created, that context MUST be closed — not leaked. The Compositions slot
+    is LAZY (no new_page at open time) so it is unaffected and still returned.
+
+    New-structure note: `_open_stage_recording_pages` first logs in once on a
+    throwaway NON-recording context (record_video_dir=None) for storage_state
+    capture, then creates the Dashboard recording context (record_video_dir set)
+    eagerly. We key the flaky new_page on the RECORDING context (rvd set) so the
+    guard is exercised on the eager Dashboard context regardless of call order.
     """
-    created: list[_FakeRecordingCtx] = []
+    recording_ctxs: list[_FakeRecordingCtx] = []
 
     class _BrowserWithFlakyNewPage:
-        def __init__(self):
-            self._n = 0
-
         def new_context(self, **kwargs):
-            self._n += 1
-            c = _FakeRecordingCtx(Path(tmp_path) / f"raw-{self._n}.webm")
-            # First context's new_page raises AFTER context creation.
-            if self._n == 1:
-                def _boom():
-                    raise RuntimeError("new_page failed post-create")
-                c.new_page = _boom  # type: ignore[assignment]
-            created.append(c)
+            rvd = kwargs.get("record_video_dir")
+            if rvd is None:
+                # Throwaway login context: supports storage_state, never leaks.
+                return _FakeRecordingCtx(
+                    Path(tempfile.mkdtemp()) / "throwaway.webm")
+            c = _FakeRecordingCtx(Path(rvd) / f"raw-{len(recording_ctxs)}.webm")
+            # The eager Dashboard recording context's new_page raises.
+            def _boom():
+                raise RuntimeError("new_page failed post-create")
+            c.new_page = _boom  # type: ignore[assignment]
+            recording_ctxs.append(c)
             return c
 
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, **kw:
-                        pw.new_context(record_video_dir=record_video_dir))
+                        lambda pw, *, record_video_dir=None, storage_state=None,
+                        **kw: pw.new_context(record_video_dir=record_video_dir))
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
 
     pages = phases._open_stage_recording_pages(
         _BrowserWithFlakyNewPage(), tmp_path / "videos", "cyberjoker", "pw")
 
-    # The first (flaky) context was closed (orphan guard), not leaked.
-    assert created[0].closed is True, (
-        "context whose new_page() raised must be closed, not leaked")
-    # The second page opened fine → exactly one BROWSER_SCALING_PAGES entry
-    # survives (the non-flaky one).
-    assert len(pages) == len(phases.browser.BROWSER_SCALING_PAGES) - 1
+    # The eager (flaky) Dashboard recording context was closed, not leaked.
+    assert recording_ctxs and recording_ctxs[0].closed is True, (
+        "eager recording context whose new_page() raised must be closed")
+    assert "Dashboard" not in pages, (
+        "Dashboard slot must be dropped when its new_page() failed")
+    # The Compositions slot is LAZY (deferred) — still present, with a factory
+    # and no live page/ctx yet (its context is created later, in measure).
+    assert "Compositions" in pages, (
+        "lazy Compositions slot must survive an eager-Dashboard new_page failure")
+    assert pages["Compositions"].get("page") is None
+    assert callable(pages["Compositions"].get("make"))
 
 
 def test_measure_all_users_produces_both_pages_named_by_stage(
@@ -984,9 +1034,9 @@ def test_measure_all_users_non_recording_uses_single_page(tmp_path, monkeypatch)
 
     def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
                       token=None, user="admin", verify_against_cluster=True,
-                      deleted_ns=None, pages_by_name=None):
+                      deleted_ns=None, pages_by_name=None, page_factories=None):
         calls.append({"user": user, "pages_by_name": pages_by_name,
-                      "page": page})
+                      "page": page, "page_factories": page_factories})
         return {"stage": stage_num, "pages": {}}
 
     def _boom_ctx(*a, **k):
@@ -1105,13 +1155,14 @@ def test_recording_mode_s8_content_gate_true_against_live_page(
     _stub_s8_s9_cluster(monkeypatch, comps_in_ns=5)
     monkeypatch.setattr(phases, "_pick_visible_composition_names",
                         lambda ns, k=8: list(picked))
-    # browser_measure_stage no-op (returns clean result, 0 widget errors).
+    # browser_measure_stage stub: materialises the lazy Compositions page
+    # (Task #307 / A1-full) like the real function so the content gate reads it.
     monkeypatch.setattr(
         phases.browser, "browser_measure_stage",
-        lambda page, *a, **k: {"stage": 8, "pages": {}})
+        _stub_measure_materializing(8))
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, **kw:
-                        pw.new_context(record_video_dir=record_video_dir))
+                        lambda pw, *, record_video_dir=None, storage_state=None,
+                        **kw: pw.new_context(record_video_dir=record_video_dir))
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)
@@ -1165,10 +1216,10 @@ def test_recording_mode_s8_content_gate_false_when_no_card_renders(
                         lambda ns, k=8: list(picked))
     monkeypatch.setattr(
         phases.browser, "browser_measure_stage",
-        lambda page, *a, **k: {"stage": 8, "pages": {}})
+        _stub_measure_materializing(8))
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, **kw:
-                        pw.new_context(record_video_dir=record_video_dir))
+                        lambda pw, *, record_video_dir=None, storage_state=None,
+                        **kw: pw.new_context(record_video_dir=record_video_dir))
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)
@@ -1205,10 +1256,10 @@ def test_recording_mode_s9_detects_still_present_card_not_blind(
     _stub_s8_s9_cluster(monkeypatch)
     monkeypatch.setattr(
         phases.browser, "browser_measure_stage",
-        lambda page, *a, **k: {"stage": 9, "pages": {}})
+        _stub_measure_materializing(9))
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, **kw:
-                        pw.new_context(record_video_dir=record_video_dir))
+                        lambda pw, *, record_video_dir=None, storage_state=None,
+                        **kw: pw.new_context(record_video_dir=record_video_dir))
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)

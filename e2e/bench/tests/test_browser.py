@@ -1577,3 +1577,152 @@ def test_scroll_capture_excludes_chrome_nav_idiom(fake_page):
     sel = browser_mod._VIDEO_SCROLL_CHROME_EXCLUDE
     assert all(k in sel for k in ("nav", "sidebar", "menu", "sider")), (
         f"_VIDEO_SCROLL_CHROME_EXCLUDE missing exclusion classes: {sel!r}")
+
+
+# ─── Task #307 / A1-full falsifiers (F-A, F-B) + Defect 2 anchor (F-C) ──────
+
+
+def _stub_stage_verify(monkeypatch, count=42):
+    """Make browser_measure_stage's VERIFY poll match on the first iteration
+    and neutralise widget validation, so the stage runs cleanly through both
+    page iterations (Dashboard then Compositions)."""
+    _patch_cluster_count(monkeypatch, comp_count=count, ns_count=2)
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: count)
+    monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
+                        lambda page: count)
+    monkeypatch.setattr(browser_mod, "_validate_widget_terminal_state",
+                        lambda page, path, label, **kw: {"terminal_state": "pass"})
+
+
+def test_A1_compositions_page_goto_log_has_no_login_no_dashboard(
+        monkeypatch, tmp_path):
+    """Falsifier F-A (Task #307): with storage-state reuse + lazy creation,
+    the Compositions recording page's `goto_log` ends on `/compositions` and
+    contains NO `/login` and NO `/dashboard` entry — i.e. the login/dashboard
+    head is gone from the page that films the /compositions nav.
+
+    Pre-fix, that page was driven through `browser_login` (goto `/login` →
+    SPA redirect to dashboard) BEFORE its /compositions goto, so its goto_log
+    led with `/login`. Post-fix the recording context starts authenticated
+    (storage_state) and is created lazily, so its FIRST and only goto is
+    `/compositions`. This is the discriminating assertion (a plain FakePage
+    has no video timeline, so the duration property can't be unit-tested —
+    see the §6.2 artifact spot-check; this locks the structural invariant).
+    """
+    from tests.conftest import FakePage
+
+    _stub_stage_verify(monkeypatch)
+
+    dash_page = FakePage(call_count=16, ui_count=42)
+    comp_page = FakePage(call_count=30, ui_count=42)
+
+    # Lazy wiring: Compositions has no live page; a factory returns comp_page
+    # ONLY when invoked (mirrors _open_stage_recording_pages' deferred slot).
+    pages_by_name = {"Dashboard": dash_page, "Compositions": None}
+    page_factories = {"Compositions": lambda: comp_page}
+
+    browser_measure_stage(
+        dash_page, stage_num=6, stage_desc="S6 A1",
+        cache_mode="ON", token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+        pages_by_name=pages_by_name, page_factories=page_factories)
+
+    comp_gotos = [u for (u, _kw) in comp_page.goto_log]
+    assert comp_gotos, "Compositions page was never navigated (factory not run?)"
+    assert comp_page.url.endswith("/compositions"), (
+        f"Compositions page did not end on /compositions: {comp_page.url!r}")
+    assert comp_gotos[-1].endswith("/compositions"), (
+        f"Compositions page's last goto was not /compositions: {comp_gotos!r}")
+    assert not any("/login" in u for u in comp_gotos), (
+        f"Compositions recording page filmed a /login goto: {comp_gotos!r}")
+    assert not any(u.rstrip("/").endswith("/dashboard") for u in comp_gotos), (
+        f"Compositions recording page filmed a /dashboard goto: {comp_gotos!r}")
+
+
+def test_A1_compositions_context_created_after_dashboard_verify(
+        monkeypatch, tmp_path):
+    """Falsifier F-B (Task #307, A1-full): the Compositions recording context's
+    FIRST goto occurs AFTER the Dashboard VERIFY/convergence block completes.
+
+    We stamp a shared monotonic counter on every goto across both pages. The
+    Dashboard page's final goto (its end-of-VERIFY `/dashboard` reload) must be
+    stamped BEFORE the Compositions page's first goto. Equivalently, the factory
+    that creates the Compositions context must not have been invoked until the
+    Compositions loop iteration (after VERIFY). Pre-fix the Compositions context
+    existed from login time — its video clock ran throughout the VERIFY poll.
+    """
+    from tests.conftest import FakePage
+
+    _stub_stage_verify(monkeypatch)
+
+    order: list[tuple[str, str]] = []  # (page_tag, url) in invocation order
+
+    class StampedPage(FakePage):
+        def __init__(self, tag, **kw):
+            super().__init__(**kw)
+            self._tag = tag
+
+        def goto(self, url, **kwargs):
+            order.append((self._tag, url))
+            super().goto(url, **kwargs)
+
+    dash_page = StampedPage("dash", call_count=16, ui_count=42)
+    comp_page = StampedPage("comp", call_count=30, ui_count=42)
+
+    factory_calls = {"n": 0}
+
+    def _make_comp():
+        factory_calls["n"] += 1
+        return comp_page
+
+    browser_measure_stage(
+        dash_page, stage_num=6, stage_desc="S6 A1 order",
+        cache_mode="ON", token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+        pages_by_name={"Dashboard": dash_page, "Compositions": None},
+        page_factories={"Compositions": _make_comp})
+
+    # The factory ran exactly once (lazy, not eager).
+    assert factory_calls["n"] == 1, (
+        f"Compositions factory invoked {factory_calls['n']}x (expected 1, lazy)")
+    # Every dashboard goto precedes every compositions goto in invocation order.
+    last_dash_idx = max(i for i, (tag, _u) in enumerate(order) if tag == "dash")
+    first_comp_idx = min(i for i, (tag, _u) in enumerate(order) if tag == "comp")
+    assert last_dash_idx < first_comp_idx, (
+        "Compositions context's first goto did NOT occur strictly after the "
+        f"Dashboard VERIFY block; invocation order={order!r}")
+
+
+def test_D2_dashboard_final_hold_targets_compositions_not_first_chart(
+        monkeypatch, fake_page):
+    """Defect 2 anchor (Task #307): the dashboard scroll's FINAL hold must
+    anchor on the COMPOSITIONS section / page bottom — NOT re-centre the
+    first chart on the page (which is the Blueprints donut, leaving the
+    Compositions donut ~150px below frame).
+
+    Falsifier: the prior code's final-hold JS took the FIRST non-chrome chart
+    via a bare `break` on `querySelectorAll('canvas, .ant-table, ...')` with no
+    'Compositions' label anchor and no scrollHeight bottom fallback. The fix's
+    final-hold JS must (a) walk for the 'Compositions' label text, AND (b) fall
+    back to `document.body.scrollHeight` (page bottom) rather than the first
+    chart / scroll-top. We assert both markers are present in the dashboard
+    scroll JS and that the OLD top=0 fallback is gone.
+    """
+    _scroll_capture_for_video(fake_page, "/dashboard")
+    joined = "\n".join(fake_page.evaluate_log)
+    # (a) Compositions-label anchor present in the final-hold JS.
+    assert "'Compositions'" in joined or '"Compositions"' in joined, (
+        "dashboard final-hold JS has no 'Compositions' label anchor — it would "
+        f"centre the first (Blueprints) chart; log={fake_page.evaluate_log!r}")
+    # (b) page-bottom (scrollHeight) fallback present, NOT the old top:0 reset.
+    assert "scrollHeight" in joined, (
+        "dashboard final-hold JS lacks a scrollHeight (page-bottom) fallback")
+    # The old bug re-centred the first chart or reset to top:0; ensure the
+    # final-hold no longer resets to the page top as its miss-fallback.
+    assert "top: 0" not in joined and "top:0" not in joined, (
+        "dashboard scroll JS still resets to top:0 (the pre-fix miss-fallback "
+        f"that framed the Blueprints donut); log={fake_page.evaluate_log!r}")
