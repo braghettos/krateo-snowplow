@@ -1,0 +1,228 @@
+// snapshot_authz_memo.go — Ship L2 (0.30.253), Task #291.
+//
+// A process-wide, snapshot-GENERATION-scoped memo of EvaluateRBAC
+// verdicts, shared by ALL callers (the six per-item refilter/dispatch/
+// serve sites AND the identity-free perpetual refresher). It collapses
+// the dominant post-L1 cost: the O(candidate-CRB) walk in
+// evaluateAgainstInformerFirstMatch, which at 50K scale re-walks the
+// 17,929 same-subject ClusterRoleBindings on EVERY EvaluateRBAC call for
+// a verdict that is identical across thousands of repetitions within and
+// across refilter passes / refresher cycles (design §0/§3).
+//
+// WHY NOT extend request_authz_memo.go (RequestAuthzMemo): that memo is
+// per-/call-request, reborn every request and every refresher cycle, and
+// single-goroutine by design (request_authz_memo.go:103). It gives the
+// identity-free perpetual refresher nothing across cycles. L2 needs a
+// shared, generation-scoped, CONCURRENT memo. Per the design (§2) and PM
+// B2, RequestAuthzMemo is left UNTOUCHED; this is a sibling object that
+// lives in internal/rbac (not internal/cache) so it can read
+// *cache.RBACSnapshot.PublishSeq directly with no hook indirection
+// (design §4 placement note).
+//
+// CORRECTNESS — generation binding (design §3.3, PM B1):
+//   - The memo is a single atomic.Pointer[snapshotAuthzShard]; each shard
+//     carries the generation (snap.PublishSeq) it is valid for, its map,
+//     and an RWMutex.
+//   - On EVERY lookup the shard's gen is compared to the PublishSeq of
+//     the snapshot the caller ALREADY loaded (evaluate.go's `snap`). No
+//     second snapshot load, no TTL, no time-based invalidation (B1).
+//   - On gen mismatch the shard is stale: CAS a fresh empty shard stamped
+//     with the new gen into the pointer (lost CAS race => another
+//     goroutine already swapped; reload and use theirs). The whole-shard
+//     swap is the primary eviction — entries NEVER outlive their snapshot,
+//     so no stale verdict can ever be served across a republish.
+//
+// CONCURRENCY (design §7 / PM B2 / feedback_shared_vs_copy_is_a_concurrency_change):
+// unlike RequestAuthzMemo this shard is SHARED MUTABLE state hit by many
+// goroutines concurrently with snapshot republishes. The RWMutex guards
+// the map; the atomic.Pointer guards the shard swap. F2 (-race republish
+// hammer) is the hard gate on this file.
+//
+// CAPACITY (design §3.4 / PM B5 / feedback_capacity_caps_empirical_per_entry_cost):
+// cap is EMPIRICALLY derived (see /tmp/b5-authz-memo-cardinality-0.30.252.txt):
+// measured steady-state upper-bound cardinality ~6,300 keys/generation ×
+// safety-multiplier 2 -> rounded to 16,384 (2^14). On cap breach the memo
+// REFUSES to insert (the caller still gets the freshly-walked verdict —
+// it just isn't cached), degrading that key to today's walk behaviour.
+// Never evict-to-OOM.
+//
+// REMOVABILITY (project_caching_is_provisional / project_single_cache_flag_direction):
+// the memo lookup sits AFTER the cache=off short-circuit in EvaluateRBAC,
+// so CACHE_ENABLED=false never reaches it (cache=off is the SAR
+// correctness baseline and must never be memoised). No new flag.
+
+package rbac
+
+import (
+	"expvar"
+	"sync"
+	"sync/atomic"
+)
+
+// snapshotAuthzMemoCap is the per-generation entry cap. Derived
+// empirically in the B5 pre-coding measurement (artifact
+// /tmp/b5-authz-memo-cardinality-0.30.252.txt): measured upper-bound
+// cardinality ~6,300 × safety-multiplier 2 ≈ 12,600, rounded up to the
+// next power of two. NOT a design-time guess.
+const snapshotAuthzMemoCap = 16384
+
+// snapshotAuthzKey is the generic EvaluateOptions tuple plus the
+// generation and the SkipUID discriminator. NO SA/CRB special-case
+// (feedback_no_special_cases): the 17,929-CRB shape is never named here;
+// it collapses simply because the tuple repeats.
+//
+// Gen is the RBACSnapshot.PublishSeq the entry was computed against.
+// Gen-in-key is LOAD-BEARING (not mere defence-in-depth) during the
+// store-race window: if a concurrent store carrying an older Gen lands
+// in a shard that a faster goroutine has already CAS-advanced to a newer
+// Gen — or if the atomic pointer is transiently observed pointing at a
+// backwards generation under interleaving — the entry's Gen no longer
+// equals the looking-up generation, so the lookup MISSES and re-walks
+// rather than serving a wrong-generation verdict. The whole-shard swap
+// is the primary invalidation; Gen-in-key is what closes the swap's
+// race window so a transiently-backwards shard can never serve stale.
+type snapshotAuthzKey struct {
+	Gen        uint64
+	Username   string
+	GroupsHash uint64 // canonicalGroupsHash(opts.Groups) — groups_hash.go
+	Verb       string
+	Group      string
+	Resource   string
+	Namespace  string
+	Name       string
+	SkipUID    bool
+}
+
+// snapshotAuthzVerdict is the cached result — exactly EvaluateRBAC's
+// (allowed, matchedBindingUID) contract. Evaluator ERRORS are NOT cached
+// (the evaluator's own error path is fail-closed-per-call and transient;
+// caching an error would pin a transient failure for a whole generation).
+type snapshotAuthzVerdict struct {
+	Allowed           bool
+	MatchedBindingUID string
+}
+
+// snapshotAuthzShard is one generation's worth of memoised verdicts. The
+// shard is immutable in its `gen` field once published; only `m` mutates,
+// guarded by `mu`. A new generation gets a brand-new shard via CAS.
+type snapshotAuthzShard struct {
+	gen uint64
+	mu  sync.RWMutex
+	m   map[snapshotAuthzKey]snapshotAuthzVerdict
+}
+
+// snapshotAuthzMemo is the process-wide singleton. The atomic pointer is
+// swapped (CAS) on generation change; readers load it once per lookup.
+var snapshotAuthzMemo atomic.Pointer[snapshotAuthzShard]
+
+// authz memo expvar counters (design §3 / wiring item 5). Registered via
+// RegisterAuthzMemoExpvar (snapshot_authz_memo_expvar.go).
+var (
+	authzMemoHits    atomic.Uint64
+	authzMemoMisses  atomic.Uint64
+	authzMemoSwaps   atomic.Uint64
+	authzMemoRefused atomic.Uint64 // cap-breach refused inserts (F5 / B5)
+)
+
+// currentAuthzShard returns the shard valid for gen, swapping in a fresh
+// empty shard (CAS) if the live shard is absent or stale. The returned
+// shard is guaranteed to have shard.gen == gen.
+//
+// Lost-CAS handling: if another goroutine swapped concurrently we reload
+// and, if its gen matches, use it; otherwise (it swapped to a DIFFERENT
+// gen — only possible if a third republish raced) we retry. Bounded retry
+// loop — generations are monotone so it converges immediately in practice.
+func currentAuthzShard(gen uint64) *snapshotAuthzShard {
+	for {
+		cur := snapshotAuthzMemo.Load()
+		if cur != nil && cur.gen == gen {
+			return cur
+		}
+		fresh := &snapshotAuthzShard{
+			gen: gen,
+			m:   make(map[snapshotAuthzKey]snapshotAuthzVerdict, 64),
+		}
+		if snapshotAuthzMemo.CompareAndSwap(cur, fresh) {
+			authzMemoSwaps.Add(1)
+			return fresh
+		}
+		// Lost the race — re-evaluate the loaded pointer next iteration.
+	}
+}
+
+// authzMemoLookup returns (verdict, true) on a hit for the given
+// generation+key, or (_, false) on miss. It performs the generation
+// guard via currentAuthzShard and a read-locked map read. Pure read; no
+// store.
+func authzMemoLookup(gen uint64, key snapshotAuthzKey) (snapshotAuthzVerdict, bool) {
+	shard := currentAuthzShard(gen)
+	shard.mu.RLock()
+	v, ok := shard.m[key]
+	shard.mu.RUnlock()
+	if ok {
+		authzMemoHits.Add(1)
+	} else {
+		authzMemoMisses.Add(1)
+	}
+	return v, ok
+}
+
+// authzMemoStore records a freshly-computed verdict for the
+// generation+key. Refuses the insert (no-op, counted) when the shard is
+// already at the empirical cap — degrading that key to the walk on the
+// next lookup rather than risking unbounded growth (PM B5). A repeated
+// store of an existing key (idempotent overwrite) is always allowed so a
+// hot key never gets stuck refused after the map fills.
+func authzMemoStore(gen uint64, key snapshotAuthzKey, v snapshotAuthzVerdict) {
+	shard := currentAuthzShard(gen)
+	shard.mu.Lock()
+	if _, exists := shard.m[key]; !exists && len(shard.m) >= snapshotAuthzMemoCap {
+		shard.mu.Unlock()
+		authzMemoRefused.Add(1)
+		return
+	}
+	shard.m[key] = v
+	shard.mu.Unlock()
+}
+
+// authzMemoEntriesForExpvar returns the current shard's entry count for
+// the snowplow_authz_memo_entries expvar. Read-locked snapshot.
+func authzMemoEntriesForExpvar() int {
+	cur := snapshotAuthzMemo.Load()
+	if cur == nil {
+		return 0
+	}
+	cur.mu.RLock()
+	n := len(cur.m)
+	cur.mu.RUnlock()
+	return n
+}
+
+// ResetAuthzMemoForTest clears the memo singleton and all counters.
+// TEST-ONLY (evaltest F2/F3/F5) — production code MUST NOT call it.
+func ResetAuthzMemoForTest() {
+	snapshotAuthzMemo.Store(nil)
+	authzMemoHits.Store(0)
+	authzMemoMisses.Store(0)
+	authzMemoSwaps.Store(0)
+	authzMemoRefused.Store(0)
+}
+
+// AuthzMemoStatsForTest returns (hits, misses, swaps, refused, entries).
+// TEST-ONLY instrumentation for F5; mirrors the expvar values.
+func AuthzMemoStatsForTest() (hits, misses, swaps, refused uint64, entries int) {
+	return authzMemoHits.Load(), authzMemoMisses.Load(), authzMemoSwaps.Load(),
+		authzMemoRefused.Load(), authzMemoEntriesForExpvar()
+}
+
+// authzMemoExpvarFuncs is consumed by RegisterAuthzMemoExpvar; kept here
+// so the counters' wiring stays adjacent to their definitions.
+func authzMemoExpvarFuncs() map[string]expvar.Func {
+	return map[string]expvar.Func{
+		"snowplow_authz_memo_hits":    func() any { return authzMemoHits.Load() },
+		"snowplow_authz_memo_misses":  func() any { return authzMemoMisses.Load() },
+		"snowplow_authz_memo_swaps":   func() any { return authzMemoSwaps.Load() },
+		"snowplow_authz_memo_refused": func() any { return authzMemoRefused.Load() },
+		"snowplow_authz_memo_entries": func() any { return authzMemoEntriesForExpvar() },
+	}
+}

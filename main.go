@@ -27,6 +27,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateoplatformops/snowplow/internal/rbac"
 	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -794,6 +795,12 @@ func main() {
 	// under cache-off the value remains 0 and the bench's
 	// _wait_rbac_propagation_to_snowplow times out as expected.
 	cache.RegisterRBACSnapshotExpvar()
+	// Ship L2 (0.30.253) / Task #291 — register the snapshot authz memo
+	// counters (hits/misses/swaps/refused/entries) next to the publish-seq
+	// expvar, BEFORE the mux mount accepts scrapes, so the F1/F5 falsifiers
+	// can read hit-rate + entry count over /debug/vars. Cache mode-agnostic
+	// registration; the memo itself is only populated on the cache=on path.
+	rbac.RegisterAuthzMemoExpvar()
 	mux.Handle("GET /debug/vars", expvar.Handler())
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{

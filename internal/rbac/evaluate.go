@@ -216,12 +216,55 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, string, erro
 		return false, "", fmt.Errorf("rbac: snapshot not yet built")
 	}
 
+	// Ship L2 (0.30.253) — snapshot-generation authz memo. Sits AFTER the
+	// cache=off / nil-snap guards (cache=off is the SAR baseline and is
+	// NEVER memoised) and BEFORE the candidate walk. The generation we
+	// validate against is snap.PublishSeq — a plain field read on the
+	// snapshot pointer we ALREADY hold (no second snapshot load, no TTL;
+	// PM B1). A hit replaces the O(candidate-CRB) walk with one keyed map
+	// read; the whole-shard swap on a PublishSeq change is the only
+	// invalidation, so no stale verdict survives a republish (PM B1,
+	// design §3.3). SkipBindingUID is part of the key so a UID-consumer
+	// (SkipBindingUID=false) and a verdict-only consumer never share an
+	// entry — the UID-consumer's cached UID is the deterministic sorted
+	// first-match, identical to the cold walk (PM B6, design §3.1).
+	memoKey := snapshotAuthzKey{
+		Gen:        snap.PublishSeq,
+		Username:   opts.Username,
+		GroupsHash: canonicalGroupsHash(opts.Groups),
+		Verb:       opts.Verb,
+		Group:      opts.Group,
+		Resource:   opts.Resource,
+		Namespace:  opts.Namespace,
+		Name:       opts.Name,
+		SkipUID:    opts.SkipBindingUID,
+	}
+	if v, ok := authzMemoLookup(snap.PublishSeq, memoKey); ok {
+		log.Debug("rbac.evaluate",
+			slog.String("path", "in-process-memo-hit"),
+			slog.String("user", opts.Username),
+			slog.Bool("allowed", v.Allowed),
+			slog.String("matched_binding_uid", v.MatchedBindingUID),
+		)
+		return v.Allowed, v.MatchedBindingUID, nil
+	}
+
 	allowed, matchedBindingUID, err := evaluateAgainstInformerFirstMatch(ctx, snap, opts)
 	if err != nil {
 		log.Error("rbac.evaluate: informer evaluation failed",
 			slog.String("user", opts.Username), slog.Any("err", err))
 		return false, "", err
 	}
+
+	// Store the freshly-walked verdict for this generation. Evaluator
+	// errors are NOT cached (the err early-return above skips this). The
+	// store re-validates the generation internally (currentAuthzShard) so
+	// a republish that landed DURING the walk swaps the shard and this
+	// store lands in the new generation's shard — never poisoning the old.
+	authzMemoStore(snap.PublishSeq, memoKey, snapshotAuthzVerdict{
+		Allowed:           allowed,
+		MatchedBindingUID: matchedBindingUID,
+	})
 
 	log.Debug("rbac.evaluate",
 		slog.String("path", "in-process"),
