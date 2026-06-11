@@ -29,7 +29,10 @@
 //
 // INVARIANTS preserved from Path 3.2.2:
 //   - Mechanism unchanged — iterateApiRefPages is the same code path.
-//   - 500-page per-widget cap stays (phase1MaxApiRefPages).
+//   - Per-widget bound: the OPERATIVE terminator is the blueprint's
+//     `.slice.continue==false`; phase1MaxApiRefPages is the liveness
+//     backstop (raised to 20,000 in #156 / 0.30.256 so it does not
+//     truncate the real population — see its doc).
 //   - Data-driven predicate (isApiRefTemplateDriven on widget SHAPE);
 //     no hardcoded GVRs.
 //   - Bounded by parent ctx — cancellation on pod shutdown propagates
@@ -40,8 +43,13 @@
 // cells. The L1 refresher then exercises those cells every cycle. We
 // instrument paginationDrainTimeout deliberately bounded (5 min, same
 // shape as pipGlobalTimeout / 8 min) so a runaway apiRef cannot leak
-// goroutines past the bounded budget; the per-job 500-page cap further
-// bounds the work each apiRef widget can produce.
+// goroutines past the bounded budget; the per-job liveness backstop
+// (phase1MaxApiRefPages) further bounds the work each apiRef widget can
+// produce. #156 raises the backstop to cover the FULL declared list, so
+// the drain now Puts MORE cells of the SAME existing widgetContent class
+// (entry-count growth, not a new populate LAYER — the 0.30.185 distinction);
+// the per-page customer-priority yield below keeps that one-time growth off
+// the customer's latency budget.
 //
 // PRIOR ART: client-go has no equivalent — apiserver pagination is a
 // snowplow concern. The collect-then-drain pattern mirrors the PIP seed
@@ -226,8 +234,18 @@ func (c *apiRefPaginationCollector) count() int {
 // Concurrency: jobs run sequentially. Per-job parallelism would compound
 // the refresher-amplification risk (each apiRef widget materialises new
 // L1 cells the refresher then exercises) — serial drain keeps the
-// post-readiness CPU shape predictable. iterateApiRefPages' own
-// per-page work is bounded by its 500-page cap + .slice.continue halt.
+// post-readiness CPU shape predictable. iterateApiRefPages' own per-page
+// work is bounded by the blueprint's `.slice.continue` halt (the operative
+// terminator) + the phase1MaxApiRefPages liveness backstop.
+//
+// Customer priority (#156 / 0.30.256): each job is preceded by an
+// engineYieldCheckpoint so a customer /call arriving mid-drain defers the
+// drain at job granularity; the per-PAGE yield inside iterateApiRefPages
+// covers within-job bursts. Same cooperative yield + customerInFlight()
+// atomic the engine uses; NO shared budget
+// (feedback_customer_priority_over_refresher). Without this, raising the
+// page backstop would turn the drain into a long-running CPU consumer that
+// competes with customer /call for the whole window.
 //
 // Cancellation: parent ctx cancel propagates into iterateApiRefPages'
 // per-page ctx.Err() check (same path the inline 0.30.220 used). On pod
@@ -289,6 +307,14 @@ func drainApiRefPaginationJobs(
 			)
 			return
 		}
+		// P8 customer-priority yield (#156 / 0.30.256): step aside for any
+		// in-flight customer /call BEFORE starting the next job. The per-page
+		// yield inside iterateApiRefPages handles bursts arriving mid-job;
+		// this checkpoint handles bursts arriving between jobs. Fast no-op
+		// when no customer is in flight (prewarm_engine.go:436-438). Uses the
+		// drainCtx (SA-credentialed) so the yield observes the drain's own
+		// cancellation, symmetric with the loop's ctx.Err() guard.
+		engineYieldCheckpoint(drainCtx)
 		// Run the original 3.2.2 mechanism, unchanged. Returns no error
 		// (logs internally); a failure leaves the page-1 cell correct
 		// and proceeds to the next job.
