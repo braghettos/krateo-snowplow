@@ -12,7 +12,8 @@ mutation on a randomly chosen composition:
     T-1s   probe   (steady-state, pre-mutation)
     MUTATE         (kubectl patch — adds an annotation marker)
     T+50ms probe   (refresh-in-flight: cache MUST serve STALE)
-    T+5s   probe   (post-refresh: cache MUST carry the new marker)
+    T+10s  probe   (post-refresh: cache MUST carry the new marker;
+                    widened from 5s for the #318-R1a refresher rate-floor)
 
 Two independent sources confirm L1 hit/miss verdict per probe:
 
@@ -35,7 +36,7 @@ Output: JSON bundle at /tmp/snowplow-runs/<tag>/verify-serve-stale-<ts>.json
 plus an ANSI-coloured stdout summary that mirrors cli.py:_setup_logger.
 
 Exit codes:
-    0 — PASS (all probes hit; T-1s body == T+50ms body; T+5s carries
+    0 — PASS (all probes hit; T-1s body == T+50ms body; T+10s carries
         marker; miss_delta == 0; informer ACK'd)
     1 — INDETERMINATE (window slip / informer not ACK'd / kubectl logs
         unavailable / sources disagree / cache OFF)
@@ -679,15 +680,21 @@ def run_verify_serve_stale(user: str = "cyberjoker",
         f"... trace={tid_mid} (offset=+{actual_mid_offset_ms}ms, "
         f"informer={informer_ack})")
 
-    # ── T+5s probe ─────────────────────────────────────────────────────
-    post_target = t_mutate + 5.000
+    # ── T+10s probe (post-refresh) ──────────────────────────────────────
+    # #318-R1a PM-gate C2: was T+5s. The refresher rate-floor (default 2s,
+    # RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS) can defer the
+    # post-mutation re-resolve by up to floor + resolve time; a 5s window
+    # raced that and would spuriously FAIL a healthy floor. 10s clears
+    # floor(2s) + worst-case resolve with margin while staying far under
+    # the 30s convergence tier.
+    post_target = t_mutate + 10.000
     sleep_fn(max(0.0, post_target - time.monotonic()))
     actual_post_offset_ms = int((time.monotonic() - t_mutate) * 1000)
     post = probe_fn(target_path, token, tid_post)
     post["window"] = "post"
     post["offset_ms"] = actual_post_offset_ms
     post["marker_present"] = _marker_in_body(post["body_bytes"], marker)
-    log(f"T+5s probe   ... code={post['code']} body_sha={post['body_sha256'][:8]}"
+    log(f"T+10s probe  ... code={post['code']} body_sha={post['body_sha256'][:8]}"
         f"... trace={tid_post} (offset=+{actual_post_offset_ms}ms, "
         f"marker={'present' if post['marker_present'] else 'ABSENT'})")
 
