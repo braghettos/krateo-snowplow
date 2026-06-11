@@ -194,6 +194,21 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContext(ctx, cacheKey)
 	}
+	// Ship 0.30.257 (#313) Cache-A — request-path error-aware Put-gate.
+	// Install a stage-error sink on the resolve ctx (the SAME seam the
+	// background refresher uses at resolve_populate.go:206). The api
+	// resolver bumps it whenever it writes dict[errorKey] for a per-item
+	// hard error (resolve.go error branches — UNCHANGED by #313). After
+	// #313 a per-item iterator failure no longer truncates the result;
+	// the partial-with-errors body is SERVED (200) but MUST NOT be
+	// PERSISTED — caching a partial pins it for the TTL, so a transient
+	// item failure would self-heal far slower. The Put below is gated on
+	// sink.Count()==0 — exactly the 0.30.254 posture (never cache an
+	// under-served result), reusing the existing sink (prior-art-in-repo,
+	// no new mechanism). The request path installed NO sink before
+	// 0.30.257, so this is the first request-path consumer; the resolver's
+	// bump sites already existed.
+	ctx, stageErrSink := cache.WithStageErrorSink(ctx)
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -224,7 +239,21 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		response.InternalError(wri, err)
 		return
 	}
-	if cacheHandle != nil && cacheKey != "" {
+	// Ship 0.30.257 (#313) Cache-A — skip the Put on ANY per-item stage
+	// error. The body is already SERVED below (200 + all successful items +
+	// the accumulated per-item errors); we just decline to PERSIST a
+	// partial-with-errors result. Symmetric with the refresher Put-gate
+	// (resolve_populate.go:242) and the 0.30.254 "never cache an under-served
+	// result" posture. sink==nil is nil-receiver-safe (Count()==0). A clean
+	// resolve (Count()==0) caches exactly as before.
+	if stageErrSink.Count() > 0 {
+		log.Warn("RESTAction served with per-item stage error(s); declining to cache the partial result",
+			slog.String("name", cr.Name),
+			slog.String("namespace", cr.Namespace),
+			slog.Int64("stage_errors", stageErrSink.Count()),
+			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+		)
+	} else if cacheHandle != nil && cacheKey != "" {
 		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback
 		// Put site's cache key + components symmetrically with widgets.go.
 		emitDispatchCacheKeyDiag(log, "per_user_fallback_put", req.Context(),

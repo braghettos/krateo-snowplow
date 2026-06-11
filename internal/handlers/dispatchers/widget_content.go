@@ -251,6 +251,34 @@ func populateWidgetContentL1(
 		)
 		return
 	}
+	// Ship 0.30.257 (#313) Cache-A — error-aware Put-gate for the
+	// identity-free widget-content cell. The walker resolves the widget's
+	// apiRef RESTAction transitively; the api resolver bumps a stage-error
+	// sink installed on the resolve ctx (phase1_walk.go) whenever it writes
+	// dict[errorKey] for a per-item iterator hard error. After #313 a
+	// per-item failure no longer truncates the result — so without this gate
+	// a partial-with-errors SHELL could be Put into the identity-free cell
+	// and served (gated per-user) for the TTL. Symmetric with the refresher
+	// Put-gate (resolve_populate.go:242), the request-path RESTAction/widget
+	// gates (restactions.go / widgets.go), and the 0.30.254 "never cache an
+	// under-served result" posture. sink==nil (no sink threaded on this ctx
+	// — e.g. a caller that did not install one) is nil-receiver-safe
+	// (Count()==0) and Puts as before; recordWidgetDeps is ALSO skipped on
+	// the declined path — there is no entry to dep-track.
+	if sink := cache.StageErrorSinkFromContext(ctx); sink.Count() > 0 {
+		log.Debug("widget_content.populate.skip_stage_error",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", in.GetNamespace()),
+			slog.String("name", in.GetName()),
+			slog.Int("perPage", perPage),
+			slog.Int("page", page),
+			slog.Int64("stage_errors", sink.Count()),
+			slog.String("reason", "apiRef RESTAction resolved with per-item stage error(s) — partial-with-errors shell; not seeding identity-free cell (Cache-A)"),
+		)
+		return
+	}
+
 	c.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,

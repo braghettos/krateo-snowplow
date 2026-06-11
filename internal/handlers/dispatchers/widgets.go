@@ -215,6 +215,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		ctx = cache.WithL1KeyContext(ctx, cacheKey)
 	}
 
+	// Ship 0.30.257 (#313) Cache-A — request-path error-aware Put-gate
+	// (see restactions.go for the full rationale). A widget's apiRef
+	// RESTAction is resolved transitively under THIS ctx; the api resolver
+	// bumps the sink on any per-item iterator error. After #313 such a
+	// partial-with-errors widget envelope is SERVED but MUST NOT be cached
+	// in the per-cohort `widgets` L1 — gated on sink.Count()==0 below.
+	ctx, stageErrSink := cache.WithStageErrorSink(ctx)
+
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
 		RC:      r.saRC,
@@ -250,7 +258,17 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		response.InternalError(wri, err)
 		return
 	}
-	if cacheHandle != nil && cacheKey != "" {
+	// Ship 0.30.257 (#313) Cache-A — skip the Put on ANY per-item stage
+	// error (symmetric with restactions.go + the refresher gate). The
+	// partial-with-errors widget body is SERVED below; it is just not
+	// PERSISTED, so a transient apiRef-item failure self-heals on the next
+	// resolve instead of pinning a partial cell for the TTL.
+	if stageErrSink.Count() > 0 {
+		log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
+			slog.Int64("stage_errors", stageErrSink.Count()),
+			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+		)
+	} else if cacheHandle != nil && cacheKey != "" {
 		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback Put
 		// site's cache key + components so they can be diff'd against the
 		// dispatcher_get (above) and seed (phase1_pip_seed.go) emissions

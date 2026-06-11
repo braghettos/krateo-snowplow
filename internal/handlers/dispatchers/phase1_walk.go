@@ -1148,6 +1148,18 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	if wcKey != "" {
 		resolveCtx = cache.WithL1KeyContext(ctx, wcKey)
 	}
+	// Ship 0.30.257 (#313) Cache-A — install a stage-error sink on the
+	// resolve ctx so populateWidgetContentL1 (below) can decline to seed the
+	// identity-free widget-content cell with a partial-with-errors shell. The
+	// api resolver bumps this sink on any per-item iterator hard error; after
+	// #313 such an error no longer truncates the resolve, so the gate (not
+	// the truncation) is what keeps a partial out of the cache. The SAME
+	// resolveCtx flows into widgets.Resolve AND into populateWidgetContentL1
+	// so the post-resolve Count() reflects this widget's resolve. (The
+	// deferred-pagination walk's own populateWidgetContentL1 call site lives
+	// in phase1_walk_pagination*.go and is not wired here — its Put stays at
+	// the pre-0.30.257 posture, an unchanged-behaviour gap, not a regression.)
+	resolveCtx, _ = cache.WithStageErrorSink(resolveCtx)
 
 	// Resolve this widget. The resolver recursively reaches this widget's
 	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any
@@ -1206,7 +1218,12 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// Ship 0.30.187 D2: populateWidgetContentL1 uses the KEY tuple — the
 	// content L1 cell must match the dispatcher's serve-time lookup
 	// (which composes its key from paginationInfo's URL-derived tuple).
-	populateWidgetContentL1(ctx, gvr, in, keyPerPage, keyPage, res)
+	//
+	// Ship 0.30.257 (#313): pass resolveCtx (NOT the bare ctx) so the
+	// stage-error sink installed above — and bumped by this widget's
+	// apiRef RESTAction resolve — reaches populateWidgetContentL1's
+	// Cache-A gate. The bare ctx carries no sink; resolveCtx does.
+	populateWidgetContentL1(resolveCtx, gvr, in, keyPerPage, keyPage, res)
 
 	// Path 3.2.2.b (0.30.221) — DEFERRED apiRef pagination. Path 3.2.2
 	// (0.30.220) ran iterateApiRefPages INLINE here on the Phase 1

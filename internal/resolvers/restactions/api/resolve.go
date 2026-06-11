@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -143,6 +144,41 @@ type ResolveOptions struct {
 	// to the 0.30.115 path rather than mis-keying.
 	RESTActionNamespace string
 	RESTActionName      string
+}
+
+// accumulateErrorKey implements Ship 0.30.257 (#313) Option W-A: the shared
+// dict[errorKey] is an ACCUMULATING slice rather than last-wins, so an
+// iterator stage with K failing items surfaces ALL K errors (not just the
+// last). All iterator items of a stage share ONE errorKey (setup.go:59), so
+// the pre-0.30.257 `dict[errorKey] = value` clobbered earlier item errors —
+// the long-standing ContinueOnError=true last-wins bug (trace §1.2 / §2.3).
+//
+//   - absent          → []any{value}
+//   - already []any   → append(existing, value)
+//   - a non-slice     → []any{existing, value}  (defensive promotion: a prior
+//     scalar from any non-iterator path is preserved, never
+//     dropped)
+//
+// CONCURRENCY: `dict` is the shared serve map written by parallel iterator
+// workers; the caller MUST hold dictMu across this call (the three worker
+// error branches do — resolve.go error sites). The append is NOT internally
+// locked — keeping the lock at the call site mirrors the existing
+// dict[ErrorKey]-write pattern and keeps the whole error-record + (in the
+// httpcall branch) the asMap decision inside one critical section. Exercised
+// concurrently by TestResolve_IteratorErrorCollection_Race under -race.
+func accumulateErrorKey(dict map[string]any, key string, value any) {
+	existing, present := dict[key]
+	if !present {
+		dict[key] = []any{value}
+		return
+	}
+	if slice, ok := existing.([]any); ok {
+		dict[key] = append(slice, value)
+		return
+	}
+	// A present non-slice value (scalar/map from any path) — promote to a
+	// slice so neither the prior value nor the new one is silently dropped.
+	dict[key] = []any{existing, value}
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
@@ -294,6 +330,26 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// EndStage copy.
 				pipTimingSink.EndStage()
 			}
+		}
+
+		// Ship 0.30.257 (#313) — genuine-cancellation guard (design
+		// §2.1.1 Option C-A). The iterator errgroup no longer cancels
+		// gctx on a per-ITEM hard error (workers record into itemErrs and
+		// return nil — see the worker branches + post-g.Wait() join
+		// below), so the ONLY thing that aborts the resolve early is a
+		// GENUINE caller cancellation (client disconnect / deadline)
+		// propagating through the request ctx. We removed the WORKER as a
+		// cancellation SOURCE, not the parent-ctx machinery: a cancelled
+		// caller still cancels gctx (errgroup.WithContext derives gctx from
+		// ctx) so each in-flight dispatch fails fast, and THIS guard at the
+		// stage-loop top makes the cancellation abort downstream STAGES
+		// promptly instead of resolving them against a dead ctx. Cheap (one
+		// atomic load) and inert on the happy path.
+		if err := ctx.Err(); err != nil {
+			log.Debug("api.Resolve: caller context cancelled; aborting remaining stages",
+				slog.String("name", id), slog.Any("err", err))
+			recordStageTiming()
+			return dict
 		}
 
 		// Tag 0.30.9 Sub-scope A: detect userAccessFilter.
@@ -468,6 +524,19 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(iterParallelism(ctx))
 
+		// Ship 0.30.257 (#313) — per-item error slots (design §2.1 / §3.2).
+		// One slot per iterator item, index-aligned with tmp. Each worker
+		// writes ONLY its own itemErrs[i] (disjoint indices) and returns nil
+		// on a per-item hard error, so the errgroup ctx is never cancelled by
+		// a per-item failure → the remaining items proceed (Option C-A; the
+		// SetLimit bound is unchanged). The slice backing array is allocated
+		// HERE, before any g.Go, and never grown — disjoint-index writes to a
+		// pre-sized slice are data-race-free without a lock (same property as
+		// a pre-sized array; proven by TestResolve_IteratorErrorCollection_Race
+		// under -race). The shared dict[errorKey] accumulation (W-A) is a
+		// SEPARATE concern and stays under dictMu.
+		itemErrs := make([]error, len(tmp))
+
 		// Ship 0.30.192 — record iterator fan-out cost. tmp slice
 		// length is the call count (1 after cluster-list collapse,
 		// N per-NS after the iterator path); iterStart anchors the
@@ -625,21 +694,39 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								slog.String("dispatch", "in-process-nested-call"),
 								slog.String("error", nerr.Error()))
 							dictMu.Lock()
-							dict[call.ErrorKey] = nerr.Error()
+							// Ship 0.30.257 (#313) W-A: accumulate per-item
+							// errors under the shared errorKey (no last-wins).
+							accumulateErrorKey(dict, call.ErrorKey, nerr.Error())
 							dictMu.Unlock()
 							// Layer (b) backstop (0.30.120): record the stage
 							// error on the refresher's sink (nil on the
 							// request path) so the error-aware Put-gate still
 							// sees a nested-/call failure. #301: Bump captures
 							// stage name + err for the decline-log sample
-							// (nil-receiver-safe).
+							// (nil-receiver-safe). UNCHANGED by #313 — the
+							// refresher Put-gate (resolve_populate.go:242) and
+							// the request-path Cache-A guard both key on this
+							// Bump's Count(), so it MUST still fire.
 							stageErrSink.Bump(id, nerr.Error())
+							// Ship 0.30.257 (#313) Option C-A: a per-item hard
+							// error NO LONGER cancels gctx. Record it into this
+							// item's disjoint slot and return nil so the
+							// remaining iterator items proceed (the errgroup
+							// SetLimit bound is unchanged; only the per-item
+							// cancel is removed). The %w-wrapped cause is
+							// preserved — it now lands in itemErrs[i] (errors.Join
+							// at post-g.Wait() makes it errors.Is-inspectable)
+							// instead of g.Wait(). ContinueOnError no longer
+							// changes the control flow here: BOTH cases record +
+							// fall through (the historical ContinueOnError=false
+							// fast-abort is intentionally retired per the #313
+							// directive — iteration continues past per-item
+							// errors regardless).
 							if !call.ContinueOnError {
-								return fmt.Errorf("api %s failed: %w", id, nerr)
+								itemErrs[i] = fmt.Errorf("api %s item %d failed: %w", id, i, nerr)
 							}
-							// ContinueOnError: fall through to the success-log
-							// line, mirroring the httpcall.Do ContinueOnError
-							// contract.
+							// Fall through to the success-log line either way,
+							// mirroring the prior ContinueOnError contract.
 						} else {
 							// The in-process result IS the referenced
 							// RESTAction's Status.Raw — byte-identical to the
@@ -789,26 +876,30 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							slog.String("dispatch", "internal-rest-config"),
 							slog.String("error", ierr.Error()))
 						dictMu.Lock()
-						dict[call.ErrorKey] = ierr.Error()
+						// Ship 0.30.257 (#313) W-A: accumulate per-item errors
+						// under the shared errorKey (no last-wins).
+						accumulateErrorKey(dict, call.ErrorKey, ierr.Error())
 						dictMu.Unlock()
 						// Ship 0.30.120 layer (b): record the stage error on
 						// the refresher's sink (nil on the request path).
 						// #301: Bump captures stage name + err for the
-						// decline-log sample (nil-receiver-safe).
+						// decline-log sample (nil-receiver-safe). UNCHANGED by
+						// #313 — the refresher Put-gate + request-path Cache-A
+						// guard both key on this Bump's Count().
 						stageErrSink.Bump(id, ierr.Error())
+						// Ship 0.30.257 (#313) Option C-A: a per-item hard error
+						// no longer cancels gctx — record into the item's
+						// disjoint slot and fall through so remaining items
+						// proceed. The %w-wrapped cause moves from g.Wait() to
+						// itemErrs[i]. We STILL must NOT fall through to
+						// httpcall.Do here (the internal dispatcher OWNED this
+						// call; re-hitting plumbing's broken TLS path would mask
+						// the real error behind a second x509 failure) — the
+						// success-log line + return below covers both the error
+						// and the fed-bytes case.
 						if !call.ContinueOnError {
-							// Cancel gctx so in-flight peers short-circuit —
-							// same contract as the httpcall.Do StatusFailure
-							// hard-error branch below.
-							return fmt.Errorf("api %s failed: %w", id, ierr)
+							itemErrs[i] = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 						}
-						// ContinueOnError: the internal dispatcher OWNED this
-						// call (an internal *rest.Config is on the context).
-						// We must NOT fall through to httpcall.Do — that would
-						// re-hit the broken plumbing TLS path and mask the
-						// real error behind a second x509 failure. Emit the
-						// success-log line and return, mirroring the
-						// httpcall.Do ContinueOnError fall-through.
 					} else {
 						// internal-rest-config dispatch result is in memory
 						// — feed direct (Ship 0.30.128 P-CORE-1).
@@ -845,30 +936,38 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 
 					dictMu.Lock()
+					// Ship 0.30.257 (#313) W-A: accumulate per-item errors
+					// under the shared errorKey (no last-wins). The recorded
+					// VALUE is unchanged per item — the asMap (when AsMap
+					// succeeded) else the raw message string; W-A only changes
+					// the container scalar→accumulating-slice.
 					if len(asMap) > 0 {
-						dict[call.ErrorKey] = asMap
+						accumulateErrorKey(dict, call.ErrorKey, asMap)
 					} else {
-						dict[call.ErrorKey] = res.Message
+						accumulateErrorKey(dict, call.ErrorKey, res.Message)
 					}
 					dictMu.Unlock()
 					// Ship 0.30.120 layer (b): record the stage error on the
 					// refresher's sink (nil on the request path) — covers both
 					// the asMap and res.Message ErrorKey-write branches above.
 					// #301: Bump captures stage name + err for the decline-log
-					// sample (nil-receiver-safe).
+					// sample (nil-receiver-safe). UNCHANGED by #313 — the
+					// refresher Put-gate + request-path Cache-A guard both key
+					// on this Bump's Count().
 					stageErrSink.Bump(id, res.Message)
 
+					// Ship 0.30.257 (#313) Option C-A: a per-item hard error no
+					// longer cancels gctx — record it into this item's disjoint
+					// slot and fall through so the remaining iterator items
+					// proceed. res.Message is a string (not an error), so the
+					// item error wraps it with %s (mirrors the pre-0.30.257
+					// g.Wait()-returned shape); the error nonetheless aggregates
+					// via errors.Join at post-g.Wait().
 					if !call.ContinueOnError {
-						// Returning a non-nil error cancels gctx so
-						// in-flight peers short-circuit; g.Wait() picks
-						// up the first such error. dict already carries
-						// call.ErrorKey from the lock-protected write
-						// above, matching the pre-0.30.95 sequential
-						// early-return contract.
-						return fmt.Errorf("api %s failed: %s", id, res.Message)
+						itemErrs[i] = fmt.Errorf("api %s item %d failed: %s", id, i, res.Message)
 					}
-					// ContinueOnError: fall through to the success-log
-					// line (preserves pre-0.30.95 behaviour where the
+					// Fall through to the success-log line (preserves
+					// pre-0.30.95 behaviour where the
 					// "successfully resolved" line emitted on every
 					// non-hard-error call).
 				}
@@ -888,6 +987,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			})
 		}
 
+		// Ship 0.30.257 (#313) — post-fan-out handling. With Option C-A
+		// the three per-ITEM hard-error branches record into itemErrs[i]
+		// and return nil, so g.Wait() NO LONGER returns non-nil for a
+		// per-item dispatch failure (the stage runs all items + downstream
+		// stages run — the central #313 behaviour change). g.Wait() can
+		// still return non-nil for a NON-per-item worker error: a response
+		// HANDLER failure (feedBytes / feedValue / inner returning a decode
+		// error — NOT in #313's scope) or a genuine ctx-cancellation
+		// surfacing through such a handler. For THOSE we preserve the
+		// pre-0.30.257 short-circuit + truncated-dict return verbatim.
 		if err := g.Wait(); err != nil {
 			log.Debug("api stage short-circuited on hard error",
 				slog.String("name", id), slog.Any("err", err))
@@ -896,6 +1005,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			return dict
 		}
 		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
+
+		// Ship 0.30.257 (#313) — per-item errors recorded by the worker
+		// branches above do NOT cancel the stage; they were collected into
+		// itemErrs (disjoint indices) and the matching dict[errorKey]
+		// accumulating-slice entries (W-A) already carry them on the wire.
+		// errors.Join folds them into a single errors.Is-inspectable
+		// aggregate (preserving the %w wraps the worker branches set) for a
+		// Debug diagnostic line ONLY — api.Resolve still returns a map, never
+		// an error (trace §2.2). The wire result is "all successful items +
+		// the accumulated per-item errors under errorKey". The refresher /
+		// request-path Cache-A guards (keyed on stageErrSink.Count(), bumped
+		// above) decide whether the partial-with-errors result is PERSISTED.
+		if joined := errors.Join(itemErrs...); joined != nil {
+			log.Debug("api stage had per-item errors (continuing)",
+				slog.String("name", id), slog.Any("err", joined))
+		}
 
 		// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
 		// applyUserAccessFilter call was DELETED; UAF now runs per-worker

@@ -127,11 +127,11 @@ func nestedResolveJWTLess(t *testing.T, stage *templates.API) map[string]any {
 // on the nested result, so the in-process path MUST deliver that
 // envelope, not the bare status.
 //
-//   * PRE-FIX (0.30.123, return res.Status.Raw): ResolveNestedCall
+//   - PRE-FIX (0.30.123, return res.Status.Raw): ResolveNestedCall
 //     returns the BARE array `[{"ns":"team-a"},...]`. The envelope keys
 //     kind/spec are absent, .status would fail on an array — the empty-
 //     result defect. This test FAILS on the pre-fix code.
-//   * POST-FIX (0.30.124, return encodeResolvedJSON(res)): ResolveNestedCall
+//   - POST-FIX (0.30.124, return encodeResolvedJSON(res)): ResolveNestedCall
 //     returns the full envelope; kind/spec/status are all present and the
 //     array sits under .status. This test PASSES.
 func TestF1_NestedCall_ReturnsFullEnvelope(t *testing.T) {
@@ -263,10 +263,34 @@ func TestF4F6_NestedCall_DepthLimitBoundedError(t *testing.T) {
 		t.Fatalf("F4/F6: depth-limit hit produced NO error key — a recursion cap "+
 			"that yields silent empty content is a masked failure; dict=%#v", dict)
 	}
-	if s, _ := errVal.(string); !strings.Contains(s, "depth limit exceeded") {
+	// Ship 0.30.257 (#313) Option W-A: dict[errorKey] is now an ACCUMULATING
+	// SLICE (scalar→[]any), not last-wins. The F4/F6 INTENT is unchanged —
+	// the depth-limit cap is surfaced AS an error, never a silent empty — so
+	// the assertion is updated to read the (single) error out of the W-A
+	// slice. A bare-string value (the pre-0.30.257 shape) is still accepted
+	// for forward-compat in case this site is ever reached via a non-iterator
+	// path that did not promote.
+	if !errKeyContains(errVal, "depth limit exceeded") {
 		t.Fatalf("F4/F6: depth-limit error key = %#v; want a `depth limit exceeded` "+
-			"message rendered AS an error", errVal)
+			"message rendered AS an error (W-A: as the element of an accumulating slice)", errVal)
 	}
+}
+
+// errKeyContains reports whether a resolved dict[errorKey] value carries
+// substr — handling BOTH the Ship 0.30.257 W-A accumulating-slice shape
+// (`[]any{"<msg>"}`) and a bare string (the pre-0.30.257 scalar shape).
+func errKeyContains(errVal any, substr string) bool {
+	switch v := errVal.(type) {
+	case string:
+		return strings.Contains(v, substr)
+	case []any:
+		for _, e := range v {
+			if s, ok := e.(string); ok && strings.Contains(s, substr) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestF4_RealResolveNestedCall_DepthCap drives the REAL ResolveNestedCall
@@ -475,6 +499,7 @@ func newNestedCallWatcherWithInner(t *testing.T, ns, name string,
 //   - if the GET somehow succeeded, ResolveNestedCall's own
 //     checkDispatchRBAC (the load-bearing in-process RBAC gate) denies
 //     with an explicit "forbidden" error.
+//
 // Either way the contract holds: a denied nested /call is an error with
 // nil bytes — never silent empty content.
 func TestF5_NestedCall_DeniedDispatchIsErrorNotEmpty(t *testing.T) {
@@ -527,8 +552,8 @@ func TestF5_RealCheckDispatchRBAC_DeniesUnauthorized(t *testing.T) {
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "denied-user"}),
 	)
 	if checkDispatchRBAC(deniedCtx, nestedCallInnerGVR, ns) {
-		t.Fatalf("F5: checkDispatchRBAC ALLOWED an identity with no `get` grant — "+
-			"the in-process nested /call RBAC gate is the single load-bearing "+
+		t.Fatalf("F5: checkDispatchRBAC ALLOWED an identity with no `get` grant — " +
+			"the in-process nested /call RBAC gate is the single load-bearing " +
 			"correctness line and must deny")
 	}
 	authedCtx := xcontext.BuildContext(context.Background(),
@@ -570,7 +595,7 @@ func TestF3_NestedCall_AuthorizedResolveNonEmpty(t *testing.T) {
 		t.Fatalf("F3: authorized nested /call must resolve cleanly, got error: %v", err)
 	}
 	if len(raw) == 0 {
-		t.Fatalf("F3: authorized nested /call produced EMPTY content — the F2-unblock "+
+		t.Fatalf("F3: authorized nested /call produced EMPTY content — the F2-unblock " +
 			"property requires real non-empty content, not a skip-to-TTL")
 	}
 	// Ship 0.30.124 content-shape contract: the result MUST be the full
