@@ -62,6 +62,7 @@ func fakeApiRefPaginationJob(ns, name string) apiRefPaginationJob {
 		Depth:      1,
 		PerPage:    5,
 		KeyPerPage: -1,
+		KeyPage:    -1,
 		AuthnNS:    "krateo-system",
 	}
 }

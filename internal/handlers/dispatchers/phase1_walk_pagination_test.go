@@ -361,6 +361,7 @@ func runIterateApiRefPagesForTest(t *testing.T, ctx context.Context) string {
 		1,                 // depth
 		5,                 // perPage
 		5,                 // keyPerPage
+		5,                 // keyPage (Task #318 Step 1 — page-1 KEY page)
 		"test-authn-ns",
 	)
 	return buf.String()

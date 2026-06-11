@@ -248,6 +248,41 @@ func resolverWantsContinue(res *unstructured.Unstructured) bool {
 	return cont
 }
 
+// drainKeyPageFor derives the dispatcher-lookup KEY page for a drain page,
+// given page-1's KEY page (keyPage, captured at collect time via
+// deriveSeedKeyTuple) and the drain's RESOLUTION page (page = 2, 3, …).
+// Task #318 Step 1.
+//
+// The KEY page is decoupled from the RESOLUTION page (Ship 0.30.187 D2): the
+// resolution page advances the apiRef RA's slice; the KEY page must match what
+// the dispatcher's paginationInfo (helpers.go:53-79) returns at serve time for
+// the request that fetches the SAME deep page. Two cases, no widget/GVR
+// special-case (the discriminant is the captured KEY tuple, not the resource):
+//
+//   - keyPage <= 0 (page-1 reached with NO declared slice — the root datagrid
+//     keys at (-1, -1)): the frontend's deep-page request carries ?page=N, so
+//     paginationInfo returns page=N. The drain's resolution page IS that N, so
+//     the KEY page == the resolution page.
+//   - keyPage >= 1 (page-1 reached at a declared ?page=K&perPage=M slice): the
+//     drain advances from the declared start, so the KEY page advances from K
+//     in lockstep with the resolution page (which starts at 2 for the first
+//     EXTRA page after page-1): keyPage + (page - 1).
+//
+// BOTH the WithL1KeyContext install (:403) and the populateWidgetContentL1 Put
+// (:446) call this with the SAME (keyPage, page) so they hash to one cell —
+// closing the AC-G.5 detached-entry defect the pre-#318 split re-introduced.
+func drainKeyPageFor(keyPage, page int) int {
+	if keyPage <= 0 {
+		// No declared slice on page-1 (root). The serve-time KEY page for the
+		// deep page is the resolution page (the frontend sends ?page=<page>).
+		return page
+	}
+	// Declared slice starting at page keyPage. The drain's first EXTRA page
+	// (resolution page 2) is the page AFTER the declared start, so advance
+	// keyPage by (page-1).
+	return keyPage + (page - 1)
+}
+
 // iterateApiRefPages — Path 3.2.2 (0.30.220) — drives apiRef pagination
 // AFTER the existing page-1 walk has resolved + populated. Inputs:
 //
@@ -277,6 +312,15 @@ func resolverWantsContinue(res *unstructured.Unstructured) bool {
 //     to `populateWidgetContentL1` so each page's seed
 //     cell matches the dispatcher's serve-time lookup
 //     for the SAME page.
+//   - keyPage       — page-1's KEY page tuple (Task #318 Step 1). The
+//     per-page KEY page is derived from this base via
+//     drainKeyPageFor(keyPage, page) so the page cell's
+//     two key sites (the WithL1KeyContext install and the
+//     populateWidgetContentL1 Put) hash to the SAME cell
+//     AND follow deriveSeedKeyTuple semantics — instead
+//     of the pre-#318 split where the install used the raw
+//     loop counter and the Put used the RESOLUTION perPage
+//     (the AC-G.5 detached-entry defect for the page cell).
 //   - authnNS       — the authn namespace; threaded to widgets.Resolve.
 //
 // Returns no error: any pagination failure is logged and stops the
@@ -296,6 +340,7 @@ func iterateApiRefPages(
 	depth int,
 	perPage int,
 	keyPerPage int,
+	keyPage int,
 	authnNS string,
 ) {
 	if in == nil || page1Res == nil || w == nil {
@@ -397,14 +442,35 @@ func iterateApiRefPages(
 
 		// Install the widgetContent L1 key on the resolveCtx (Ship G
 		// AC-G.5 — see phase1_walk.go:910-931 for the rationale). The
-		// key tuple uses (keyPerPage, page) — symmetric with the
-		// page-1 site, decoupled from the resolution tuple per Ship
-		// 0.30.187 D2.
-		wcKey, _ := widgetContentL1Key(gvr, ns, name, keyPerPage, page)
+		// page cell's KEY tuple is (keyPerPage, keyPageForThisPage) —
+		// decoupled from the RESOLUTION (perPage, page) per Ship
+		// 0.30.187 D2 and symmetric with the page-1 site
+		// (phase1_walk.go:1146). keyPageForThisPage advances page-1's
+		// KEY page (keyPage) in lockstep with the drain's resolution
+		// page so each deep page lands in its OWN cell while staying on
+		// the deriveSeedKeyTuple model.
+		//
+		// Task #318 Step 1: pre-#318 this site used the RESOLUTION-loop
+		// counter `page` as the KEY page and the Put at :446 used the
+		// RESOLUTION `perPage` — so the two key sites disagreed (the
+		// AC-G.5 detached-entry defect for the page cell). Both sites now
+		// compute keyPageForThisPage + keyPerPage identically.
+		keyPageForThisPage := drainKeyPageFor(keyPage, page)
+		wcKey, _ := widgetContentL1Key(gvr, ns, name, keyPerPage, keyPageForThisPage)
 		resolveCtx := ctx
 		if wcKey != "" {
 			resolveCtx = cache.WithL1KeyContext(resolveCtx, wcKey)
 		}
+		// Task #318 Step 1 — Cache-A sink parity. Install a stage-error
+		// sink on the resolve ctx so the populate below (passed resolveCtx,
+		// NOT the bare ctx) can decline to seed a partial-with-errors shell
+		// for the recursed leaf-CHILD cells (the drain's only serveable
+		// value, design §1d) — symmetric with the page-1 site
+		// (phase1_walk.go:1162/1226), the request paths (widgets.go,
+		// restactions.go), and the refresher (resolve_populate.go). For the
+		// RBAC-sensitive datagrid PAGE cell the gate is moot (the Put is
+		// already declined upstream at widget_content.go:213) but harmless.
+		resolveCtx, _ = cache.WithStageErrorSink(resolveCtx)
 
 		res, err := paginationResolvePageFn(resolveCtx, widgets.ResolveOptions{
 			In:      got.Unstructured,
@@ -443,7 +509,14 @@ func iterateApiRefPages(
 		// sensitive + empty-shell guards (already enforced for page 1)
 		// — for page N these are the same conditions, so behaviour is
 		// uniform.
-		populateWidgetContentL1(ctx, gvr, got.Unstructured, perPage, page, res)
+		//
+		// Task #318 Step 1: pass the KEY tuple (keyPerPage,
+		// keyPageForThisPage) — BYTE-IDENTICAL to the :403 install key
+		// above — NOT the RESOLUTION (perPage, page); and pass resolveCtx
+		// (which carries the stage-error sink + the L1 key) NOT the bare
+		// ctx, so the Cache-A gate inside populateWidgetContentL1 sees this
+		// resolve's sink (parity with phase1_walk.go:1226).
+		populateWidgetContentL1(resolveCtx, gvr, got.Unstructured, keyPerPage, keyPageForThisPage, res)
 		pagesWalked++
 
 		// Recurse into the children this page produced. Honours the

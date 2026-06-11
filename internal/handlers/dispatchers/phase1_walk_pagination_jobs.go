@@ -65,6 +65,8 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
+	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -123,6 +125,19 @@ type apiRefPaginationJob struct {
 	// dispatcher's serve-time lookup.
 	KeyPerPage int
 
+	// KeyPage is page-1's dispatcher-lookup KEY page tuple (Ship
+	// 0.30.187 D2; Task #318 Step 1). Decoupled from the RESOLUTION
+	// page the drain advances. Captured at collect time from the SAME
+	// deriveSeedKeyTuple the page-1 walk used (phase1_walk.go's
+	// keyPage), so the drain can reconstruct page-1's KEY tuple instead
+	// of substituting the raw loop counter. The per-page KEY page for a
+	// drain page is derived from this base via drainKeyPageFor — see
+	// phase1_walk_pagination.go. Pre-#318 the job carried only
+	// KeyPerPage, so the drain's :403 install and :446 Put disagreed on
+	// the key tuple (the AC-G.5 detached-entry defect re-introduced for
+	// the page cell).
+	KeyPage int
+
 	// AuthnNS is the authn namespace — threaded to widgets.Resolve.
 	AuthnNS string
 }
@@ -150,11 +165,30 @@ func (j apiRefPaginationJob) jobKey() string {
 type apiRefPaginationCollector struct {
 	mu   sync.Mutex
 	jobs map[string]apiRefPaginationJob
+
+	// pendingRecollect holds the COLLECTION-ROBUSTNESS candidates (Task
+	// #318 Step 1, design option (c)): widgets the walk reached that ARE
+	// eligible (isApiRefTemplateDriven) but whose page-1 resolve did NOT
+	// signal continuation. On a healthy boot this is empty; on a POST-STORM
+	// boot the datagrid's page-1 resolve can see a transiently short/empty
+	// apiRef RA (the same data-availability window the empty-shell guard
+	// defends) → no continuation → the job is (correctly) NOT collected.
+	// Pre-#318 that condition was SILENT — the page-2..N coverage dropped to
+	// literally zero with no signal. We record the candidate here so the
+	// post-MarkPhase1Done drain can re-resolve page-1 after the informer
+	// settles (recollectPendingApiRefPaginationJobs) and, if continuation now
+	// fires, collect the job. Keyed by jobKey so duplicate eligible-no-continue
+	// observations across roots coalesce. A candidate that later collects
+	// normally (a second walk reached it with continuation) is removed.
+	pendingRecollect map[string]apiRefPaginationJob
 }
 
 // newApiRefPaginationCollector returns an empty collector.
 func newApiRefPaginationCollector() *apiRefPaginationCollector {
-	return &apiRefPaginationCollector{jobs: map[string]apiRefPaginationJob{}}
+	return &apiRefPaginationCollector{
+		jobs:             map[string]apiRefPaginationJob{},
+		pendingRecollect: map[string]apiRefPaginationJob{},
+	}
 }
 
 // collectApiRefPaginationJob appends j to the collector iff the page-1
@@ -174,11 +208,32 @@ func (c *apiRefPaginationCollector) collect(j apiRefPaginationJob) {
 	if !isApiRefTemplateDriven(j.Page1Res.Object) {
 		return
 	}
-	if !resolverWantsContinue(j.Page1Res) {
-		return
-	}
 	key := j.jobKey()
 	if key == "" {
+		return
+	}
+	if !resolverWantsContinue(j.Page1Res) {
+		// COLLECTION ROBUSTNESS (Task #318 Step 1, design option (c)): the
+		// widget IS eligible (apiRef+template) but page-1 produced NO
+		// continuation. On a healthy boot this is the normal end-of-list and
+		// nothing more is needed. On a POST-STORM boot it can be a transiently
+		// short/empty apiRef RA → the page-2..N coverage would silently drop to
+		// zero. Record the candidate (keyed by jobKey, so cross-root duplicates
+		// coalesce) + bump the observable counter so the drain can re-resolve
+		// page-1 after the informer settles. NOT collected as a job — page-1
+		// genuinely said "no more" at walk time; only a retry that NOW sees
+		// continuation produces a job (recollectPendingApiRefPaginationJobs).
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if _, alreadyJob := c.jobs[key]; alreadyJob {
+			// A continuing observation already collected this widget — the
+			// eligible-no-continue observation is stale, ignore it.
+			return
+		}
+		if _, seen := c.pendingRecollect[key]; !seen {
+			c.pendingRecollect[key] = j
+			bumpPrewarmEligibleNoContinue()
+		}
 		return
 	}
 	c.mu.Lock()
@@ -191,6 +246,10 @@ func (c *apiRefPaginationCollector) collect(j apiRefPaginationJob) {
 		return
 	}
 	c.jobs[key] = j
+	// A continuing observation supersedes any earlier eligible-no-continue
+	// candidate for the same widget — drop it so the drain does not also
+	// re-collect a widget already queued for the normal drain.
+	delete(c.pendingRecollect, key)
 }
 
 // drain returns a snapshot of the collected jobs and clears the
@@ -222,6 +281,41 @@ func (c *apiRefPaginationCollector) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.jobs)
+}
+
+// pendingRecollectCount returns the number of eligible-but-no-continuation
+// candidates currently queued for re-collection (Task #318 Step 1). Used by
+// recollectPendingApiRefPaginationJobs' logger and by tests. Nil-safe.
+func (c *apiRefPaginationCollector) pendingRecollectCount() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pendingRecollect)
+}
+
+// drainPendingRecollect returns a snapshot of the eligible-but-no-continuation
+// candidates and clears them. Symmetric with drain(): the snapshot is what the
+// re-collection pass retries; clearing makes the pass one-shot (a candidate
+// that retries successfully collects a job; one that still has no continuation
+// is dropped — items beyond page 1 fall back to the per-user serve path, the
+// same posture as a widget that legitimately ends at page 1). Nil-safe.
+func (c *apiRefPaginationCollector) drainPendingRecollect() []apiRefPaginationJob {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pendingRecollect) == 0 {
+		return nil
+	}
+	out := make([]apiRefPaginationJob, 0, len(c.pendingRecollect))
+	for _, j := range c.pendingRecollect {
+		out = append(out, j)
+	}
+	c.pendingRecollect = map[string]apiRefPaginationJob{}
+	return out
 }
 
 // drainApiRefPaginationJobs runs the deferred pagination AFTER
@@ -343,6 +437,7 @@ func drainApiRefPaginationJobs(
 			j.Depth,
 			j.PerPage,
 			j.KeyPerPage,
+			j.KeyPage,
 			j.AuthnNS,
 		)
 		completed++
@@ -353,5 +448,169 @@ func drainApiRefPaginationJobs(
 		slog.String("phase", "post_phase1_done"),
 		slog.Int("jobs_completed", completed),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+	)
+}
+
+// paginationRecollectDelay is the informer-settle wait before the
+// re-collection pass re-resolves page-1 for the eligible-but-no-continuation
+// candidates (Task #318 Step 1). The post-storm zero-collection trigger is a
+// transiently short/empty apiRef RA at boot; the wait lets the informer catch
+// up before the retry. Bounded + ctx-cancellable (the wait short-circuits on
+// drain ctx cancel). Code-time constant per Diego's "no new env vars / flags"
+// mandate; a package var (not const) ONLY so the unit falsifier can set it to 0
+// (recollectDelayForTest) — production never mutates it.
+var paginationRecollectDelay = 15 * time.Second
+
+// recollectDelayForTest overrides paginationRecollectDelay for unit tests so
+// the re-collection falsifier does not wait the production settle window.
+// Production code MUST NOT call this.
+func recollectDelayForTest(d time.Duration) (restore func()) {
+	prev := paginationRecollectDelay
+	paginationRecollectDelay = d
+	return func() { paginationRecollectDelay = prev }
+}
+
+// recollectPendingApiRefPaginationJobs is the COLLECTION-ROBUSTNESS retry
+// (Task #318 Step 1, design option (c)). It composes with the post-MarkPhase1Done
+// drain goroutine — it is NOT a new loop and spawns NO goroutine of its own.
+//
+// For each eligible-but-no-continuation candidate the walk recorded (a widget
+// that IS apiRef+template-driven but whose page-1 resolve produced no
+// continuation — the post-storm short/empty-list window), it waits an
+// informer-settle delay then re-resolves PAGE 1 through the SAME
+// paginationFetchPageFn / paginationResolvePageFn seams the drain uses. If the
+// settled re-resolve NOW signals continuation, it hands the job back to
+// collector.collect (idempotent — dedup by jobKey + the same shape predicates),
+// so the caller's subsequent collector.drain() picks it up. A candidate that
+// STILL has no continuation is dropped (drainPendingRecollect cleared it) —
+// items beyond page 1 fall back to the per-user serve-time path, the same
+// posture as a widget that legitimately ends at page 1.
+//
+// Bounded + log-only + ctx-aware, exactly like the drain:
+//   - the settle wait short-circuits on ctx cancel;
+//   - a per-candidate engineYieldCheckpoint keeps the retry off the customer's
+//     latency budget (feedback_customer_priority_over_refresher);
+//   - a fetch/resolve failure on one candidate is logged and the pass moves on.
+//
+// saRC is the SA *rest.Config the re-resolve passes into
+// widgets.ResolveOptions.RC. It MUST be non-nil in production for the SAME
+// reason the drain threads w.rc (phase1_walker_new.go): a nil rc 500s in
+// crdschema.ValidateObjectStatus → cache.GVRFor → discoverPluralInfo
+// ("plurals discovery: nil *rest.Config") — the nil-rc class behind six HARD
+// REVERTs (0.30.226→231). The launcher passes the same SA rc the drain uses.
+// Unit tests swap paginationResolvePageFn so they pass nil safely (the fake
+// seam ignores opts.RC).
+//
+// nil-collector / no-candidate => fast no-op (matches the empty-drain posture).
+func recollectPendingApiRefPaginationJobs(ctx context.Context, c *apiRefPaginationCollector, saRC *rest.Config) {
+	if c == nil {
+		return
+	}
+	log := xcontext.Logger(ctx)
+	if log == nil {
+		log = slog.Default()
+	}
+
+	candidates := c.drainPendingRecollect()
+	if len(candidates) == 0 {
+		return
+	}
+
+	log.Info("phase1.pagination_recollect.start",
+		slog.String("subsystem", "cache"),
+		slog.String("phase", "post_phase1_done"),
+		slog.Int("candidates", len(candidates)),
+		slog.String("settle_delay", paginationRecollectDelay.String()),
+	)
+
+	// Informer-settle wait — bounded, ctx-cancellable. The post-storm trigger
+	// is data-availability lag; the delay lets the apiRef RA's informer catch
+	// up before the retry. Skipped when the delay is non-positive (unit tests).
+	if paginationRecollectDelay > 0 {
+		t := time.NewTimer(paginationRecollectDelay)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			log.Warn("phase1.pagination_recollect.ctx_cancel_during_settle",
+				slog.String("subsystem", "cache"),
+				slog.Int("candidates", len(candidates)),
+				slog.Any("err", ctx.Err()),
+			)
+			return
+		case <-t.C:
+		}
+	}
+
+	recollected := 0
+	for _, cand := range candidates {
+		if err := ctx.Err(); err != nil {
+			log.Warn("phase1.pagination_recollect.ctx_cancel",
+				slog.String("subsystem", "cache"),
+				slog.Int("recollected", recollected),
+				slog.Any("err", err),
+			)
+			return
+		}
+		// Customer priority: defer the retry for any in-flight customer /call.
+		engineYieldCheckpoint(ctx)
+
+		ns := cand.In.GetNamespace()
+		name := cand.In.GetName()
+		ref := templatesv1.ObjectReference{
+			Reference:  templatesv1.Reference{Name: name, Namespace: ns},
+			Resource:   cand.GVR.Resource,
+			APIVersion: cand.GVR.GroupVersion().String(),
+		}
+		got := paginationFetchPageFn(ctx, ref)
+		if got.Err != nil || got.Unstructured == nil {
+			log.Warn("phase1.pagination_recollect.fetch_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", cand.GVR.String()),
+				slog.String("ns", ns),
+				slog.String("name", name),
+				slog.Any("err", got.Err),
+			)
+			continue
+		}
+		// Re-resolve PAGE 1 (we are re-trying the page-1 continuation decision,
+		// not advancing to page 2). Use the candidate's RESOLUTION perPage.
+		res, err := paginationResolvePageFn(ctx, widgets.ResolveOptions{
+			In:      got.Unstructured,
+			RC:      saRC, // SA rest.Config — see the function doc (nil-rc 500 class).
+			AuthnNS: cand.AuthnNS,
+			PerPage: cand.PerPage,
+			Page:    1,
+		})
+		if err != nil || res == nil {
+			log.Warn("phase1.pagination_recollect.resolve_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", cand.GVR.String()),
+				slog.String("ns", ns),
+				slog.String("name", name),
+				slog.Any("err", err),
+			)
+			continue
+		}
+		// If the settled re-resolve NOW signals continuation, hand the job back
+		// to collect (it re-checks both shape predicates and dedups by jobKey,
+		// landing it in c.jobs for the caller's drain). If it STILL has no
+		// continuation we DROP it (the snapshot was already cleared by
+		// drainPendingRecollect) — one-shot retry; items beyond page 1 fall back
+		// to the per-user serve-time path until the next boot re-walk. We do NOT
+		// re-queue here, which would re-bump the eligible-no-continue counter and
+		// could loop the candidate across passes.
+		if !resolverWantsContinue(res) {
+			continue
+		}
+		cand.Page1Res = res
+		c.collect(cand)
+		recollected++
+	}
+
+	log.Info("phase1.pagination_recollect.complete",
+		slog.String("subsystem", "cache"),
+		slog.String("phase", "post_phase1_done"),
+		slog.Int("candidates", len(candidates)),
+		slog.Int("recollected", recollected),
 	)
 }

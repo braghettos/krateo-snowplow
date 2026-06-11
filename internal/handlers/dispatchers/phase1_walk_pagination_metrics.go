@@ -74,6 +74,18 @@ var (
 	// prewarmApiRefPagesTotal — one per EXTRA apiRef page (page 2..N) the
 	// walk resolved. Confirms the backstop raise took effect when >> 500×.
 	prewarmApiRefPagesTotal atomic.Uint64
+
+	// prewarmEligibleNoContinueTotal — Task #318 Step 1 (collection
+	// robustness). One per DISTINCT eligible widget (isApiRefTemplateDriven)
+	// whose page-1 resolve produced NO continuation at collect time — the
+	// detectable post-storm zero-collection condition. On a healthy boot this
+	// is the normal end-of-list and the value tracks the count of
+	// genuinely-single-page apiRef widgets. A SPIKE on a post-storm boot (the
+	// datagrid's page-1 saw a transiently short/empty apiRef RA) is the signal
+	// that the re-collection pass (phase1.pagination_recollect.*) had work to
+	// retry — making the previously-SILENT zero-collection condition
+	// observable. Read lazily at scrape; zero per-/call cost.
+	prewarmEligibleNoContinueTotal atomic.Uint64
 )
 
 // bumpPrewarmUnitsPlanned increments the planned-units grand total by n.
@@ -87,6 +99,15 @@ func bumpPrewarmUnitsSeeded() { prewarmUnitsSeeded.Add(1) }
 // bumpPrewarmApiRefPagesTotal increments the extra-pages grand total.
 // Called once per resolved page 2..N.
 func bumpPrewarmApiRefPagesTotal() { prewarmApiRefPagesTotal.Add(1) }
+
+// bumpPrewarmEligibleNoContinue increments the eligible-but-no-continuation
+// grand total (Task #318 Step 1). Called once per DISTINCT eligible widget the
+// collector saw with no page-1 continuation (collect()'s no-continue branch).
+func bumpPrewarmEligibleNoContinue() { prewarmEligibleNoContinueTotal.Add(1) }
+
+// eligibleNoContinueCount returns the current eligible-but-no-continuation
+// grand total. Used by tests (the #318 falsifier reads the delta).
+func eligibleNoContinueCount() uint64 { return prewarmEligibleNoContinueTotal.Load() }
 
 // phase1PaginationMetricsOnce guards expvar.Publish against the double-
 // publish panic (mirrors phase1WalkMetricsOnce / widgetContentMetricsOnce).
@@ -117,6 +138,9 @@ func registerPhase1PaginationMetrics() {
 		}))
 		expvar.Publish("snowplow_phase1_apiref_pages_total", expvar.Func(func() any {
 			return prewarmApiRefPagesTotal.Load()
+		}))
+		expvar.Publish("snowplow_phase1_eligible_no_continue_total", expvar.Func(func() any {
+			return prewarmEligibleNoContinueTotal.Load()
 		}))
 	})
 }

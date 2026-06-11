@@ -495,9 +495,30 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	// launch the drain goroutine without knowing about endpoints (same
 	// shape as pipSeed). nil when the collector is nil (cache /
 	// prewarm OFF) — the drain step is a clean no-op.
+	//
+	// Task #318 Step 1 — collection robustness composes HERE, inside the
+	// SAME post-MarkPhase1Done goroutine (no new loop, no new goroutine):
+	//   1. drain the jobs the walk collected normally;
+	//   2. run recollectPendingApiRefPaginationJobs — after an informer-settle
+	//      delay it re-resolves page-1 for the eligible-but-no-continuation
+	//      candidates (the post-storm zero-collection set) and, on continuation,
+	//      hands them back to the collector;
+	//   3. drain whatever the re-collection produced.
+	// The re-collection seams (objects.Get / widgets.Resolve) ride the SA-
+	// credentialed ctx, so we wrap dctx with withPhase1SAContext for the pass
+	// (symmetric with drainApiRefPaginationJobs' own internal SA wrap).
 	var paginationDrain paginationDrainFn
 	if pagCollector != nil {
 		paginationDrain = func(dctx context.Context) {
+			drainApiRefPaginationJobs(dctx, pagCollector.drain(), *saEP, rc)
+			// rc is threaded explicitly into the re-collection so its page-1
+			// re-resolve carries the SA *rest.Config (nil-rc 500 class —
+			// phase1_walker_new.go). The SA ctx wrap supplies the credentialed
+			// transport for objects.Get; rc supplies ResolveOptions.RC.
+			recollectPendingApiRefPaginationJobs(withPhase1SAContext(dctx, *saEP, rc), pagCollector, rc)
+			// Drain any jobs the re-collection produced (a candidate whose
+			// settled page-1 retry now signals continuation). Empty when the
+			// post-storm window did not apply — a clean no-op.
 			drainApiRefPaginationJobs(dctx, pagCollector.drain(), *saEP, rc)
 		}
 	}
@@ -1251,7 +1272,11 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		Depth:      depth,
 		PerPage:    perPage,
 		KeyPerPage: keyPerPage,
-		AuthnNS:    w.authnNS,
+		// Task #318 Step 1: thread page-1's KEY page so the drain can
+		// reconstruct page-1's KEY tuple (keyPerPage, keyPage) instead of
+		// substituting the raw loop counter — see drainKeyPageFor.
+		KeyPage: keyPage,
+		AuthnNS: w.authnNS,
 	})
 
 	// Read status.resourcesRefs.items[] — the child widget endpoints.
