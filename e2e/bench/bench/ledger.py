@@ -286,8 +286,8 @@ def _load_stage_proof_metric(stage_id: str, key: str, *,
 
 # ─── Latency tier thresholds (ms) ───────────────────────────────────────────
 #
-# warm_p50 (1000) and cold (1300) are the REVISED verdict tiers (Task #121,
-# Diego-ratified 2026-06-10). They are NOT north-star: 500ms warm / 1000ms cold
+# warm_p50 (1000) and cold (2200) are the REVISED verdict tiers (Task #121,
+# Diego-ratified 2026-06-10; cold re-baselined 2026-06-11 — see below). They are NOT north-star: 500ms warm / 1000ms cold
 # remain the ASPIRATIONAL frontend-scope target (documented below, NOT deleted).
 # These verdict tiers are set to the measured-achievable floor under the
 # snowplow+chart control surface, because the warm/cold tiers are STRUCTURALLY
@@ -313,6 +313,16 @@ def _load_stage_proof_metric(stage_id: str, key: str, *,
 #     i.e. run-variance headroom over the worst clean run.
 #   - cold measured across the same 3 runs = 1196 / 1185 / 1175. Tier 1300 =
 #     ~1.09× worst-observed (1196), same headroom basis.
+#   - cold RE-BASELINED 1300 -> 2200 (Diego-ratified 2026-06-11): the bench
+#     cold METHODOLOGY changed — per-stage lazy recording contexts + the
+#     fresh-login two-window flow (commits e6feee1 / 8a69848) start the cold
+#     navigation from a colder browser state than the pre-#304 flow did.
+#     Mix-weighted cold across the clean 50K validations under the CURRENT
+#     methodology = 2043 / 2052 / ~2070 (0.30.255-0.30.257), while warm_p50
+#     stayed FLAT (~911 vs the 890-914 band) — proving the shift is the
+#     measurement methodology, not a serve-path regression. Tier 2200 =
+#     ~1.06× worst-observed (~2070), same headroom basis as #121. The old
+#     1300 applies only to pre-methodology rows; 1000 stays aspirational.
 #
 # CONV_TIER_MS = 30000 is the 50K-scale REVISED convergence tier (Task #289,
 # Diego-ratified 2026-06-10). The prior 1000ms tier is structurally
@@ -330,7 +340,7 @@ def _load_stage_proof_metric(stage_id: str, key: str, *,
 # tightening this tier later.
 CONV_TIER_MS = 30000
 WARM_P50_TIER_MS = 1000  # Task #121: 500 -> 1000 (~1.09× worst clean run 914; 500 stays aspirational)
-COLD_TIER_MS = 1300      # Task #121: 1000 -> 1300 (~1.09× worst clean run 1196; 1000 stays aspirational)
+COLD_TIER_MS = 2200      # #121 pattern, re-baselined 2026-06-11: 1300 -> 2200 (~1.06× worst clean run ~2070 under the lazy-context two-window methodology; 1000 stays aspirational)
 
 
 # ─── compute_verdict (worktree source 7351-7416) ────────────────────────────
@@ -350,9 +360,11 @@ def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
                  toggle (cache_supported=false). Surfaces as structural N/A.
     REJECT:      pod crashed, no usable measurements
 
-    Tiers: warm_p50 = WARM_P50_TIER_MS (1000ms), cold = COLD_TIER_MS (1300ms)
-    revised Task #121; conv = CONV_TIER_MS (30000ms at 50K) revised Task #289 —
-    see each constant's comment block for the structural-limit derivation.
+    Tiers: warm_p50 = WARM_P50_TIER_MS (1000ms) revised Task #121; cold =
+    COLD_TIER_MS (2200ms; #121 then re-baselined 2026-06-11 for the
+    lazy-context cold methodology); conv = CONV_TIER_MS (30000ms at 50K)
+    revised Task #289 — see each constant's comment block for the
+    structural-limit derivation.
     """
     if not mix_weighted:
         return "REJECT"

@@ -11,7 +11,9 @@ Coverage (per the dispatch brief):
     `--from-stage S8b --to-stage S8c`).
   - content predicate + negative-control logic (fake /call bodies: marker flips
     at poll k → conv_ms computed; control changed → FAIL).
-  - timeout → -1 + stage FAIL.
+  - timeout → -1 + stage FAIL (S8b, gating). S8c is INFORMATIONAL
+    (gating=False, Diego 2026-06-11): measurement failures are recorded as
+    would_pass=False but never fail the run; harness crashes still raise.
   - revert/teardown called on BOTH the success and failure paths.
   - ledger by-key read of conv_widget_mod_ms / conv_ra_mod_ms (report-only).
   - fixture-YAML echo-field shape (the resolver-confirmed echo fields).
@@ -237,6 +239,9 @@ def test_ra_stage_converges_when_probe_field_flips(tmp_path, monkeypatch):
     assert body["control_unchanged"] is True
     assert body["refresher_completed_delta"] == 2
     assert proof.passed is True
+    # S8c is informational: stamped as such, with the would-be verdict TRUE.
+    assert body["informational"] is True
+    assert body["would_pass"] is True
 
 
 # ─── Negative control: control flipped → FAIL ───────────────────────────────
@@ -299,6 +304,55 @@ def test_stage_fails_with_minus_one_on_poll_timeout(tmp_path, monkeypatch):
     assert body["conv_widget_mod_ms"] == -1
     assert proof.passed is False
     assert body["poll_samples"] >= 1
+    # S8b is the GATING reconcile stage — no informational demotion.
+    assert "informational" not in body
+
+
+def test_s8c_timeout_is_informational_never_fails_the_run(tmp_path, monkeypatch):
+    """S8c never converging records conv_ra_mod_ms=-1 / would_pass=False but
+    the stage PASSES — Diego 2026-06-11: "we should not care about restaction
+    reconcile". S8b keeps gating (previous test)."""
+    _stub_cluster(monkeypatch)
+    monkeypatch.setattr(phases, "_S8BC_POLL_BUDGET_S", 2)
+    monkeypatch.setattr(phases, "_S8BC_POLL_INTERVAL_S", 0.0)
+    scripted = _ScriptedCall({
+        # Always stale "v1" — never converges.
+        "bench-ra-mod-probe": ['{"probe":"v1"}'],
+        "bench-ra-mod-control": ['{"probe":"ctrl"}'],
+    })
+    monkeypatch.setattr(phases, "_s8bc_call_body", scripted)
+    seq = iter([1, 1])  # refresher did NOT move either
+    monkeypatch.setattr(phases.browser, "read_snowplow_expvar_int",
+                        lambda key: next(seq))
+    monkeypatch.setattr(phases.time, "sleep", lambda s: None)
+
+    proof = phases.stage_s8c_ra_mod_reconcile(_ctx(tmp_path))
+    body = proof.proof
+
+    assert body["conv_ra_mod_ms"] == -1
+    assert body["informational"] is True
+    assert body["would_pass"] is False
+    assert proof.passed is True
+
+
+def test_s8c_harness_crash_still_raises_not_informational(tmp_path, monkeypatch):
+    """gating=False demotes MEASUREMENT failures only — a harness exception
+    (crash != measurement) still propagates so _run_stage records a FAIL."""
+    _stub_cluster(monkeypatch)
+    scripted = _ScriptedCall({
+        "bench-ra-mod-probe": ['{"probe":"v1"}'],
+        "bench-ra-mod-control": ['{"probe":"ctrl"}'],
+    })
+    monkeypatch.setattr(phases, "_s8bc_call_body", scripted)
+
+    def _boom(key):
+        raise RuntimeError("expvar transport exploded")
+
+    monkeypatch.setattr(phases.browser, "read_snowplow_expvar_int", _boom)
+    monkeypatch.setattr(phases.time, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError):
+        phases.stage_s8c_ra_mod_reconcile(_ctx(tmp_path))
 
 
 # ─── Revert + teardown on BOTH success and failure paths ────────────────────
@@ -337,7 +391,9 @@ def test_teardown_runs_on_success_path(tmp_path, monkeypatch):
 
 def test_teardown_runs_on_failure_path_apply_failed(tmp_path, monkeypatch):
     """When fixture apply FAILS, the stage exits early — but the `finally`
-    teardown still fires (idempotent: revert + delete attempted)."""
+    teardown still fires (idempotent: revert + delete attempted). S8c is
+    informational, so the failure is recorded (error + would_pass=False)
+    without failing the run."""
     log = _stub_cluster(monkeypatch, apply_ok=False)
     # The HTTP seam must never be needed on this path, but stub it defensively.
     monkeypatch.setattr(phases, "_s8bc_call_body",
@@ -348,7 +404,9 @@ def test_teardown_runs_on_failure_path_apply_failed(tmp_path, monkeypatch):
 
     proof = phases.stage_s8c_ra_mod_reconcile(_ctx(tmp_path))
 
-    assert proof.passed is False
+    assert proof.passed is True
+    assert proof.proof["informational"] is True
+    assert proof.proof["would_pass"] is False
     assert proof.proof["error"] == "fixture_apply_failed"
     assert proof.proof["conv_ra_mod_ms"] == -1
     # Teardown still ran (delete attempted on both fixtures).

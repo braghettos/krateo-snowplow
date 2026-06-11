@@ -2285,9 +2285,15 @@ def _run_cr_mod_reconcile_stage(stage_id: str,
                                 patch_to_v1,
                                 metric_key: str,
                                 kind_label: str,
-                                what_breaks_if_skipped: str) -> StageProof:
+                                what_breaks_if_skipped: str,
+                                gating: bool = True) -> StageProof:
     """Shared S8b/S8c body. Symmetric across widget / RESTAction — only the
     fixture YAML, the GVR, the patch builders and the metric key differ.
+
+    With gating=False the stage is INFORMATIONAL: the measurement and the
+    would-be verdict are still recorded on the proof (`would_pass`), but the
+    stage never fails the run. Harness exceptions still FAIL via _run_stage —
+    a crashed harness is not a measurement.
 
     Flow (design §4.2):
       0. precheck token present.
@@ -2306,7 +2312,7 @@ def _run_cr_mod_reconcile_stage(stage_id: str,
     """
     V1, V2, CTRL = "v1", "v2", "ctrl"
 
-    def _work(c: StageContext) -> dict:
+    def _measure(c: StageContext) -> dict:
         ns = _S8BC_FIXTURE_NS
         token = c.tokens.get("admin")
 
@@ -2439,6 +2445,17 @@ def _run_cr_mod_reconcile_stage(stage_id: str,
             # 7. REVERT + TEARDOWN on BOTH success and failure paths.
             proof["teardown"] = _teardown()
 
+    def _work(c: StageContext) -> dict:
+        proof = _measure(c)
+        if not gating:
+            # Diego 2026-06-11 ("we should not care about restaction
+            # reconcile"): record the measurement and the would-be verdict,
+            # never fail the run on it.
+            proof["informational"] = True
+            proof["would_pass"] = bool(proof.get("__passed__", False))
+            proof["__passed__"] = True
+        return proof
+
     return _run_stage(stage_id, ctx, _work,
                       what_breaks_if_skipped=what_breaks_if_skipped)
 
@@ -2486,6 +2503,10 @@ def stage_s8c_ra_mod_reconcile(ctx: StageContext) -> StageProof:
     moment a customer /call serves `"probe":"v2"`. Exercises the
     restactions.go:252 self-dep -> dirty-mark -> refresher re-resolve path on
     the restactions GVR. Report-only (`conv_ra_mod_ms`).
+
+    INFORMATIONAL (gating=False, Diego 2026-06-11): records the reconcile
+    time but never fails the run — S8b (widget) is the gating reconcile
+    stage; RESTAction definition-edits are a rare admin authoring event.
     """
     g = _RA_FIXTURE_GVR
 
@@ -2504,6 +2525,7 @@ def stage_s8c_ra_mod_reconcile(ctx: StageContext) -> StageProof:
         patch_to_v1=lambda name: _patch_filter(name, "v1"),
         metric_key="conv_ra_mod_ms",
         kind_label="restaction",
+        gating=False,
         what_breaks_if_skipped=(
             "without the RESTAction-CR-modification reconcile stage, a "
             "regression that stalls the restactions self-dep -> dirty-mark "

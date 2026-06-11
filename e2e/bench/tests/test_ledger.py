@@ -445,13 +445,16 @@ def test_conv_tier_boundary_exactly_30s_passes():
 
 
 def test_warm_cold_tiers_revised_to_measured_floor_task_121():
-    """Task #121: warm_p50 tier 500 -> 1000, cold tier 1000 -> 1300, set to
-    the measured-achievable floor (~1.09× worst clean 50K run: warm 914,
-    cold 1196). The warm/cold tiers are structurally frontend-gated
+    """Task #121: warm_p50 tier 500 -> 1000 (~1.09× worst clean 50K run 914).
+    Cold tier 1000 -> 1300 (#121), then RE-BASELINED 1300 -> 2200 (Diego
+    2026-06-11) to the measured floor of the lazy-context two-window cold
+    methodology (mix-weighted ~2043-2070 across the clean 0.30.255-257
+    validations; warm flat at ~911 proves it is methodology, not a serve
+    regression). The warm/cold tiers are structurally frontend-gated
     (docs/task-288 + docs/task-300); 500/1000 stay aspirational, documented,
     NOT deleted."""
     assert ledger.WARM_P50_TIER_MS == 1000
-    assert ledger.COLD_TIER_MS == 1300
+    assert ledger.COLD_TIER_MS == 2200
 
 
 def test_measured_clean_50k_run_scores_no_tier_miss_task_121():
@@ -472,12 +475,12 @@ def test_warm_p50_boundary_1000_exact_no_miss_1001_misses():
                                   conv_s8_p99=23800, cells=None) == "WEAK_PASS"
 
 
-def test_cold_boundary_1300_exact_no_miss_1301_misses():
-    """Boundary: cold == 1300 is NOT > 1300 → no miss (clean warm/conv →
-    PASS); cold == 1301 IS a miss → one tier → WEAK_PASS."""
-    assert ledger.compute_verdict(_mw(890, 1300), restarts=0,
+def test_cold_boundary_2200_exact_no_miss_2201_misses():
+    """Boundary: cold == 2200 is NOT > 2200 → no miss (clean warm/conv →
+    PASS); cold == 2201 IS a miss → one tier → WEAK_PASS."""
+    assert ledger.compute_verdict(_mw(890, 2200), restarts=0,
                                   conv_s8_p99=23800, cells=None) == "PASS"
-    assert ledger.compute_verdict(_mw(890, 1301), restarts=0,
+    assert ledger.compute_verdict(_mw(890, 2201), restarts=0,
                                   conv_s8_p99=23800, cells=None) == "WEAK_PASS"
 
 
@@ -610,13 +613,14 @@ def test_call_count_mismatches_still_records_genuine_mismatch():
 def test_failed_gates_carries_tier_entries_on_fail(tmp_path, monkeypatch):
     """A FAIL verdict (2 tiers missed) must enumerate the tier misses so
     failed_gates is never empty on a non-PASS verdict. Thresholds track the
-    Task #121 revision (warm>1000, cold>1300)."""
+    Task #121 revision + the 2026-06-11 cold re-baseline (warm>1000,
+    cold>2200)."""
     monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", ""))
-    # warm 1100>1000 AND cold 1500>1300 → 2 misses → FAIL.
+    # warm 1100>1000 AND cold 2500>2200 → 2 misses → FAIL.
     all_results = [{"stage": "6", "cache": "ON", "pages": {"Dashboard": {
         "navigations": [
             {"user": "cyberjoker", "nav_num": 1, "cold_warm": "COLD",
-             "waterfallMs": 1500, "validation": {"terminal_state": "pass"}},
+             "waterfallMs": 2500, "validation": {"terminal_state": "pass"}},
             {"user": "cyberjoker", "nav_num": 2, "waterfallMs": 1100,
              "validation": {"terminal_state": "pass"}},
         ],
@@ -628,7 +632,7 @@ def test_failed_gates_carries_tier_entries_on_fail(tmp_path, monkeypatch):
     fg = summary["failed_gates"]
     assert any(g.startswith("tier:warm_p50 ") and g.endswith(">1000")
                for g in fg), fg
-    assert any(g.startswith("tier:cold ") and g.endswith(">1300")
+    assert any(g.startswith("tier:cold ") and g.endswith(">2200")
                for g in fg), fg
     # Sanity: the contradiction the fix targets (FAIL with [] gates) is gone.
     assert fg != []
