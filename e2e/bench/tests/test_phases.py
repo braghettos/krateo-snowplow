@@ -650,12 +650,23 @@ class _FakePageWithVideo:
     `wait_for_timeout`) so the SAME page that 'filmed' the nav can be the one
     the S8/S9 content asserts inspect (architect Option A). `present_names`
     is the set of composition names whose `text=NAME` locator reports >=1.
+
+    Also exposes `evaluate`/`screenshot` + a URL-tracking `goto` so it can
+    drive the REAL `browser.browser_measure_stage` (incl. the Dashboard VERIFY
+    poll) in the F-B′ end-to-end discrimination test. `evaluate` returns a
+    fixed UI count for the verify probe and True for the scroll JS; every other
+    probe returns a benign default.
     """
-    def __init__(self, raw_webm, present_names=None):
+    def __init__(self, raw_webm, present_names=None, ui_count=42,
+                 call_count=16):
         self.video = _FakeVideo(raw_webm)
         self.present_names = set(present_names or [])
         self.reloaded = 0
         self.url = "http://fake/compositions"
+        self.goto_log: list[tuple] = []
+        self.evaluate_log: list[str] = []
+        self._ui_count = ui_count
+        self._call_count = call_count
 
     def locator(self, selector):
         name = (selector[len("text="):] if selector.startswith("text=")
@@ -664,9 +675,39 @@ class _FakePageWithVideo:
 
     def goto(self, url, **kw):
         self.reloaded += 1
+        self.goto_log.append((url, kw))
+        self.url = url
 
     def wait_for_timeout(self, ms):
         pass
+
+    def on(self, event, handler):
+        # Playwright response listener registration — no events fired in fakes.
+        pass
+
+    def evaluate(self, js, *args):
+        self.evaluate_log.append(js)
+        if "dashboard-compositions-panel-row-piechart" in js:
+            return self._ui_count
+        if "performance.clearResourceTimings" in js:
+            return None
+        if "filter(e => e.name.includes('/call')).length" in js:
+            return self._call_count
+        if "GAP_MS" in js and "calls.length" in js:
+            return {"callCount": self._call_count, "waterfallMs": 10,
+                    "loadComplete": 20, "httpOk": 0, "httpErr": 0}
+        if "navigation" in js and "loadEventEnd" in js:
+            return {"loadComplete": 20}
+        if "scrollIntoView" in js:
+            return True
+        return None
+
+    def screenshot(self, path, **kw):
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(b"\x89PNG")
+        except Exception:
+            pass
 
 
 class _FakeRecordingCtx:
@@ -817,56 +858,104 @@ def test_video_page_slug_maps_names():
     assert phases._video_page_slug("") == "page"
 
 
-def test_open_stage_recording_pages_closes_context_on_new_page_failure(
+def test_open_stage_recording_pages_all_slots_lazy_no_eager_recording_ctx(
         tmp_path, monkeypatch):
-    """Orphan-leak guard (architect nit) under Task #307 / A1-full: if the
-    EAGER (Dashboard) recording context's new_page() raises AFTER the context
-    is created, that context MUST be closed — not leaked. The Compositions slot
-    is LAZY (no new_page at open time) so it is unaffected and still returned.
+    """Falsifier F-open (Task #307 / ArchLazyDash): EVERY slot returned by
+    `_open_stage_recording_pages` is LAZY — page is None AND make is callable —
+    and NO recording context (record_video_dir set) is created at open time.
 
-    New-structure note: `_open_stage_recording_pages` first logs in once on a
-    throwaway NON-recording context (record_video_dir=None) for storage_state
-    capture, then creates the Dashboard recording context (record_video_dir set)
-    eagerly. We key the flaky new_page on the RECORDING context (rvd set) so the
-    guard is exercised on the eager Dashboard context regardless of call order.
+    Pre-fix the Dashboard slot was EAGER: `_open_stage_recording_pages` created
+    a recording BrowserContext (record_video_dir=videos_dir) + new_page for it
+    right here, so its `.webm` clock started during the in-frame
+    count_compositions() header probe + cold-nav poll idle. Post-fix the ONLY
+    context created at open time is the throwaway NON-recording login context
+    (record_video_dir=None) used for storage_state capture; every recording
+    context is deferred to its page's loop iteration in browser_measure_stage.
+
+    Discriminator: we record every make_browser_context call's record_video_dir.
+    With the fix, the recording-dir count is 0 at open time and BOTH slots
+    (Dashboard + Compositions) are lazy. Pre-fix the Dashboard slot is eager so
+    a recording context is created here and its slot's page is non-None.
     """
-    recording_ctxs: list[_FakeRecordingCtx] = []
+    rvd_calls: list = []  # record_video_dir per make_browser_context call
 
-    class _BrowserWithFlakyNewPage:
-        def new_context(self, **kwargs):
-            rvd = kwargs.get("record_video_dir")
-            if rvd is None:
-                # Throwaway login context: supports storage_state, never leaks.
-                return _FakeRecordingCtx(
-                    Path(tempfile.mkdtemp()) / "throwaway.webm")
-            c = _FakeRecordingCtx(Path(rvd) / f"raw-{len(recording_ctxs)}.webm")
-            # The eager Dashboard recording context's new_page raises.
-            def _boom():
-                raise RuntimeError("new_page failed post-create")
-            c.new_page = _boom  # type: ignore[assignment]
-            recording_ctxs.append(c)
-            return c
+    def _fake_make_ctx(pw, *, record_video_dir=None, storage_state=None, **kw):
+        rvd_calls.append(record_video_dir)
+        # Throwaway login context (rvd=None) supports storage_state capture.
+        return _FakeRecordingCtx(
+            Path(tempfile.mkdtemp()) / "throwaway.webm")
 
-    monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, storage_state=None,
-                        **kw: pw.new_context(record_video_dir=record_video_dir))
+    monkeypatch.setattr(phases.browser, "make_browser_context", _fake_make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
 
     pages = phases._open_stage_recording_pages(
-        _BrowserWithFlakyNewPage(), tmp_path / "videos", "cyberjoker", "pw")
+        _StageRecordingBrowser(), tmp_path / "videos", "cyberjoker", "pw")
 
-    # The eager (flaky) Dashboard recording context was closed, not leaked.
-    assert recording_ctxs and recording_ctxs[0].closed is True, (
-        "eager recording context whose new_page() raised must be closed")
-    assert "Dashboard" not in pages, (
-        "Dashboard slot must be dropped when its new_page() failed")
-    # The Compositions slot is LAZY (deferred) — still present, with a factory
-    # and no live page/ctx yet (its context is created later, in measure).
-    assert "Compositions" in pages, (
-        "lazy Compositions slot must survive an eager-Dashboard new_page failure")
-    assert pages["Compositions"].get("page") is None
-    assert callable(pages["Compositions"].get("make"))
+    # Exactly one make_browser_context call at open time — the throwaway login
+    # context — and it is NON-recording (record_video_dir is None). NO recording
+    # context (record_video_dir set) is created eagerly for ANY page.
+    assert rvd_calls == [None], (
+        f"open time must create exactly one NON-recording (storage_state) "
+        f"context; recording-dir calls leaked: {rvd_calls!r}")
+    recording_dir_calls = [r for r in rvd_calls if r is not None]
+    assert recording_dir_calls == [], (
+        f"eager record_video_dir context(s) created at open time: "
+        f"{recording_dir_calls!r}")
+
+    # BOTH slots present and LAZY: page is None + a callable make factory.
+    assert set(pages) == {"Dashboard", "Compositions"}, sorted(pages)
+    for page_name, slot in pages.items():
+        assert slot.get("page") is None, (
+            f"{page_name} slot must be lazy (page=None at open); got "
+            f"{slot.get('page')!r}")
+        assert slot.get("ctx") is None, (
+            f"{page_name} slot must be lazy (ctx=None at open)")
+        assert callable(slot.get("make")), (
+            f"{page_name} slot must carry a make factory")
+
+
+def test_open_stage_lazy_factory_creates_recording_context_when_invoked(
+        tmp_path, monkeypatch):
+    """The deferred factory (for EVERY page now) creates a RECORDING context
+    (record_video_dir set) + materialises ctx/page into its slot when invoked —
+    and is idempotent (a second call returns the same page without a 2nd ctx).
+
+    This locks the lazy materialise contract that browser_measure_stage relies
+    on (it invokes each slot's `make` at the page's loop iteration). It replaces
+    the old eager-Dashboard orphan-leak guard, since there is no longer an eager
+    new_page() at open time; the factory failure path is the B1 fallback in
+    browser_measure_stage (covered by test_lazy_factory_failure_falls_back_*).
+    """
+    rvd_calls: list = []
+
+    def _fake_make_ctx(pw, *, record_video_dir=None, storage_state=None, **kw):
+        rvd_calls.append(record_video_dir)
+        raw = (Path(record_video_dir) / f"raw-{len(rvd_calls)}.webm"
+               if record_video_dir is not None
+               else Path(tempfile.mkdtemp()) / "throwaway.webm")
+        return _FakeRecordingCtx(raw)
+
+    monkeypatch.setattr(phases.browser, "make_browser_context", _fake_make_ctx)
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+
+    pages = phases._open_stage_recording_pages(
+        _StageRecordingBrowser(), tmp_path / "videos", "cyberjoker", "pw")
+
+    # Only the throwaway login context so far.
+    assert rvd_calls == [None]
+
+    dash = pages["Dashboard"]
+    pg = dash["make"]()
+    # The factory created a RECORDING context (record_video_dir set) and wired
+    # the slot.
+    assert rvd_calls[-1] == tmp_path / "videos", rvd_calls
+    assert dash["page"] is pg and dash["ctx"] is not None
+    # Idempotent: a second call returns the same page, no new context.
+    before = len(rvd_calls)
+    assert dash["make"]() is pg
+    assert len(rvd_calls) == before, "factory created a second context"
 
 
 def test_measure_all_users_produces_both_pages_named_by_stage(
@@ -1056,6 +1145,181 @@ def test_measure_all_users_non_recording_uses_single_page(tmp_path, monkeypatch)
     assert calls[0]["pages_by_name"] is None
     assert calls[0]["page"] is persistent_page
     assert "__stage_videos__" not in ctx.user_pages
+
+
+def test_measure_all_users_all_lazy_selects_persistent_page_and_both_factories(
+        tmp_path, monkeypatch):
+    """Falsifier F-measure (Task #307 / ArchLazyDash): with EVERY recording
+    slot now lazy (page=None), `_measure_all_users` selects
+    `measure_page == u_state["page"]` (the persistent non-recording page) as the
+    `page` arg to browser_measure_stage — NOT an eager slot page — and passes a
+    `page_factories` mapping that now includes BOTH Dashboard AND Compositions,
+    with `pages_by_name` mapping both to None.
+
+    Pre-fix the Dashboard slot was EAGER (page non-None), so the `next(...)`
+    selection picked that live Dashboard page as `measure_page` and
+    page_factories carried ONLY Compositions. Post-fix the selection falls
+    through to the persistent page (None for a recording user, which is correct:
+    every page is materialised on its own lazy context inside
+    browser_measure_stage, so the page arg is only the no-recording fallback).
+
+    Discriminators that flip on revert: (a) "Dashboard" in page_factories;
+    (b) Dashboard maps to None in pages_by_name; (c) the `page` arg is the
+    persistent u_state["page"] fallback, not a live Dashboard page object.
+    """
+    captured: dict = {}
+
+    def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
+                      token=None, user="admin", verify_against_cluster=True,
+                      deleted_ns=None, pages_by_name=None, page_factories=None):
+        captured["page"] = page
+        captured["pages_by_name"] = pages_by_name
+        captured["factory_keys"] = (sorted(page_factories)
+                                    if page_factories else None)
+        # Mirror the real function: materialise every lazy page at measure.
+        if page_factories:
+            for _pn, make in page_factories.items():
+                make()
+        return {"stage": stage_num, "pages": {}}
+
+    # Real _open_stage_recording_pages (hermetic ctx factory), real lazy slots.
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, *, record_video_dir=None, storage_state=None,
+                        **kw: pw.new_context(record_video_dir=record_video_dir))
+    monkeypatch.setattr(phases.browser, "browser_login",
+                        lambda page, u, p: True)
+    _stub_video_to_gif(monkeypatch)
+    monkeypatch.setattr(phases.browser, "browser_measure_stage", _fake_measure)
+
+    ctx, _pw = _recording_ctx(tmp_path, users=("admin",))
+    # Production recording-user shape: persistent page is None (fresh per-stage
+    # contexts are used instead). Capture it as the expected fallback.
+    persistent = ctx.user_pages["admin"].get("page")
+    assert persistent is None  # sanity: recording user holds no persistent page
+
+    phases._measure_all_users(ctx, 6, "S6 desc")
+
+    # (a) page_factories now carries BOTH pages (Dashboard is lazy too).
+    assert captured["factory_keys"] == ["Compositions", "Dashboard"], (
+        f"page_factories must include BOTH Dashboard + Compositions (all lazy); "
+        f"got {captured['factory_keys']!r}")
+    # (b) pages_by_name maps every page (incl. Dashboard) to None at selection.
+    assert captured["pages_by_name"] == {"Dashboard": None,
+                                         "Compositions": None}, (
+        f"all slots lazy → pages_by_name all-None; got "
+        f"{captured['pages_by_name']!r}")
+    # (c) the page arg is the persistent non-recording fallback (u_state["page"],
+    # None for a recording user), NOT a live eager Dashboard page object.
+    assert captured["page"] is persistent, (
+        f"measure_page must fall through to the persistent non-recording page "
+        f"({persistent!r}); got a non-fallback page {captured['page']!r}")
+
+
+def test_FB_prime_dashboard_lazy_end_to_end_verify_on_materialized_page(
+        tmp_path, monkeypatch):
+    """Falsifier F-B′ end-to-end (Task #307 / ArchLazyDash) — the TRUE
+    prod-revert discriminator for the Dashboard-lazy behaviour, driven through
+    the REAL `_open_stage_recording_pages` → `_measure_all_users` →
+    `browser.browser_measure_stage` path (no measure stub).
+
+    The Dashboard recording context is created LAZILY at its measure-time loop
+    iteration (via the slot factory), NOT eagerly at open time, and the
+    Dashboard VERIFY poll's `verify_composition_count_ui` runs on that
+    lazily-materialised page.
+
+    Discriminators that flip RED on prod revert (HEAD's eager Dashboard):
+      (a) NO recording context (record_video_dir set) is created during
+          `_open_stage_recording_pages`; the Dashboard recording context is
+          created during `_measure_all_users` instead. Pre-fix the Dashboard
+          recording context is created at open time.
+      (b) the page `verify_composition_count_ui` inspected carries the
+          factory-stamped `_lazy_materialised` marker — i.e. it came from the
+          lazy slot factory. Pre-fix the Dashboard page is the eager open-time
+          page (no marker) → RED.
+    """
+    # Phase tracking: count recording-context creations during open vs measure.
+    phase = {"name": "open"}
+    rec_ctx_creates = {"open": 0, "measure": 0}
+
+    real_browser = phases.browser
+
+    def _counting_make_ctx(pw, *, record_video_dir=None, storage_state=None,
+                           **kw):
+        if record_video_dir is not None:
+            rec_ctx_creates[phase["name"]] += 1
+        return pw.new_context(record_video_dir=record_video_dir)
+
+    monkeypatch.setattr(real_browser, "make_browser_context", _counting_make_ctx)
+    monkeypatch.setattr(real_browser, "browser_login", lambda page, u, p: True)
+    _stub_video_to_gif(monkeypatch)
+
+    # Module-level probes the REAL browser_measure_stage / VERIFY poll call.
+    monkeypatch.setattr(real_browser, "FRONTEND", "http://fake")
+    monkeypatch.setattr(real_browser, "_count_compositions", lambda: 42)
+    monkeypatch.setattr(real_browser, "_count_bench_ns", lambda: 2)
+    monkeypatch.setattr(real_browser, "verify_composition_count_api",
+                        lambda token: 42)
+    monkeypatch.setattr(real_browser, "_validate_widget_terminal_state",
+                        lambda page, path, label, **kw: {"terminal_state": "pass"})
+
+    ui_called_on: list = []
+
+    def _verify_ui(page):
+        ui_called_on.append(page)
+        return 42
+    monkeypatch.setattr(real_browser, "verify_composition_count_ui", _verify_ui)
+
+    # Build the recording context, then run open + measure as the real pipeline
+    # would, flipping the phase marker so we know WHEN each recording ctx is
+    # created. `_measure_all_users` itself calls `_open_stage_recording_pages`,
+    # so we wrap that to stamp the factory-materialised Dashboard page + record
+    # the phase boundary.
+    pw_browser = _StageRecordingBrowser(present_names={"comp-0"})
+    (tmp_path / "videos").mkdir(parents=True, exist_ok=True)
+    ctx = phases.StageContext(
+        tag="t", scale=5000, run_dir=tmp_path,
+        state_path=tmp_path / "state.json", video="representative",
+        user_pages={"__browser__": pw_browser, "__pw__": None,
+                    "__stage_videos__": {},
+                    "admin": {"ctx": None, "page": None, "pwd": "pw",
+                              "token": "tok", "record_video": True}})
+
+    real_open = phases._open_stage_recording_pages
+
+    def _wrapped_open(*a, **k):
+        phase["name"] = "open"
+        pages = real_open(*a, **k)
+        # Stamp every slot's factory so the page it materialises is marked.
+        for _pn, slot in pages.items():
+            inner = slot.get("make")
+            if inner is None:
+                continue
+
+            def _stamping(_inner=inner):
+                pg = _inner()
+                try:
+                    pg._lazy_materialised = True
+                except Exception:
+                    pass
+                return pg
+            slot["make"] = _stamping
+        phase["name"] = "measure"
+        return pages
+    monkeypatch.setattr(phases, "_open_stage_recording_pages", _wrapped_open)
+
+    phases._measure_all_users(ctx, 6, "S6 F-B' e2e")
+
+    # (a) The Dashboard recording context was created at MEASURE time, not open.
+    assert rec_ctx_creates["open"] == 0, (
+        f"recording context(s) created EAGERLY at open time: "
+        f"{rec_ctx_creates['open']} (Dashboard must be lazy)")
+    assert rec_ctx_creates["measure"] >= 1, (
+        "no recording context created at measure time — lazy factory never ran")
+    # (b) The Dashboard VERIFY poll ran on a factory-materialised page.
+    assert ui_called_on, "verify_composition_count_ui was never called"
+    assert all(getattr(p, "_lazy_materialised", False) for p in ui_called_on), (
+        "Dashboard VERIFY ran on a NON-lazily-materialised page (the eager "
+        f"open-time page) — Dashboard was not lazy; pages={ui_called_on!r}")
 
 
 def test_run_stage_attaches_this_stages_videos_to_its_own_proof(

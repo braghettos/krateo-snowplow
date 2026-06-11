@@ -1697,6 +1697,136 @@ def test_A1_compositions_context_created_after_dashboard_verify(
         f"Dashboard VERIFY block; invocation order={order!r}")
 
 
+def test_browser_measure_stage_materializes_lazy_dashboard_and_verifies_on_it(
+        monkeypatch, tmp_path):
+    """B1 invariant lock (Task #307 / ArchLazyDash): when the DASHBOARD arrives
+    LAZY (pages_by_name["Dashboard"]=None + a factory in page_factories),
+    browser_measure_stage materialises it as the FIRST statement of the
+    Dashboard iteration and the VERIFY read (`verify_composition_count_ui`) runs
+    on the lazily-materialised dashboard page — NOT on the shared/fallback page.
+
+    NOTE — invariant lock, NOT a prod-revert discriminator: browser.py's
+    materialise block (B1) already generalises to ANY lazy page; the ONLY prod
+    change in browser.py for this ship is the comment generalisation. The
+    behavioural change that makes Dashboard lazy lives in
+    phases._open_stage_recording_pages (P1), discriminated by the test_phases.py
+    F-B′ end-to-end test + F-open + F-measure. This test guards that the
+    consumer contract browser.py relies on — materialise-before-VERIFY for a
+    lazy Dashboard — stays true after the change, so it must remain GREEN both
+    pre- and post-fix when a lazy Dashboard slot is supplied directly.
+
+    Asserts: (a) the Dashboard factory is invoked exactly once, at/after the
+    Dashboard iteration start (its first goto is `/dashboard`); (b)
+    verify_composition_count_ui was called with the factory's page object, not
+    the shared/fallback page.
+    """
+    from tests.conftest import FakePage
+
+    _patch_cluster_count(monkeypatch, comp_count=42, ns_count=2)
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: 42)
+    monkeypatch.setattr(browser_mod, "_validate_widget_terminal_state",
+                        lambda page, path, label, **kw: {"terminal_state": "pass"})
+
+    # Distinct live pages: a shared/fallback page (must NOT drive VERIFY) and the
+    # lazily-materialised dashboard + compositions pages.
+    shared_page = FakePage(call_count=16, ui_count=42)
+    dash_page = FakePage(call_count=16, ui_count=42)
+    comp_page = FakePage(call_count=30, ui_count=42)
+
+    # Record which page object each verify_composition_count_ui call inspected.
+    ui_called_on: list = []
+    monkeypatch.setattr(
+        browser_mod, "verify_composition_count_ui",
+        lambda page: (ui_called_on.append(page), 42)[1])
+
+    dash_factory_calls = {"n": 0}
+
+    def _make_dash():
+        dash_factory_calls["n"] += 1
+        return dash_page
+
+    # ALL slots lazy: pages_by_name maps both to None; factories materialise.
+    browser_measure_stage(
+        shared_page, stage_num=6, stage_desc="S6 F-B'",
+        cache_mode="ON", token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+        pages_by_name={"Dashboard": None, "Compositions": None},
+        page_factories={"Dashboard": _make_dash,
+                        "Compositions": lambda: comp_page})
+
+    # (a) The Dashboard factory ran exactly once (lazy, not eager).
+    assert dash_factory_calls["n"] == 1, (
+        f"Dashboard factory invoked {dash_factory_calls['n']}x (expected 1, "
+        f"lazy — pre-fix the Dashboard slot was eager with no factory)")
+    # The materialised Dashboard page's first/only nav is /dashboard (the
+    # factory was NOT invoked before the Dashboard iteration started).
+    dash_gotos = [u for (u, _kw) in dash_page.goto_log]
+    assert dash_gotos and dash_gotos[0].endswith("/dashboard"), (
+        f"materialised Dashboard page's first goto must be /dashboard; "
+        f"got {dash_gotos!r}")
+    # (b) The VERIFY read ran on the lazily-materialised dashboard page object,
+    # NOT on the shared/fallback page and NOT on the compositions page.
+    assert ui_called_on, "verify_composition_count_ui was never called"
+    assert all(p is dash_page for p in ui_called_on), (
+        "VERIFY poll's verify_composition_count_ui did NOT run on the lazily-"
+        f"materialised dashboard page; ran on {ui_called_on!r}")
+    assert shared_page not in ui_called_on, (
+        "VERIFY ran on the shared/fallback page — the materialise block did not "
+        "replace nav_page before the VERIFY poll")
+
+
+def test_lazy_factory_failure_falls_back_to_shared_page(monkeypatch, tmp_path):
+    """Safety invariant (ArchLazyDash): if a lazy page factory raises, the stage
+    falls back to the persistent non-recording `page` and still measures +
+    runs VERIFY on it (parity with today's no-video path) — it does NOT abort.
+
+    Now that the Dashboard is lazy too, a Dashboard-factory failure must degrade
+    gracefully: the VERIFY poll runs on the shared fallback page. This replaces
+    the open-time orphan-leak guard (there is no eager new_page() at open time
+    anymore; the only failure surface is the lazy factory, handled by the B1
+    fallback `nav_page = page` in browser_measure_stage).
+    """
+    from tests.conftest import FakePage
+
+    _patch_cluster_count(monkeypatch, comp_count=42, ns_count=2)
+    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
+    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
+                        lambda token: 42)
+    monkeypatch.setattr(browser_mod, "_validate_widget_terminal_state",
+                        lambda page, path, label, **kw: {"terminal_state": "pass"})
+
+    shared_page = FakePage(call_count=16, ui_count=42)
+    ui_called_on: list = []
+    monkeypatch.setattr(
+        browser_mod, "verify_composition_count_ui",
+        lambda page: (ui_called_on.append(page), 42)[1])
+
+    def _boom():
+        raise RuntimeError("lazy dashboard context create failed")
+
+    # Both factories raise; nav_page must fall back to shared_page each time.
+    result = browser_measure_stage(
+        shared_page, stage_num=6, stage_desc="S6 fallback",
+        cache_mode="ON", token="tok", num_navs=1, user="admin",
+        verify_against_cluster=True, verify_timeout=5, verify_interval=0,
+        screenshots_dir=tmp_path / "ss",
+        pages_by_name={"Dashboard": None, "Compositions": None},
+        page_factories={"Dashboard": _boom, "Compositions": _boom})
+
+    # Stage still produced results (did not abort on the factory failure).
+    assert result and "pages" in result, result
+    # The Dashboard nav + VERIFY ran on the shared fallback page.
+    assert any(u.endswith("/dashboard") for (u, _kw) in shared_page.goto_log), (
+        f"fallback shared page never navigated /dashboard; "
+        f"goto_log={shared_page.goto_log!r}")
+    assert ui_called_on and all(p is shared_page for p in ui_called_on), (
+        f"VERIFY must run on the shared fallback page when the factory fails; "
+        f"ran on {ui_called_on!r}")
+
+
 def test_D2_dashboard_final_hold_targets_compositions_not_first_chart(
         monkeypatch, fake_page):
     """Defect 2 anchor (Task #307): the dashboard scroll's FINAL hold must

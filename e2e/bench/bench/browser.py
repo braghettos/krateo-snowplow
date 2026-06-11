@@ -1977,15 +1977,16 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
         # shared page (backward-compatible default).
         nav_page = (pages_by_name or {}).get(page_name, page)
 
-        # Task #307 / A1-full: a LAZY page (e.g. Compositions) has nav_page
-        # None here and a factory in `page_factories`. Materialise it NOW —
-        # at this page's loop iteration. Because Dashboard is the FIRST
-        # BROWSER_SCALING_PAGES entry and its entire VERIFY/convergence/content
-        # block runs before the loop advances, the Compositions factory fires
-        # strictly AFTER the Dashboard VERIFY poll completes (falsifier F-B):
-        # its recording context — and thus its video clock — does not exist
-        # during that multi-minute poll, so the `.webm` begins on /compositions
-        # rather than on the idle login-landing dashboard. The factory is
+        # Task #307 / ArchLazyDash: a LAZY page (now EVERY page, incl. the
+        # Dashboard) has nav_page None here and a factory in `page_factories`.
+        # Materialise it NOW — at this page's loop iteration, which is the FIRST
+        # statement of the iteration body (before the per-page nav loop and the
+        # Dashboard VERIFY/convergence block below). So each page's recording
+        # context — and thus its video clock — does not exist until ITS nav
+        # begins: the Dashboard `.webm` starts at the /dashboard nav rather than
+        # filming the in-frame count_compositions() header probe + cold-nav poll
+        # idle, and the Compositions context still materialises strictly AFTER
+        # the Dashboard VERIFY poll (falsifiers F-B / F-B′). The factory is
         # best-effort; on failure we fall back to the shared `page` so the
         # stage still measures (no recording for that page).
         if nav_page is None and page_factories and page_name in page_factories:

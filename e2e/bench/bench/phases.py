@@ -823,7 +823,8 @@ def _open_stage_recording_pages(pw_browser, videos_dir: Path,
     slug}}; a page that fails to open is skipped. Never raises (best-effort —
     a recording failure must not abort the stage measurement).
 
-    Task #307 / A1-full (Diego 2026-06-10) — kill the login/dashboard head:
+    Task #307 (Diego 2026-06-10; ArchLazyDash / Option A 2026-06-11) — kill the
+    login/dashboard head AND the in-frame idle:
 
       1. STORAGE-STATE REUSE. Log in ONCE on a throwaway NON-recording context,
          capture `context.storage_state()`, and create every per-page recording
@@ -833,19 +834,20 @@ def _open_stage_recording_pages(pw_browser, videos_dir: Path,
          landing is filmed. (Previously each recording context drove the login
          form, so its `.webm` began on `/login` → dashboard.)
 
-      2. LAZY COMPOSITIONS CONTEXT. The Compositions context is NOT created
-         here. Its slot carries a zero-arg `make` factory (closing over the
-         captured storage_state + videos_dir) plus `page=None`, `ctx=None`.
-         `browser.browser_measure_stage` invokes that factory at the Compositions
-         loop iteration — i.e. AFTER the Dashboard VERIFY/convergence poll has
-         completed — so the Compositions context is not even alive (and its video
-         clock has not started) during that multi-minute poll. The factory writes
-         the materialised ctx/page back into the same slot dict, so the deferred
-         finalize (`_finalize_stage_videos`) and the subject content-gate
+      2. LAZY CONTEXTS — EVERY page (incl. Dashboard). No recording context is
+         created here. Each slot carries a zero-arg `make` factory (closing over
+         the captured storage_state + videos_dir) plus `page=None`, `ctx=None`.
+         `browser.browser_measure_stage` invokes that factory at THAT page's own
+         loop iteration, as the first statement of the iteration body, so the
+         context — and thus its video clock — does not exist until ITS nav
+         begins. For the Dashboard (the FIRST BROWSER_SCALING_PAGES entry) this
+         means its `.webm` starts at the /dashboard nav rather than filming the
+         in-frame `count_compositions()` header probe + cold-nav poll idle; the
+         Compositions context still materialises strictly AFTER the Dashboard
+         VERIFY/convergence poll completes. The factory writes the materialised
+         ctx/page back into the same slot dict, so the deferred finalize
+         (`_finalize_stage_videos`) and the subject content-gate
          (`u_state["page"]`) read the live filmed page unchanged.
-
-    The Dashboard context is created eagerly (it drives the VERIFY poll), also
-    via storage_state so its own `.webm` skips the login head too.
     """
     pages: dict[str, dict] = {}
 
@@ -878,43 +880,26 @@ def _open_stage_recording_pages(pw_browser, videos_dir: Path,
     for page_name, _page_path in browser.BROWSER_SCALING_PAGES:
         slug = _video_page_slug(page_name)
 
-        if page_name == "Compositions":
-            # (2) LAZY: defer context creation to the Compositions loop
-            # iteration (after the Dashboard VERIFY poll). The factory
-            # materialises ctx/page and writes them back into THIS slot.
-            slot: dict = {"ctx": None, "page": None, "slug": slug}
+        # (2) LAZY (ALL pages, incl. Dashboard): defer context creation to that
+        # page's loop iteration in browser_measure_stage. The factory closes
+        # over the captured storage_state + videos_dir, materialises ctx/page,
+        # and writes them back into THIS slot — so the recording context (and
+        # its video clock) does not exist until the nav begins.
+        slot: dict = {"ctx": None, "page": None, "slug": slug}
 
-            def _make(_slot=slot):
-                if _slot.get("page") is not None:
-                    return _slot["page"]
-                c = browser.make_browser_context(
-                    pw_browser, record_video_dir=videos_dir,
-                    storage_state=storage_state)
-                pg = c.new_page()
-                _slot["ctx"] = c
-                _slot["page"] = pg
-                return pg
-
-            slot["make"] = _make
-            pages[page_name] = slot
-            continue
-
-        # Eager (Dashboard): authenticated recording context, no login filmed.
-        p_ctx = None
-        try:
-            p_ctx = browser.make_browser_context(
+        def _make(_slot=slot):
+            if _slot.get("page") is not None:
+                return _slot["page"]
+            c = browser.make_browser_context(
                 pw_browser, record_video_dir=videos_dir,
                 storage_state=storage_state)
-            p_page = p_ctx.new_page()
-            pages[page_name] = {"ctx": p_ctx, "page": p_page, "slug": slug}
-        except Exception as e:
-            if p_ctx is not None:
-                try:
-                    p_ctx.close()
-                except Exception:
-                    pass
-            print(f"  WARN: open stage recording page {user}/{page_name}: "
-                  f"{type(e).__name__}: {e}", flush=True)
+            pg = c.new_page()
+            _slot["ctx"] = c
+            _slot["page"] = pg
+            return pg
+
+        slot["make"] = _make
+        pages[page_name] = slot
     return pages
 
 
@@ -1120,18 +1105,21 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
                 stage_pages = _open_stage_recording_pages(
                     pw_browser, videos_dir, u_name, u_state.get("pwd"))
                 if stage_pages:
-                    # Task #307 / A1-full: a lazy slot (e.g. Compositions) has
-                    # page=None + a `make` factory; browser_measure_stage calls
-                    # the factory at that page's iteration (after the Dashboard
-                    # VERIFY poll) and the materialised page lands back in the
-                    # slot. Eager slots (Dashboard) expose their live page now.
+                    # Task #307 / ArchLazyDash: EVERY slot (incl. Dashboard) is
+                    # lazy — page=None + a `make` factory. browser_measure_stage
+                    # calls each factory at that page's own loop iteration and
+                    # the materialised page lands back in the slot. So
+                    # pages_by_name maps every page to None here.
                     pages_by_name = {pn: pp.get("page")
                                      for pn, pp in stage_pages.items()}
                     page_factories = {pn: pp["make"]
                                       for pn, pp in stage_pages.items()
                                       if pp.get("make") is not None}
-                    # The dashboard page (eager, non-None) drives the
-                    # VERIFY/convergence block; never pick a lazy None slot.
+                    # All slots are lazy (page=None), so this next() falls
+                    # through to the persistent non-recording page. The actual
+                    # recording pages are materialised by browser_measure_stage
+                    # at each page's iteration (it drives VERIFY on the live
+                    # Dashboard page it materialises, not on this fallback).
                     measure_page = next(
                         (pp["page"] for pp in stage_pages.values()
                          if pp.get("page") is not None),
