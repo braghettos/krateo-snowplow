@@ -30,6 +30,8 @@ from bench.cluster import (
     COMPDEF_NAME,
     FINALIZER_PATCH,
     NS,
+    helm_context_args,
+    kubectl_context_args,
     _count,
     _count_bench_argo,
     _count_match,
@@ -126,7 +128,8 @@ def _start_port_forward():
         log("WARNING: no snowplow pod found for port-forward")
         return None
     _port_forward_proc = subprocess.Popen(
-        ["kubectl", "port-forward", f"pod/{pod_name}",
+        ["kubectl", *kubectl_context_args(),
+         "port-forward", f"pod/{pod_name}",
          f"{_PORT_FORWARD_PORT}:8081", "-n", NS],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     pf_url = f"http://localhost:{_PORT_FORWARD_PORT}"
@@ -229,6 +232,8 @@ def _set_cache_via_helm(value):
             "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
         ]
 
+    # Diego hard rule 2026-06-11: helm always pins the cluster explicitly.
+    args.extend(helm_context_args())
     proc = subprocess.run(args, capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         raise RuntimeError(

@@ -349,3 +349,38 @@ def test_flush_without_expected_tag_skips_verify_and_restarts(monkeypatch):
 
     assert not any(c[:2] == ("get", "deployment") for c in calls)
     assert any(c[:2] == ("rollout", "restart") for c in calls)
+
+
+# ─── Diego hard rule 2026-06-11: bench helm upgrades pin --kube-context ─────
+
+
+def test_set_cache_via_helm_pins_kube_context(monkeypatch):
+    """The cache-toggle helm upgrade MUST carry --kube-context to the
+    canonical GKE context — an unpinned helm upgrade on a drifted
+    current-context would mutate the WRONG cluster."""
+    import subprocess as subprocess_mod
+    import bench.cluster as cluster_mod
+
+    monkeypatch.delenv("BENCH_ALLOW_NON_GKE", raising=False)
+    monkeypatch.setattr(lifecycle_mod, "_chart_supports_cache_toggle",
+                        lambda: True)
+    monkeypatch.setattr(lifecycle_mod, "log", lambda *a, **k: None)
+    seen = {}
+
+    class _P:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        return _P()
+
+    monkeypatch.setattr(subprocess_mod, "run", fake_run)
+
+    assert lifecycle_mod._set_cache_via_helm(True) is True
+    argv = seen["argv"]
+    assert argv[0] == "helm" and argv[1] == "upgrade"
+    assert "--kube-context" in argv
+    assert argv[argv.index("--kube-context") + 1] == \
+        cluster_mod.CANONICAL_GKE_CONTEXT

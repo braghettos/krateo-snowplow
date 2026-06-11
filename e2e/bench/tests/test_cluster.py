@@ -1248,3 +1248,19 @@ def test_k8s_create_namespaced_role_rejects_no_args():
             "bench-ns-01", "test-role")
     assert ok is False
     assert "must pass either" in diag
+
+
+# ─── Diego hard rule 2026-06-11: helm pins the cluster explicitly ───────────
+
+
+def test_helm_context_args_pinned_by_default(monkeypatch):
+    import bench.cluster as cluster_mod
+    monkeypatch.delenv("BENCH_ALLOW_NON_GKE", raising=False)
+    assert cluster_mod.helm_context_args() == [
+        "--kube-context", cluster_mod.CANONICAL_GKE_CONTEXT]
+
+
+def test_helm_context_args_empty_under_non_gke_escape(monkeypatch):
+    import bench.cluster as cluster_mod
+    monkeypatch.setenv("BENCH_ALLOW_NON_GKE", "1")
+    assert cluster_mod.helm_context_args() == []

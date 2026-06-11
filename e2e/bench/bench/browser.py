@@ -412,8 +412,10 @@ def _read_password_from_secret(secret_name, ns=NS):
     secret is missing or malformed -- the bench MUST not silently fall
     back to a stale literal.
     """
+    from bench import cluster  # lazy, matches this module's import style
     proc = subprocess.run(
-        ["kubectl", "get", "secret", secret_name, "-n", ns,
+        ["kubectl", *cluster.kubectl_context_args(),
+         "get", "secret", secret_name, "-n", ns,
          "-o", "jsonpath={.data.password}"],
         capture_output=True, text=True, timeout=30,
     )

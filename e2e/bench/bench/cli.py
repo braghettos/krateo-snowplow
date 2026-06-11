@@ -264,7 +264,8 @@ def _gate_helm_lockstep(expected_tag: str) -> tuple[bool, str]:
     """
     try:
         proc = subprocess.run(
-            ["helm", "get", "values", "snowplow", "-n", NS, "-o", "json"],
+            ["helm", "get", "values", "snowplow", "-n", NS, "-o", "json"]
+            + cluster.helm_context_args(),
             capture_output=True, timeout=15,
         )
     except FileNotFoundError:

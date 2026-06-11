@@ -124,6 +124,36 @@ def kubectl(*args, input_data=None, timeout_secs=120):
         return 1, "", f"kubectl timed out after {timeout_secs}s"
 
 
+def _allow_non_gke_env():
+    """True when the kind/minikube escape hatch is set (also unit tests)."""
+    return os.environ.get(
+        "BENCH_ALLOW_NON_GKE", "0").strip().lower() in ("1", "true", "yes")
+
+
+def helm_context_args():
+    """`--kube-context` args every bench helm invocation must append.
+
+    Diego hard rule 2026-06-11: kubectl AND helm always pin the canonical
+    GKE context explicitly — current-context drifts (gcloud rewrites it),
+    and an unpinned `helm upgrade` would mutate the WRONG cluster. Mirrors
+    kubectl()'s injection semantics: empty under BENCH_ALLOW_NON_GKE
+    (kind/minikube), pinned otherwise.
+    """
+    if _allow_non_gke_env():
+        return []
+    return ["--kube-context", CANONICAL_GKE_CONTEXT]
+
+
+def kubectl_context_args():
+    """`--context` args for bench code that must shell kubectl DIRECTLY
+    (Popen streamers: port-forward, `logs -f`, secret reads) and so cannot
+    go through kubectl()'s auto-injection. Same hard-rule semantics.
+    """
+    if _allow_non_gke_env():
+        return []
+    return [f"--context={CANONICAL_GKE_CONTEXT}"]
+
+
 # ─── Kubernetes-client helper layer (k8s_* prefix) ───────────────────────────
 
 try:

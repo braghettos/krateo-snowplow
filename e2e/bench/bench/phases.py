@@ -419,7 +419,8 @@ class _PerStageLogStreamer:
         while self._running.is_set():
             try:
                 proc = subprocess.Popen(
-                    ["kubectl", "logs",
+                    ["kubectl", *cluster.kubectl_context_args(),
+                     "logs",
                      "-n", self._namespace,
                      self._deployment,
                      "-c", self._container,
