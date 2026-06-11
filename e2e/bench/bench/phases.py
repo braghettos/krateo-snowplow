@@ -2069,6 +2069,450 @@ def stage_s9_remove_rb_from_populated_ns(ctx: StageContext) -> StageProof:
     )
 
 
+# ─── S8b / S8c: CR-definition-modification reconcile latency (Task #314) ────
+#
+# Measure wall-clock from a `kubectl patch` of a BENCH-OWNED Widget /
+# RESTAction CR's definition to the moment a customer `/call` serves output
+# reflecting the modified definition. Two SEPARATE metrics on two SEPARATE
+# invalidation paths (per Task #314 design
+# docs/task-314-widget-ra-mod-reconcile-bench-design-2026-06-11.md):
+#   - S8b widget: dirty-mark via recordWidgetDeps self-dep on the widgets GVR.
+#   - S8c RA:     dirty-mark via the restactions.go:252 self-dep on the
+#                 restactions GVR.
+# Report-only (the #121 pattern): metrics land in proofs + the canonical
+# ledger row; they do NOT feed compute_verdict this ship.
+#
+# ECHO-FIELD CHOICES (read from the resolver code, NOT assumed — the design's
+# flagged INFERRED-pending-read item; file:line cited in the dev report):
+#   - Widget: `spec.widgetData.<scalar>` round-trips VERBATIM into
+#     status.widgetData when the widget carries NO widgetDataTemplate
+#     (internal/resolvers/widgets/resolve.go:182-238 returns
+#     src = GetWidgetData(spec.widgetData) and only overwrites keys named by
+#     a widgetDataTemplate eval; widgets.go:60-66 reads spec.widgetData). The
+#     served body is the whole resolved Widget marshaled
+#     (widgets.go dispatcher → encodeResolvedJSON). A Button with no apiRef /
+#     widgetDataTemplate is NOT RBAC-sensitive (widgets.go dispatcher:134 →
+#     isRBACSensitiveApiRefWidget), so it lands in the per-cohort `widgets`
+#     cell — exactly the cell a customer /call hits.
+#   - RESTAction: the top-level `spec.filter` jq is evaluated over the
+#     resolved api dict and its string output IS the served Status.Raw
+#     (internal/resolvers/restactions/restactions.go:57-79). With NO spec.api
+#     (api.Resolve returns {} for empty Items — resolve.go:149-151) a constant
+#     filter `'{ probe: "v1" }'` round-trips to body `{"probe":"v1"}`.
+#
+# Probe A SUBSTITUTION (deliberate deviation from the design, stated in the
+# dev report): the design cited `dirtyMark_total` from the ORPHAN file
+# internal/cache/apistage_bypass_counter.go (slated for exclusion/deletion in
+# #315). We instead read the WIRED signal `snowplow_refresher_completed_total`
+# (internal/cache/refresher_metrics.go:70, an expvar.Publish) — its delta
+# across the mutate→converge window proves the refresher ran. The design
+# already lists this expvar + the pod-log lines (deps.go:549 cache_event.consumed
+# / resolve_populate.go:291 re-resolved+stored) as corroboration.
+
+# Bench namespace the fixtures live in (per design §3.1 — already populated +
+# cj-granted by the time S8 has run; S8b/S8c run after S9).
+_S8BC_FIXTURE_NS = "bench-ns-01"
+
+# Widget fixture GVR (the portal-shipped widgets group; a plain `Button` has a
+# free `spec.widgetData.label` scalar and no apiRef → per-cohort `widgets`
+# cell). resource plural `buttons`.
+_WIDGET_FIXTURE_GVR = {
+    "group": "widgets.templates.krateo.io",
+    "version": "v1beta1",
+    "plural": "buttons",
+}
+_WIDGET_PROBE_NAME = "bench-widget-mod-probe"
+_WIDGET_CONTROL_NAME = "bench-widget-mod-control"
+
+# RESTAction fixture GVR (templates.krateo.io/v1, resource `restactions`).
+_RA_FIXTURE_GVR = {
+    "group": "templates.krateo.io",
+    "version": "v1",
+    "plural": "restactions",
+}
+_RA_PROBE_NAME = "bench-ra-mod-probe"
+_RA_CONTROL_NAME = "bench-ra-mod-control"
+
+# Convergence poll envelope (design §1.4 — principled, 6× the 10s AC-98.12
+# CRUD-to-completed SLA the refresher was tuned against).
+_S8BC_POLL_BUDGET_S = 60
+_S8BC_POLL_INTERVAL_S = 1.0
+
+
+def _widget_fixture_yaml(label_probe: str, label_control: str) -> str:
+    """Bench Widget fixtures: probe (mutated) + control (NEVER mutated).
+
+    A `Button` with a plain `spec.widgetData.label` scalar and NO apiRef /
+    widgetDataTemplate — so it routes to the per-cohort `widgets` L1 cell and
+    `status.widgetData.label` echoes the spec scalar verbatim (resolve.go:
+    182-238). The probe's label is the convergence marker; the control's
+    label is the negative-control invariant.
+    """
+    g = _WIDGET_FIXTURE_GVR
+    return f"""\
+---
+apiVersion: {g['group']}/{g['version']}
+kind: Button
+metadata:
+  name: {_WIDGET_PROBE_NAME}
+  namespace: {_S8BC_FIXTURE_NS}
+spec:
+  widgetData:
+    actions: {{}}
+    clickActionId: nop
+    type: text
+    label: "{label_probe}"
+---
+apiVersion: {g['group']}/{g['version']}
+kind: Button
+metadata:
+  name: {_WIDGET_CONTROL_NAME}
+  namespace: {_S8BC_FIXTURE_NS}
+spec:
+  widgetData:
+    actions: {{}}
+    clickActionId: nop
+    type: text
+    label: "{label_control}"
+"""
+
+
+def _ra_fixture_yaml(probe_value: str, control_value: str) -> str:
+    """Bench RESTAction fixtures: probe (mutated) + control (NEVER mutated).
+
+    No `spec.api` stage — the top-level `spec.filter` jq emits a constant
+    object `{{ probe: "<value>" }}`. api.Resolve returns {{}} for empty Items
+    (resolve.go:149-151); restactions.Resolve evaluates spec.filter over it
+    and the string output IS the served Status.Raw (restactions.go:57-79). So
+    the served body is `{{"probe":"<value>"}}`. The probe's value is the
+    convergence marker; the control's value is the negative-control invariant.
+    """
+    g = _RA_FIXTURE_GVR
+    return f"""\
+---
+apiVersion: {g['group']}/{g['version']}
+kind: RESTAction
+metadata:
+  name: {_RA_PROBE_NAME}
+  namespace: {_S8BC_FIXTURE_NS}
+spec:
+  filter: '{{ probe: "{probe_value}" }}'
+---
+apiVersion: {g['group']}/{g['version']}
+kind: RESTAction
+metadata:
+  name: {_RA_CONTROL_NAME}
+  namespace: {_S8BC_FIXTURE_NS}
+spec:
+  filter: '{{ probe: "{control_value}" }}'
+"""
+
+
+def _call_url_for(gvr: dict, name: str, ns: str) -> str:
+    """Build the snowplow /call query path for a CR (design §2 / phases.py:
+    2557-2559 prior art). apiVersion is `<group>/<version>`, url-encoded.
+    """
+    api_version = f"{gvr['group']}/{gvr['version']}"
+    api_version_enc = api_version.replace("/", "%2F")
+    return (f"/call?apiVersion={api_version_enc}"
+            f"&resource={gvr['plural']}&name={name}&namespace={ns}")
+
+
+def _s8bc_call_body(gvr: dict, name: str, ns: str, token: str) -> str | None:
+    """GET a CR's /call body once and return the DECODED text (gzip-aware via
+    browser._decompress), or None on any transport failure.
+
+    Reuses _phase8_poll_via_snowplow's URL/header shape but decodes the body
+    properly (the phase8 helper grepped raw bytes; decoding first is strictly
+    more correct and matches browser.read_snowplow_expvar_int's pattern).
+    """
+    import urllib.request
+    snowplow = os.environ.get("SNOWPLOW_URL", browser.SNOWPLOW)
+    url = snowplow.rstrip("/") + _call_url_for(gvr, name, ns)
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": "Bearer " + token,
+                     "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = r.read()
+            body = browser._decompress(body, headers=dict(r.headers))
+            return body.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _mutate_poll_reconcile(gvr: dict, probe_name: str, ns: str, token: str,
+                           marker: str) -> tuple[int, int]:
+    """Poll the probe CR's /call body until `marker` appears; budget 60s @ 1s.
+
+    CONTENT predicate (never status-200, per feedback_validate_content_not_
+    just_status): the decoded /call body must CONTAIN `marker` (the new echo
+    value). The caller has already issued the kubectl patch at t0.
+
+    Returns (conv_ms, poll_samples):
+      conv_ms       — ms from this function's entry to the first marker
+                      sighting; -1 on timeout.
+      poll_samples  — number of poll iterations attempted (proof bookkeeping).
+
+    The clock anchors at this function's OWN entry, so callers MUST invoke it
+    immediately after the `kubectl patch` returns. The patch RTT is therefore
+    EXCLUDED from the measurement (the clock starts after the apiserver has
+    committed the patch) — the correct anchor for "snowplow reconcile time":
+    it isolates informer→dirty-mark→refresher→serve from the bench client's
+    own network hop.
+    """
+    start = time.time()
+    deadline = start + _S8BC_POLL_BUDGET_S
+    samples = 0
+    while time.time() < deadline:
+        samples += 1
+        body = _s8bc_call_body(gvr, probe_name, ns, token)
+        if body is not None and marker in body:
+            return int((time.time() - start) * 1000), samples
+        time.sleep(_S8BC_POLL_INTERVAL_S)
+    return -1, samples
+
+
+def _run_cr_mod_reconcile_stage(stage_id: str,
+                                ctx: StageContext,
+                                *,
+                                gvr: dict,
+                                probe_name: str,
+                                control_name: str,
+                                fixture_yaml: str,
+                                patch_to_v2,
+                                patch_to_v1,
+                                metric_key: str,
+                                kind_label: str,
+                                what_breaks_if_skipped: str) -> StageProof:
+    """Shared S8b/S8c body. Symmetric across widget / RESTAction — only the
+    fixture YAML, the GVR, the patch builders and the metric key differ.
+
+    Flow (design §4.2):
+      0. precheck token present.
+      1. apply fixtures (probe="v1", control="ctrl"); idempotent.
+      2. PRIME: GET both /call once (admin); assert probe body carries "v1"
+         and control body carries "ctrl" — populates the per-cohort cell +
+         records the self-dep edge. (Cold-miss resolve, not the measurement.)
+      3. snapshot Probe-A expvar refresher_completed_total.
+      4. MUTATE: patch probe echo-field -> "v2"; t0 = now.
+      5. POLL probe /call body for "v2"; budget 60s. record conv_ms.
+         Probe A: assert refresher_completed_total INCREMENTED vs snapshot.
+      6. NEGATIVE CONTROL: GET control /call; assert body STILL "ctrl".
+      7. REVERT probe -> "v1" (best-effort) + TEARDOWN both fixtures.
+         REVERT/TEARDOWN run in a `finally` so they fire on BOTH the success
+         and the failure paths.
+    """
+    V1, V2, CTRL = "v1", "v2", "ctrl"
+
+    def _work(c: StageContext) -> dict:
+        ns = _S8BC_FIXTURE_NS
+        token = c.tokens.get("admin")
+
+        proof: dict = {
+            "kind": kind_label,
+            "fixture_ns": ns,
+            "fixture_gvr": dict(gvr),
+            "probe_name": probe_name,
+            "control_name": control_name,
+            "marker_observed": V2,
+            "poll_budget_s": _S8BC_POLL_BUDGET_S,
+            "poll_interval_s": _S8BC_POLL_INTERVAL_S,
+        }
+
+        # 0. precheck — without an admin token we cannot /call-poll.
+        if not token:
+            proof.update({
+                "error": "no_admin_token",
+                metric_key: -1,
+                "__passed__": False,
+            })
+            return proof
+
+        teardown_done = {"v": False}
+
+        def _teardown() -> dict:
+            """Revert probe to v1 (best-effort) then delete every fixture.
+            Idempotent + safe to call twice (guarded). Returns a small diag.
+            """
+            if teardown_done["v"]:
+                return {}
+            teardown_done["v"] = True
+            revert_ok, revert_diag = patch_to_v1(probe_name)
+            d1 = cluster.k8s_delete_custom(
+                gvr["group"], gvr["version"], gvr["plural"], ns, probe_name)
+            d2 = cluster.k8s_delete_custom(
+                gvr["group"], gvr["version"], gvr["plural"], ns, control_name)
+            return {
+                "revert_ok": bool(revert_ok),
+                "revert_diag": revert_diag,
+                "probe_deleted": bool(d1),
+                "control_deleted": bool(d2),
+            }
+
+        try:
+            # 1. create fixtures (idempotent server-side apply).
+            apply_ok, apply_diag = cluster.k8s_apply_yaml(fixture_yaml)
+            proof["apply_ok"] = apply_ok
+            if not apply_ok:
+                proof.update({
+                    "apply_diag": apply_diag,
+                    "error": "fixture_apply_failed",
+                    metric_key: -1,
+                    "__passed__": False,
+                })
+                return proof
+
+            # 2. PRIME both cells (cold-miss resolve + self-dep record).
+            prime_probe = _s8bc_call_body(gvr, probe_name, ns, token)
+            prime_control = _s8bc_call_body(gvr, control_name, ns, token)
+            prime_probe_ok = prime_probe is not None and V1 in prime_probe
+            prime_control_ok = prime_control is not None and CTRL in prime_control
+            proof["prime_probe_ok"] = prime_probe_ok
+            proof["prime_control_ok"] = prime_control_ok
+            if not (prime_probe_ok and prime_control_ok):
+                proof.update({
+                    "error": "prime_failed",
+                    "prime_probe_snippet": (prime_probe or "")[:200],
+                    "prime_control_snippet": (prime_control or "")[:200],
+                    metric_key: -1,
+                    "__passed__": False,
+                })
+                return proof
+
+            # 3. Probe-A snapshot (WIRED refresher_completed_total expvar).
+            refresher_before = browser.read_snowplow_expvar_int(
+                "snowplow_refresher_completed_total")
+
+            # 4. MUTATE probe -> v2. t0 anchors the reconcile wall-clock.
+            patch_ok, patch_diag = patch_to_v2(probe_name)
+            proof["mutate_ok"] = patch_ok
+            if not patch_ok:
+                proof.update({
+                    "mutate_diag": patch_diag,
+                    "error": "mutate_failed",
+                    metric_key: -1,
+                    "__passed__": False,
+                })
+                return proof
+
+            # 5. POLL probe /call body for "v2".
+            conv_ms, poll_samples = _mutate_poll_reconcile(
+                gvr, probe_name, ns, token, V2)
+            proof[metric_key] = conv_ms
+            proof["poll_samples"] = poll_samples
+
+            # Probe A: refresher_completed_total must have incremented.
+            refresher_after = browser.read_snowplow_expvar_int(
+                "snowplow_refresher_completed_total")
+            refresher_delta = None
+            if refresher_before is not None and refresher_after is not None:
+                refresher_delta = refresher_after - refresher_before
+            proof["refresher_completed_before"] = refresher_before
+            proof["refresher_completed_after"] = refresher_after
+            proof["refresher_completed_delta"] = refresher_delta
+
+            # 6. NEGATIVE CONTROL: control body MUST still carry "ctrl" and
+            #    MUST NOT carry "v2" at the moment the probe converged.
+            control_body = _s8bc_call_body(gvr, control_name, ns, token)
+            control_unchanged = (
+                control_body is not None
+                and CTRL in control_body
+                and V2 not in control_body
+            )
+            proof["control_unchanged"] = control_unchanged
+            proof["control_snippet"] = (control_body or "")[:200]
+
+            converged = (conv_ms is not None and conv_ms >= 0)
+            # Probe-A is corroboration; treat an unreadable expvar (None
+            # delta) as non-blocking but require a positive delta when it IS
+            # readable (a converge with zero refresher delta means the body
+            # changed for the wrong reason — design falsifier #2).
+            refresher_ok = (refresher_delta is None or refresher_delta > 0)
+            proof["refresher_probe_ok"] = refresher_ok
+
+            proof["__passed__"] = bool(
+                converged and control_unchanged and refresher_ok)
+            return proof
+        finally:
+            # 7. REVERT + TEARDOWN on BOTH success and failure paths.
+            proof["teardown"] = _teardown()
+
+    return _run_stage(stage_id, ctx, _work,
+                      what_breaks_if_skipped=what_breaks_if_skipped)
+
+
+def stage_s8b_widget_mod_reconcile(ctx: StageContext) -> StageProof:
+    """S8b — Widget CR definition-modification reconcile latency (#314).
+
+    Patches a bench-owned Button's `spec.widgetData.label` "v1"->"v2" and
+    measures wall-clock to the moment a customer /call serves the new label.
+    Exercises the recordWidgetDeps self-dep -> dirty-mark -> refresher
+    re-resolve path on the widgets GVR. Report-only (`conv_widget_mod_ms`).
+    """
+    g = _WIDGET_FIXTURE_GVR
+
+    def _patch_label(name: str, value: str):
+        return cluster.k8s_patch_cr_spec(
+            g["group"], g["version"], g["plural"], _S8BC_FIXTURE_NS, name,
+            {"widgetData": {"label": value}})
+
+    return _run_cr_mod_reconcile_stage(
+        "S8b", ctx,
+        gvr=g,
+        probe_name=_WIDGET_PROBE_NAME,
+        control_name=_WIDGET_CONTROL_NAME,
+        fixture_yaml=_widget_fixture_yaml("v1", "ctrl"),
+        patch_to_v2=lambda name: _patch_label(name, "v2"),
+        patch_to_v1=lambda name: _patch_label(name, "v1"),
+        metric_key="conv_widget_mod_ms",
+        kind_label="widget",
+        what_breaks_if_skipped=(
+            "without the widget-CR-modification reconcile stage, a "
+            "regression that stalls the recordWidgetDeps self-dep -> "
+            "dirty-mark -> refresher re-resolve path (an edited widget "
+            "definition never reaching a customer /call) would ship "
+            "undetected."
+        ),
+    )
+
+
+def stage_s8c_ra_mod_reconcile(ctx: StageContext) -> StageProof:
+    """S8c — RESTAction CR definition-modification reconcile latency (#314).
+
+    Patches a bench-owned RESTAction's top-level `spec.filter` jq literal
+    '{ probe: "v1" }' -> '{ probe: "v2" }' and measures wall-clock to the
+    moment a customer /call serves `"probe":"v2"`. Exercises the
+    restactions.go:252 self-dep -> dirty-mark -> refresher re-resolve path on
+    the restactions GVR. Report-only (`conv_ra_mod_ms`).
+    """
+    g = _RA_FIXTURE_GVR
+
+    def _patch_filter(name: str, value: str):
+        return cluster.k8s_patch_cr_spec(
+            g["group"], g["version"], g["plural"], _S8BC_FIXTURE_NS, name,
+            {"filter": f'{{ probe: "{value}" }}'})
+
+    return _run_cr_mod_reconcile_stage(
+        "S8c", ctx,
+        gvr=g,
+        probe_name=_RA_PROBE_NAME,
+        control_name=_RA_CONTROL_NAME,
+        fixture_yaml=_ra_fixture_yaml("v1", "ctrl"),
+        patch_to_v2=lambda name: _patch_filter(name, "v2"),
+        patch_to_v1=lambda name: _patch_filter(name, "v1"),
+        metric_key="conv_ra_mod_ms",
+        kind_label="restaction",
+        what_breaks_if_skipped=(
+            "without the RESTAction-CR-modification reconcile stage, a "
+            "regression that stalls the restactions self-dep -> dirty-mark "
+            "-> refresher re-resolve path (an edited RESTAction filter/output "
+            "never reaching a customer /call) would ship undetected."
+        ),
+    )
+
+
 # ─── S10: delete 1 namespace (was S8 pre-1.1.0) ────────────────────────────
 
 
@@ -2167,13 +2611,19 @@ STAGE_REGISTRY: dict[str, Callable[[StageContext], StageProof]] = {
     # Task #250 Block 2: new RBAC-mutation stages inserted after S7.
     "S8": stage_s8_add_rb_to_populated_ns,
     "S9": stage_s9_remove_rb_from_populated_ns,
+    # Task #314 Block: CR-definition-modification reconcile-latency stages,
+    # inserted after S9 / before S10 so they measure invalidation under the
+    # fully-populated 50K dep graph (lettered sub-stages avoid renumbering
+    # S10/S11 again — the 1.1.0 churn already renamed S8/S9→S10/S11 once).
+    "S8b": stage_s8b_widget_mod_reconcile,
+    "S8c": stage_s8c_ra_mod_reconcile,
     # Renamed from pre-1.1.0 layout (was S8 / S9).
     "S10": stage_s10_delete_one_ns,
     "S11": stage_s11_report,
 }
 
 STAGE_ORDER = ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7",
-               "S8", "S9", "S10", "S11"]
+               "S8", "S9", "S8b", "S8c", "S10", "S11"]
 
 
 # ─── --from-stage / --to-stage semantics (per §E.3) ─────────────────────────
@@ -2279,6 +2729,26 @@ def _proof_validation_re_runner(state: dict,
                             else "fail:rb_still_present")
             else:
                 out[sid] = "skipped:no_rb_metadata"
+        elif sid in ("S8b", "S8c"):
+            # Task #314: S8b/S8c tear down their bench fixtures (probe +
+            # control CR) at stage end. Re-verify the probe fixture is gone
+            # at the apiserver — parametric off the proof's stamped GVR +
+            # name (no string literal). Mirrors the S9 "verify RB gone"
+            # branch. When the GVR/name metadata is absent (older proof) we
+            # fall back to the safe `skipped:no_live_check` default per the
+            # design's §4.4 safe-default guidance.
+            gvr = proof_body.get("fixture_gvr") or {}
+            grp = gvr.get("group")
+            ver = gvr.get("version")
+            plural = gvr.get("plural")
+            ns = proof_body.get("fixture_ns")
+            probe_name = proof_body.get("probe_name")
+            if grp and ver and plural and ns and probe_name:
+                obj = cluster.k8s_get_custom(grp, ver, plural, ns, probe_name)
+                out[sid] = ("pass" if obj is None
+                            else "fail:fixture_still_present")
+            else:
+                out[sid] = "skipped:no_live_check"
         else:
             # S0/S1/S7/S10: no live-cluster reverify (S0 is meta,
             # S1 zero-state, S7/S10 already mutated — can't undo).
@@ -2372,8 +2842,17 @@ def run_phase6(tag: str,
     # Task #250 Block 2: new S8/S9 stages run measurements via
     # _measure_all_users, so they share the browser scaffolding. S10
     # (was S8 — delete 1 ns) keeps the existing measurement footprint.
+    #
+    # Task #314: S8b/S8c poll snowplow's /call over urllib (NOT Chrome) and
+    # do not use the per-user Playwright pages. They are listed here to keep
+    # the scaffolding/teardown symmetry with the S8/S9 prior art the design
+    # cites; the poll TOKEN they actually need comes from the `needs_login`
+    # path above (browser.login_all → ctx.tokens), which already covers any
+    # non-S0/S11 stage. So a standalone `--from-stage S8b --to-stage S8c`
+    # window still acquires the admin poll token even though _setup_users
+    # is the heavier (Playwright) half of the scaffolding.
     needs_browser = any(s in ("S1", "S2", "S3", "S4", "S5", "S6", "S7",
-                              "S8", "S9", "S10")
+                              "S8", "S9", "S8b", "S8c", "S10")
                         for s in window)
     if needs_browser and browser.FRONTEND is not None:
         try:

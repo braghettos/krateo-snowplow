@@ -301,6 +301,18 @@
         "null"
       ]
     },
+    "conv_widget_mod_ms": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "conv_ra_mod_ms": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
     "tag_specific_verifications": {
       "type": "object"
     },

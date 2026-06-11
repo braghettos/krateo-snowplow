@@ -37,12 +37,16 @@ from bench.phases import (
 def test_stage_registry_contains_S0_through_S11():
     # Task #250 Block 2 / SCHEMA_VERSION 1.1.0: new S8 (RB-add) +
     # S9 (RB-remove) inserted after S7; old S8/S9 renamed to S10/S11.
+    # Task #314: additive lettered sub-stages S8b (widget-mod reconcile) +
+    # S8c (RA-mod reconcile) inserted after S9, before S10 — no renumber of
+    # S10/S11 (additive ids, no SCHEMA_MAJOR bump).
     assert set(STAGE_REGISTRY.keys()) == {
         "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7",
-        "S8", "S9", "S10", "S11",
+        "S8", "S9", "S8b", "S8c", "S10", "S11",
     }
     assert STAGE_ORDER == ["S0", "S1", "S2", "S3", "S4",
-                           "S5", "S6", "S7", "S8", "S9", "S10", "S11"]
+                           "S5", "S6", "S7", "S8", "S9",
+                           "S8b", "S8c", "S10", "S11"]
 
 
 # ─── --from-stage / --to-stage semantics ────────────────────────────────────
@@ -56,10 +60,12 @@ def test_from_stage_S5_skips_S1_S2_S3_S4():
 
 def test_to_stage_S11_includes_S0_through_S11_inclusive():
     # SCHEMA 1.1.0 — the report stage is now S11. Operators selecting
-    # the full window via --to-stage S11 must see all 12 stages.
+    # the full window via --to-stage S11 must see all stages, now including
+    # the Task #314 S8b/S8c reconcile sub-stages (after S9, before S10).
     window = _stages_in_window(None, "S11")
     assert window == ["S0", "S1", "S2", "S3", "S4",
-                      "S5", "S6", "S7", "S8", "S9", "S10", "S11"]
+                      "S5", "S6", "S7", "S8", "S9",
+                      "S8b", "S8c", "S10", "S11"]
 
 
 def test_to_stage_S3_stops_after_S3():

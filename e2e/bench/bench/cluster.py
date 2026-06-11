@@ -648,6 +648,101 @@ def k8s_delete_custom(group, version, plural, ns, name):
         return _k8s_is_404(e)
 
 
+# ── Bench-owned CR apply / patch / read (Task #314 S8b/S8c reconcile) ──────
+#
+# These three primitives let the S8b (Widget) / S8c (RESTAction) reconcile-
+# latency stages create + mutate + (re)read BENCH-OWNED fixture CRs.
+# Parametric — the caller owns the group/version/plural and the patch body;
+# this layer only mediates the apiserver call (feedback_no_special_cases).
+#
+# Helm-ownership note: these are used EXCLUSIVELY on `bench-*` fixture CRs in
+# a bench namespace. They never touch a portal/helm-owned object. This is the
+# bench-internal-kubectl/apiserver path that feedback_never_kubectl_apply
+# explicitly exempts ("Bench-internal kubectl is exempt").
+
+
+def k8s_apply_yaml(yaml_str):
+    """Server-side-apply a YAML document (one or many CRs) via kubectl.
+
+    Mirrors the bench's existing `kubectl(..., input_data=...)` prior art
+    (composition_yaml / deploy_compositiondefinition use `kubectl apply`).
+    `--server-side --force-conflicts` makes the apply idempotent across
+    re-runs (the S8b/S8c PRIME step is re-entrant on `--from-stage` resume).
+
+    Returns:
+        (ok, diag) — ok=True when kubectl exits 0; ok=False with the
+        stderr (truncated) on any failure. Matches the (ok, diag) shape of
+        the k8s_create_namespaced_role* helpers so stage proofs surface the
+        diagnostic verbatim.
+    """
+    rc, out, err = kubectl(
+        "apply", "--server-side", "--force-conflicts", "-f", "-",
+        input_data=yaml_str, timeout_secs=60)
+    if rc == 0:
+        return True, ""
+    return False, (err or out or "kubectl apply failed")[:500]
+
+
+def k8s_patch_cr_spec(group, version, plural, ns, name, spec_patch):
+    """JSON Merge Patch a custom resource's `spec` sub-tree.
+
+    `spec_patch` is the dict written under `{"spec": spec_patch}` — a
+    strategic-free JSON merge patch (RFC 7386 semantics via the k8s client's
+    default merge-patch content type). Used by S8b/S8c to flip the echo
+    field (widget `spec.widgetData.<scalar>` / RESTAction `spec.filter`)
+    from its primed value to the mutated value, and to revert it.
+
+    Mirrors k8s_patch_custom_finalizers_null's construction but takes a
+    caller-supplied spec sub-tree instead of a fixed finalizers=null body.
+
+    Returns:
+        (ok, diag) — ok=True on success or 404 (treated as success: the
+        fixture is already gone, so there is nothing to patch/revert).
+        ok=False with the exception detail otherwise.
+    """
+    if not _k8s_init():
+        return False, ("patch_failed: k8s client unavailable "
+                       "(_k8s_init returned False)")
+    body = {"spec": spec_patch}
+    try:
+        _k8s_custom.patch_namespaced_custom_object(
+            group=group, version=version, plural=plural,
+            namespace=ns, name=name, body=body,
+            _request_timeout=30)
+        return True, ""
+    except Exception as e:
+        if _k8s_is_404(e):
+            return True, ""
+        if _K8S_LIB_AVAILABLE and isinstance(
+                e, _k8s_client_mod.exceptions.ApiException):
+            status = getattr(e, "status", None)
+            reason = getattr(e, "reason", "") or ""
+            return False, (f"patch_failed: api_exception "
+                           f"status={status} reason={reason}")
+        return False, f"patch_failed: {type(e).__name__}: {e}"
+
+
+def k8s_get_custom(group, version, plural, ns, name):
+    """Read one namespaced custom object. Returns the object dict, or None
+    on NotFound (404) / client-unavailable.
+
+    Used by the S8b/S8c PRIME pre-check to confirm the fixture landed at the
+    apiserver before measurement (and is parametric — no name literal).
+    Non-404 transport errors propagate so they are not silently read as
+    'absent'.
+    """
+    if not _k8s_init():
+        return None
+    try:
+        return _k8s_custom.get_namespaced_custom_object(
+            group=group, version=version, plural=plural,
+            namespace=ns, name=name, _request_timeout=30)
+    except Exception as e:
+        if _k8s_is_404(e):
+            return None
+        raise
+
+
 # ── Bulk parallel helpers ─────────────────────────────────────────────────
 
 def k8s_bulk_delete_clusterscope(kind, names, workers=64):
@@ -1139,6 +1234,10 @@ __all__ = [
     "k8s_list_cluster_custom",
     "k8s_patch_custom_finalizers_null",
     "k8s_delete_custom",
+    # Task #314 — bench-owned CR apply / patch / read (S8b/S8c reconcile).
+    "k8s_apply_yaml",
+    "k8s_patch_cr_spec",
+    "k8s_get_custom",
     "k8s_bulk_delete_clusterscope",
     "k8s_bulk_delete_namespaced",
     "k8s_bulk_patch_finalizers_null_custom",

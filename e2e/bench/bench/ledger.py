@@ -256,6 +256,34 @@ def _load_per_mutation_metric(key: str, *, run_dir: Path | None = None):
     return None
 
 
+def _load_stage_proof_metric(stage_id: str, key: str, *,
+                             run_dir: Path | None = None):
+    """Read a single scalar by-key from a per-stage proof JSON on disk.
+
+    Task #314: the S8b/S8c reconcile stages stamp `conv_widget_mod_ms` /
+    `conv_ra_mod_ms` into their `proofs/{stage}.json` proof body. This
+    mirrors `_load_per_mutation_metric`'s by-key disk read so the canonical
+    ledger row can surface them REPORT-ONLY (no verdict coupling). Returns
+    None when run_dir is absent, the proof file is missing/malformed, or the
+    key is not present (forward-compatible with pre-#314 runs).
+    """
+    if run_dir is None:
+        return None
+    path = Path(run_dir) / "proofs" / f"{stage_id}.json"
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        # _write_stage_proof nests the stage payload under "proof".
+        body = d.get("proof") if isinstance(d, dict) else None
+        if isinstance(body, dict):
+            v = body.get(key)
+            if v is not None:
+                return v
+    except Exception:
+        return None
+    return None
+
+
 # ─── Latency tier thresholds (ms) ───────────────────────────────────────────
 #
 # warm_p50 (1000) and cold (1300) are the REVISED verdict tiers (Task #121,
@@ -560,6 +588,16 @@ def build_canonical_ledger_row(all_results: list[dict], *,
             "warm_p99", run_dir=run_dir),
         "convergence_per_class_cold_p99":   _load_per_mutation_metric(
             "cold_p99", run_dir=run_dir),
+        # Task #314 — CR-definition-modification reconcile latency, REPORT-
+        # ONLY (the #121 pattern). Read by-key from the S8b/S8c proofs; -1
+        # sentinel = the stage's poll timed out (FAIL). These do NOT feed
+        # compute_verdict this ship (a CONV_MOD_TIER_MS gate is a follow-up
+        # after the first 50K distribution is known). Null when the stage
+        # did not run (pre-#314 run, or window excluded S8b/S8c).
+        "conv_widget_mod_ms": _load_stage_proof_metric(
+            "S8b", "conv_widget_mod_ms", run_dir=run_dir),
+        "conv_ra_mod_ms": _load_stage_proof_metric(
+            "S8c", "conv_ra_mod_ms", run_dir=run_dir),
         "tag_specific_verifications": {},
         "pod_restart_count": restarts,
         "validation": validation,
@@ -970,6 +1008,9 @@ def _ledger_row_schema_doc() -> dict:
             "convergence_per_class_hot_p99":    {"type": ["integer", "null"]},
             "convergence_per_class_warm_p99":   {"type": ["integer", "null"]},
             "convergence_per_class_cold_p99":   {"type": ["integer", "null"]},
+            # Task #314 — additive optional report-only reconcile metrics.
+            "conv_widget_mod_ms": {"type": ["integer", "null"]},
+            "conv_ra_mod_ms":     {"type": ["integer", "null"]},
             "tag_specific_verifications": {"type": "object"},
             "pod_restart_count": {"type": "integer", "minimum": 0},
             "validation": {
