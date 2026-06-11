@@ -24,10 +24,10 @@ func GroupVersion(obj map[string]any) schema.GroupVersion {
 
 	switch strings.Count(av, "/") {
 	case 0:
-		return schema.GroupVersion{"", av}
+		return schema.GroupVersion{Group: "", Version: av}
 	case 1:
 		i := strings.Index(av, "/")
-		return schema.GroupVersion{av[:i], av[i+1:]}
+		return schema.GroupVersion{Group: av[:i], Version: av[i+1:]}
 	default:
 		return schema.GroupVersion{}
 	}

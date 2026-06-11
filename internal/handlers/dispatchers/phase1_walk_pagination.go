@@ -367,7 +367,7 @@ func iterateApiRefPages(
 			if !walkShouldRecurse(child) {
 				continue
 			}
-			childRef, ok := util.ParseCallPathToObjectRef(child.Path)
+			childRef, ok := objects.ParseCallPathToObjectRef(child.Path)
 			if !ok {
 				continue
 			}

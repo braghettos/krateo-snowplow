@@ -22,7 +22,7 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -608,14 +608,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				//   2. the resolver seam is wired (nestedCallResolver != nil
 				//      — the second structural fallback);
 				//   3. the call is a GET whose path parses as a /call
-				//      loopback (util.ParseCallPathToObjectRef — SHAPE only,
+				//      loopback (objects.ParseCallPathToObjectRef — SHAPE only,
 				//      no resource/name/host literal).
 				// On a nested error: honour ContinueOnError / ErrorKey
 				// exactly as the HTTP path, AND bump the 0.30.120 stage-error
 				// sink so layer (b)'s Put-gate still sees the failure.
 				if inprocessNestedCallEnabled() && nestedCallResolver != nil &&
 					ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
-					if ref, isLoopback := util.ParseCallPathToObjectRef(call.Path); isLoopback {
+					if ref, isLoopback := objects.ParseCallPathToObjectRef(call.Path); isLoopback {
 						statusRaw, nerr := nestedCallResolver(gctx, ref,
 							opts.PerPage, opts.Page, opts.Extras)
 						if nerr != nil {
@@ -635,7 +635,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							// (nil-receiver-safe).
 							stageErrSink.Bump(id, nerr.Error())
 							if !call.ContinueOnError {
-								return fmt.Errorf("api %s failed: %s", id, nerr.Error())
+								return fmt.Errorf("api %s failed: %w", id, nerr)
 							}
 							// ContinueOnError: fall through to the success-log
 							// line, mirroring the httpcall.Do ContinueOnError
@@ -800,7 +800,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							// Cancel gctx so in-flight peers short-circuit —
 							// same contract as the httpcall.Do StatusFailure
 							// hard-error branch below.
-							return fmt.Errorf("api %s failed: %s", id, ierr.Error())
+							return fmt.Errorf("api %s failed: %w", id, ierr)
 						}
 						// ContinueOnError: the internal dispatcher OWNED this
 						// call (an internal *rest.Config is on the context).

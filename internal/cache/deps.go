@@ -369,7 +369,7 @@ var (
 func Deps() *DepTracker {
 	depsOnce.Do(func() {
 		depsInstance = newDepTracker(
-			int64FromEnv(envDepsMaxRecords, defaultDepsMaxRecords),
+			int64BytesFromEnv(envDepsMaxRecords, defaultDepsMaxRecords),
 		)
 	})
 	return depsInstance

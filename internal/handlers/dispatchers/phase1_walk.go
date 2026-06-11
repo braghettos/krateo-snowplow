@@ -1255,7 +1255,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 			if walkShouldRecurse(child) {
 				recurseCount++
 			}
-			if _, ok := util.ParseCallPathToObjectRef(child.Path); ok {
+			if _, ok := objects.ParseCallPathToObjectRef(child.Path); ok {
 				parseCount++
 			}
 		}
@@ -1286,7 +1286,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 			continue
 		}
 
-		ref, ok := util.ParseCallPathToObjectRef(child.Path)
+		ref, ok := objects.ParseCallPathToObjectRef(child.Path)
 		if !ok {
 			// A child path that is not a /call?... widget endpoint
 			// (external link, malformed) — nothing to recurse into.

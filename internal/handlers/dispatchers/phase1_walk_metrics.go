@@ -52,7 +52,7 @@ import (
 	"sync/atomic"
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -102,7 +102,7 @@ func recordWalkChildren(gvr schema.GroupVersionResource, ns, name string, depth 
 		if walkShouldRecurse(child) {
 			recurse++
 		}
-		if _, ok := util.ParseCallPathToObjectRef(child.Path); ok {
+		if _, ok := objects.ParseCallPathToObjectRef(child.Path); ok {
 			parse++
 		}
 	}

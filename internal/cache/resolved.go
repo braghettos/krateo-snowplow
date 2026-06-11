@@ -547,15 +547,19 @@ func ResolvedCache() *ResolvedCacheStore {
 	resolvedCacheOnce.Do(func() {
 		resolvedCacheInstance = newResolvedCache(
 			intFromEnv(envResolvedCacheMaxEntries, defaultResolvedCacheMaxEntries),
-			int64FromEnv(envResolvedCacheMaxBytes, defaultResolvedCacheMaxBytes),
+			int64BytesFromEnv(envResolvedCacheMaxBytes, defaultResolvedCacheMaxBytes),
 			time.Duration(intFromEnv(envResolvedCacheTTLSeconds, defaultResolvedCacheTTLSeconds))*time.Second,
 		)
 		// Ship 4a (0.30.198) — wire the resident-region budget. A 0 value is
 		// VALID and explicitly DISABLES pinning (kill-switch), so it is read
 		// directly rather than through newResolvedCache's positive-default
-		// guard. int64FromEnv returns the default only when the var is unset
-		// or unparseable; an explicit "0" disables pinning.
-		resolvedCacheInstance.maxResidentBytes = int64FromEnv(
+		// guard. int64BytesFromEnv (#278-C) returns the default only when the
+		// var is unset, unparseable, or NEGATIVE; an explicit "0" disables
+		// pinning and is preserved (its range contract accepts 0). Parse-
+		// reject and negative now emit a WARN — the #154 silent-512MiB-
+		// truncation case is now operator-visible, and scientific notation
+		// (e.g. "5e8") parses via the ParseFloat fallback.
+		resolvedCacheInstance.maxResidentBytes = int64BytesFromEnv(
 			envResolvedCacheMaxResidentBytes, defaultResolvedCacheMaxResidentBytes)
 		// 0.30.8: wire the cache into the dep tracker so OnDelete can
 		// evict and so any eviction path (LRU/TTL/DELETE) calls
@@ -1352,4 +1356,108 @@ func boolFromEnv(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// positiveIntFromEnv parses an env var as an int that MUST be >= 1,
+// falling back to def with a VISIBLE WARN slog on either (a) a parse
+// failure or (b) an out-of-range (<= 0) value. This is the
+// range-validating sibling of intFromEnv (#278-C / generalizes #154):
+// intFromEnv silently swallows malformed values, and the historic
+// `if n <= 0 { n = def }` clamps at the call sites were silent too — a
+// misconfigured RESOLVED_CACHE_REFRESHER_PARALLELISM=-1 or =garbage
+// became the default with no operator-visible signal. The absence of
+// that log line WAS the #154 failure-mode.
+//
+// Behaviour preserved: the SAME def applies in the SAME cases the old
+// `intFromEnv(...)` + `if n <= 0` clamp applied it. Only the WARN is
+// new. Used by the parallelism / queue-len / worker-count knobs, all of
+// which require a strictly-positive value.
+func positiveIntFromEnv(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		slog.Warn("cache.env.parse_rejected",
+			slog.String("subsystem", "cache"),
+			slog.String("key", key),
+			slog.String("value", v),
+			slog.Int("default_applied", def),
+			slog.String("note", "unparseable as int — falling back to default"),
+		)
+		return def
+	}
+	if n <= 0 {
+		slog.Warn("cache.env.out_of_range",
+			slog.String("subsystem", "cache"),
+			slog.String("key", key),
+			slog.Int("value", n),
+			slog.Int("default_applied", def),
+			slog.String("note", "value must be >= 1 — falling back to default"),
+		)
+		return def
+	}
+	return n
+}
+
+// int64BytesFromEnv parses an env var as an int64 byte-count, falling
+// back to def with a VISIBLE WARN slog on either a parse failure or a
+// negative value. Used by the byte-cap knobs (RESOLVED_CACHE_MAX_BYTES,
+// RESOLVED_CACHE_MAX_RESIDENT_BYTES, DEPS_MAX_RECORDS).
+//
+// #154 ORIGINAL REPORT: a scientific-notation value such as "5e8" failed
+// strconv.ParseInt and silently truncated to the 512MiB default with no
+// log. This variant adds a strconv.ParseFloat fallback so "5e8" /
+// "1.5e9" parse to their integer byte-count, AND emits a WARN whenever
+// the value is rejected outright.
+//
+// RANGE CONTRACT: zero is ACCEPTED (it is a VALID kill-switch for
+// RESOLVED_CACHE_MAX_RESIDENT_BYTES — see ResolvedCache() at the
+// maxResidentBytes wire site — and the downstream `<= 0` guards in
+// newResolvedCache already map a 0 max-bytes/max-entries onto the
+// positive default). Only a NEGATIVE value is out-of-range; it WARNs and
+// returns def. This preserves which defaults apply — only rejection is
+// now visible.
+func int64BytesFromEnv(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n < 0 {
+			slog.Warn("cache.env.out_of_range",
+				slog.String("subsystem", "cache"),
+				slog.String("key", key),
+				slog.Int64("value", n),
+				slog.Int64("default_applied", def),
+				slog.String("note", "byte-count must be >= 0 — falling back to default"),
+			)
+			return def
+		}
+		return n
+	}
+	// strconv.ParseInt failed — try scientific / float notation (#154).
+	f, ferr := strconv.ParseFloat(v, 64)
+	if ferr != nil {
+		slog.Warn("cache.env.parse_rejected",
+			slog.String("subsystem", "cache"),
+			slog.String("key", key),
+			slog.String("value", v),
+			slog.Int64("default_applied", def),
+			slog.String("note", "unparseable as int64 byte-count (incl. scientific notation) — falling back to default"),
+		)
+		return def
+	}
+	if f < 0 {
+		slog.Warn("cache.env.out_of_range",
+			slog.String("subsystem", "cache"),
+			slog.String("key", key),
+			slog.String("value", v),
+			slog.Int64("default_applied", def),
+			slog.String("note", "byte-count must be >= 0 — falling back to default"),
+		)
+		return def
+	}
+	return int64(f)
 }

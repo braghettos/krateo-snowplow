@@ -60,7 +60,7 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -506,7 +506,7 @@ func recomputeAllowedFromRefItem(ctx context.Context, item map[string]any) bool 
 	if path == "" || verb == "" {
 		return false
 	}
-	ref, ok := util.ParseCallPathToObjectRef(path)
+	ref, ok := objects.ParseCallPathToObjectRef(path)
 	if !ok {
 		// Not a /call endpoint — external URL or malformed. The cold-
 		// resolve path would not have set allowed=true for this item

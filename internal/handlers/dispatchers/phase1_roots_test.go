@@ -13,7 +13,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 )
 
 // TestFrontendConfig_ParsesInitAndRoutesLoader proves config.json's
@@ -56,7 +56,7 @@ func TestFrontendConfig_RootsDecodeFromConfigNotLiterals(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	initRef, ok := util.ParseCallPathToObjectRef(cfg.API.Init)
+	initRef, ok := objects.ParseCallPathToObjectRef(cfg.API.Init)
 	if !ok {
 		t.Fatalf("INIT /call URL did not decode")
 	}
@@ -65,7 +65,7 @@ func TestFrontendConfig_RootsDecodeFromConfigNotLiterals(t *testing.T) {
 		t.Fatalf("INIT ref not config-derived: %+v", initRef)
 	}
 
-	rlRef, ok := util.ParseCallPathToObjectRef(cfg.API.RoutesLoader)
+	rlRef, ok := objects.ParseCallPathToObjectRef(cfg.API.RoutesLoader)
 	if !ok {
 		t.Fatalf("ROUTES_LOADER /call URL did not decode")
 	}
@@ -87,7 +87,7 @@ func TestFrontendConfig_MissingEntryPointTolerated(t *testing.T) {
 	if cfg.API.Init != "" {
 		t.Fatalf("expected empty INIT")
 	}
-	if _, ok := util.ParseCallPathToObjectRef(cfg.API.RoutesLoader); !ok {
+	if _, ok := objects.ParseCallPathToObjectRef(cfg.API.RoutesLoader); !ok {
 		t.Fatalf("ROUTES_LOADER should still decode")
 	}
 }
@@ -101,7 +101,7 @@ func TestFrontendConfig_NonCallURLRejected(t *testing.T) {
 		"/call?name=x&namespace=y", // no resource/apiVersion
 		"not a url at all ${leak}",
 	} {
-		if _, ok := util.ParseCallPathToObjectRef(bad); ok {
+		if _, ok := objects.ParseCallPathToObjectRef(bad); ok {
 			t.Fatalf("bad entry point %q should NOT decode to a root ref", bad)
 		}
 	}

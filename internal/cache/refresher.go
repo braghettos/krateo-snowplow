@@ -263,18 +263,9 @@ var (
 // it lazily.
 func refresherSingleton() *refresher {
 	refresherInit.Do(func() {
-		parallelism := intFromEnv(envRefresherParallelism, defaultRefresherParallelism)
-		if parallelism <= 0 {
-			parallelism = defaultRefresherParallelism
-		}
-		baseMS := intFromEnv(envRefresherBaseDelayMS, defaultRefresherBaseDelayMS)
-		if baseMS <= 0 {
-			baseMS = defaultRefresherBaseDelayMS
-		}
-		maxMS := intFromEnv(envRefresherMaxDelayMS, defaultRefresherMaxDelayMS)
-		if maxMS <= 0 {
-			maxMS = defaultRefresherMaxDelayMS
-		}
+		parallelism := positiveIntFromEnv(envRefresherParallelism, defaultRefresherParallelism)
+		baseMS := positiveIntFromEnv(envRefresherBaseDelayMS, defaultRefresherBaseDelayMS)
+		maxMS := positiveIntFromEnv(envRefresherMaxDelayMS, defaultRefresherMaxDelayMS)
 		rl := workqueue.NewTypedItemExponentialFailureRateLimiter[string](
 			time.Duration(baseMS)*time.Millisecond,
 			time.Duration(maxMS)*time.Millisecond,

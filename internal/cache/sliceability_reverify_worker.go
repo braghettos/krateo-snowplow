@@ -72,10 +72,7 @@ type sliceabilityReverifyWorker struct {
 var reverifyWorker = newSliceabilityReverifyWorker()
 
 func newSliceabilityReverifyWorker() *sliceabilityReverifyWorker {
-	qlen := intFromEnv(envSliceabilityReverifyQueueLen, defaultSliceabilityReverifyQueueLen)
-	if qlen < 1 {
-		qlen = 1
-	}
+	qlen := positiveIntFromEnv(envSliceabilityReverifyQueueLen, defaultSliceabilityReverifyQueueLen)
 	return &sliceabilityReverifyWorker{
 		queue: make(chan string, qlen),
 	}
@@ -102,10 +99,7 @@ func StartSliceabilityReverifier(ctx context.Context) {
 	}
 	w.started = true
 
-	workers := intFromEnv(envSliceabilityReverifyWorkers, defaultSliceabilityReverifyWorkers)
-	if workers < 1 {
-		workers = 1
-	}
+	workers := positiveIntFromEnv(envSliceabilityReverifyWorkers, defaultSliceabilityReverifyWorkers)
 
 	for i := 0; i < workers; i++ {
 		go w.runWorker(ctx, i)

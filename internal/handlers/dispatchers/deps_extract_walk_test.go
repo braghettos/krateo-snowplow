@@ -14,7 +14,7 @@ package dispatchers
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 )
 
 // TestParseCallPathToObjectRef covers the /call widget-endpoint decoder.
@@ -71,7 +71,7 @@ func TestParseCallPathToObjectRef(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ref, ok := util.ParseCallPathToObjectRef(tc.path)
+			ref, ok := objects.ParseCallPathToObjectRef(tc.path)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v (ref=%+v)", ok, tc.wantOK, ref)
 			}
