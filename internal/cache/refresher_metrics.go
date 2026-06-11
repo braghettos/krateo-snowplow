@@ -114,6 +114,18 @@ func registerRefresherMetrics() {
 		expvar.Publish("snowplow_refresher_capped_total", expvar.Func(func() any {
 			return refresherStatsSnapshot().capped
 		}))
+		// Task #321 (#318-R1a) — per-key re-resolve rate-floor falsifier.
+		// _floored_total ticks every time the dequeue-side floor gate
+		// DEFERRED a key (entry younger than the floor) instead of
+		// re-resolving it now. THE primary post-deploy falsifier readout:
+		// under the install-churn storm completed_total collapses (target Δ
+		// < 30,000 vs 141,381) while _floored_total is > 0 and rising. Per
+		// PM gate C1 _floored_total EXCEEDS the completed-collapse delta (it
+		// counts the bounded immediate-repush re-cycles too) — it is
+		// qualitative evidence the gate fired, NOT equal to the collapse.
+		expvar.Publish("snowplow_refresher_floored_total", expvar.Func(func() any {
+			return refresherStatsSnapshot().floored
+		}))
 	})
 }
 

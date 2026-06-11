@@ -79,6 +79,34 @@ func TestRefresherMetrics_PublishedAndReflectsAtomics(t *testing.T) {
 	}
 }
 
+// TestRefresherMetrics_FlooredTotalPublishedAndReflectsAtomics — Task #321
+// (#318-R1a) C6: the new snowplow_refresher_floored_total expvar key MUST
+// be published (Disabled()-gated, expvar.Func-lazy) and MUST report the
+// live flooredTotal atomic. Drives the atomic directly, then reads the
+// published Func to confirm it observes the bump.
+func TestRefresherMetrics_FlooredTotalPublishedAndReflectsAtomics(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	registerRefresherMetrics()
+
+	got := expvar.Get("snowplow_refresher_floored_total")
+	if got == nil {
+		t.Fatalf("snowplow_refresher_floored_total not published")
+	}
+
+	before := refresherStatsSnapshot().floored
+	// Drive the atomic the production floored branch bumps.
+	refresherSingleton().flooredTotal.Add(1)
+	after := refresherStatsSnapshot().floored
+	if after != before+1 {
+		t.Fatalf("floored snapshot after Add: got %d want %d", after, before+1)
+	}
+
+	// The published Func must report the same value.
+	if expvarVal, wantStr := got.String(), jsonUint64(after); expvarVal != wantStr {
+		t.Fatalf("snowplow_refresher_floored_total expvar = %s, want %s", expvarVal, wantStr)
+	}
+}
+
 // jsonUint64 renders n the way expvar.Func.String() does for a
 // uint64 return: no quoting, plain decimal.
 func jsonUint64(n uint64) string {

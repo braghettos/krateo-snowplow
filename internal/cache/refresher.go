@@ -54,11 +54,55 @@ const (
 	envRefresherBaseDelayMS = "RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS"
 	envRefresherMaxDelayMS  = "RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS"
 
+	// Task #321 (#318-R1a) — per-key re-resolve RATE-FLOOR. The minimum
+	// interval, in seconds, between SUCCESSFUL re-resolves of any one L1
+	// key on the refresher dequeue path. When an entry is younger than
+	// this floor (time.Since(entry.CreatedAt) < floor — CreatedAt is the
+	// wall-clock of the last successful Put, resolved.go:767-768), the
+	// dequeued key is NOT re-resolved now: it is Forgotten (reset backoff,
+	// we are NOT failing) and re-scheduled via AddAfter(remaining) onto the
+	// SAME tier queue it was drawn from, then the worker returns. The
+	// deferred re-resolve fires at >= floor expiry against LATEST cluster
+	// state. This collapses the install-churn storm's repeated within-wave
+	// re-marks of the same cluster-LIST cell (R1 trace: 141,381 redundant
+	// completed re-resolves driven by ~28 configmap events fanning into the
+	// cluster-wide bucket) into one re-resolve per floor window.
+	//
+	// LOSSLESS (the invariant): the floored branch never drops a dirty
+	// mark — AddAfter always eventually calls the idempotent base Add
+	// (client-go@v0.33.0 delaying_queue.go:305), and the workqueue's Done
+	// re-pushes any mark that arrived during processing (queue.go:303-306),
+	// so the FINAL state change inside the floor still re-resolves at
+	// expiry (last-write-wins convergence ≤ floor). NOT in the 6-revert
+	// stale-clean class.
+	//
+	// floor=0 (RATE_FLOOR_SECONDS unset / 0 / negative) short-circuits the
+	// entire gate — byte-identical to pre-#321 behaviour. This is the
+	// kill-switch (project_caching_is_provisional). It is a TUNING var
+	// UNDER the cache, not a feature flag: the gate runs only on the
+	// refresher dequeue path, which never executes under cache-off
+	// (StartRefresher early-returns, refresher.go:309). Read via
+	// int64FromEnv per the SLICEABILITY_REVERIFY_RATE_FLOOR_SECONDS
+	// prior-art pattern (ra_full_list_slice.go:419-425).
+	envRefresherRateFloorSeconds = "RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS"
+
 	defaultRefresherParallelism = 4
 	// Exponential-failure backoff: first retry after baseDelay, doubling
 	// each requeue, capped at maxDelay. 500ms -> 1s -> 2s -> ... -> 60s.
 	defaultRefresherBaseDelayMS = 500
 	defaultRefresherMaxDelayMS  = 60_000
+
+	// defaultRefresherRateFloorSeconds — the #318-R1a rate-floor default,
+	// 2s per the PM gate ruling (docs/ship-318-r1a-pm-gate-2026-06-11.md
+	// §3): 2s keeps the pathological worst-case refresher convergence AT
+	// the documented 10s SLA (yield 5s + resolve ≤3s + floor 2s = 10s),
+	// not over it, so the existing hard SLA stands with NO re-documentation;
+	// and it already coalesces a whole sub-second within-wave configmap
+	// burst into one re-resolve (the incremental collapse of 3s over 2s is
+	// small — inter-wave gaps already exceed 3s). 3s remains a valid
+	// env-knob tune-up (RESOLVED_CACHE_REFRESHER_RATE_FLOOR_SECONDS) if
+	// Phase-6 shows 2s under-collapses; the conservative default ships.
+	defaultRefresherRateFloorSeconds int64 = 2
 
 	// Ship #98 / 0.30.215 — customer-priority cooperative yield. The
 	// refresher worker parks while a customer /call is in flight, mirroring
@@ -209,6 +253,22 @@ type refresher struct {
 	skippedNoEntryTotal atomic.Uint64
 	skippedNoHandler    atomic.Uint64
 
+	// Task #321 (#318-R1a) — rate-floor falsifier counter. flooredTotal
+	// ticks every time the dequeue-side floor gate DEFERS a key (entry
+	// younger than the floor): Forget + AddAfter(remaining) + return,
+	// instead of re-resolving now. THE primary falsifier readout — under
+	// the install storm completed_total collapses while flooredTotal rises.
+	//
+	// ACCOUNTING (PM gate condition C1): flooredTotal counts EVERY floored
+	// re-cycle — including the bounded immediate-repush re-cycles when a
+	// concurrent re-mark sets the dirty bit during a floored dequeue (Done
+	// re-pushes, the key re-dequeues inside the floor and is floored again
+	// without a re-resolve). So flooredTotal EXCEEDS the completed-collapse
+	// delta (old completed − new completed); it is NOT equal to it. GREEN =
+	// completed_total collapses AND flooredTotal > 0 and rising. Do NOT
+	// equate flooredTotal to the collapse delta.
+	flooredTotal atomic.Uint64
+
 	// Ship 0.30.120 layer (b) — error-aware Put-gate counter.
 	// refresherSkippedStageError counts L1 Puts the error-aware gate
 	// declined because a stage error was observed during the refresh
@@ -286,6 +346,17 @@ func refresherSingleton() *refresher {
 		}
 	})
 	return refresherInstance
+}
+
+// rateFloor returns the active #318-R1a per-key re-resolve rate-floor as a
+// time.Duration. Read on every dequeue from the env so deployers can
+// re-tune at pod start without a code change (matches the prior-art
+// sliceabilityReverifyRateFloorSeconds pattern, ra_full_list_slice.go:419-425).
+// A value <= 0 disables the floor (byte-identical to pre-#321); the caller's
+// `floor > 0` guard short-circuits the gate. int64FromEnv returns the default
+// for unset/empty/unparseable (resolved.go:1332-1342).
+func (r *refresher) rateFloor() time.Duration {
+	return time.Duration(int64FromEnv(envRefresherRateFloorSeconds, defaultRefresherRateFloorSeconds)) * time.Second
 }
 
 // RegisterRefreshFunc wires a refresh handler for handlerKind ("restactions",
@@ -624,13 +695,64 @@ func (r *refresher) processNext(ctx context.Context) bool {
 
 	// Select the queue to mutate on success/failure (Forget /
 	// AddRateLimited / NumRequeues all read per-tier rate-limiter
-	// state).
+	// state). Task #321 — the floored branch's Forget/AddAfter use this
+	// SAME q, so a floored cluster_list key defers onto clusterListQueue
+	// and the deferred Done (refresher.go above) is on the matching tier.
 	q := r.queue
 	if fromCL {
 		q = r.clusterListQueue
 	}
 
-	if err := r.processOne(ctx, key); err != nil {
+	// Task #321 (#318-R1a) — per-key re-resolve RATE-FLOOR (S1: reuse
+	// ResolvedEntry.CreatedAt; NO new map). Single Get site (PM gate C5):
+	// the entry fetched here is passed into processOne below, so there is
+	// exactly one c.Get per dequeue. A miss / nil cache falls through to
+	// processOne, which bumps skipped_no_entry exactly as pre-#321 — the
+	// floor never fires on an absent (DELETE-evicted / TTL-expired) entry,
+	// so DELETE invalidation of the SELF entry stays immediate
+	// (feedback_l1_invalidation_delete_only).
+	//
+	// C3 note: a DELETE's LIST-dep / dependent-GET-dep refreshes are
+	// dirty-marks (deps.go:613-624 → enqueue), NOT evictions, so they
+	// reach this gate and are floor-delayed by ≤ floor — the deleted row
+	// disappears from the dependent LIST cell within ≤ floor (same
+	// stale-while-revalidate posture as any UPDATE; the self entry's own
+	// eviction via RemoveL1Key remains immediate).
+	c := ResolvedCache()
+	var (
+		entry *ResolvedEntry
+		ok    bool
+	)
+	if c != nil {
+		entry, ok = c.Get(key)
+	}
+	if floor := r.rateFloor(); floor > 0 && ok && entry != nil {
+		if elapsed := time.Since(entry.CreatedAt); elapsed < floor {
+			// Floored: the entry's content is younger than the floor, so a
+			// re-resolve now is redundant. Do NOT drop the mark — defer it.
+			// Forget clears any backoff (we are NOT failing); AddAfter
+			// schedules the deferred re-resolve at floor expiry. remaining
+			// > 0 by construction (elapsed < floor), so AddAfter always
+			// takes the async delaying-queue path (delaying_queue.go:260),
+			// never the immediate Add. The delaying-heap dedup is
+			// earliest-wins (insert(), delaying_queue.go), so concurrent
+			// re-marks collapse to ONE pending deferred add. At expiry the
+			// re-dequeue finds elapsed >= floor → NOT floored → re-resolves
+			// against LATEST cluster state. LOSSLESS: see the rate-floor
+			// invariant comment at envRefresherRateFloorSeconds.
+			// FAIL-OPEN on declines: CreatedAt is stamped ONLY by a
+			// successful Put (resolved.go:767-768); a refresh that DECLINES
+			// to cache (never-cache-partials sink skip) leaves CreatedAt
+			// old, so a persistently-declining key is never floored — it
+			// re-resolves on every dequeue, favoring freshness over collapse.
+			q.Forget(key)
+			q.AddAfter(key, floor-elapsed)
+			r.flooredTotal.Add(1)
+			return true
+		}
+	}
+
+	if err := r.processOne(ctx, key, entry, ok); err != nil {
 		r.failedTotal.Add(1)
 		// Poison-pill bound (Part A). NumRequeues is how many times this
 		// exact key has already been AddRateLimited. Once it exceeds the
@@ -668,21 +790,23 @@ func (r *refresher) processNext(ctx context.Context) bool {
 	return true
 }
 
-// processOne handles a single refresh: load the entry from L1, dispatch
-// the registered handler for its kind. Returns the handler's error
-// (drives the requeue decision). A missing entry / missing handler /
-// legacy nil-Inputs entry is a non-error skip (counted, not retried).
-func (r *refresher) processOne(ctx context.Context, key string) error {
-	c := ResolvedCache()
-	if c == nil {
-		r.skippedNoEntryTotal.Add(1)
-		return nil
-	}
-	entry, ok := c.Get(key)
+// processOne handles a single refresh: dispatch the registered handler
+// for the entry's kind. Returns the handler's error (drives the requeue
+// decision). A missing entry / missing handler / legacy nil-Inputs entry
+// is a non-error skip (counted, not retried).
+//
+// Task #321 (#318-R1a) — SINGLE-GET refactor (PM gate C5): the entry is
+// fetched ONCE in processNext (it serves the rate-floor's CreatedAt read)
+// and passed in here, so there is exactly one c.Get per dequeue. `ok` is
+// the Get result (false for a nil cache or a miss); the skipped_no_entry
+// semantics are byte-identical to the pre-#321 in-line Get (a nil cache
+// or a miss both bump skipped_no_entry and return nil).
+func (r *refresher) processOne(ctx context.Context, key string, entry *ResolvedEntry, ok bool) error {
 	if !ok || entry == nil {
 		// L1 may have evicted between the dirty-mark and us picking up
-		// the key (e.g. a DELETE raced the UPDATE). Stale-while-
-		// revalidate degrades to next-cold-miss; not an error, not a
+		// the key (e.g. a DELETE raced the UPDATE), or the cache is nil
+		// (cache-off; not reached in production from this path). Stale-
+		// while-revalidate degrades to next-cold-miss; not an error, not a
 		// retry — the entry is gone.
 		r.skippedNoEntryTotal.Add(1)
 		return nil
@@ -725,6 +849,7 @@ type refresherStats struct {
 	skippedStageError uint64 // Ship 0.30.120 layer (b)
 	yielded           uint64 // Ship #98 — customer-priority yields
 	capped            uint64 // Ship #98 — max-parked cap hits
+	floored           uint64 // Task #321 (#318-R1a) — rate-floor deferrals
 
 	// Path 3.2 / 0.30.218 — per-tier observability for the two-tier
 	// priority queue.
@@ -748,6 +873,7 @@ func refresherStatsSnapshot() refresherStats {
 		skippedStageError:    r.refresherSkippedStageError.Load(),
 		yielded:              r.yieldedTotal.Load(),
 		capped:               r.cappedTotal.Load(),
+		floored:              r.flooredTotal.Load(),
 		clusterListEnqueued:  r.clusterListEnqueueTotal.Load(),
 		clusterListCompleted: r.clusterListCompletedTotal.Load(),
 	}

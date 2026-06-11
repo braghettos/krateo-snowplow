@@ -38,6 +38,12 @@ func resetRefresherForTwoTierTest(t *testing.T) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	// Task #321 (#318-R1a) — disable the per-key re-resolve rate-floor by
+	// default: the two-tier priority-drain tests Put fresh cells then assert
+	// IMMEDIATE drain ordering, which the floor (default 2s) would defer.
+	// floor=0 is the byte-identical kill-switch; the floor's own falsifiers
+	// live in refresher_rate_floor_test.go.
+	t.Setenv(envRefresherRateFloorSeconds, "0")
 	ResetResolvedCacheForTest()
 	ResetDepsForTest()
 	resetRefresherForTest()
