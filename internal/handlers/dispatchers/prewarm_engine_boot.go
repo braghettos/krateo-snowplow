@@ -312,6 +312,24 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 // skipped by the seed engine here; the customer /call resolves them
 // cold-then-warm via the on-demand dispatcher (helpers.go's
 // dispatchCacheLookupKey populates the cell at first call).
+//
+// enumeratePrewarmTargetsForGVRFn / seedOneWidgetFn are test seams over the
+// two external dependencies seedScopeYielding consumes — the per-binding
+// target SOURCE (cache.EnumeratePrewarmTargetsForGVR) and the per-target
+// seed PRIMITIVE (seedOneWidget). Same 1-LOC `var fooFn = foo` pattern as
+// seedCohortFn (phase1_pip_seed.go:640) and enumerateAggregatePrewarmTargetsFn
+// (phase1_pip_seed.go:404). The engine-path re-enqueue-latch falsifier
+// (#316) swaps them to drive the widget seed loop's classifyEngineSeedErr
+// branch + reEnqueued latch end-to-end without a live cache/RBAC snapshot
+// or apiserver. Production ALWAYS uses the real functions; the restaction
+// loop and restActionTargetGVR are left direct (the widget loop exercises
+// the SAME shared classifier closure + latch — design §3.1).
+var enumeratePrewarmTargetsForGVRFn = cache.EnumeratePrewarmTargetsForGVR
+
+// seedOneWidgetFn is a test seam over seedOneWidget — see
+// enumeratePrewarmTargetsForGVRFn.
+var seedOneWidgetFn = seedOneWidget
+
 func seedScopeYielding(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
@@ -372,7 +390,7 @@ func seedScopeYielding(ctx context.Context,
 		if !haveGVR {
 			return nil, false
 		}
-		raw := cache.EnumeratePrewarmTargetsForGVR(gvr, "list")
+		raw := enumeratePrewarmTargetsForGVRFn(gvr, "list")
 		if len(raw) == 0 {
 			return nil, false
 		}
@@ -451,7 +469,7 @@ func seedScopeYielding(ctx context.Context,
 		)
 		for _, c := range targets {
 			err := seedOneTarget(c, func(cohortCtx context.Context) error {
-				return seedOneWidget(cohortCtx, e, authnNS)
+				return seedOneWidgetFn(cohortCtx, e, authnNS)
 			})
 			if err != nil && ctx.Err() != nil {
 				return ctx.Err()
