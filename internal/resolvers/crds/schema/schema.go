@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -77,11 +78,36 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 	// unsafe — resourceInterfaceFor (client.go:146) calls
 	// uc.mapper.RESTMapping unconditionally; the opts.GVR/opts.GVK
 	// branch at line 138 only chooses the source GVK, it does not
-	// skip the mapper. WithSkipMapper has been removed; the mapper
-	// build is a dead allocation here but cannot panic.
-	cli, err := dynamic.NewClient(rc)
+	// skip the mapper. WithSkipMapper has been removed.
+	//
+	// Task #322 (#318-R2) Commit 1 — the per-call dynamic.NewClient
+	// here built a FRESH memCacheClient + DeferredDiscoveryRESTMapper
+	// every child GET, so the first GVR-only KindFor re-downloaded the
+	// full API surface per call (TRACED 2.13% of the 0.30.258 drain
+	// profile). SharedSADiscoveryClient returns a process-singleton
+	// whose mapper is built ONCE and reused warm; the discovery
+	// download is amortised to one boot download. rc here is ALWAYS the
+	// SA rest.Config (opts.RC = widgets.go:228 r.saRC on the customer
+	// /call path; phase1_walk_pagination_jobs.go:433/:579 saRC on the
+	// drain) — the singleton's identity invariant. This is the cached-
+	// mapper correction, NOT the WithSkipMapper revival: the mapper is
+	// always non-nil and populated (cached_client.go header).
+	//
+	// FALLBACK — if the singleton errors (nil rc / startup race),
+	// fall back to the per-call dynamic.NewClient so the path is never
+	// worse than today (project_cache_off_is_transparent_fallback).
+	cli, err := dynamic.SharedSADiscoveryClient(rc)
 	if err != nil {
-		return err
+		// Fall back LOUDLY: a systemically broken singleton would
+		// otherwise silently evaporate the caching win back to
+		// per-call discovery downloads.
+		slog.Warn("schema: SA discovery singleton unavailable; "+
+			"falling back to per-call client",
+			slog.String("error", err.Error()))
+		cli, err = dynamic.NewClient(rc)
+		if err != nil {
+			return err
+		}
 	}
 	crdObj, err := cli.Get(ctx, fmt.Sprintf("%s.%s", gvr.Resource, gvr.Group), dynamic.Options{
 		GVR:       crdGVR,

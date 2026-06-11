@@ -365,6 +365,15 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 			slog.Any("err", derr),
 		)
 	}
+
+	// Task #322 (#318-R2) Commit 1 — invalidate the SA-singleton cached
+	// discovery client AFTER DiscoverGroupResources, so the next
+	// ValidateObjectStatus for the new/changed GVR rebuilds the mapper
+	// and sees the new CRD's schema. STRICTLY ordered after discovery
+	// (F-4 safety): a stale discovery cache cannot persist past this CRD
+	// ADD/UPDATE. Soft no-op when the dynamic singleton is unwired
+	// (discovery_invalidation_hook.go).
+	invalidateSADiscovery()
 }
 
 // triggerCRDDelete handles a CRD DELETE event: derive the GVRs that
@@ -481,6 +490,16 @@ func triggerCRDDelete(obj interface{}) {
 		slog.String("plural", plural),
 		slog.Int("gvrs_torn_down", torn),
 	)
+
+	// Task #322 (#318-R2) Commit 1 — invalidate the SA-singleton cached
+	// discovery client AFTER teardown (RemoveResourceType +
+	// OnResourceTypeRemoved), so the next ValidateObjectStatus for a
+	// just-deleted GVR rebuilds the mapper WITHOUT the removed GVR
+	// (KindFor then misses -> error returned to the caller, not a stale
+	// positive). STRICTLY ordered after teardown (F-4 safety). Soft
+	// no-op when the dynamic singleton is unwired
+	// (discovery_invalidation_hook.go).
+	invalidateSADiscovery()
 
 	// NOTE: navDiscoveredGroups stays append-only. See doc-comment
 	// above + spec §11.2 OQ1 worked-examples deep-dive — the

@@ -24,6 +24,7 @@ import (
 	"github.com/krateoplatformops/plumbing/slogs/pretty"
 	_ "github.com/krateoplatformops/snowplow/docs"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
@@ -217,6 +218,16 @@ func main() {
 					// idempotent, soft-fails to walker-only discovery
 					// if ever unset.
 					cache.SetProcessSARestConfig(rc)
+
+					// Task #322 (#318-R2) Commit 1 — wire the SA-singleton
+					// cached-discovery invalidation callback so the
+					// CRD-lifecycle bridge (crd_discovery_side_effect.go)
+					// can invalidate the dynamic-package discovery
+					// singleton AFTER DiscoverGroupResources / teardown
+					// without an import cycle (cache is below dynamic).
+					// Same set-once-at-startup lifecycle as
+					// SetProcessSARestConfig above; soft no-op if unset.
+					cache.SetSADiscoveryInvalidator(idynamic.InvalidateSADiscovery)
 
 					// Ship 0.30.122 R4 Lever 1: wire the in-cluster
 					// *rest.Config so the composition GVR's streaming
