@@ -395,6 +395,14 @@ func enumerateAggregatePrewarmTargets() []seedTarget {
 	return out
 }
 
+// enumerateAggregatePrewarmTargetsFn is a test seam over
+// enumerateAggregatePrewarmTargets — same pattern as seedCohortFn /
+// phase1MaxApiRefPagesForTest. The #158 discrimination falsifier swaps it
+// to inject a fixed cohort list so runPIPSeed's classification + retry
+// branches can be driven end-to-end without a live cache/RBAC snapshot.
+// Production always uses the real enumerator.
+var enumerateAggregatePrewarmTargetsFn = enumerateAggregatePrewarmTargets
+
 // runPIPSeed is the Ship PIP Step 7.6 entry point invoked by
 // phase1WarmupWith. Enumerates per-binding targets and seeds the
 // resolved-output L1 (restactions + widgets) for every target.
@@ -429,7 +437,7 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	// resolves widgets+restactions covering whatever cells its identity
 	// authorises). Path B (Phase 2b deferral): seed dispatch derives its
 	// own per-layer BindingUID at populate time via direct rbac.EvaluateRBAC.
-	targets := enumerateAggregatePrewarmTargets()
+	targets := enumerateAggregatePrewarmTargetsFn()
 	if len(targets) == 0 {
 		log.Info("phase1.seed.skipped",
 			slog.String("subsystem", "cache"),
@@ -475,6 +483,20 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	}
 	g.SetLimit(limit)
 
+	// #158 (design §1.5) — legacy-path bounded re-enqueue. Operational
+	// failures (NOT RBAC denies) are collected here during the errgroup,
+	// then drained ONCE after g.Wait() with a per-retry customer-priority
+	// yield (engineYieldCheckpoint — the SAME customerInFlight() predicate
+	// the engine uses; NOT a private busy loop, NOT a shared budget). Bound:
+	// ≤1 retry per cohort per run — a cohort that fails operationally TWICE
+	// is logged + dropped (the customer's first /call lazily warms it). The
+	// engine path (PrewarmEngineEnabled()==true) does NOT reach runPIPSeed;
+	// it re-enqueues a coalesced scopeKindBoot instead (seedScopeYielding).
+	var (
+		retryMu      sync.Mutex
+		retryCohorts []seedTarget
+	)
+
 	for _, c := range cohorts {
 		cohort := c // pin loop variable
 		g.Go(func() error {
@@ -497,15 +519,43 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 			// FOREGROUND (still gates phase1Done) but per-cohort
 			// failures no longer FAIL-CLOSE the whole pod.
 			pipBindingSetSeedResolvesTotal.Add(1)
-			if err := seedCohort(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
+			if err := seedCohortFn(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
+				// #158 — classify the failure instead of blanket-labelling
+				// it "expected RBAC." pipBindingSetSeedFailuresTotal is kept
+				// as the back-compat grand total (= rbac_deny + operational).
 				pipBindingSetSeedFailuresTotal.Add(1)
-				slog.Warn("phase1.seed.cohort.skipped",
-					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(cohort)),
-					slog.Any("err", err),
-					slog.String("effect", "cohort skipped; phase1Done not blocked — narrow RBAC cohorts "+
-						"that cannot read seed targets are expected to fail and need no L1 entry"),
-				)
+				switch classifySeedErr(err) {
+				case seedFailRBACDeny:
+					// EXPECTED: a narrow cohort that genuinely cannot read the
+					// seed target. Info, not Warn; NOT re-enqueued (it would
+					// deny again — nothing to retry).
+					pipSeedRBACDenyTotal.Add(1)
+					slog.Info("phase1.seed.cohort.expected_deny",
+						slog.String("subsystem", "cache"),
+						slog.String("cohort", cohortLogLabel(cohort)),
+						slog.Any("err", err),
+						slog.String("effect", "cohort skipped; phase1Done not blocked — this cohort's "+
+							"identity is forbidden from the seed target (403/401), which is the expected "+
+							"narrow-RBAC posture and needs no L1 entry"),
+					)
+				default:
+					// OPERATIONAL (incl. the fail-loud default): ctx
+					// timeout/cancel, 5xx, transport, panic, or any
+					// unclassified error. Warn + dedicated counter + queue
+					// for a bounded single retry after g.Wait().
+					pipSeedOperationalFailTotal.Add(1)
+					slog.Warn("phase1.seed.cohort.operational_failure",
+						slog.String("subsystem", "cache"),
+						slog.String("cohort", cohortLogLabel(cohort)),
+						slog.Any("err", err),
+						slog.String("effect", "cohort seed failed operationally (NOT an RBAC deny); queued "+
+							"for one bounded re-attempt after the seed loop — see "+
+							"snowplow_phase1_seed_operational_fail_total at /debug/vars"),
+					)
+					retryMu.Lock()
+					retryCohorts = append(retryCohorts, cohort)
+					retryMu.Unlock()
+				}
 				// Non-fatal — return nil so the global seed loop completes.
 				return nil
 			}
@@ -525,6 +575,52 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 		return err
 	}
 
+	// #158 (design §1.5) — drain the operational-failure retry slice ONCE,
+	// serially, with a customer-priority yield before each re-attempt. This
+	// is the legacy path's bounded re-enqueue (no engine queue exists when
+	// PrewarmEngineEnabled()==false). ≤1 retry per cohort: a cohort that
+	// fails operationally AGAIN here is logged + dropped (the customer's
+	// first /call lazily warms it — the documented degraded posture). The
+	// yield reuses engineYieldCheckpoint (the SAME customerInFlight()
+	// predicate the engine uses) so a customer burst arriving mid-retry
+	// defers the remaining retries — never a private busy loop, never a
+	// shared budget.
+	retryMu.Lock()
+	pending := retryCohorts
+	retryMu.Unlock()
+	if len(pending) > 0 {
+		log.Info("phase1.seed.retry.started",
+			slog.String("subsystem", "cache"),
+			slog.Int("operational_failed_cohorts", len(pending)),
+		)
+		retried := 0
+		for _, cohort := range pending {
+			if err := pctx.Err(); err != nil {
+				// Step 7.6 budget exhausted — stop retrying; remaining
+				// cohorts warm lazily on first /call.
+				break
+			}
+			engineYieldCheckpoint(pctx)
+			if err := seedCohortFn(pctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
+				// Second operational failure → drop (bound = ≤1 retry).
+				slog.Warn("phase1.seed.cohort.retry_exhausted",
+					slog.String("subsystem", "cache"),
+					slog.String("cohort", cohortLogLabel(cohort)),
+					slog.Any("err", err),
+					slog.String("effect", "cohort still failing after one bounded re-attempt; dropped — "+
+						"the cohort's first /call cold-resolves + warms lazily"),
+				)
+				continue
+			}
+			retried++
+		}
+		log.Info("phase1.seed.retry.completed",
+			slog.String("subsystem", "cache"),
+			slog.Int("operational_failed_cohorts", len(pending)),
+			slog.Int("retry_succeeded", retried),
+		)
+	}
+
 	log.Info("phase1.seed.completed",
 		slog.String("subsystem", "cache"),
 		slog.Int("cohorts", len(cohorts)),
@@ -534,6 +630,14 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	)
 	return nil
 }
+
+// seedCohortFn is a test seam over seedCohort — same pattern as
+// phase1MaxApiRefPagesForTest (phase1_walk_pagination.go:124). The
+// #158 discrimination falsifier (phase1_seed_classify_test.go) swaps this
+// to inject a fake seedCohort returning a controlled error class without a
+// live cluster, then asserts the call site's branch (counter + log + the
+// re-enqueue delta). Production always uses the real seedCohort.
+var seedCohortFn = seedCohort
 
 // seedCohort seeds one cohort's per-user restactions + widgets L1
 // entries. Per-cohort timeout + per-cohort error containment.
@@ -825,7 +929,14 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string) error {
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
-		return fmt.Errorf("fetch RESTAction %s/%s: %s", ref.Namespace, ref.Name, got.Err.Message)
+		// #158 (design §1.3): preserve the typed status error so the call
+		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
+		// instead of an opaque string. statusErrFromResponse lifts the
+		// plumbing *response.Status back into an *apierrors.StatusError
+		// carrying Code+Reason. Wrapped with %w so the RESTAction identity
+		// is visible in logs while errors.As/Is still thread through to the
+		// embedded StatusError.
+		return fmt.Errorf("fetch RESTAction %s/%s: %w", ref.Namespace, ref.Name, statusErrFromResponse(got.Err))
 	}
 	if got.Unstructured == nil {
 		return fmt.Errorf("fetch RESTAction %s/%s: nil object", ref.Namespace, ref.Name)

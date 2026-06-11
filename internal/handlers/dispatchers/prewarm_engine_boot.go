@@ -318,6 +318,50 @@ func seedScopeYielding(ctx context.Context,
 
 	log := slog.Default()
 
+	// #158 (design §1.4 + §1.5 engine path) — classify per-target seed
+	// failures instead of swallowing them. RBAC-deny → Info + rbac_deny
+	// counter (NO re-enqueue). Operational → Warn + operational counter +
+	// re-enqueue a fresh scopeKindBoot. The engine queue dedups on
+	// key()=="boot" (prewarm_engine.go:184-188,251-260) so N operational
+	// failures during one run coalesce to AT MOST ONE pending re-walk
+	// (design §3.1 storm bound); reEnqueued makes us enqueue at most once
+	// per seedScopeYielding invocation so enqueuedTotal stays honest. The
+	// re-walk re-runs seedScopeYielding, which yields to customers between
+	// every target — a target that failed on transient apiserver pressure
+	// is re-seeded after the pressure clears. The back-compat grand total
+	// pipBindingSetSeedFailuresTotal is bumped for parity with the legacy
+	// path (= rbac_deny + operational).
+	reEnqueued := false
+	classifyEngineSeedErr := func(kind, label, target string, err error) {
+		pipBindingSetSeedFailuresTotal.Add(1)
+		if classifySeedErr(err) == seedFailRBACDeny {
+			pipSeedRBACDenyTotal.Add(1)
+			slog.Info("prewarm.engine.seed.expected_deny",
+				slog.String("subsystem", "cache"),
+				slog.String("kind", kind),
+				slog.String("target", target),
+				slog.String(kind, label),
+				slog.Any("err", err),
+			)
+			return
+		}
+		// Operational (incl. fail-loud default).
+		pipSeedOperationalFailTotal.Add(1)
+		slog.Warn("prewarm.engine.seed.operational_failure",
+			slog.String("subsystem", "cache"),
+			slog.String("kind", kind),
+			slog.String("target", target),
+			slog.String(kind, label),
+			slog.Any("err", err),
+			slog.String("effect", "operational seed failure (NOT an RBAC deny); a coalesced boot "+
+				"re-walk is enqueued (dedup on key()==\"boot\") to retry after pressure clears"),
+		)
+		if !reEnqueued {
+			reEnqueued = true
+			prewarmEngineSingleton().enqueueScope(prewarmScope{kind: scopeKindBoot})
+		}
+	}
+
 	// targetsFor resolves the per-binding target set for a target GVR.
 	// Empty when (a) the index is not built (pre-readiness), (b) no
 	// binding authorises (gvr, list), or (c) haveGVR=false (runtime-
@@ -384,12 +428,8 @@ func seedScopeYielding(ctx context.Context,
 				return ctx.Err()
 			}
 			if err != nil {
-				slog.Warn("prewarm.engine.seed.restaction_skipped",
-					slog.String("subsystem", "cache"),
-					slog.String("target", cohortLogLabel(c)),
-					slog.String("restaction", ref.Namespace+"/"+ref.Name),
-					slog.Any("err", err),
-				)
+				// #158 — classify (was: blanket Warn, no counter).
+				classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
 			}
 		}
 	}
@@ -417,12 +457,8 @@ func seedScopeYielding(ctx context.Context,
 				return ctx.Err()
 			}
 			if err != nil {
-				slog.Warn("prewarm.engine.seed.widget_skipped",
-					slog.String("subsystem", "cache"),
-					slog.String("target", cohortLogLabel(c)),
-					slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-					slog.Any("err", err),
-				)
+				// #158 — classify (was: blanket Warn, no counter).
+				classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
 			}
 		}
 	}

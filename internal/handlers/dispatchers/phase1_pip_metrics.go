@@ -60,6 +60,26 @@ var (
 	// internal/cache (single source of truth).
 	pipBindingSetSeedResolvesTotal atomic.Uint64
 	pipBindingSetSeedFailuresTotal atomic.Uint64
+
+	// #158 (P9-B) — the SPLIT of pipBindingSetSeedFailuresTotal by error
+	// class. pipBindingSetSeedFailuresTotal is KEPT as the back-compat
+	// grand total (= rbac_deny + operational) so existing dashboards do
+	// not break; these two carry the discriminated signal:
+	//
+	//   - pipSeedRBACDenyTotal (snowplow_phase1_seed_rbac_deny_total):
+	//     EXPECTED narrow-RBAC denies (403/401). A non-zero value here is
+	//     normal — these cohorts genuinely cannot read the seed target and
+	//     need no L1 entry. NOT re-enqueued.
+	//   - pipSeedOperationalFailTotal (snowplow_phase1_seed_operational_fail_total):
+	//     UNEXPECTED operational failures (ctx timeout/cancel, 5xx,
+	//     transport, panic, fail-loud default). A non-zero value is a real
+	//     hole the operator can act on; these ARE re-enqueued (legacy:
+	//     bounded retry; engine: coalesced boot re-walk).
+	//
+	// Both call sites (runPIPSeed + seedScopeYielding) feed these via
+	// classifySeedErr — see phase1_seed_classify.go.
+	pipSeedRBACDenyTotal        atomic.Uint64
+	pipSeedOperationalFailTotal atomic.Uint64
 )
 
 // Per-cohort counters. sync.Map keyed by cohort label, value is
@@ -201,6 +221,17 @@ func registerPIPMetrics() {
 		}))
 		expvar.Publish("snowplow_phase1_bindingset_seed_failures_total", expvar.Func(func() any {
 			return pipBindingSetSeedFailuresTotal.Load()
+		}))
+
+		// #158 (P9-B) — the discriminated split of the failures total. The
+		// back-compat grand total above stays = rbac_deny + operational so
+		// existing dashboards don't break; these two let an operator tell an
+		// EXPECTED narrow-RBAC deny from a REAL operational hole.
+		expvar.Publish("snowplow_phase1_seed_rbac_deny_total", expvar.Func(func() any {
+			return pipSeedRBACDenyTotal.Load()
+		}))
+		expvar.Publish("snowplow_phase1_seed_operational_fail_total", expvar.Func(func() any {
+			return pipSeedOperationalFailTotal.Load()
 		}))
 
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so
