@@ -820,8 +820,9 @@ def _open_stage_recording_pages(pw_browser, videos_dir: Path,
 
     Used per STAGE so each stage gets its own short-lived recording contexts
     → one .webm per (stage, user, page). Returns {page_name: {ctx, page,
-    slug}}; a page that fails to open is skipped. Never raises (best-effort —
-    a recording failure must not abort the stage measurement).
+    slug, make}} LAZY slots (page/ctx None until the `make` factory runs);
+    if the throwaway login fails the dict is empty. Never raises (best-effort
+    — a recording failure must not abort the stage measurement).
 
     Task #307 (Diego 2026-06-10; ArchLazyDash / Option A 2026-06-11) — kill the
     login/dashboard head AND the in-frame idle:
@@ -1092,11 +1093,11 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
             recording = (bool(u_state.get("record_video"))
                          and pw_browser is not None)
 
-            # Per-STAGE recording (Task #267 correction): open FRESH per-page
-            # recording contexts for THIS stage so each stage yields its own
-            # S{n}_{user}_{slug}.webm. Each page is measured on its dedicated
-            # context via pages_by_name; the single persistent page is used
-            # only for the non-recording path.
+            # Per-STAGE recording (Task #267 correction): hand
+            # browser_measure_stage one lazy `make` factory per page so each
+            # stage yields its own S{n}_{user}_{slug}.webm on a context created
+            # at that page's own nav. The single persistent page is used only
+            # for the non-recording path (and as a pure fallback).
             stage_pages: dict[str, dict] = {}
             pages_by_name = None
             page_factories = None
@@ -1108,22 +1109,12 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
                     # Task #307 / ArchLazyDash: EVERY slot (incl. Dashboard) is
                     # lazy — page=None + a `make` factory. browser_measure_stage
                     # calls each factory at that page's own loop iteration and
-                    # the materialised page lands back in the slot. So
-                    # pages_by_name maps every page to None here.
-                    pages_by_name = {pn: pp.get("page")
-                                     for pn, pp in stage_pages.items()}
+                    # the materialised page lands back in the slot;
+                    # `measure_page` stays the persistent non-recording page
+                    # (a pure fallback on the recording path).
+                    pages_by_name = {pn: None for pn in stage_pages}
                     page_factories = {pn: pp["make"]
-                                      for pn, pp in stage_pages.items()
-                                      if pp.get("make") is not None}
-                    # All slots are lazy (page=None), so this next() falls
-                    # through to the persistent non-recording page. The actual
-                    # recording pages are materialised by browser_measure_stage
-                    # at each page's iteration (it drives VERIFY on the live
-                    # Dashboard page it materialises, not on this fallback).
-                    measure_page = next(
-                        (pp["page"] for pp in stage_pages.values()
-                         if pp.get("page") is not None),
-                        u_state.get("page"))
+                                      for pn, pp in stage_pages.items()}
 
             # Architect Option A (content-gate correctness): the S8/S9
             # CONTENT asserts run in the stage's `_work` AFTER this function

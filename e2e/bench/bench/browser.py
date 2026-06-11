@@ -1403,6 +1403,57 @@ _VIDEO_SCROLL_CHROME_EXCLUDE = (
     'nav, [class*="sidebar"], [class*="menu"], [class*="sider"]')
 
 
+# Dashboard final-hold script (Task #307): after the stepped descent, anchor
+# the camera on the COMPOSITIONS donut (the north-star widget), NOT the first
+# chart in document order (the Blueprints donut — the original bug). Strategy
+# is structural — no magic pixel offsets:
+#   (a) the on-page (non-chrome) "Compositions"/"Composition" label's nearest
+#       chart/canvas — that is the Compositions donut;
+#   (b) else the LAST chart in document order (Compositions renders below
+#       Blueprints, so the last donut is the Compositions one);
+#   (c) else the page bottom (scrollHeight) so the lowest widget is framed —
+#       never re-centre the first/Blueprints chart, which was the bug.
+# Module constant so tests assert the final hold structurally (the last
+# evaluate IS this script) instead of grepping source tokens.
+_DASHBOARD_FINAL_HOLD_JS = """(chromeExclude) => {
+    const inChrome = (el) =>
+        !!(el && el.closest && el.closest(chromeExclude));
+    const chartSel =
+        'canvas, [class*="chart"], [class*="pie"], [class*="g2"]';
+    // (a) label-anchored Compositions donut.
+    let target = null;
+    const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null);
+    while (walker.nextNode()) {
+        const t = walker.currentNode.textContent.trim();
+        if (t !== 'Compositions' && t !== 'Composition') continue;
+        let el = walker.currentNode.parentElement;
+        if (!el || inChrome(el)) continue;
+        // Climb to the widget container, then find its chart/canvas.
+        let scope = el;
+        for (let i = 0; i < 6 && scope.parentElement; i++) {
+            const c = scope.querySelector(chartSel);
+            if (c && !inChrome(c)) { target = c; break; }
+            scope = scope.parentElement;
+        }
+        if (target) break;
+    }
+    // (b) else the LAST chart/canvas in document order.
+    if (!target) {
+        const charts = [...document.querySelectorAll(chartSel)]
+            .filter((el) => !inChrome(el));
+        if (charts.length) target = charts[charts.length - 1];
+    }
+    if (target) {
+        target.scrollIntoView({ block: 'center', behavior: 'instant' });
+    } else {
+        // (c) page bottom — frames the lowest (Compositions) widget.
+        window.scrollTo(
+            { top: document.body.scrollHeight, behavior: 'instant' });
+    }
+}"""
+
+
 def _scroll_capture_for_video(page, page_path):
     """Scroll the page through its content so Playwright films below-the-fold.
 
@@ -1524,69 +1575,9 @@ def _scroll_capture_for_video(page, page_path):
                 "document.body.scrollHeight * f, behavior: 'instant' })",
                 frac)
             _pause(650)
-        # 3) End by holding on the COMPOSITIONS piechart+table region (the
-        #    48,999 donut — the north-star metric), NOT the first chart on the
-        #    page. Task #307 (Diego empirical trace 2026-06-10): the dashboard
-        #    renders the Blueprints donut FIRST in document order, then the
-        #    Compositions donut below it; the prior `break`-on-first-chart hold
-        #    centred the *Blueprints* donut and left the Compositions donut
-        #    ~150px below the framed window. We anchor specifically on the
-        #    Compositions section instead — derived from page STRUCTURE (the
-        #    "Compositions" widget label + DOM order + scrollHeight), no magic
-        #    pixel offset:
-        #      a) find the on-page (non-chrome) "Compositions"/"Composition"
-        #         label text node and, from its widget container, the nearest
-        #         chart/canvas — that is the Compositions donut;
-        #      b) else take the LAST chart/canvas in document order (Compositions
-        #         is below Blueprints, so the last donut is the Compositions one);
-        #      c) else fall back to the page BOTTOM (scrollHeight) so the lowest
-        #         widget — the Compositions donut — is framed (never re-centre
-        #         the first/Blueprints chart, which was the bug).
-        _eval(
-            """(chromeExclude) => {
-                const inChrome = (el) =>
-                    !!(el && el.closest && el.closest(chromeExclude));
-                const isChart = (el) => {
-                    const cls = (el.className || '').toString().toLowerCase();
-                    return el.tagName === 'CANVAS' ||
-                        cls.includes('chart') || cls.includes('pie') ||
-                        cls.includes('g2');
-                };
-                // (a) label-anchored Compositions donut.
-                let target = null;
-                const walker = document.createTreeWalker(
-                    document.body, NodeFilter.SHOW_TEXT, null);
-                while (walker.nextNode()) {
-                    const t = walker.currentNode.textContent.trim();
-                    if (t !== 'Compositions' && t !== 'Composition') continue;
-                    let el = walker.currentNode.parentElement;
-                    if (!el || inChrome(el)) continue;
-                    // Climb to the widget container, then find its chart/canvas.
-                    let scope = el;
-                    for (let i = 0; i < 6 && scope.parentElement; i++) {
-                        const c = scope.querySelector(
-                            'canvas, [class*="chart"], [class*="pie"], [class*="g2"]');
-                        if (c && !inChrome(c)) { target = c; break; }
-                        scope = scope.parentElement;
-                    }
-                    if (target) break;
-                }
-                // (b) else the LAST chart/canvas in document order.
-                if (!target) {
-                    const charts = [...document.querySelectorAll(
-                        'canvas, [class*="chart"], [class*="pie"], [class*="g2"]')]
-                        .filter((el) => !inChrome(el) && isChart(el));
-                    if (charts.length) target = charts[charts.length - 1];
-                }
-                if (target) {
-                    target.scrollIntoView({ block: 'center', behavior: 'instant' });
-                } else {
-                    // (c) page bottom — frames the lowest (Compositions) widget.
-                    window.scrollTo(
-                        { top: document.body.scrollHeight, behavior: 'instant' });
-                }
-            }""",
-            _VIDEO_SCROLL_CHROME_EXCLUDE)
+        # 3) End by holding on the COMPOSITIONS donut (Task #307) — see the
+        #    _DASHBOARD_FINAL_HOLD_JS constant for the anchor strategy.
+        _eval(_DASHBOARD_FINAL_HOLD_JS, _VIDEO_SCROLL_CHROME_EXCLUDE)
         _pause(800)
 
     elif is_compositions:
@@ -1950,18 +1941,19 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
     persists a stage proof with passed=False + convergence_timeout=true,
     then re-raises to abort the run with exit 4.
 
-    `pages_by_name` (Task #267 FIX 2 — film both pages): an optional
-    {page_name: page_object} mapping of per-page Playwright pages, each
-    living in its OWN recording BrowserContext (set up by
-    phases._setup_users). Playwright records exactly one .webm per context,
-    so to film BOTH the dashboard AND a /compositions nav we measure each
-    page on its dedicated page/context — the dashboard context's video then
-    contains only dashboard navs, the compositions context's only
-    compositions navs. When None (every unit test + the no-video path), the
-    single `page` argument is used for every page_name, exactly as before
-    (zero behavioural change). The VERIFY/convergence/content block runs in
-    the Dashboard branch on that page's dedicated object, so its logic is
-    untouched.
+    `pages_by_name` + `page_factories` (Task #267 FIX 2 + #307 ArchLazyDash —
+    film both pages, lazily): in the recording path phases passes
+    `pages_by_name` as {page_name: None} (a routing sentinel — no live pages)
+    and `page_factories` as {page_name: zero-arg factory}. Each factory is
+    invoked at ITS page's loop iteration below and creates that page's
+    dedicated recording BrowserContext (Playwright records exactly one .webm
+    per context), so the dashboard context's video contains only dashboard
+    navs and the compositions context's only compositions navs — and neither
+    context (nor its video clock) exists before its own nav. When both are
+    None (every unit test + the no-video path), the single `page` argument is
+    used for every page_name, exactly as before. The VERIFY/convergence/
+    content block runs in the Dashboard branch on the materialised page, so
+    its logic is untouched.
     """
     ns_count, comp_count = _count_bench_ns(), _count_compositions()
     _log(f"Cluster: {ns_count} bench ns, {comp_count} compositions")
@@ -1973,8 +1965,9 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
 
     pages_data = {}
     for page_name, page_path in BROWSER_SCALING_PAGES:
-        # Per-page recording context (FIX 2) when provided; else the single
-        # shared page (backward-compatible default).
+        # Recording path: pages_by_name maps every page to None (lazy slots),
+        # so this resolves None and routes into the factory branch below.
+        # No-video path: pages_by_name is None → the shared `page` is used.
         nav_page = (pages_by_name or {}).get(page_name, page)
 
         # Task #307 / ArchLazyDash: a LAZY page (now EVERY page, incl. the

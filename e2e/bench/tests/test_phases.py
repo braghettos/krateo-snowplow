@@ -10,7 +10,6 @@ Per docs/bench-restructure-path-b-plan-2026-06-02.md §C.7 + §G Block 4.
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -644,29 +643,28 @@ class _FakeVideo:
         return self._raw
 
 
-class _FakePageWithVideo:
-    """Page stand-in that exposes `.video.path()` like Playwright does AND
-    enough of the content-gate surface (`locator().count()`, `goto`,
-    `wait_for_timeout`) so the SAME page that 'filmed' the nav can be the one
-    the S8/S9 content asserts inspect (architect Option A). `present_names`
-    is the set of composition names whose `text=NAME` locator reports >=1.
+from tests.conftest import FakePage
 
-    Also exposes `evaluate`/`screenshot` + a URL-tracking `goto` so it can
-    drive the REAL `browser.browser_measure_stage` (incl. the Dashboard VERIFY
-    poll) in the F-B′ end-to-end discrimination test. `evaluate` returns a
-    fixed UI count for the verify probe and True for the scroll JS; every other
-    probe returns a benign default.
+
+class _FakePageWithVideo(FakePage):
+    """conftest.FakePage + `.video.path()` + the content-gate surface
+    (`present_names`-backed `locator`, reload-counting `goto`) so the SAME
+    page that 'filmed' the nav is the one the S8/S9 content asserts inspect
+    (architect Option A) — and so it can drive the REAL
+    `browser.browser_measure_stage` (incl. the Dashboard VERIFY poll) in the
+    F-B′ end-to-end discrimination test. All JS-probe dispatch (verify UI
+    count, waterfall, nav-timing, scroll, skeleton) is inherited from
+    FakePage — one dispatch table to keep in sync with browser.py, not two.
     """
-    def __init__(self, raw_webm, present_names=None, ui_count=42,
+    def __init__(self, raw_webm=None, present_names=None, ui_count=42,
                  call_count=16):
-        self.video = _FakeVideo(raw_webm)
+        super().__init__(ui_count=ui_count, call_count=call_count,
+                         url="http://fake/compositions")
+        # Non-recording pages (raw_webm None) expose video=None, as Playwright
+        # does for a context created without record_video_dir.
+        self.video = _FakeVideo(raw_webm) if raw_webm is not None else None
         self.present_names = set(present_names or [])
         self.reloaded = 0
-        self.url = "http://fake/compositions"
-        self.goto_log: list[tuple] = []
-        self.evaluate_log: list[str] = []
-        self._ui_count = ui_count
-        self._call_count = call_count
 
     def locator(self, selector):
         name = (selector[len("text="):] if selector.startswith("text=")
@@ -675,48 +673,18 @@ class _FakePageWithVideo:
 
     def goto(self, url, **kw):
         self.reloaded += 1
-        self.goto_log.append((url, kw))
-        self.url = url
-
-    def wait_for_timeout(self, ms):
-        pass
-
-    def on(self, event, handler):
-        # Playwright response listener registration — no events fired in fakes.
-        pass
-
-    def evaluate(self, js, *args):
-        self.evaluate_log.append(js)
-        if "dashboard-compositions-panel-row-piechart" in js:
-            return self._ui_count
-        if "performance.clearResourceTimings" in js:
-            return None
-        if "filter(e => e.name.includes('/call')).length" in js:
-            return self._call_count
-        if "GAP_MS" in js and "calls.length" in js:
-            return {"callCount": self._call_count, "waterfallMs": 10,
-                    "loadComplete": 20, "httpOk": 0, "httpErr": 0}
-        if "navigation" in js and "loadEventEnd" in js:
-            return {"loadComplete": 20}
-        if "scrollIntoView" in js:
-            return True
-        return None
-
-    def screenshot(self, path, **kw):
-        try:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_bytes(b"\x89PNG")
-        except Exception:
-            pass
+        super().goto(url, **kw)
 
 
 class _FakeRecordingCtx:
     """BrowserContext stand-in. On close(), the raw .webm 'finalizes' (we
     write a small byte blob to disk so record_video_to_gif sees a source).
+    `raw_webm=None` models a NON-recording context (e.g. the throwaway login
+    context): close() writes nothing and the page exposes video=None.
     `present_names` is forwarded to the page so the content gate can inspect
     the live (deferred) Compositions page."""
-    def __init__(self, raw_webm, present_names=None):
-        self._raw = Path(raw_webm)
+    def __init__(self, raw_webm=None, present_names=None):
+        self._raw = Path(raw_webm) if raw_webm is not None else None
         self.closed = False
         self.page = _FakePageWithVideo(raw_webm, present_names=present_names)
 
@@ -729,8 +697,9 @@ class _FakeRecordingCtx:
 
     def close(self):
         self.closed = True
-        self._raw.parent.mkdir(parents=True, exist_ok=True)
-        self._raw.write_bytes(b"FAKE_WEBM" * 8)
+        if self._raw is not None:
+            self._raw.parent.mkdir(parents=True, exist_ok=True)
+            self._raw.write_bytes(b"FAKE_WEBM" * 8)
 
 
 def _stub_video_to_gif(monkeypatch):
@@ -763,16 +732,29 @@ class _StageRecordingBrowser:
         rvd_arg = kwargs.get("record_video_dir")
         if rvd_arg is None:
             # Task #307 / A1-full: the one-time throwaway login context is
-            # NON-recording (no record_video_dir). It is not appended to
-            # `contexts` (it never produces a stage .webm) so the per-stage
-            # video-count assertions still see exactly the recording contexts.
-            return _FakeRecordingCtx(
-                Path(tempfile.mkdtemp()) / "throwaway.webm",
-                present_names=self._present_names)
+            # NON-recording (no record_video_dir → raw=None, writes nothing).
+            # It is not appended to `contexts` (it never produces a stage
+            # .webm) so the per-stage video-count assertions still see exactly
+            # the recording contexts.
+            return _FakeRecordingCtx(present_names=self._present_names)
         raw = Path(rvd_arg) / f"raw-{self._n}.webm"
         c = _FakeRecordingCtx(raw, present_names=self._present_names)
         self.contexts.append(c)
         return c
+
+
+def _hermetic_make_ctx(pw_browser, *, record_video_dir=None, **kw):
+    """Hermetic make_browser_context stand-in: forwards record_video_dir to
+    the fake pw_browser and swallows storage_state + any future kwargs — so a
+    make_browser_context signature change is a zero-touch edit here."""
+    return pw_browser.new_context(record_video_dir=record_video_dir)
+
+
+def _materialise(page_factories):
+    """Invoke every lazy slot factory — mirrors the real browser_measure_stage
+    materialising each page at its own loop iteration (Task #307)."""
+    for _pn, make in (page_factories or {}).items():
+        make()
 
 
 def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
@@ -784,10 +766,8 @@ def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
     test force a ConvergenceTimeout-shaped failure to prove the partial video
     is still finalized.
     """
-    def _make_ctx(pw_browser, *, record_video_dir=None, storage_state=None,
-                  **kw):
-        return pw_browser.new_context(record_video_dir=record_video_dir)
-    monkeypatch.setattr(phases.browser, "make_browser_context", _make_ctx)
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        _hermetic_make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)
@@ -799,13 +779,12 @@ def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
                       deleted_ns=None, pages_by_name=None,
                       page_factories=None):
         # Task #307 / A1-full: mirror real browser_measure_stage — materialise
-        # any lazy page (e.g. Compositions) by invoking its factory, so the
-        # deferred-finalize + content-gate path sees the live page (the real
-        # function does this at the page's loop iteration, after VERIFY).
+        # any lazy page by invoking its factory, so the deferred-finalize +
+        # content-gate path sees the live page (the real function does this
+        # at the page's loop iteration, after VERIFY).
         materialised_keys = sorted(pages_by_name) if pages_by_name else None
         if page_factories:
-            for pn, make in page_factories.items():
-                make()
+            _materialise(page_factories)
             if pages_by_name is not None:
                 materialised_keys = sorted(
                     set(pages_by_name) | set(page_factories))
@@ -826,9 +805,7 @@ def _stub_measure_materializing(stage_num):
     Compositions page MUST use this (a bare no-op stub leaves the lazy slot's
     page None → the gate would falsely see an empty/None page)."""
     def _measure(page, *a, page_factories=None, **k):
-        if page_factories:
-            for _pn, make in page_factories.items():
-                make()
+        _materialise(page_factories)
         return {"stage": stage_num, "pages": {}}
     return _measure
 
@@ -882,8 +859,7 @@ def test_open_stage_recording_pages_all_slots_lazy_no_eager_recording_ctx(
     def _fake_make_ctx(pw, *, record_video_dir=None, storage_state=None, **kw):
         rvd_calls.append(record_video_dir)
         # Throwaway login context (rvd=None) supports storage_state capture.
-        return _FakeRecordingCtx(
-            Path(tempfile.mkdtemp()) / "throwaway.webm")
+        return _FakeRecordingCtx()
 
     monkeypatch.setattr(phases.browser, "make_browser_context", _fake_make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
@@ -932,8 +908,7 @@ def test_open_stage_lazy_factory_creates_recording_context_when_invoked(
     def _fake_make_ctx(pw, *, record_video_dir=None, storage_state=None, **kw):
         rvd_calls.append(record_video_dir)
         raw = (Path(record_video_dir) / f"raw-{len(rvd_calls)}.webm"
-               if record_video_dir is not None
-               else Path(tempfile.mkdtemp()) / "throwaway.webm")
+               if record_video_dir is not None else None)
         return _FakeRecordingCtx(raw)
 
     monkeypatch.setattr(phases.browser, "make_browser_context", _fake_make_ctx)
@@ -1177,15 +1152,12 @@ def test_measure_all_users_all_lazy_selects_persistent_page_and_both_factories(
         captured["factory_keys"] = (sorted(page_factories)
                                     if page_factories else None)
         # Mirror the real function: materialise every lazy page at measure.
-        if page_factories:
-            for _pn, make in page_factories.items():
-                make()
+        _materialise(page_factories)
         return {"stage": stage_num, "pages": {}}
 
     # Real _open_stage_recording_pages (hermetic ctx factory), real lazy slots.
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, storage_state=None,
-                        **kw: pw.new_context(record_video_dir=record_video_dir))
+                        _hermetic_make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)
@@ -1425,8 +1397,7 @@ def test_recording_mode_s8_content_gate_true_against_live_page(
         phases.browser, "browser_measure_stage",
         _stub_measure_materializing(8))
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, storage_state=None,
-                        **kw: pw.new_context(record_video_dir=record_video_dir))
+                        _hermetic_make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)
@@ -1482,8 +1453,7 @@ def test_recording_mode_s8_content_gate_false_when_no_card_renders(
         phases.browser, "browser_measure_stage",
         _stub_measure_materializing(8))
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, storage_state=None,
-                        **kw: pw.new_context(record_video_dir=record_video_dir))
+                        _hermetic_make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)
@@ -1522,8 +1492,7 @@ def test_recording_mode_s9_detects_still_present_card_not_blind(
         phases.browser, "browser_measure_stage",
         _stub_measure_materializing(9))
     monkeypatch.setattr(phases.browser, "make_browser_context",
-                        lambda pw, *, record_video_dir=None, storage_state=None,
-                        **kw: pw.new_context(record_video_dir=record_video_dir))
+                        _hermetic_make_ctx)
     monkeypatch.setattr(phases.browser, "browser_login",
                         lambda page, u, p: True)
     _stub_video_to_gif(monkeypatch)

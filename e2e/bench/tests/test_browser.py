@@ -1582,16 +1582,18 @@ def test_scroll_capture_excludes_chrome_nav_idiom(fake_page):
 # ─── Task #307 / A1-full falsifiers (F-A, F-B) + Defect 2 anchor (F-C) ──────
 
 
-def _stub_stage_verify(monkeypatch, count=42):
+def _stub_stage_verify(monkeypatch, count=42, ui=None):
     """Make browser_measure_stage's VERIFY poll match on the first iteration
     and neutralise widget validation, so the stage runs cleanly through both
-    page iterations (Dashboard then Compositions)."""
+    page iterations (Dashboard then Compositions). `ui` overrides the
+    verify_composition_count_ui stub (e.g. a recorder noting which page object
+    the VERIFY read ran on)."""
     _patch_cluster_count(monkeypatch, comp_count=count, ns_count=2)
     monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
     monkeypatch.setattr(browser_mod, "verify_composition_count_api",
                         lambda token: count)
     monkeypatch.setattr(browser_mod, "verify_composition_count_ui",
-                        lambda page: count)
+                        ui if ui is not None else (lambda page: count))
     monkeypatch.setattr(browser_mod, "_validate_widget_terminal_state",
                         lambda page, path, label, **kw: {"terminal_state": "pass"})
 
@@ -1722,24 +1724,16 @@ def test_browser_measure_stage_materializes_lazy_dashboard_and_verifies_on_it(
     """
     from tests.conftest import FakePage
 
-    _patch_cluster_count(monkeypatch, comp_count=42, ns_count=2)
-    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
-    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
-                        lambda token: 42)
-    monkeypatch.setattr(browser_mod, "_validate_widget_terminal_state",
-                        lambda page, path, label, **kw: {"terminal_state": "pass"})
+    # Record which page object each verify_composition_count_ui call inspected.
+    ui_called_on: list = []
+    _stub_stage_verify(
+        monkeypatch, ui=lambda page: (ui_called_on.append(page), 42)[1])
 
     # Distinct live pages: a shared/fallback page (must NOT drive VERIFY) and the
     # lazily-materialised dashboard + compositions pages.
     shared_page = FakePage(call_count=16, ui_count=42)
     dash_page = FakePage(call_count=16, ui_count=42)
     comp_page = FakePage(call_count=30, ui_count=42)
-
-    # Record which page object each verify_composition_count_ui call inspected.
-    ui_called_on: list = []
-    monkeypatch.setattr(
-        browser_mod, "verify_composition_count_ui",
-        lambda page: (ui_called_on.append(page), 42)[1])
 
     dash_factory_calls = {"n": 0}
 
@@ -1791,18 +1785,11 @@ def test_lazy_factory_failure_falls_back_to_shared_page(monkeypatch, tmp_path):
     """
     from tests.conftest import FakePage
 
-    _patch_cluster_count(monkeypatch, comp_count=42, ns_count=2)
-    monkeypatch.setattr(browser_mod, "FRONTEND", "http://fake")
-    monkeypatch.setattr(browser_mod, "verify_composition_count_api",
-                        lambda token: 42)
-    monkeypatch.setattr(browser_mod, "_validate_widget_terminal_state",
-                        lambda page, path, label, **kw: {"terminal_state": "pass"})
+    ui_called_on: list = []
+    _stub_stage_verify(
+        monkeypatch, ui=lambda page: (ui_called_on.append(page), 42)[1])
 
     shared_page = FakePage(call_count=16, ui_count=42)
-    ui_called_on: list = []
-    monkeypatch.setattr(
-        browser_mod, "verify_composition_count_ui",
-        lambda page: (ui_called_on.append(page), 42)[1])
 
     def _boom():
         raise RuntimeError("lazy dashboard context create failed")
@@ -1834,25 +1821,26 @@ def test_D2_dashboard_final_hold_targets_compositions_not_first_chart(
     first chart on the page (which is the Blueprints donut, leaving the
     Compositions donut ~150px below frame).
 
-    Falsifier: the prior code's final-hold JS took the FIRST non-chrome chart
-    via a bare `break` on `querySelectorAll('canvas, .ant-table, ...')` with no
-    'Compositions' label anchor and no scrollHeight bottom fallback. The fix's
-    final-hold JS must (a) walk for the 'Compositions' label text, AND (b) fall
-    back to `document.body.scrollHeight` (page bottom) rather than the first
-    chart / scroll-top. We assert both markers are present in the dashboard
-    scroll JS and that the OLD top=0 fallback is gone.
+    Falsifier (structural): the dashboard choreography's LAST evaluate must BE
+    the module constant `_DASHBOARD_FINAL_HOLD_JS` (the Compositions-anchored
+    hold), and that constant must carry the 'Compositions' label anchor + the
+    scrollHeight bottom fallback and must NOT reset to top:0 (the pre-fix
+    miss-fallback that framed the Blueprints donut). Asserting on the constant
+    — not a whole-log token grep — keeps the test discriminating even if other
+    scroll steps legitimately use these tokens.
     """
     _scroll_capture_for_video(fake_page, "/dashboard")
-    joined = "\n".join(fake_page.evaluate_log)
-    # (a) Compositions-label anchor present in the final-hold JS.
-    assert "'Compositions'" in joined or '"Compositions"' in joined, (
-        "dashboard final-hold JS has no 'Compositions' label anchor — it would "
-        f"centre the first (Blueprints) chart; log={fake_page.evaluate_log!r}")
-    # (b) page-bottom (scrollHeight) fallback present, NOT the old top:0 reset.
-    assert "scrollHeight" in joined, (
-        "dashboard final-hold JS lacks a scrollHeight (page-bottom) fallback")
-    # The old bug re-centred the first chart or reset to top:0; ensure the
-    # final-hold no longer resets to the page top as its miss-fallback.
-    assert "top: 0" not in joined and "top:0" not in joined, (
-        "dashboard scroll JS still resets to top:0 (the pre-fix miss-fallback "
-        f"that framed the Blueprints donut); log={fake_page.evaluate_log!r}")
+    assert fake_page.evaluate_log, "no scroll JS ran on /dashboard"
+    final = browser_mod._DASHBOARD_FINAL_HOLD_JS
+    assert fake_page.evaluate_log[-1] == final, (
+        "the dashboard scroll's final hold is not the Compositions-anchored "
+        f"constant; last evaluate was: {fake_page.evaluate_log[-1][:120]!r}")
+    # The constant itself carries the anchor strategy markers.
+    assert "'Compositions'" in final, (
+        "_DASHBOARD_FINAL_HOLD_JS has no 'Compositions' label anchor — it "
+        "would centre the first (Blueprints) chart")
+    assert "scrollHeight" in final, (
+        "_DASHBOARD_FINAL_HOLD_JS lacks a scrollHeight (page-bottom) fallback")
+    assert "top: 0" not in final and "top:0" not in final, (
+        "_DASHBOARD_FINAL_HOLD_JS still resets to top:0 (the pre-fix "
+        "miss-fallback that framed the Blueprints donut)")
