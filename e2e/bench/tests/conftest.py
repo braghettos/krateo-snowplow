@@ -29,6 +29,19 @@ if str(_E2E_BENCH_DIR) not in sys.path:
 
 
 @pytest.fixture(autouse=True)
+def _stub_k8s_client_preflight(monkeypatch):
+    """#320: cmd_check gate 8 / the cmd_phase6 pre-check call
+    cluster._k8s_init(), which loads a real kubeconfig — unit tests must
+    never do that (and a successful init leaks K8S_CLIENT_AVAILABLE=True
+    across tests). Stub the GATE; tests of the gate itself bind the real
+    function at module import time, and wiring tests re-patch explicitly.
+    """
+    import bench.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "_gate_k8s_client",
+                        lambda: (True, "k8s_client: PASS (test stub)"))
+
+
+@pytest.fixture(autouse=True)
 def _stub_deploy_fingerprint(monkeypatch):
     """#320: _run_stage fingerprints the live snowplow Deployment around
     every stage (`kubectl get deploy -o json`). Unit tests must never shell

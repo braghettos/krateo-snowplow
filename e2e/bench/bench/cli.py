@@ -366,14 +366,14 @@ def _gate_overlay_freshness(allow_stale: bool) -> tuple[bool, str]:
 
 
 def cmd_check(args) -> int:
-    """7-item preflight gate. No mutations; 60s wall-clock budget.
+    """8-item preflight gate. No mutations; 60s wall-clock budget.
 
     Returns:
-        0 — all 7 gates PASS
+        0 — all 8 gates PASS
         2 — one or more gates FAIL (stderr names each)
         3 — non-GKE kubectl context (handled inside _gke_context_guard)
 
-    Gates (per plan §G Block 2):
+    Gates (per plan §G Block 2; gate 8 added by the #320 follow-up):
         1. GKE context match
         2. snowplow pod ready in krateo-system
         3. image tag matches --tag
@@ -381,9 +381,10 @@ def cmd_check(args) -> int:
         5. helm release lockstep
         6. frontend LB reachable
         7. overlay freshness (--allow-stale-overlay to bypass)
+        8. in-process kubernetes client importable + initialized
     """
     start = time.time()
-    section("bench check — preflight (7 gates)")
+    section("bench check — preflight (8 gates)")
 
     # Gate 1: GKE context.
     allow_non_gke = bool(getattr(args, "allow_non_gke", False))
@@ -436,6 +437,11 @@ def cmd_check(args) -> int:
     results.append(("overlay_freshness", ok, msg))
     (log if ok else _stderr_log)(msg)
 
+    # Gate 8 (#320 follow-up): in-process kubernetes client.
+    ok, msg = _gate_k8s_client()
+    results.append(("k8s_client", ok, msg))
+    (log if ok else _stderr_log)(msg)
+
     elapsed = time.time() - start
     failed = [name for name, ok, _ in results if not ok]
     section(f"check complete in {elapsed:.1f}s")
@@ -446,8 +452,28 @@ def cmd_check(args) -> int:
             f"{', '.join(failed)}{RESET}\n"
         )
         return 2
-    log(f"{GREEN}{BOLD}check PASS (7/7 gates){RESET}")
+    n = len(results) + 1  # +1 = the context gate logged before the loop
+    log(f"{GREEN}{BOLD}check PASS ({n}/{n} gates){RESET}")
     return 0
+
+
+def _gate_k8s_client() -> tuple[bool, str]:
+    """Gate 8 (#320 follow-up, the 0.30.258 INVALID-run lesson): the
+    in-process kubernetes client must import AND initialize. The
+    fixture/RBAC stages (S8/S9/S8b/S8c) mutate CRs through it and used to
+    degrade SILENTLY to `*_unavailable` errors mid-run when the venv
+    lacked the lib — invalidating the run hours in instead of failing
+    preflight.
+    """
+    if not cluster._K8S_LIB_AVAILABLE:
+        return False, ("k8s_client: FAIL (python 'kubernetes' lib not "
+                       "importable in this venv — pip install "
+                       "'kubernetes>=28.0.0' per requirements.txt)")
+    if not cluster._k8s_init():
+        return False, ("k8s_client: FAIL (lib present but client init "
+                       "failed — kubeconfig/context problem; canonical "
+                       f"context is {cluster.CANONICAL_GKE_CONTEXT!r})")
+    return True, "k8s_client: PASS (in-process client initialized)"
 
 
 def _stderr_log(msg):
@@ -647,6 +673,15 @@ def cmd_phase6(args) -> int:
             f"{RED}{BOLD}phase6: {msg}. "
             f"Run `python -m bench calibrate` to refresh.{RESET}\n"
         )
+        return 2
+
+    # #320 follow-up (0.30.258 INVALID-run lesson): the in-process k8s
+    # client is required by the fixture/RBAC stages (S8/S9/S8b/S8c) and
+    # declared in requirements.txt. A missing/broken client used to
+    # degrade those stages silently HOURS into the run — fail at minute 0.
+    ok, msg = _gate_k8s_client()
+    if not ok:
+        sys.stderr.write(f"{RED}{BOLD}phase6: {msg}{RESET}\n")
         return 2
 
     try:

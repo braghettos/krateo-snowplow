@@ -165,6 +165,8 @@ def test_check_command_passes_all_7_gates(monkeypatch, capsys):
                         lambda: (True, "frontend_lb_reachable: PASS"))
     monkeypatch.setattr(cli_mod, "_gate_overlay_freshness",
                         lambda allow_stale: (True, "overlay_freshness: PASS"))
+    monkeypatch.setattr(cli_mod, "_gate_k8s_client",
+                        lambda: (True, "k8s_client: PASS"))
     monkeypatch.setattr(cli_mod, "_gke_context_guard",
                         lambda allow_non_gke=False: "stub-context")
 
@@ -195,6 +197,8 @@ def test_check_command_fails_without_tag(monkeypatch, capsys):
                         lambda: (True, "frontend_lb_reachable: PASS"))
     monkeypatch.setattr(cli_mod, "_gate_overlay_freshness",
                         lambda allow_stale: (True, "overlay_freshness: PASS"))
+    monkeypatch.setattr(cli_mod, "_gate_k8s_client",
+                        lambda: (True, "k8s_client: PASS"))
     monkeypatch.setattr(cli_mod, "_gke_context_guard",
                         lambda allow_non_gke=False: "stub-context")
 

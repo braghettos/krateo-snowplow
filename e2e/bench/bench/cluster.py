@@ -167,7 +167,16 @@ def _k8s_init():
         _k8s_init_attempted = True
         try:
             try:
-                _k8s_config_mod.load_kube_config()
+                # #320 follow-up: pin the canonical GKE context unless the
+                # non-GKE escape hatch is set — gcloud rewrites
+                # current-context, and a bare load_kube_config() once
+                # pointed the in-process client at the wrong cluster
+                # (subprocess kubectl self-pins; this client must too).
+                env_flag = os.environ.get(
+                    "BENCH_ALLOW_NON_GKE", "0").strip().lower()
+                pin = (None if env_flag in ("1", "true", "yes")
+                       else CANONICAL_GKE_CONTEXT)
+                _k8s_config_mod.load_kube_config(context=pin)
             except Exception:
                 # Fall back to in-cluster config (when running in a pod)
                 _k8s_config_mod.load_incluster_config()
