@@ -267,3 +267,85 @@ def test_widget_kinds_includes_panels_and_restactions():
     # Every entry MUST be a CRD-style "plural.group" string.
     for kind in WIDGET_KINDS:
         assert "." in kind, f"WIDGET_KINDS entry {kind!r} is not a plural.group string"
+
+
+# ─── #320: _flush_snowplow_cache — verifier-only, the bench NEVER deploys ────
+
+
+def _flush_kubectl_recorder(live_image="ghcr.io/braghettos/snowplow:0.30.258"):
+    """Recording kubectl stub: GET deployment returns `live_image`; every
+    other call (rollout restart/status) succeeds."""
+    calls = []
+
+    def fake_kubectl(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("get", "deployment"):
+            return (0, live_image, "")
+        return (0, "", "")
+
+    return calls, fake_kubectl
+
+
+def test_flush_verifies_matching_image_and_never_deploys(monkeypatch):
+    """EXPECTED_IMAGE_TAG matches the live image → verify, then restart.
+    The class kill (#320 / #319 trace): NO `kubectl set image` ever issued
+    (feedback_chart_only_for_snowplow + feedback_chart_release_lockstep)."""
+    calls, fake = _flush_kubectl_recorder()
+    monkeypatch.setattr(lifecycle_mod, "kubectl", fake)
+    monkeypatch.setattr(lifecycle_mod, "log", lambda *a, **k: None)
+    monkeypatch.setenv("EXPECTED_IMAGE_TAG", "0.30.258")
+
+    lifecycle_mod._flush_snowplow_cache()
+
+    assert not any("set" in c for c in calls)
+    assert any(c[:2] == ("rollout", "restart") for c in calls)
+    assert any(c[:2] == ("rollout", "status") for c in calls)
+
+
+def test_flush_raises_on_image_mismatch_before_any_mutation(monkeypatch):
+    """Live image behind the expected tag → RuntimeError directing the
+    operator to helm-upgrade; nothing mutated (no set-image, no restart)."""
+    calls, fake = _flush_kubectl_recorder(
+        live_image="ghcr.io/braghettos/snowplow:0.30.257")
+    monkeypatch.setattr(lifecycle_mod, "kubectl", fake)
+    monkeypatch.setattr(lifecycle_mod, "log", lambda *a, **k: None)
+    monkeypatch.setenv("EXPECTED_IMAGE_TAG", "0.30.258")
+
+    with pytest.raises(RuntimeError, match="does not deploy"):
+        lifecycle_mod._flush_snowplow_cache()
+
+    assert not any("set" in c for c in calls)
+    assert not any(c[:2] == ("rollout", "restart") for c in calls)
+
+
+def test_flush_unreadable_image_raises_not_silently_restarts(monkeypatch):
+    """kubectl get failing while a tag IS expected must abort, not flush a
+    pod whose image we could not verify."""
+    calls = []
+
+    def fake_kubectl(*args, **kwargs):
+        calls.append(args)
+        return (1, "", "boom")
+
+    monkeypatch.setattr(lifecycle_mod, "kubectl", fake_kubectl)
+    monkeypatch.setattr(lifecycle_mod, "log", lambda *a, **k: None)
+    monkeypatch.setenv("EXPECTED_IMAGE_TAG", "0.30.258")
+
+    with pytest.raises(RuntimeError, match="unreadable"):
+        lifecycle_mod._flush_snowplow_cache()
+
+    assert not any(c[:2] == ("rollout", "restart") for c in calls)
+
+
+def test_flush_without_expected_tag_skips_verify_and_restarts(monkeypatch):
+    """No EXPECTED_IMAGE_TAG → legacy behavior: no verify read, straight to
+    the flush-restart (which stays — correct between-run hygiene)."""
+    calls, fake = _flush_kubectl_recorder()
+    monkeypatch.setattr(lifecycle_mod, "kubectl", fake)
+    monkeypatch.setattr(lifecycle_mod, "log", lambda *a, **k: None)
+    monkeypatch.delenv("EXPECTED_IMAGE_TAG", raising=False)
+
+    lifecycle_mod._flush_snowplow_cache()
+
+    assert not any(c[:2] == ("get", "deployment") for c in calls)
+    assert any(c[:2] == ("rollout", "restart") for c in calls)

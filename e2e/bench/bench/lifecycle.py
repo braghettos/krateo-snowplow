@@ -1249,11 +1249,39 @@ def clean_environment():
                         "--ignore-not-found", "--wait=false")
                 log(f"Deleted {len(bench_items)} {res} in krateo-system")
 
-    tag = os.environ.get("EXPECTED_IMAGE_TAG")
+    _flush_snowplow_cache()
+
+
+def _flush_snowplow_cache():
+    """Verify the live snowplow image, then restart the pod to clear the
+    in-process cache.
+
+    The bench NEVER deploys (Task #320, from the #319 re-roll trace): all
+    snowplow deploys flow exclusively through `helm upgrade` with the
+    lockstep chart tag (feedback_chart_only_for_snowplow +
+    feedback_chart_release_lockstep). The retired `kubectl set image`
+    branch here was the chart-vs-live-drift class behind the OBS-1
+    incident. On tag mismatch this raises so the operator helm-upgrades
+    first — the bench is a verifier, not a deployer.
+
+    The flush-restart itself is deliberate and stays: between runs it is
+    the only way to drop stale L3/L1 state (#319 attributed the
+    "external re-roll" incidents to exactly this call — correct behavior,
+    now also visible per-stage via the phases.py revision-guard).
+    """
+    tag = (os.environ.get("EXPECTED_IMAGE_TAG") or "").strip()
     if tag:
-        log(f"Deploying snowplow image tag {tag} ...")
-        kubectl("set", "image", "deployment/snowplow",
-                f"snowplow=ghcr.io/braghettos/snowplow:{tag}", "-n", "krateo-system")
+        rc, out, _ = kubectl(
+            "get", "deployment", "snowplow", "-n", "krateo-system", "-o",
+            'jsonpath={.spec.template.spec.containers[?(@.name=="snowplow")].image}')
+        live = out.strip() if rc == 0 else ""
+        live_tag = live.split(":")[-1] if ":" in live else ""
+        if live_tag != tag:
+            raise RuntimeError(
+                f"live snowplow image tag {live_tag or 'unreadable'!r} != "
+                f"expected {tag!r} — the bench does not deploy; run "
+                f"`helm upgrade` with the lockstep chart first (#320)")
+        log(f"  Live snowplow image verified: {live}")
     log("Restarting snowplow pod to clear in-process cache ...")
     kubectl("rollout", "restart", "deployment/snowplow", "-n", "krateo-system")
     kubectl("rollout", "status", "deployment/snowplow", "-n", "krateo-system",

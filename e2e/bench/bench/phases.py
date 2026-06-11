@@ -490,6 +490,56 @@ class _PerStageLogStreamer:
 # ─── Stage runner wrapper (catches ConvergenceTimeout per R3.2) ─────────────
 
 
+def _snowplow_deploy_fingerprint() -> dict | None:
+    """Best-effort {revision, restarted_at} of the live snowplow Deployment.
+
+    Task #320 (from the #319 trace): a snowplow re-roll inside a measurement
+    window invalidates the sample — and once cost a full mis-attribution
+    investigation. `deployment.kubernetes.io/revision` moves on every
+    rollout; `kubectl.kubernetes.io/restartedAt` fingerprints
+    `kubectl rollout restart` actors specifically. Returns None when the
+    deployment is unreadable (never raises — this is telemetry).
+    """
+    rc, out, _ = cluster.kubectl(
+        "get", "deploy", "snowplow", "-n", "krateo-system", "-o", "json")
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return None
+    return {
+        "revision": (d.get("metadata", {}).get("annotations", {})
+                     .get("deployment.kubernetes.io/revision")),
+        "restarted_at": (d.get("spec", {}).get("template", {})
+                         .get("metadata", {}).get("annotations", {})
+                         .get("kubectl.kubernetes.io/restartedAt")),
+    }
+
+
+def _annotate_deploy_revision(stage_id: str, proof_dict: dict,
+                              before: dict | None) -> None:
+    """Stamp the stage proof with the deploy-revision window (#320).
+
+    REPORT-ONLY — never gates the stage (cache-toggle stages restart
+    snowplow intentionally; the annotation makes both the intentional and
+    the unexpected re-rolls visible in the proof instead of silent).
+    """
+    after = _snowplow_deploy_fingerprint()
+    proof_dict["deploy_revision_before"] = (before or {}).get("revision")
+    proof_dict["deploy_revision_after"] = (after or {}).get("revision")
+    rerolled = (before is not None and after is not None
+                and before.get("revision") != after.get("revision"))
+    proof_dict["pod_rerolled_mid_stage"] = rerolled
+    if rerolled:
+        lifecycle.log(
+            f"  WARNING {stage_id}: snowplow Deployment rolled MID-STAGE "
+            f"(revision {before.get('revision')} -> {after.get('revision')}, "
+            f"restartedAt={after.get('restarted_at')}). If this stage did "
+            f"not intentionally restart snowplow, treat its measurements "
+            f"as suspect (#320).")
+
+
 def _run_stage(stage_id: str,
                ctx: StageContext,
                work: Callable[[StageContext], dict],
@@ -523,6 +573,7 @@ def _run_stage(stage_id: str,
         out_path=stage_log_path,
     )
     streamer.start()
+    deploy_fp_before = _snowplow_deploy_fingerprint()
     try:
         try:
             try:
@@ -534,6 +585,7 @@ def _run_stage(stage_id: str,
                 # the proof's video-artifact attach below, so the deferred
                 # `.webm` is in __stage_videos__ when it is attached.
                 _drain_pending_video_finalize(ctx)
+            _annotate_deploy_revision(stage_id, proof_dict, deploy_fp_before)
             passed = bool(proof_dict.pop("__passed__", True))
             proof = StageProof(
                 stage_id=stage_id,

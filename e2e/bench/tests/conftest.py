@@ -28,6 +28,21 @@ if str(_E2E_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_BENCH_DIR))
 
 
+@pytest.fixture(autouse=True)
+def _stub_deploy_fingerprint(monkeypatch):
+    """#320: _run_stage fingerprints the live snowplow Deployment around
+    every stage (`kubectl get deploy -o json`). Unit tests must never shell
+    real kubectl — stub the fingerprint to None (annotation fields become
+    None / pod_rerolled_mid_stage=False). Tests that exercise the guard
+    re-set `phases._snowplow_deploy_fingerprint` themselves; the real
+    function is capturable at test-module import time (collection runs
+    before fixtures).
+    """
+    import bench.phases as phases_mod
+    monkeypatch.setattr(phases_mod, "_snowplow_deploy_fingerprint",
+                        lambda: None)
+
+
 @pytest.fixture
 def reset_k8s_state():
     """Reset bench.cluster k8s-client module globals between tests.
