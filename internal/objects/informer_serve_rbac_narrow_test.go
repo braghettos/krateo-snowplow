@@ -182,7 +182,7 @@ func newRBACNarrowServeWatcher(t *testing.T) *cache.ResourceWatcher {
 // gate.
 func TestGet_RBACNarrowing_DeniedNamespaceNotServed(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newRBACNarrowServeWatcher).
 	newRBACNarrowServeWatcher(t)
 
 	ctx := ctxWithUser(narrowUser)
@@ -241,7 +241,7 @@ func TestGet_RBACNarrowing_DeniedNamespaceNotServed(t *testing.T) {
 // per-user token gate is the authoritative answer).
 func TestGet_RBACFailClosed_NilIdentity(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newRBACNarrowServeWatcher).
 	newRBACNarrowServeWatcher(t)
 
 	// No UserInfo attached — context.Background() only. Use the
@@ -284,7 +284,7 @@ func TestGet_RBACNarrowing_GroupGrant(t *testing.T) {
 	}
 	resetServeCounters()
 	t.Setenv("CACHE_ENABLED", "true")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 
 	var seed []runtime.Object
 	seed = append(seed, newServeTestObject(authorizedNS, "obj-authorized", "marker-a"))

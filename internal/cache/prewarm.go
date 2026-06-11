@@ -30,9 +30,11 @@
 // a startup GVR-walk RE-ARMS multiple documented regressions while the
 // pivot consumer is off:
 //
-//   - No-consumer apiserver pressure (0.30.6 / 0.30.61). With
-//     RESOLVER_USE_INFORMER OFF by default the resolver pivot does not
-//     read from these informers. Each EnsureResourceType the walk fires
+//   - No-consumer apiserver pressure (0.30.6 / 0.30.61). When the
+//     resolver pivot is inactive (historically RESOLVER_USE_INFORMER OFF;
+//     post-#57 the pivot is implicit-on-cache, so "inactive" == cache
+//     off) the resolver pivot does not read from these informers. Each
+//     EnsureResourceType the walk fires
 //     lands in the post-Start late-registration branch and immediately
 //     spawns a LIST+WATCH against the apiserver — N informers nobody
 //     reads. The 0.30.61 feature-journal entry recorded exactly this:
@@ -60,8 +62,10 @@
 // why the gate, not fire-and-forget alone, is the safety mechanism.
 //
 // Promotion to default-ON requires a PREWARM_REGISTER_ENABLED=true bench
-// at 50K scale measuring apiserver QPS + RSS-under-load, run alongside
-// RESOLVER_USE_INFORMER=true so the pivot consumer is actually present.
+// at 50K scale measuring apiserver QPS + RSS-under-load, run with the
+// cache subsystem on (CACHE_ENABLED=true) so the resolver pivot consumer
+// is actually present (#57: the pivot is implicit-on-cache — there is no
+// longer a separate RESOLVER_USE_INFORMER flag to set).
 
 package cache
 

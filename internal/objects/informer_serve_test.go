@@ -1,19 +1,22 @@
 // informer_serve_test.go — Tag 0.30.96 Gap A unit tests for the
 // `objects.Get` informer-serve routed branch.
 //
-// Coverage matrix:
+// Coverage matrix (#57: the routed branch is now implicit-on-cache —
+// useInformer() == !cache.Disabled(); the RESOLVER_USE_INFORMER flag was
+// retired):
 //
-//	  SCENARIO                       | TEST                                   | EXPECT
-//	  -------------------------------|----------------------------------------|------------------------------
-//	  flag off                       | TestGet_FlagOff_ApiserverPath          | apiserver path, counters untouched
-//	  cache disabled                 | TestGet_CacheDisabled_ApiserverPath    | apiserver path, counters untouched
-//	  synced informer + hit          | TestGet_InformerServed                 | object returned + strip + counter++
-//	  not-synced informer            | TestGet_NotSynced_Fallthrough          | EnsureResourceType fired + fallthrough++
-//	  metadata-only GVR              | TestGet_MetadataOnly_Fallthrough       | fallthrough++ (informer untouched)
-//	  passthrough mode               | TestGet_Passthrough_Fallthrough        | fallthrough++ (no informer serve)
-//	  GET-miss (synced, absent)      | TestGet_GetMiss_Fallthrough            | fallthrough++
+//	  SCENARIO                       | TEST                                       | EXPECT
+//	  -------------------------------|--------------------------------------------|------------------------------
+//	  cache off (clean)              | TestGet_CacheOff_ApiserverPath             | apiserver path, counters untouched
+//	  cache off + stale flag=true    | TestGet_CacheDisabled_StaleFlagIgnored     | apiserver path, counters untouched (flag ignored)
+//	  cache on, no flag (implicit)   | TestGet_CacheOn_ImplicitInformerServe      | informer-served + counter++ (fold proof)
+//	  synced informer + hit          | TestGet_InformerServed                     | object returned + strip + counter++
+//	  not-synced informer            | TestGet_NotSynced_Fallthrough              | EnsureResourceType fired + fallthrough++
+//	  metadata-only GVR              | TestGet_MetadataOnly_Fallthrough           | fallthrough++ (informer untouched)
+//	  passthrough mode               | TestGet_Passthrough_Fallthrough            | fallthrough++ (no informer serve)
+//	  GET-miss (synced, absent)      | TestGet_GetMiss_Fallthrough                | fallthrough++
 //	  byte-equivalence strip         | TestGet_InformerServed_StripsManagedFields | managedFields nil + LAC dropped
-//	  summary log line shape         | TestObjectsGetSummary_LineFormat       | stable greppable shape
+//	  summary log line shape         | TestObjectsGetSummary_LineFormat           | stable greppable shape
 //
 // Per `feedback_no_special_cases.md`: every test uses a generic customer
 // GVR — no per-resource branch is exercised.
@@ -223,34 +226,43 @@ func newServeWatcher(t *testing.T, seed ...runtime.Object) *cache.ResourceWatche
 	return rw
 }
 
-// TestGet_FlagOff_ApiserverPath — with RESOLVER_USE_INFORMER unset the
-// routed branch is skipped entirely; Get takes the apiserver path and
-// NEITHER counter moves. Preserves the R-FALSE-1 byte-identical invariant.
-func TestGet_FlagOff_ApiserverPath(t *testing.T) {
+// TestGet_CacheOff_ApiserverPath — #57 re-frame of the old
+// TestGet_FlagOff_ApiserverPath. The routed branch was formerly gated by
+// RESOLVER_USE_INFORMER; that flag was folded into CACHE_ENABLED, so
+// cache-OFF is now the way to get the apiserver byte-identity path. With
+// CACHE_ENABLED=false the cache.Disabled() short-circuit (get.go:51)
+// returns BEFORE the routed branch and NEITHER counter moves — the
+// R-FALSE-1 byte-identity invariant, now keyed on the cache toggle.
+func TestGet_CacheOff_ApiserverPath(t *testing.T) {
 	resetServeCounters()
-	newServeWatcher(t, newServeTestObject("default", "alpha", "m"))
-	// RESOLVER_USE_INFORMER intentionally NOT set.
+	t.Setenv("CACHE_ENABLED", "false")
+	// No RESOLVER_USE_INFORMER set — the clean cache-off path.
 
 	res := Get(context.Background(), serveTestRef("default", "alpha"))
 
 	// The apiserver path fails at UserConfig (no endpoint in ctx) — that
-	// is the expected pre-0.30.96 behaviour; we only assert the routed
+	// is the expected cache-off behaviour; we only assert the routed
 	// branch did NOT run.
 	if res.Unstructured != nil {
-		t.Fatalf("flag off: expected apiserver path (no informer serve); got served object")
+		t.Fatalf("cache off: expected apiserver path (no informer serve); got served object")
 	}
 	if s := ObjectsGetStatsSnapshot(); s.InformerServed != 0 || s.ApiserverFallthrough != 0 {
-		t.Fatalf("flag off: counters must be untouched; got served=%d fallthrough=%d",
+		t.Fatalf("cache off: counters must be untouched; got served=%d fallthrough=%d",
 			s.InformerServed, s.ApiserverFallthrough)
 	}
 }
 
-// TestGet_CacheDisabled_ApiserverPath — CACHE_ENABLED unset/false routes
+// TestGet_CacheDisabled_StaleFlagIgnored — CACHE_ENABLED=false routes
 // straight to apiserver before the routed branch; counters untouched.
-func TestGet_CacheDisabled_ApiserverPath(t *testing.T) {
+// #57: a stale RESOLVER_USE_INFORMER=true in the env is IGNORED — the
+// cache.Disabled() short-circuit wins regardless of the retired flag.
+// This is a direct proof of falsifier (b): the fold cannot alter the
+// cache-off path because cache-off is gated by cache.Disabled() upstream,
+// flag-independent.
+func TestGet_CacheDisabled_StaleFlagIgnored(t *testing.T) {
 	resetServeCounters()
 	t.Setenv("CACHE_ENABLED", "false")
-	t.Setenv("RESOLVER_USE_INFORMER", "true") // flag on, but cache disabled
+	t.Setenv("RESOLVER_USE_INFORMER", "true") // stale/retired flag — must be ignored under cache-off
 
 	res := Get(context.Background(), serveTestRef("default", "alpha"))
 
@@ -263,12 +275,36 @@ func TestGet_CacheDisabled_ApiserverPath(t *testing.T) {
 	}
 }
 
+// TestGet_CacheOn_ImplicitInformerServe — #57 positive fold proof. With
+// CACHE_ENABLED=true and NO RESOLVER_USE_INFORMER set, the informer-serve
+// routed branch is now IMPLICITLY active (useInformer() == !cache.Disabled()).
+// A synced informer holding the object + an authorized identity must be
+// served from the informer — the InformerServed counter increments. This
+// is the inverse of the pre-#57 flag-off assertion: implicit-on-cache.
+func TestGet_CacheOn_ImplicitInformerServe(t *testing.T) {
+	resetServeCounters()
+	// newServeWatcher sets CACHE_ENABLED=true and syncs the GVR.
+	// RESOLVER_USE_INFORMER is deliberately NOT set — the pivot is implicit.
+	newServeWatcher(t, newServeTestObject("default", "alpha", "marker-alpha"))
+
+	res := Get(serveAdminCtx(), serveTestRef("default", "alpha"))
+	if res.Err != nil {
+		t.Fatalf("implicit informer-serve: unexpected Err: %v", res.Err)
+	}
+	if res.Unstructured == nil {
+		t.Fatalf("implicit informer-serve: expected an object served from the informer; got nil")
+	}
+	if s := ObjectsGetStatsSnapshot(); s.InformerServed != 1 {
+		t.Fatalf("implicit informer-serve: InformerServed want 1 (pivot implicit-on-cache); got %d", s.InformerServed)
+	}
+}
+
 // TestGet_InformerServed — synced informer holding the object → Get
 // serves it from the informer, increments objectsGetInformerServed, and
 // returns the correct GVR.
 func TestGet_InformerServed(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newServeWatcher).
 	newServeWatcher(t, newServeTestObject("default", "alpha", "marker-alpha"))
 
 	// serveAdminCtx carries an identity with a cluster-wide RBAC
@@ -302,7 +338,7 @@ func TestGet_InformerServed(t *testing.T) {
 // annotation dropped, all other annotations preserved.
 func TestGet_InformerServed_StripsManagedFields(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newServeWatcher).
 	newServeWatcher(t, newServeTestObject("default", "alpha", "m"))
 
 	res := Get(serveAdminCtx(), serveTestRef("default", "alpha"))
@@ -335,7 +371,7 @@ func TestGet_InformerServed_StripsManagedFields(t *testing.T) {
 // the strip.
 func TestGet_InformerServed_DoesNotMutateStore(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newServeWatcher).
 	rw := newServeWatcher(t, newServeTestObject("default", "alpha", "m"))
 
 	res := Get(serveAdminCtx(), serveTestRef("default", "alpha"))
@@ -367,7 +403,7 @@ func TestGet_InformerServed_DoesNotMutateStore(t *testing.T) {
 func TestGet_NotSynced_Fallthrough(t *testing.T) {
 	resetServeCounters()
 	t.Setenv("CACHE_ENABLED", "true")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		serveTestScheme(), serveTestListKinds())
@@ -418,7 +454,7 @@ func TestGet_NotSynced_Fallthrough(t *testing.T) {
 func TestGet_UnservableGVR_Fallthrough(t *testing.T) {
 	resetServeCounters()
 	t.Setenv("CACHE_ENABLED", "true")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		serveTestScheme(), serveTestListKinds())
@@ -457,7 +493,7 @@ func TestGet_UnservableGVR_Fallthrough(t *testing.T) {
 func TestGet_MetadataOnly_Fallthrough(t *testing.T) {
 	resetServeCounters()
 	t.Setenv("CACHE_ENABLED", "true")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		serveTestScheme(), serveTestListKinds())
@@ -510,7 +546,7 @@ func TestGet_MetadataOnly_Fallthrough(t *testing.T) {
 func TestGet_Passthrough_Fallthrough(t *testing.T) {
 	resetServeCounters()
 	t.Setenv("CACHE_ENABLED", "false")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	t.Setenv("RESOLVER_USE_INFORMER", "true") // #57: stale/retired flag — ignored under cache-off
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		serveTestScheme(), serveTestListKinds())
@@ -541,7 +577,7 @@ func TestGet_Passthrough_Fallthrough(t *testing.T) {
 // apiserver NotFound envelope; the fallthrough counter increments.
 func TestGet_GetMiss_Fallthrough(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newServeWatcher).
 	newServeWatcher(t, newServeTestObject("default", "alpha", "m"))
 
 	res := Get(context.Background(), serveTestRef("default", "missing"))

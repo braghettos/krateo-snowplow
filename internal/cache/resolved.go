@@ -500,9 +500,13 @@ func ResolvedCacheEnabled() bool {
 //     refresher, which the api-stage entry reuses verbatim.
 //  3. RESOLVED_CACHE_APISTAGE_ENABLED=="true" — the per-feature opt-in.
 //
-// Default OFF (gate 3 must be the explicit string "true", mirroring
-// PrewarmEnabled). Flag-off the RESTAction resolver runs byte-identical
-// to 0.30.115 — no per-stage Get/Put, no api-stage L1 key (AC-E1).
+// Internal default OFF (gate 3 must be the explicit string "true"). This
+// is a back-out knob for the api-stage L1 key-swap — a working,
+// load-bearing, RBAC-sensitive identity-free cache that runs =true in
+// production (#57: kept as a back-out knob, NOT folded — same class as
+// RESOLVED_CACHE_ENABLED). Flag-off the RESTAction resolver runs
+// byte-identical to 0.30.115 — no per-stage Get/Put, no api-stage L1 key
+// (AC-E1).
 func ApistageL1Enabled() bool {
 	if !ResolvedCacheEnabled() {
 		return false

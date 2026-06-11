@@ -77,7 +77,8 @@
 // + AUTHN_NAMESPACE). See phase1_roots.go.
 //
 // BEHAVIOR-NEUTRAL — the whole walk runs only when cache.PrewarmEnabled()
-// (PREWARM_ENABLED=true). main.go does not call Phase1Warmup otherwise.
+// (#57: implicit-on-cache, i.e. the cache subsystem is on). main.go does
+// not call Phase1Warmup otherwise.
 
 package dispatchers
 

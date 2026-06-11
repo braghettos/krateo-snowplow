@@ -1,19 +1,28 @@
-// informer_dispatch_rfalse1_test.go — Tag 0.30.98 falsifier F4 (R-FALSE-1).
+// informer_dispatch_rfalse1_test.go — Tag 0.30.98 falsifier F4 (R-FALSE-1),
+// re-framed for the #57 implicit-on-cache fold.
 //
-// R-FALSE-1 (architect falsifier, carried since the 0.30.95 pivot): with
-// RESOLVER_USE_INFORMER unset, the binary's pivot path is byte-identical
-// to the prior tag — the resolver NEVER routes a read through the
-// informer cache, and therefore never reaches the 0.30.98 four-conjunct
-// servability gate (IsServable / ListObjectsServable).
+// R-FALSE-1 (architect falsifier, carried since the 0.30.95 pivot): when
+// the pivot is inactive, the binary's pivot path is byte-identical to the
+// apiserver path — the resolver NEVER routes a read through the informer
+// cache, and therefore never reaches the 0.30.98 four-conjunct servability
+// gate (IsServable / ListObjectsServable).
 //
-// Why this test lives HERE and not in internal/cache: R-FALSE-1 is a
-// property of the FLAG-GATED CONSUMER, not of the servability predicate.
-// The predicate is pure and has no flag read. The single consumer gate
-// is in resolve.go:
+// #57 — the pivot was gated by the standalone RESOLVER_USE_INFORMER flag;
+// that flag was folded into the single CACHE_ENABLED master gate. The
+// resolve.go consumer gate is now:
 //
-//	if resolverUseInformer() == "true" {
+//	if resolverUseInformer() {   // == !cache.Disabled()
 //	    if raw, served := dispatchViaInformer(gctx, call); served { ... }
 //	}
+//
+// So "pivot inactive" is now exactly "cache subsystem OFF". Cache-OFF is
+// the byte-identity path the falsifier guards. (This is independent of —
+// and in addition to — the get.go:51 / Gate-4 cache.Disabled() short-
+// circuits; here we pin the CONSUMER GATE itself.)
+//
+// Why this test lives HERE and not in internal/cache: R-FALSE-1 is a
+// property of the GATED CONSUMER, not of the servability predicate. The
+// predicate is pure and has no gate read.
 //
 // dispatchViaInformer is the ONLY function in the resolver that calls
 // IsServable / ListObjectsServable. Every path through dispatchViaInformer
@@ -24,14 +33,15 @@
 //
 // This test asserts the true behavioral surface:
 //
-//   - NEGATIVE control: with the flag unset / "false" / "shadow", the
-//     resolve.go gate (resolverUseInformer() == "true") evaluates false,
-//     dispatchViaInformer is not invoked, and the pivot counters stay
-//     frozen — the servable gate is unreachable.
-//   - POSITIVE control: with the flag "true", the gate passes, invoking
-//     dispatchViaInformer DOES move a counter — proving the counter is a
-//     faithful witness of the gate being reached, so the negative
-//     control's "counters frozen" is meaningful.
+//   - NEGATIVE control: with the cache subsystem OFF, the resolve.go gate
+//     (resolverUseInformer()) evaluates false, dispatchViaInformer is not
+//     invoked, and the pivot counters stay frozen — the servable gate is
+//     unreachable. A stale RESOLVER_USE_INFORMER=true is IGNORED (the fold
+//     means cache-off closes the gate regardless).
+//   - POSITIVE control: with the cache subsystem ON, the gate passes,
+//     invoking dispatchViaInformer DOES move a counter — proving the
+//     counter is a faithful witness of the gate being reached, so the
+//     negative control's "counters frozen" is meaningful.
 //
 // Per feedback_no_special_cases.md: the assertion uses the generic
 // dispatchTestGVR; no per-resource branching.
@@ -44,39 +54,37 @@ import (
 )
 
 // gateReachesPivot replicates the EXACT resolve.go consumer gate
-// (resolve.go ~line 344). The resolver invokes dispatchViaInformer — and
+// (resolve.go ~line 794). The resolver invokes dispatchViaInformer — and
 // hence the servability gate — if and only if this returns true. Keeping
 // the predicate in one helper means a future change to the resolve.go
-// gate that diverges from this is caught by the test below.
+// gate that diverges from this is caught by the tests below.
 func gateReachesPivot() bool {
-	return resolverUseInformer() == "true"
+	return resolverUseInformer()
 }
 
-// TestF4_ResolverFlagOff_DispatchDoesNotReachServableGate is the
-// behavioral R-FALSE-1 falsifier. For every non-"true" flag value it
-// asserts the resolve.go gate evaluates false AND that, honouring the
-// gate as resolve.go does, dispatchViaInformer is never invoked — so the
-// 0.30.98 servable gate stays unreached and the pivot counters do not
-// move.
-func TestF4_ResolverFlagOff_DispatchDoesNotReachServableGate(t *testing.T) {
-	// A fully-synced cache=on watcher with a seeded, servable GVR. If the
-	// gate were (incorrectly) open, dispatchViaInformer WOULD serve this
-	// call from the indexer and bump ListServed — so the watcher being
-	// "ready to serve" makes the negative control strict.
-	newDispatchWatcher(t, newTestRestActionRuntimeObject("default", "ra-1", "m1"))
-
+// TestF4_CacheOff_DispatchDoesNotReachServableGate is the behavioral
+// R-FALSE-1 falsifier, re-framed to the #57 fold: with the cache subsystem
+// OFF the resolve.go gate evaluates false AND, honouring the gate as
+// resolve.go does, dispatchViaInformer is never invoked — so the 0.30.98
+// servable gate stays unreached and the pivot counters do not move. A
+// stale RESOLVER_USE_INFORMER value (any) is ignored under the fold.
+func TestF4_CacheOff_DispatchDoesNotReachServableGate(t *testing.T) {
 	// A LIST call the pivot could serve if it were ever reached.
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
 
-	for _, flag := range []string{"", "false", "FALSE", "0", "shadow", "no", "yes", "1"} {
-		flag := flag
-		t.Run("flag="+flag, func(t *testing.T) {
-			t.Setenv("RESOLVER_USE_INFORMER", flag)
+	// Cache OFF is the byte-identity path. A range of stale
+	// RESOLVER_USE_INFORMER values (including "true") must NOT re-open the
+	// gate — the fold keys the gate on CACHE_ENABLED alone.
+	for _, staleFlag := range []string{"", "true", "false", "shadow", "1", "0"} {
+		staleFlag := staleFlag
+		t.Run("stale_flag="+staleFlag, func(t *testing.T) {
+			t.Setenv("CACHE_ENABLED", "false")
+			t.Setenv("RESOLVER_USE_INFORMER", staleFlag)
 
-			// The resolve.go gate MUST evaluate false for every value
-			// that is not exactly "true".
+			// The resolve.go gate MUST evaluate false when the cache
+			// subsystem is off, regardless of the stale flag value.
 			if gateReachesPivot() {
-				t.Fatalf("flag=%q: resolve.go gate must be closed for non-\"true\" values; got open", flag)
+				t.Fatalf("stale RESOLVER_USE_INFORMER=%q: resolve.go gate must be closed when cache is OFF; got open", staleFlag)
 			}
 
 			before := DispatchInformerStatsSnapshot()
@@ -91,9 +99,9 @@ func TestF4_ResolverFlagOff_DispatchDoesNotReachServableGate(t *testing.T) {
 
 			after := DispatchInformerStatsSnapshot()
 			if after != before {
-				t.Fatalf("flag=%q: pivot counters moved (before=%+v after=%+v) — "+
-					"the dispatch path reached the servable gate with the flag off (R-FALSE-1 violated)",
-					flag, before, after)
+				t.Fatalf("stale RESOLVER_USE_INFORMER=%q: pivot counters moved (before=%+v after=%+v) — "+
+					"the dispatch path reached the servable gate with cache OFF (R-FALSE-1 violated)",
+					staleFlag, before, after)
 			}
 		})
 	}
@@ -103,14 +111,15 @@ func TestF4_ResolverFlagOff_DispatchDoesNotReachServableGate(t *testing.T) {
 // negative test above. It proves that reaching dispatchViaInformer DOES
 // move a pivot counter — so "counters frozen" in the negative control
 // genuinely means "dispatchViaInformer was not entered", not "the
-// counter is dead". With the flag "true" the resolve.go gate opens and a
+// counter is dead". With the cache subsystem ON (#57: gate open) a
 // servable LIST is answered from the indexer, bumping ListServed.
 func TestF4_PivotCounterIsAFaithfulWitness(t *testing.T) {
+	// newDispatchWatcher sets CACHE_ENABLED=true → the gate is open under
+	// the #57 fold.
 	newDispatchWatcher(t, newTestRestActionRuntimeObject("default", "ra-1", "m1"))
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
 
 	if !gateReachesPivot() {
-		t.Fatalf("flag=true: resolve.go gate must be open")
+		t.Fatalf("cache ON: resolve.go gate must be open under the #57 fold")
 	}
 
 	call := buildCall(http.MethodGet, "/apis/templates.krateo.io/v1/namespaces/default/restactions")
@@ -120,7 +129,7 @@ func TestF4_PivotCounterIsAFaithfulWitness(t *testing.T) {
 	after := DispatchInformerStatsSnapshot()
 
 	if !served {
-		t.Fatalf("positive control: flag=true + synced+servable GVR must serve; got served=false")
+		t.Fatalf("positive control: cache ON + synced+servable GVR must serve; got served=false")
 	}
 	if len(raw) == 0 {
 		t.Fatalf("positive control: served call returned 0 bytes")

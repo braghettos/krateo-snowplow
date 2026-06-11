@@ -11,6 +11,17 @@
 // via the CACHE_ENABLED env toggle. Disabled() is the single read of
 // that toggle; when true the package returns nil watchers and every
 // consumer falls back to the apiserver / SubjectAccessReview path.
+//
+// #57 — CACHE_ENABLED is the single master gate. Two formerly-standalone
+// flags were folded into it (project_single_cache_flag_direction):
+// startup prewarm (PrewarmEnabled, was PREWARM_ENABLED) and the
+// resolver/objects informer-serve pivot (resolverUseInformer / useInformer,
+// was RESOLVER_USE_INFORMER) are now IMPLICIT under this gate — on iff the
+// cache subsystem is on, off iff it is off. There is no separate prewarm
+// or informer-pivot env flag; stale values of the retired names are
+// ignored (main.go's retired-flag audit warns once). Several sub-layer
+// back-out knobs remain explicit (RESOLVED_CACHE_ENABLED,
+// RESOLVED_CACHE_APISTAGE_ENABLED, WIDGET_CONTENT_L1_ENABLED, etc.).
 package cache
 
 import "os"

@@ -757,9 +757,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 
 				// 0.30.95 resolver pivot — dispatch GET reads to the
-				// informer cache when RESOLVER_USE_INFORMER=true.
-				// Flag default OFF: this branch is byte-identical to
-				// 0.30.94 with the flag unset (R-FALSE-1 invariant).
+				// informer cache when the cache subsystem is on. #57:
+				// implicit-on-cache — resolverUseInformer() now folds to
+				// !cache.Disabled() (the standalone RESOLVER_USE_INFORMER
+				// flag was retired). Cache OFF: this branch is byte-
+				// identical to the apiserver path (R-FALSE-1 invariant).
 				//
 				// The pivot returns served=true ONLY when the call is
 				// safely cache-servable (GET, parseable apiserver path,
@@ -791,7 +793,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// step 2 — no cross-user leak, the hit path is gated too.
 				// Flag-off (apistageEnabled false) this is byte-identical
 				// to the 0.30.118 pivot path.
-				if resolverUseInformer() == "true" {
+				if resolverUseInformer() {
 					if apistageEnabled {
 						if gatedVal, served, ok := apistageContentServe(gctx, apistageStore, call); ok {
 							if served {
@@ -1111,11 +1113,11 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 		//     unregistered composition GVR will hit apiserver via
 		//     fall-through.
 		//
-		// Gated by PREWARM_ENABLED so a flag-OFF process is byte-
-		// identical (the nav-discovered set stays empty and the
-		// discovery hop never runs). Non-templated paths also flow
-		// through here harmlessly — their group is added too (it IS
-		// navigation-reached).
+		// Gated by PrewarmEnabled() — #57 implicit-on-cache, so a
+		// cache-OFF process is byte-identical (the nav-discovered set
+		// stays empty and the discovery hop never runs). Non-templated
+		// paths also flow through here harmlessly — their group is added
+		// too (it IS navigation-reached).
 		if cache.PrewarmEnabled() {
 			if grp, grpOK := cache.ExtractAPIServerGroupFromTemplatedPath(path); grpOK {
 				cache.AddNavigationDiscoveredGroup(grp)

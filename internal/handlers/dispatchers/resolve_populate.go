@@ -19,7 +19,8 @@
 // The widget resolver (widgets.Resolve) reads xcontext.UserConfig(ctx)
 // directly and fails "user *Endpoint not found in context" if only the
 // identity (WithUserInfo) is supplied. With the informer pivot ON
-// (RESOLVER_USE_INFORMER=true) every K8s read is informer-served and
+// (#57: implicit-on-cache, i.e. the cache subsystem on) every K8s read
+// is informer-served and
 // RBAC-narrowed IN-PROCESS from WithUserInfo — never from the user's
 // token — so the user's Endpoint is needed ONLY as a transport. We
 // therefore supply the snowplow ServiceAccount endpoint + *rest.Config

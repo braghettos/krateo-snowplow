@@ -438,7 +438,7 @@ func newNestedCallWatcherWithInner(t *testing.T, ns, name string,
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: informer pivot is implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 	cache.ResetResolvedCacheForTest()
 	cache.ResetDepsForTest()
 	t.Cleanup(func() {

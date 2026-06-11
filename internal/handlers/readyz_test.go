@@ -40,9 +40,11 @@ func TestReadyz_503BeforePhase1Done(t *testing.T) {
 }
 
 // TestReadyz_200AfterPhase1Done asserts /readyz flips to 200 once the
-// Phase 1 warmup signals done. This is also the flag-OFF behavior: when
-// PREWARM_ENABLED is OFF, main.go calls MarkPhase1Done immediately so
-// /readyz is an immediate-200 no-op from the first probe.
+// Phase 1 warmup signals done. This is also the cache-OFF behavior: when
+// the cache subsystem is off (CACHE_ENABLED unset/false), prewarm is
+// implicit-off (#57 — prewarm is implicit-on-cache), so main.go calls
+// MarkPhase1Done immediately and /readyz is an immediate-200 no-op from
+// the first probe.
 func TestReadyz_200AfterPhase1Done(t *testing.T) {
 	cache.ResetPhase1DoneForTest()
 	t.Cleanup(cache.ResetPhase1DoneForTest)

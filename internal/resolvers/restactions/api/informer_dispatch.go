@@ -1,43 +1,34 @@
 // informer_dispatch.go — Tag 0.30.95 resolver pivot.
 //
-// Routes resolver GET reads to the in-process informer cache when the
-// `RESOLVER_USE_INFORMER` flag is set. The pivot eliminates per-call
-// apiserver round-trips for the K8s read shapes A-D in the resolver
+// Routes resolver GET reads to the in-process informer cache whenever
+// the cache subsystem is on. The pivot eliminates per-call apiserver
+// round-trips for the K8s read shapes A-D in the resolver
 // (compositions-list, sidebar widgets, resourceRefs targets, etc.):
 // under apiserver-routed dispatch each inner-call cost a full TLS
 // handshake + apiserver LIST/GET; under the pivot the same call is
 // served from the indexer in O(1) (GET) or O(N) over the namespace
 // partition (LIST), with zero network I/O.
 //
-// Why a flag rather than always-on:
-//   - The pivot's output envelope must be byte-equivalent to apiserver
-//     for the downstream JQ pipeline (`feedback_cache_must_not_constrain_jq.md`).
-//     We keep the flag default OFF in 0.30.95 so the binary is byte-identical
-//     to 0.30.94 with `RESOLVER_USE_INFORMER` unset — zero risk on rollout.
-//   - 0.30.96 will enable the flag in bench-only; 0.30.97 promotes to
-//     production after soak. Canonical 0.30.10 wraps the pivot together
-//     with the bundled permission-check cache.
+// #57 — implicit-on-cache. The pivot was originally gated by a
+// standalone `RESOLVER_USE_INFORMER` env flag (staged-rollout default
+// OFF at 0.30.95 → bench-only 0.30.96 → prod 0.30.97). That flag was
+// folded away in Task #57: the pivot is now implicit under the single
+// CACHE_ENABLED master gate (`resolverUseInformer()` returns
+// `!cache.Disabled()`). The staged rollout is complete and production
+// runs cache-on, so the flag had no remaining purpose. A stale
+// RESOLVER_USE_INFORMER in the environment is ignored (main.go's
+// retired-flag audit warns once).
 //
-// Three flag values:
-//
-//   - "true"    — pivot active. dispatchViaInformer serves the call when it
-//                 can; falls through to apiserver for the gated edge cases
-//                 (verb gate, subresource paths, external paths, passthrough
-//                 mode, unsynced informer, metadata-only routed GVR, 404).
-//
-//   - "shadow"  — RESERVED. Documented here as a soak-validation design
-//                 (both paths execute; disagreement logged) but NOT wired
-//                 in 0.30.95. The resolve.go pivot branch only checks for
-//                 "true". A future ship (likely 0.30.96 if shadow proves
-//                 needed during bench validation) would add the comparison
-//                 closure + disagreement-log code path. Treat any caller
-//                 setting RESOLVER_USE_INFORMER=shadow today as equivalent
-//                 to OFF.
-//
-//   - ""        — default OFF. Pivot is a no-op; every call takes the
-//                 apiserver branch unchanged from 0.30.94. The architect's
-//                 falsifier R-FALSE-1 is "0.30.95 binary with flag OFF is
-//                 byte-identical to 0.30.94" — this default preserves that.
+//   - cache ON  — pivot active. dispatchViaInformer serves the call when
+//                 it can; falls through to apiserver for the gated edge
+//                 cases (verb gate, subresource paths, external paths,
+//                 passthrough mode, unsynced informer, metadata-only
+//                 routed GVR, 404).
+//   - cache OFF — pivot is a no-op; every call takes the apiserver branch.
+//                 The architect's falsifier R-FALSE-1 ("binary with the
+//                 pivot inactive is byte-identical to the apiserver path")
+//                 is preserved by the cache-off toggle. Note Gate-4 below
+//                 ALSO re-checks cache.Disabled() as defense-in-depth.
 //
 // Per `feedback_no_special_cases.md`: the pivot is uniform across GVRs.
 // No per-resource carve-out. The gate is verb (GET only) + path-shape
@@ -53,7 +44,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -64,13 +54,6 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
-
-// resolverUseInformerEnv is the env-var key for the 0.30.95 pivot.
-// Reading it on every dispatch is cheap (~ns) and lets operators flip
-// the gate without a pod restart for soak/rollback drills. The flag is
-// process-wide; a per-RestAction override would re-introduce the
-// per-resource carve-out we explicitly disallow.
-const resolverUseInformerEnv = "RESOLVER_USE_INFORMER"
 
 // envSyncWaitMS is the Ship 0.30.121 R2-b knob: the maximum time a Gate-6
 // dispatch will block waiting for a freshly-registered GVR's informer to
@@ -92,12 +75,15 @@ func syncWaitBudget() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-// resolverUseInformer reads the env-var on each call. Returns the raw
-// value lowercased; callers compare against "true" / "shadow" / "".
-// We do NOT cache the value: env-var flips happen rarely and the read
-// is sub-microsecond against the runtime envcache.
-func resolverUseInformer() string {
-	return strings.ToLower(strings.TrimSpace(os.Getenv(resolverUseInformerEnv)))
+// resolverUseInformer reports whether the resolver pivot is active.
+// Folded in Task #57 to be implicit-on-cache: it returns
+// `!cache.Disabled()` — the pivot is on iff the cache subsystem is on.
+// The standalone RESOLVER_USE_INFORMER env flag was retired (see the
+// package-doc #57 note); the sole production caller (resolve.go) now
+// reads this bool directly. Cheap enough to read per dispatch
+// (delegates to cache.Disabled()).
+func resolverUseInformer() bool {
+	return !cache.Disabled()
 }
 
 // subresourceSuffixes lists the apiserver subresource path tails that

@@ -1,31 +1,34 @@
 // register_on_navigation_f4_test.go — Tag 0.30.99 (Tag B) falsifier F4
-// (R-FALSE-1) for the resolver register-on-navigation path.
+// (R-FALSE-1) for the resolver register-on-navigation path, re-framed for
+// the #57 implicit-on-cache fold.
 //
 // R-FALSE-1 for Tag B has TWO halves, and they are deliberately
 // asymmetric — the asymmetry is the load-bearing finding:
 //
-//   1. The pivot SERVING path (dispatchViaInformer) is flag-gated. With
-//      RESOLVER_USE_INFORMER unset the resolver never serves a read from
-//      the informer. This half is fully covered by the existing
-//      informer_dispatch_rfalse1_test.go
-//      (TestF4_ResolverFlagOff_DispatchDoesNotReachServableGate +
+//   1. The pivot SERVING path (dispatchViaInformer) is gated. With the
+//      pivot inactive the resolver never serves a read from the informer.
+//      #57: that gate was the standalone RESOLVER_USE_INFORMER flag, now
+//      folded into CACHE_ENABLED (pivot inactive == cache OFF). This half
+//      is covered by informer_dispatch_rfalse1_test.go
+//      (TestF4_CacheOff_DispatchDoesNotReachServableGate +
 //      TestF4_PivotCounterIsAFaithfulWitness) — not re-implemented here.
 //
 //   2. Register-on-navigation (lazyRegisterInnerCallPaths in resolve.go)
-//      is NOT flag-gated, and MUST NOT be. It is called unconditionally
+//      is NOT pivot-gated, and MUST NOT be. It is called unconditionally
 //      on every API stage — see resolve.go ~line 258, before the
-//      flag-gated `resolverUseInformer() == "true"` dispatch branch.
-//      Rationale: lazyRegisterInnerCallPaths registers the informer so
-//      the 0.30.8 dep-tracker DELETE-evict edges fire; that L1
-//      invalidation contract is active at flag-OFF. Coupling
-//      register-on-navigation to RESOLVER_USE_INFORMER would silently
-//      break DELETE-evict whenever the pivot is off — a regression.
+//      pivot-gated `resolverUseInformer()` dispatch branch. Rationale:
+//      lazyRegisterInnerCallPaths registers the informer so the 0.30.8
+//      dep-tracker DELETE-evict edges fire; that L1 invalidation contract
+//      runs on the cache-on path independent of the pivot. Coupling
+//      register-on-navigation to the (now-retired) RESOLVER_USE_INFORMER
+//      toggle would have silently broken DELETE-evict — a regression.
 //
-// Tag B's F4 contract is therefore: flag OFF ⇒ the pivot SERVE path is
-// inert (binary serves byte-identically to the prior tag on the pivot
-// path), while register-on-navigation stays active (it is not a pivot
-// behaviour — it predates the pivot and powers DELETE-evict). This test
-// captures half 2: register-on-navigation is flag-independent.
+// Tag B's F4 contract is therefore: register-on-navigation stays active
+// on the cache-on path regardless of any (now-retired) pivot toggle — it
+// is not a pivot behaviour; it predates the pivot and powers DELETE-evict.
+// This test captures half 2: register-on-navigation is independent of the
+// retired RESOLVER_USE_INFORMER flag's value (stale values are ignored;
+// the watcher is cache-on, which is the only state where the walk runs).
 //
 // Per feedback_no_special_cases.md: a generic customer-style apiserver
 // path is used; no per-resource branching.
@@ -54,31 +57,31 @@ const f4NavPath = "/apis/templates.krateo.io/v1/namespaces/default/restactions"
 
 // TestF4_RegisterOnNavigation_FlagIndependent asserts the Tag B F4
 // contract for register-on-navigation: lazyRegisterInnerCallPaths
-// registers the informer for a navigated GVR REGARDLESS of the
-// RESOLVER_USE_INFORMER flag value. For every non-"true" flag value
-// (and for "true"), a never-walked GVR derived from an inner-call path
-// must become registered.
+// registers the informer for a navigated GVR REGARDLESS of the (now
+// retired, #57) RESOLVER_USE_INFORMER flag value. For every stale flag
+// value, on a cache-on watcher, a never-walked GVR derived from an
+// inner-call path must become registered.
 //
-// If register-on-navigation were (incorrectly) flag-gated, the flag-OFF
-// sub-tests would leave the GVR unregistered — and the 0.30.8
-// DELETE-evict dep edges for it would never fire. The test fails in
-// exactly that scenario.
+// If register-on-navigation were (incorrectly) coupled to the pivot
+// toggle, a stale flag value would leave the GVR unregistered — and the
+// 0.30.8 DELETE-evict dep edges for it would never fire. The test fails
+// in exactly that scenario. (The watcher is cache-on throughout, which is
+// the only state where the walk runs under the #57 fold.)
 func TestF4_RegisterOnNavigation_FlagIndependent(t *testing.T) {
 	gvr, ok := cache.ParseAPIServerPathToGVR(f4NavPath)
 	if !ok {
 		t.Fatalf("test setup: f4NavPath %q must parse to a GVR", f4NavPath)
 	}
 
-	for _, flag := range []string{"", "false", "FALSE", "0", "shadow", "true"} {
-		flag := flag
-		t.Run("flag="+flag, func(t *testing.T) {
-			t.Setenv("RESOLVER_USE_INFORMER", flag)
-
-			// A pristine cache=on watcher. dispatchTestGVR is the only
-			// GVR newDispatchWatcher pre-registers; we use a SEPARATE
-			// pristine watcher here so the navigated GVR is genuinely
-			// never-walked at the start of the sub-test.
+	// Stale RESOLVER_USE_INFORMER values — all retired/ignored under #57.
+	for _, staleFlag := range []string{"", "false", "FALSE", "0", "shadow", "true"} {
+		staleFlag := staleFlag
+		t.Run("stale_flag="+staleFlag, func(t *testing.T) {
+			// A pristine cache=on watcher (newPristineFlagWatcher sets
+			// CACHE_ENABLED=true). The stale RESOLVER_USE_INFORMER value
+			// must not change register-on-navigation behaviour.
 			rw := newPristineFlagWatcher(t)
+			t.Setenv("RESOLVER_USE_INFORMER", staleFlag)
 
 			// Pre-condition: the navigated GVR is not yet registered.
 			// EnsureResourceType on a fresh watcher returns added=true
@@ -89,7 +92,7 @@ func TestF4_RegisterOnNavigation_FlagIndependent(t *testing.T) {
 			// Drive the resolver's register-on-navigation entry point
 			// with a single inner-call RequestOptions. This is the exact
 			// call resolve.go makes unconditionally on every API stage
-			// (resolve.go ~line 258), before the flag-gated dispatch
+			// (resolve.go ~line 258), before the pivot-gated dispatch
 			// branch.
 			opts := []httpcall.RequestOptions{{
 				RequestInfo: httpcall.RequestInfo{
@@ -99,17 +102,17 @@ func TestF4_RegisterOnNavigation_FlagIndependent(t *testing.T) {
 			}}
 			lazyRegisterInnerCallPaths(context.Background(), slog.Default(), opts)
 
-			// The GVR MUST now be registered regardless of the flag.
+			// The GVR MUST now be registered regardless of the stale flag.
 			// EnsureResourceType returning added=false proves the GVR is
 			// already registered (register-on-navigation registered it);
 			// added=true would mean lazyRegisterInnerCallPaths did NOT
-			// register it — a flag-gating regression.
+			// register it — a pivot-coupling regression.
 			added, _ := rw.EnsureResourceType(gvr)
 			if added {
-				t.Fatalf("flag=%q: register-on-navigation must register the navigated "+
-					"GVR independent of RESOLVER_USE_INFORMER; the GVR was still "+
+				t.Fatalf("stale RESOLVER_USE_INFORMER=%q: register-on-navigation must register "+
+					"the navigated GVR independent of the retired flag; the GVR was still "+
 					"unregistered after lazyRegisterInnerCallPaths (DELETE-evict would "+
-					"silently break)", flag)
+					"silently break)", staleFlag)
 			}
 		})
 	}

@@ -1,11 +1,12 @@
 // phase1.go — 0.30.102 Tag B: startup informer-warmup state + the
 // hardcoded meta-query seed budget + the all-informer sync-wait.
 //
-// Tag B premise (resting on Tag A 0.30.100): the resolver pivot
-// (RESOLVER_USE_INFORMER=true) can only serve a GVR whose informer is
-// registered AND synced. 0.30.99's bench failed because the navigated
-// informers were registered lazily-late and never synced inside the
-// navigation window — the pivot served nothing cold.
+// Tag B premise (resting on Tag A 0.30.100): the resolver pivot (now
+// implicit-on-cache, #57; historically gated by RESOLVER_USE_INFORMER=true)
+// can only serve a GVR whose informer is registered AND synced. 0.30.99's
+// bench failed because the navigated informers were registered lazily-late
+// and never synced inside the navigation window — the pivot served nothing
+// cold.
 //
 // Tag B closes that cold window with a startup PHASE 1: at boot, before
 // traffic, the TWO navigation roots (the `routesloaders` and `navmenus`
@@ -40,17 +41,19 @@
 // the time the walker encounters a templated path it is already
 // running.
 //
-// BEHAVIOR-NEUTRAL — PrewarmEnabled() gates the whole feature behind
-// PREWARM_ENABLED (default OFF), mirroring PREWARM_REGISTER_ENABLED.
-// When OFF: Phase 1 never runs and Phase1Done is pre-set true at startup
-// so /readyz is an immediate-200 no-op. The flag is NOT in the chart
-// configmap — absent => OFF.
+// IMPLICIT-ON-CACHE (#57) — PrewarmEnabled() is now implicit under the
+// single CACHE_ENABLED master gate: prewarm runs whenever the cache
+// subsystem is on, and never when it is off. The standalone
+// PREWARM_ENABLED env flag was folded away in Task #57
+// (project_single_cache_flag_direction: "prewarm implicit when cache
+// on"). When cache is OFF: Phase 1 never runs and Phase1Done is pre-set
+// true at startup so /readyz is an immediate-200 no-op. This is the
+// transparent cache-off fallback (project_cache_off_is_transparent_fallback).
 
 package cache
 
 import (
 	"context"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -60,15 +63,15 @@ import (
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
-// envPrewarmEnabled is the opt-in gate for the Tag B startup warmup
-// (Phase 1 + walker-driven discovery). Default OFF — absent / "" /
-// anything but "true" => the feature is dormant and behavior-neutral.
-const envPrewarmEnabled = "PREWARM_ENABLED"
-
-// PrewarmEnabled reports whether the Tag B startup warmup is opted in.
-// Read once at startup by main.go; cheap enough to read per call.
+// PrewarmEnabled reports whether the Tag B startup warmup runs. Folded
+// in Task #57 to be implicit-on-cache: prewarm is on iff the cache
+// subsystem is on (CACHE_ENABLED truthy). The standalone PREWARM_ENABLED
+// env flag was retired — see the package-doc IMPLICIT-ON-CACHE note. A
+// stale PREWARM_ENABLED in the environment is ignored (main.go's
+// retired-flag audit warns once); the only prewarm toggle is now
+// CACHE_ENABLED. Cheap enough to read per call (delegates to Disabled()).
 func PrewarmEnabled() bool {
-	return os.Getenv(envPrewarmEnabled) == "true"
+	return !Disabled()
 }
 
 // phase1Done is the process-wide atomic that flips true exactly once,
@@ -77,16 +80,17 @@ func PrewarmEnabled() bool {
 // via cache.DiscoverGroupResources during the walk) has reached
 // HasSynced.
 //
-// When PrewarmEnabled()==false the startup sequence calls
+// When PrewarmEnabled()==false (cache off) the startup sequence calls
 // MarkPhase1Done immediately (nothing to wait for) so /readyz is a
-// no-op. When true, MarkPhase1Done is called only at the END of
-// Phase1Warmup. /readyz returns 200 iff phase1Done.Load()==true.
+// no-op. When true (cache on), MarkPhase1Done is called only at the END
+// of Phase1Warmup. /readyz returns 200 iff phase1Done.Load()==true.
 var phase1Done atomic.Bool
 
 // MarkPhase1Done flips the process-wide Phase1Done signal to true. Safe
 // to call multiple times — atomic store is idempotent. Called once by
-// the startup sequence (immediately when PREWARM_ENABLED is OFF, or at
-// the tail of Phase1Warmup when ON).
+// the startup sequence (immediately when the cache subsystem is OFF —
+// prewarm is implicit-on-cache, #57 — or at the tail of Phase1Warmup
+// when ON).
 func MarkPhase1Done() {
 	phase1Done.Store(true)
 }
@@ -108,19 +112,26 @@ func IsPhase1Done() bool {
 // watcher failed to construct, NO informer-warming work exists — the
 // gate must flip at boot or the pod is stuck "warming" forever, the
 // Service drops it from Endpoints, and the LB has 0 backends. The
-// healthy CACHE_ENABLED=true + PREWARM_ENABLED=true path returns false
-// here so Phase1Warmup retains ownership of the flip.
+// healthy cache-on path (with prewarm implicit-on-cache, #57) returns
+// false here so Phase1Warmup retains ownership of the flip.
 //
-// 0.30.153 — Ship: introduced as a named helper to make the four-disjunct
+// 0.30.153 — Ship: introduced as a named helper to make the three-disjunct
 // invariant testable and to retire the inline conditional at main.go that
-// missed the CACHE_ENABLED=false + PREWARM_ENABLED=true + watcher-non-nil
-// case (incident: pod stuck `{"status":"warming","phase1Done":false}`,
-// Service endpoints empty, snowplow LB unroutable).
+// missed the cache-off + watcher-non-nil case (incident: pod stuck
+// `{"status":"warming","phase1Done":false}`, Service endpoints empty,
+// snowplow LB unroutable).
 //
 // Three reasons to flip (any one suffices):
 //   - cacheEnabled == false — cache subsystem off, no informers exist
 //   - prewarmEnabled == false — prewarm disabled, no warmup goroutine runs
 //   - watcherIsNil == true — watcher construction failed, no informers exist
+//
+// #57 — the SIGNATURE is preserved verbatim (3 disjuncts) even though
+// prewarm is now implicit-on-cache, so callers pass cache.PrewarmEnabled()
+// which folds to !Disabled(); the middle disjunct then equals the first.
+// The 0.30.153 incident was a MISSING disjunct readyz-hang, so the named
+// 3-arg helper is the regression's encoded falsifier — collapsing it to 2
+// disjuncts would erase that encoding for zero benefit.
 //
 // MarkPhase1Done is idempotent (atomic store) so a caller may invoke it
 // unconditionally when this returns true.
@@ -424,13 +435,8 @@ func (rw *ResourceWatcher) RegisteredCount() int {
 	return len(rw.informers)
 }
 
-// Ship 0.30.127: WithPhase1Resolution / IsPhase1Resolution and their
-// context key were REMOVED. The marker's sole consumer was the
-// phase1IteratorCap in the RESTAction resolver (setup.go), deleted this
-// ship — the cap truncated the Phase-1 navmenu walk's per-namespace
-// iterator to namespaces holding no navmenuitems, so the walk descended
-// nothing past the roots. With the cap gone the marker has zero
-// consumers; it is swept rather than left as dead code.
+// Ship 0.30.127: WithPhase1Resolution / IsPhase1Resolution + their context
+// key were removed (sole consumer — the deleted phase1IteratorCap).
 
 // ctxKeyInternalEndpointType is the typed empty-struct context key for
 // WithInternalEndpoint / InternalEndpointFromContext.

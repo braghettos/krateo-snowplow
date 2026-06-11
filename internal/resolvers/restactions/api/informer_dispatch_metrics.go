@@ -11,8 +11,9 @@
 //
 // Counters here are incremented inside `dispatchViaInformer`. The summary
 // goroutine is lazy-started on first dispatch (sync.Once-bounded — one
-// goroutine for the process lifetime, never started when
-// RESOLVER_USE_INFORMER stays off). This mirrors `objects` package's
+// goroutine for the process lifetime, never started when the pivot is
+// inactive — #57: the pivot is implicit-on-cache, so it never starts
+// when the cache subsystem is off). This mirrors `objects` package's
 // `startObjectsGetSummary` and `cache`'s `startResolvedCacheSummary`.
 
 package api
@@ -93,7 +94,8 @@ var dispatchSummaryOnce sync.Once
 // same contract as `startResolvedCacheSummary`).
 //
 // Started lazily on the first `dispatchViaInformer` call so the goroutine
-// never exists when RESOLVER_USE_INFORMER stays off.
+// never exists when the pivot is inactive (#57: implicit-on-cache — never
+// when the cache subsystem is off).
 func startDispatchSummary() {
 	dispatchSummaryOnce.Do(func() {
 		every := time.Duration(dispatchSummaryEverySeconds()) * time.Second

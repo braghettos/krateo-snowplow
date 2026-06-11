@@ -100,9 +100,10 @@
 //
 // PREWARM GATE
 //
-// Wired through `cache.PrewarmEnabled()` — the same env gate that
-// controls whether Phase1Warmup runs at all (main.go won't even
-// schedule the walker otherwise). No new env var.
+// Wired through `cache.PrewarmEnabled()` — the same gate that controls
+// whether Phase1Warmup runs at all (main.go won't even schedule the
+// walker otherwise). #57: PrewarmEnabled() is implicit-on-cache; no
+// prewarm-specific env var.
 
 package dispatchers
 

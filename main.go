@@ -151,6 +151,18 @@ func main() {
 	// a nil resolver (this wiring skipped) is the structural fallback.
 	restactionsapi.RegisterNestedCallResolver(dispatchers.ResolveNestedCall)
 
+	// #57 — retired-flag startup audit. PREWARM_ENABLED and
+	// RESOLVER_USE_INFORMER were folded into the single CACHE_ENABLED
+	// master gate (prewarm + informer-pivot are now implicit-on-cache).
+	// A stale value of either name in the env is functionally ignored
+	// (the helpers no longer read them); this emits one audit line per
+	// retired flag still present — Warn when set to "false" (a silent
+	// behavior change: the operator asked for OFF and now gets ON) and
+	// Info otherwise (a harmless no-op). Absent keys emit nothing. Placed
+	// before the cache banner so the audit reads alongside the cache-mode
+	// determination. See cache.AuditRetiredFlags (retired_flags.go).
+	cache.AuditRetiredFlags(log)
+
 	// Cache subsystem — Tag 0.30.4 (cache=on activation).
 	//
 	// When CACHE_ENABLED is unset / false / 0 / no, cache.Disabled()
@@ -524,8 +536,10 @@ func main() {
 						// production.
 						//
 						// Why default OFF (architect REJECT of default-on,
-						// adjudicated): with RESOLVER_USE_INFORMER OFF by
-						// default the resolver pivot does NOT consume the
+						// adjudicated): when the resolver pivot is inactive
+						// (historically RESOLVER_USE_INFORMER OFF; post-#57
+						// the pivot is implicit-on-cache, so "inactive" ==
+						// cache off) the resolver pivot does NOT consume the
 						// informers a startup walk would register. A walk
 						// would register N informers nobody reads — each
 						// EnsureResourceType lands in the post-Start branch
@@ -544,13 +558,15 @@ func main() {
 						//
 						// Promotion to ON-by-default requires a
 						// PREWARM_REGISTER_ENABLED=true bench at 50K
-						// measuring apiserver QPS + RSS-under-load,
-						// alongside RESOLVER_USE_INFORMER=true so the pivot
-						// consumer is actually present.
+						// measuring apiserver QPS + RSS-under-load, with the
+						// cache subsystem on (CACHE_ENABLED=true) so the
+						// pivot consumer is actually present (#57: the pivot
+						// is implicit-on-cache; no separate
+						// RESOLVER_USE_INFORMER flag to set).
 						if os.Getenv("PREWARM_REGISTER_ENABLED") == "true" {
 							log.Info("prewarm-register: enabled via PREWARM_REGISTER_ENABLED=true",
 								slog.String("subsystem", "cache"),
-								slog.String("hint", "startup navigation GVR-walk active; opt-in only — costs apiserver QPS while RESOLVER_USE_INFORMER is off"),
+								slog.String("hint", "startup navigation GVR-walk active; opt-in only — costs apiserver QPS when the resolver pivot is inactive (cache off, #57)"),
 							)
 							// Soft failure: a LIST error is logged +
 							// ignored — the lazy register-on-navigation
@@ -573,14 +589,18 @@ func main() {
 						} else {
 							log.Info("prewarm-register: disabled (default); set PREWARM_REGISTER_ENABLED=true to opt-in",
 								slog.String("subsystem", "cache"),
-								slog.String("rationale", "startup walk registers informers the pivot does not consume while RESOLVER_USE_INFORMER is off — re-arms the 0.30.61 no-consumer apiserver-QPS regression + the unmitigated 0.30.8/0.30.92 OOM modes"),
+								slog.String("rationale", "startup walk registers informers the pivot does not consume when the pivot is inactive (cache off, #57) — re-arms the 0.30.61 no-consumer apiserver-QPS regression + the unmitigated 0.30.8/0.30.92 OOM modes"),
 							)
 						}
 
 						// 0.30.102 Tag B — Phase 1 SA-credentialed
 						// resolution walk + CRD-watch + probe-gated
-						// readiness. Gated behind PREWARM_ENABLED
-						// (default OFF). Distinct from the 0.30.99
+						// readiness. #57: implicit-on-cache —
+						// cache.PrewarmEnabled() now folds to
+						// !cache.Disabled(), so reaching here (inside the
+						// !cache.Disabled() block) it is always true; the
+						// standalone PREWARM_ENABLED flag was retired.
+						// Distinct from the 0.30.99
 						// PREWARM_REGISTER_ENABLED GVR-walk above: Tag B
 						// resolves the routesloaders navigation roots
 						// under SA identity (discovering GVRs by
@@ -597,14 +617,15 @@ func main() {
 						// context AND cacheCtx; it terminates when
 						// Phase1Warmup returns.
 						//
-						// When PREWARM_ENABLED is OFF the goroutine is not
-						// spawned and cache.MarkPhase1Done() is called
-						// immediately — /readyz then returns 200 from the
-						// first probe (no-op gate; behavior-neutral
-						// default). PREWARM_ENABLED is NOT in the chart
-						// configmap — absent => OFF.
+						// When the cache subsystem is OFF, prewarm is
+						// implicit-off: this branch is unreachable (the
+						// enclosing !cache.Disabled() guard) and the
+						// readiness safety-net below calls
+						// cache.MarkPhase1Done() immediately — /readyz
+						// then returns 200 from the first probe (no-op
+						// gate; transparent cache-off fallback).
 						if cache.PrewarmEnabled() {
-							log.Info("prewarm: Phase 1 startup warmup enabled via PREWARM_ENABLED=true",
+							log.Info("prewarm: Phase 1 startup warmup enabled (implicit-on-cache, #57)",
 								slog.String("subsystem", "cache"),
 								slog.String("hint", "SA-credentialed routesloaders resolution walk + CRD-watch; /readyz gates on Phase1Done"),
 							)
@@ -629,9 +650,15 @@ func main() {
 								// returns — /readyz is now 200.
 							}()
 						} else {
-							log.Info("prewarm: Phase 1 startup warmup disabled (default); set PREWARM_ENABLED=true to opt-in",
+							// #57: PrewarmEnabled() is implicit-on-cache, so
+							// inside this !cache.Disabled() block it is always
+							// true — this else is defensively retained (the
+							// gate symbol is preserved) but unreachable under
+							// cache-on. The cache-off no-op path lives in the
+							// readiness safety-net below.
+							log.Info("prewarm: Phase 1 startup warmup not scheduled",
 								slog.String("subsystem", "cache"),
-								slog.String("rationale", "Tag B is behavior-neutral by default — Phase 1 does not run and /readyz returns 200 immediately"),
+								slog.String("rationale", "prewarm is implicit-on-cache (#57); the cache-off no-op flips Phase1Done via the readiness safety-net"),
 							)
 							// Nothing to warm — flip the readiness gate now
 							// so /readyz is an immediate-200 no-op.
@@ -688,22 +715,25 @@ func main() {
 	}()
 
 	// 0.30.102 Tag B — readiness-gate safety net. The Tag B block above
-	// flips the Phase1Done gate (immediately when PREWARM_ENABLED is OFF,
-	// or asynchronously at the tail of Phase1Warmup when ON). But several
-	// startup paths bypass that block entirely: CACHE_ENABLED=false
-	// (diagnostic passthrough), PREWARM_ENABLED=false, or a cache-setup
-	// failure (nil watcher). On any such path there is nothing to warm,
-	// so /readyz must still return 200. When CACHE_ENABLED is ON AND
-	// PREWARM_ENABLED is ON AND a watcher exists, the Phase1Warmup
+	// flips the Phase1Done gate (immediately when prewarm is off, or
+	// asynchronously at the tail of Phase1Warmup when on). #57: prewarm is
+	// implicit-on-cache, so "prewarm off" == cache off. Several startup
+	// paths bypass that block entirely: CACHE_ENABLED=false (diagnostic
+	// passthrough) or a cache-setup failure (nil watcher). On any such
+	// path there is nothing to warm, so /readyz must still return 200.
+	// When the cache subsystem is ON AND a watcher exists, the Phase1Warmup
 	// goroutine owns the flip — do NOT pre-flip here, or the
 	// premature-Ready invariant breaks.
 	//
-	// 0.30.153 — the four-disjunct invariant is encoded in
+	// 0.30.153 — the three-disjunct invariant is encoded in
 	// cache.ShouldFlipPhase1DoneOnStartup so the cache-off case
-	// (CACHE_ENABLED=false + PREWARM_ENABLED=true + non-nil passthrough
-	// watcher) is covered. The prior 2-disjunct condition missed that
-	// case; pod was stuck `{"status":"warming","phase1Done":false}`
-	// forever, Service endpoints empty, snowplow LB unroutable.
+	// (CACHE_ENABLED=false + non-nil passthrough watcher) is covered. The
+	// prior 2-disjunct condition missed that case; pod was stuck
+	// `{"status":"warming","phase1Done":false}` forever, Service endpoints
+	// empty, snowplow LB unroutable. #57 preserves the 3-arg signature
+	// (cache.PrewarmEnabled() folds to !Disabled(), so the middle disjunct
+	// now equals the first) — the named helper is the regression's encoded
+	// falsifier.
 	if cache.ShouldFlipPhase1DoneOnStartup(
 		!cache.Disabled(),
 		cache.PrewarmEnabled(),

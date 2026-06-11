@@ -112,9 +112,10 @@ const (
 	// envPrewarmPIPEnabled is the Ship PIP (0.30.173) opt-in gate.
 	// Chart default is true (active by default for this ship); operators
 	// may set "false" to disable the seed if a regression is observed.
-	// PIP additionally requires PREWARM_ENABLED + PREWARM_CONTENT_ENABLED
-	// (the apiRefHarvester depends on the content-prewarm path) — when
-	// either is off, PIP stays inert regardless of this knob.
+	// PIP additionally requires prewarm-on (#57: implicit-on-cache, i.e.
+	// the cache subsystem is on) + PREWARM_CONTENT_ENABLED (the
+	// apiRefHarvester depends on the content-prewarm path) — when either
+	// is off, PIP stays inert regardless of this knob.
 	envPrewarmPIPEnabled = "PREWARM_PIP_ENABLED"
 
 	// Ship 2 / 0.30.196 — the PER-COHORT CAP IS DELETED. pipCohortCapDefault

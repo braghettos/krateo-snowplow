@@ -116,24 +116,42 @@ func TestNavMenusGVR_IsV1Beta1(t *testing.T) {
 	}
 }
 
-// --- PrewarmEnabled gate ---------------------------------------------------
+// --- PrewarmEnabled gate (#57 fold: implicit-on-cache) ---------------------
 
-func TestPrewarmEnabled_DefaultOff(t *testing.T) {
-	t.Setenv("PREWARM_ENABLED", "")
-	if cache.PrewarmEnabled() {
-		t.Fatalf("PrewarmEnabled must default OFF when PREWARM_ENABLED is unset")
+// TestPrewarmEnabled_TracksCacheEnabled is the #57 fold truth-table.
+// PrewarmEnabled() was folded to implicit-on-cache: it returns
+// !Disabled() (the standalone PREWARM_ENABLED env flag was retired).
+// Prewarm is therefore on iff the cache subsystem is on.
+//
+// The last two rows assert the FOLD: a stale PREWARM_ENABLED in the
+// environment is IGNORED — prewarm tracks CACHE_ENABLED regardless of the
+// retired flag's value (a stale "false" no longer suppresses prewarm when
+// cache is on; main.go's retired-flag audit warns once on it).
+func TestPrewarmEnabled_TracksCacheEnabled(t *testing.T) {
+	cases := []struct {
+		name      string
+		cacheEnv  string
+		staleFlag string
+		setStale  bool
+		want      bool
+	}{
+		{name: "cache_on", cacheEnv: "true", want: true},
+		{name: "cache_off_false", cacheEnv: "false", want: false},
+		{name: "cache_off_unset", cacheEnv: "", want: false},
+		{name: "cache_on_stale_prewarm_false_ignored", cacheEnv: "true", staleFlag: "false", setStale: true, want: true},
+		{name: "cache_off_stale_prewarm_true_ignored", cacheEnv: "false", staleFlag: "true", setStale: true, want: false},
 	}
-	t.Setenv("PREWARM_ENABLED", "false")
-	if cache.PrewarmEnabled() {
-		t.Fatalf("PrewarmEnabled must be OFF for PREWARM_ENABLED=false")
-	}
-	t.Setenv("PREWARM_ENABLED", "1")
-	if cache.PrewarmEnabled() {
-		t.Fatalf("PrewarmEnabled must be OFF for any value but exactly 'true'")
-	}
-	t.Setenv("PREWARM_ENABLED", "true")
-	if !cache.PrewarmEnabled() {
-		t.Fatalf("PrewarmEnabled must be ON for PREWARM_ENABLED=true")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CACHE_ENABLED", tc.cacheEnv)
+			if tc.setStale {
+				t.Setenv("PREWARM_ENABLED", tc.staleFlag)
+			}
+			if got := cache.PrewarmEnabled(); got != tc.want {
+				t.Fatalf("PrewarmEnabled() with CACHE_ENABLED=%q stale PREWARM_ENABLED=%q: want %v; got %v",
+					tc.cacheEnv, tc.staleFlag, tc.want, got)
+			}
+		})
 	}
 }
 

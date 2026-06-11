@@ -30,7 +30,7 @@ import (
 // so collectMatches finds nothing for the fetched object.
 func TestFalsifierF3_GetRecordsDepEdge(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newServeWatcher below).
 	cache.ResetDepsForTest()
 
 	newServeWatcher(t, newServeTestObject("default", "alpha", "marker-alpha"))
@@ -60,7 +60,7 @@ func TestFalsifierF3_GetRecordsDepEdge(t *testing.T) {
 // objects.Get with NO L1 key in context must record nothing.
 func TestFalsifierF3_GetNoKeyRecordsNothing(t *testing.T) {
 	resetServeCounters()
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: pivot implicit under CACHE_ENABLED (set by newServeWatcher below).
 	cache.ResetDepsForTest()
 
 	newServeWatcher(t, newServeTestObject("default", "beta", "marker-beta"))
@@ -83,7 +83,7 @@ func TestFalsifierF3_GetNoKeyRecordsNothing(t *testing.T) {
 func TestACR5_CacheDisabledRecordsNothing(t *testing.T) {
 	resetServeCounters()
 	t.Setenv("CACHE_ENABLED", "false")
-	t.Setenv("RESOLVER_USE_INFORMER", "true") // flag on, but cache disabled
+	t.Setenv("RESOLVER_USE_INFORMER", "true") // #57: stale/retired flag — ignored under cache-off
 	cache.ResetDepsForTest()
 
 	// Even with an L1 key in context, cache-off must record nothing.

@@ -70,8 +70,9 @@ import (
 // the BindingsByGVR index) instead of the legacy global runPIPSeed.
 // Default false: flag-off the engine is inert and the legacy PIP seed
 // path runs byte-identically. The engine additionally requires
-// PREWARM_ENABLED + PREWARM_CONTENT_ENABLED + PREWARM_PIP_ENABLED (it
-// shares the same harvesters); when any is off it stays inert.
+// prewarm-on (#57: implicit-on-cache) + PREWARM_CONTENT_ENABLED +
+// PREWARM_PIP_ENABLED (it shares the same harvesters); when any is off
+// it stays inert.
 const envPrewarmEngineEnabled = "PREWARM_ENGINE_ENABLED"
 
 // PrewarmEngineEnabled reports whether the Ship 1 unified engine is opted

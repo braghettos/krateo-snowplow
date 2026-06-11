@@ -25,11 +25,13 @@ type readyzInfo struct {
 // the Kubernetes readinessProbe / startupProbe withhold traffic from a
 // pod whose navigated informers are still cold.
 //
-// Behavior-neutral default: when PREWARM_ENABLED is OFF (the default),
-// the startup sequence calls cache.MarkPhase1Done() immediately — there
-// is nothing to warm — so /readyz returns 200 from the first probe and
-// the gate is a no-op. RESOLVER_USE_INFORMER also stays OFF-default; the
-// cold-vs-warm bench opts both flags ON together.
+// Behavior-neutral under cache-off: when the cache subsystem is OFF
+// (CACHE_ENABLED unset/false), prewarm is implicit-off (#57 — prewarm is
+// implicit-on-cache), so the startup sequence calls cache.MarkPhase1Done()
+// immediately — there is nothing to warm — so /readyz returns 200 from
+// the first probe and the gate is a no-op. The informer pivot is likewise
+// implicit-on-cache (#57); the cold-vs-warm bench toggles them all via the
+// single CACHE_ENABLED gate.
 //
 // /readyz is distinct from /health: /health is liveness-only (process
 // alive — a still-warming pod is alive and must NOT be restarted).

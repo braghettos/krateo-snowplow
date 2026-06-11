@@ -64,7 +64,7 @@ func newD42WatcherWithGetConfigmaps(t *testing.T) *cache.ResourceWatcher {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: informer pivot is implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 	cache.ResetResolvedCacheForTest()
 	cache.ResetDepsForTest()
 	t.Cleanup(func() {

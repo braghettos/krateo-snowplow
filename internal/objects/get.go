@@ -53,10 +53,13 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	}
 
 	// 0.30.96 Gap A — routed branch. Serve widget / entry-CR object GETs
-	// from the in-process informer cache. Gated by the SAME
-	// RESOLVER_USE_INFORMER flag as the 0.30.95 resolver pivot: with the
-	// flag unset this whole block is skipped and the binary is
-	// byte-identical to 0.30.95 (R-FALSE-1 invariant preserved).
+	// from the in-process informer cache. #57: implicit-on-cache —
+	// useInformer() now folds to !cache.Disabled() (the standalone
+	// RESOLVER_USE_INFORMER flag was retired). With cache off the
+	// cache.Disabled() short-circuit above already returned, so this
+	// block runs only on the cache-on path; the binary is byte-identical
+	// to the apiserver path under cache-off (R-FALSE-1 invariant
+	// preserved via the single CACHE_ENABLED master gate).
 	//
 	// Per feedback_no_special_cases.md: the branch is uniform across
 	// every GVR — the gate is cache-mode + informer-state predicates,

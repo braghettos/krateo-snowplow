@@ -312,19 +312,21 @@ func TestF2_WatchDisconnected_FallsThroughThenRecovers(t *testing.T) {
 	}
 }
 
-// --- F4 — R-FALSE-1: flag-off byte-identical pivot path -------------------
+// --- F4 — R-FALSE-1: cache-off byte-identical pivot path ------------------
 //
-// F4 is NOT in this file. R-FALSE-1 is a property of the FLAG-GATED
-// CONSUMER, not of the servability predicate — the predicate is pure and
-// has no flag read. Testing the predicate's side-effect-freedom would
-// not prove that the dispatch path leaves the servable gate untouched
-// when RESOLVER_USE_INFORMER is unset. The behavioral F4 therefore lives
-// next to the consumer:
+// F4 is NOT in this file. R-FALSE-1 is a property of the GATED CONSUMER,
+// not of the servability predicate — the predicate is pure and has no
+// gate read. Testing the predicate's side-effect-freedom would not prove
+// that the dispatch path leaves the servable gate untouched when the
+// pivot is inactive. #57: the pivot gate was the standalone
+// RESOLVER_USE_INFORMER flag, now folded into CACHE_ENABLED (pivot
+// inactive == cache OFF). The behavioral F4 therefore lives next to the
+// consumer:
 //
 //	internal/resolvers/restactions/api/informer_dispatch_rfalse1_test.go
-//	  → TestF4_ResolverFlagOff_DispatchDoesNotReachServableGate
+//	  → TestF4_CacheOff_DispatchDoesNotReachServableGate
 //
-// That test asserts that with the flag unset the resolver dispatch
-// branch never invokes dispatchViaInformer — hence never reaches
+// That test asserts that with the cache subsystem OFF the resolver
+// dispatch branch never invokes dispatchViaInformer — hence never reaches
 // IsServable / ListObjectsServable — by observing the pivot's served /
 // fallthrough counters stay at zero.

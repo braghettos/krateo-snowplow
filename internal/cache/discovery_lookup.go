@@ -336,10 +336,11 @@ func DiscoverGroupResources(ctx context.Context, rc *rest.Config, group string) 
 				//     missed by the empty-iterator short-circuit
 				//     (resolve.go:377-381 — H4 root cause).
 				//
-				// Gated on PrewarmEnabled() — when PREWARM_ENABLED=false the
-				// engine is inert and the hook has no consumer; the call is
-				// still safe but pointless. Matches the PREWARM_ENABLED
-				// contract per project_single_cache_flag_direction.
+				// Gated on PrewarmEnabled() — #57 implicit-on-cache, so when
+				// the cache subsystem is off the engine is inert and the hook
+				// has no consumer; the call is still safe but pointless.
+				// Prewarm is now implicit under the single CACHE_ENABLED gate
+				// (project_single_cache_flag_direction).
 				if PrewarmEnabled() {
 					AddNavigatedGVR(gvr)
 					notifyGVRDiscoveredForReprewarm(gvr)

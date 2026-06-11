@@ -1,0 +1,154 @@
+// retired_flags.go — #57 retired-flag startup audit.
+//
+// Task #57 folded two formerly-standalone env flags into the single
+// CACHE_ENABLED master gate (project_single_cache_flag_direction):
+//
+//   - PREWARM_ENABLED      — startup prewarm is now implicit-on-cache
+//                            (PrewarmEnabled() == !Disabled()).
+//   - RESOLVER_USE_INFORMER — the resolver/objects informer-serve pivot is
+//                            now implicit-on-cache (resolverUseInformer() /
+//                            useInformer() == !cache.Disabled()).
+//
+// The helpers no longer READ these env vars, so a stale value in the
+// environment is functionally ignored. We do NOT hard-error on a retired
+// key: the standard `helm upgrade` recovery pattern legitimately carries
+// the deployed release's values (which still set these keys) into the next
+// upgrade through no operator fault — a hard error would brick that path
+// (feedback_helm_no_reuse_values_on_chart_default_change). Instead we
+// IGNORE + audit-log once per flag per process.
+//
+// Severity split (PM gate #57 C2):
+//   - value "false"            -> slog.Warn. This is a SILENT behavior
+//                                 change: the operator deliberately asked
+//                                 for prewarm/pivot OFF, and now gets it ON
+//                                 (it is implicit-on-cache). A behavior
+//                                 change the operator did not consent to
+//                                 must be loud (feedback_no_park_broken_behind_flag
+//                                 spirit). The line names the flag, says it
+//                                 is ignored, states the new effective
+//                                 behavior, and gives the remediation.
+//   - any other value ("true",
+//     "1", ...)                -> slog.Info. A true no-op: the feature is
+//                                 on anyway, so a single informational line
+//                                 is sufficient.
+//
+// Absent keys emit nothing (os.LookupEnv distinguishes absent from set-empty).
+
+package cache
+
+import (
+	"log/slog"
+	"os"
+	"strings"
+	"sync"
+)
+
+// retiredFlag describes one folded env key and the implicit behavior that
+// replaced it. behavior is interpolated into both the WARN and INFO lines.
+type retiredFlag struct {
+	name     string
+	behavior string
+}
+
+// retiredFlags is the closed list of env keys folded into CACHE_ENABLED by
+// #57. Adding a future fold appends here; the audit + its test enumerate
+// this slice, so a new entry is covered automatically.
+//
+// These string literals are the ONLY surviving source-level occurrences of
+// the folded env names outside test fixtures (falsifier (d)): no production
+// code path reads them via os.Getenv any more.
+var retiredFlags = []retiredFlag{
+	{
+		name:     "PREWARM_ENABLED",
+		behavior: "startup prewarm is now implicit-on-cache; set CACHE_ENABLED=false to disable",
+	},
+	{
+		name:     "RESOLVER_USE_INFORMER",
+		behavior: "the informer-serve pivot is now implicit-on-cache; set CACHE_ENABLED=false to disable",
+	},
+}
+
+// retiredFlagAuditedOnce guards warn-once-per-flag-per-process. Keyed by
+// flag name; the stored *sync.Once fires the log line at most once even
+// under concurrent AuditRetiredFlags calls.
+var (
+	retiredFlagAuditMu     sync.Mutex
+	retiredFlagAuditedOnce = map[string]*sync.Once{}
+)
+
+// AuditRetiredFlags emits a one-time-per-flag audit line for each retired
+// env flag (see retiredFlags) still present in the environment, at the
+// severity dictated by the #57 C2 split (value "false" => Warn, else =>
+// Info). Absent flags emit nothing. Safe for concurrent callers and
+// idempotent across repeated calls (warn-once per flag per process).
+//
+// Invoked from main.go near the cache-mode banner. log must be non-nil
+// (main.go passes the configured handler); a nil log is a no-op so a
+// mis-wired caller cannot panic at boot.
+func AuditRetiredFlags(log *slog.Logger) {
+	if log == nil {
+		return
+	}
+	for _, rf := range retiredFlags {
+		val, present := os.LookupEnv(rf.name)
+		if !present {
+			continue
+		}
+		once := retiredFlagOnce(rf.name)
+		once.Do(func() {
+			if strings.EqualFold(strings.TrimSpace(val), "false") {
+				// Silent behavior change — the operator asked for OFF and
+				// now gets ON. Loud by design.
+				log.Warn("config.retired_flag_ignored",
+					slog.String("subsystem", "cache"),
+					slog.String("flag", rf.name),
+					slog.String("value", val),
+					slog.String("status", "ignored"),
+					slog.String("effective_behavior", rf.behavior),
+					slog.String("remediation", "remove "+rf.name+" from values/env"),
+				)
+				return
+			}
+			// Harmless no-op — the feature is on anyway.
+			log.Info("config.retired_flag_ignored",
+				slog.String("subsystem", "cache"),
+				slog.String("flag", rf.name),
+				slog.String("value", val),
+				slog.String("status", "ignored"),
+				slog.String("effective_behavior", rf.behavior),
+			)
+		})
+	}
+}
+
+// retiredFlagOnce returns the per-flag sync.Once, lazily creating it under
+// the mutex so AuditRetiredFlags is concurrency-safe.
+func retiredFlagOnce(name string) *sync.Once {
+	retiredFlagAuditMu.Lock()
+	defer retiredFlagAuditMu.Unlock()
+	once, ok := retiredFlagAuditedOnce[name]
+	if !ok {
+		once = &sync.Once{}
+		retiredFlagAuditedOnce[name] = once
+	}
+	return once
+}
+
+// ResetRetiredFlagAuditForTest clears the warn-once state so a test can
+// assert the audit fires afresh. TEST-ONLY — the production lifecycle
+// audits once per process.
+func ResetRetiredFlagAuditForTest() {
+	retiredFlagAuditMu.Lock()
+	defer retiredFlagAuditMu.Unlock()
+	retiredFlagAuditedOnce = map[string]*sync.Once{}
+}
+
+// RetiredFlagNamesForTest returns the audited env-key names so a test can
+// drive the audit without hardcoding the list.
+func RetiredFlagNamesForTest() []string {
+	out := make([]string, 0, len(retiredFlags))
+	for _, rf := range retiredFlags {
+		out = append(out, rf.name)
+	}
+	return out
+}

@@ -47,7 +47,7 @@ const saUsernameForTest = "system:serviceaccount:krateo-system:snowplow"
 func buildP0Watcher(t *testing.T) (*cache.ResourceWatcher, templatesv1.ObjectReference) {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
-	t.Setenv("RESOLVER_USE_INFORMER", "true")
+	// #57: informer pivot is implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 
 	restGVR := schema.GroupVersionResource{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"}
 	crbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}

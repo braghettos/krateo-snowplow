@@ -1,8 +1,9 @@
 // streaming_list.go — Ship 0.30.122 R4 Lever 1: a streaming ListWatch
 // for the composition GVR's dynamic informer.
 //
-// THE OOM (0.30.121): with PREWARM_ENABLED=true the dynamic informer's
-// initial relist of the 48,999-composition fixture ran at pod startup.
+// THE OOM (0.30.121): with prewarm on (then PREWARM_ENABLED=true; post-#57
+// prewarm is implicit-on-cache) the dynamic informer's initial relist of
+// the 48,999-composition fixture ran at pod startup.
 // The standard NewFilteredDynamicInformer ListFunc calls
 // dynamic.Interface.List, which inside client-go:
 //   (a) io.ReadAll's the whole HTTP response body of a page;

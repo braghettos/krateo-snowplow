@@ -633,26 +633,39 @@ func itemNameSet(items []any) map[string]bool {
 	return out
 }
 
-// TestResolverUseInformer_FlagParsing covers the env-var read.
-// Default OFF is the R-FALSE-1 binding invariant — the 0.30.95 binary
-// with the flag unset MUST be byte-identical to 0.30.94.
-func TestResolverUseInformer_FlagParsing(t *testing.T) {
+// TestResolverUseInformer_TracksCacheEnabled is the #57 fold truth-table.
+// resolverUseInformer() was folded to implicit-on-cache: it returns
+// !cache.Disabled() (the standalone RESOLVER_USE_INFORMER env flag was
+// retired). The pivot is therefore active iff the cache subsystem is on.
+// Cache-OFF is the R-FALSE-1 byte-identity path — the gate must be closed.
+//
+// The final row asserts the FOLD: a stale RESOLVER_USE_INFORMER=false in
+// the environment is IGNORED — with cache ON the gate stays open (the flag
+// no longer suppresses the pivot). main.go's retired-flag audit warns once
+// on that stale value; the gate behavior is implicit-on-cache regardless.
+func TestResolverUseInformer_TracksCacheEnabled(t *testing.T) {
 	cases := []struct {
-		env, want string
+		name        string
+		cacheEnv    string
+		staleFlag   string // RESOLVER_USE_INFORMER value, "" = unset
+		setStale    bool
+		want        bool
 	}{
-		{"", ""},
-		{"true", "true"},
-		{"TRUE", "true"},
-		{" true ", "true"},
-		{"shadow", "shadow"},
-		{"false", "false"},
-		{"yes", "yes"}, // arbitrary; only "true"/"shadow" branch in the resolver
+		{name: "cache_on", cacheEnv: "true", want: true},
+		{name: "cache_off_false", cacheEnv: "false", want: false},
+		{name: "cache_off_unset", cacheEnv: "", want: false},
+		{name: "cache_on_stale_flag_false_ignored", cacheEnv: "true", staleFlag: "false", setStale: true, want: true},
+		{name: "cache_off_stale_flag_true_ignored", cacheEnv: "false", staleFlag: "true", setStale: true, want: false},
 	}
 	for _, tc := range cases {
-		t.Run("env="+tc.env, func(t *testing.T) {
-			t.Setenv(resolverUseInformerEnv, tc.env)
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CACHE_ENABLED", tc.cacheEnv)
+			if tc.setStale {
+				t.Setenv("RESOLVER_USE_INFORMER", tc.staleFlag)
+			}
 			if got := resolverUseInformer(); got != tc.want {
-				t.Fatalf("resolverUseInformer(): want %q; got %q", tc.want, got)
+				t.Fatalf("resolverUseInformer() with CACHE_ENABLED=%q stale RESOLVER_USE_INFORMER=%q: want %v; got %v",
+					tc.cacheEnv, tc.staleFlag, tc.want, got)
 			}
 		})
 	}

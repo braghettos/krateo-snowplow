@@ -12,15 +12,21 @@
 // a full apiserver round-trip the informer already holds. 0.30.96 fills
 // that gap.
 //
-// Gating. Reuse the SAME `RESOLVER_USE_INFORMER` env flag as the 0.30.95
-// pivot. With the flag unset the routed branch is a no-op and the binary
-// is byte-identical to 0.30.95 — preserves the architect's R-FALSE-1
-// invariant. We deliberately do NOT import the `restactions/api`
-// `resolverUseInformer()` helper: although `api` does not import
-// `objects` today, adding an `objects → api` edge would be a fragile
-// cross-package coupling that a future refactor could turn into an import
-// cycle. The flag check is a one-line `os.Getenv`; replicating it here is
-// cheaper than the coupling risk (task guidance, explicit).
+// Gating (#57 — implicit-on-cache). The routed branch is now active
+// whenever the cache subsystem is on (CACHE_ENABLED truthy) and inert
+// when it is off. The standalone `RESOLVER_USE_INFORMER` env flag that
+// formerly gated this branch (shared with the 0.30.95 pivot) was folded
+// away in Task #57; informer-serve is implicit under the single
+// CACHE_ENABLED master gate. With cache OFF the routed branch is a no-op
+// and the binary is byte-identical to the apiserver path — preserves the
+// architect's R-FALSE-1 invariant under the cache-off toggle. The gate
+// helper `useInformer()` returns `!cache.Disabled()`; we deliberately do
+// NOT import the `restactions/api` `resolverUseInformer()` helper:
+// although `api` does not import `objects` today, adding an
+// `objects → api` edge would be a fragile cross-package coupling that a
+// future refactor could turn into an import cycle. `internal/cache` is
+// already an `objects` dependency (get.go), so reusing `cache.Disabled()`
+// is cycle-free and cheaper than the coupling risk.
 //
 // Byte-equivalence (`feedback_cache_must_not_constrain_jq.md`). The
 // informer-served object MUST be stripped identically to
@@ -42,33 +48,30 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// resolverUseInformerEnv is the env-var key shared with the 0.30.95
-// resolver pivot. Keeping the literal identical (not the helper) is
-// intentional — see the package-doc rationale on the coupling risk.
-const resolverUseInformerEnv = "RESOLVER_USE_INFORMER"
-
 // useInformer reports whether the 0.30.96 routed branch is active.
-// Matches the 0.30.95 pivot's `resolverUseInformer() == "true"` check:
-// lowercased + trimmed, compared against the exact string "true".
-// "shadow" / "" / anything else => OFF (the pivot reserves "shadow" but
-// never wired it; we treat it as OFF identically).
+// Folded in Task #57 to be implicit-on-cache: the branch is active iff
+// the cache subsystem is on (CACHE_ENABLED truthy). The standalone
+// `RESOLVER_USE_INFORMER` env flag was retired — see the package-doc
+// gating note. A stale RESOLVER_USE_INFORMER in the environment is
+// ignored (main.go's retired-flag audit warns once).
 //
-// Read on every call: env-var reads are sub-microsecond against the Go
-// runtime envcache and letting operators flip the gate without a pod
-// restart is worth the negligible cost.
+// Note: objects.Get already short-circuits to getFromAPIServer on
+// cache.Disabled() (get.go) BEFORE this is read, so this gate only ever
+// evaluates true on the cache-on path — but it is kept as the explicit
+// uniform predicate the routed branch reads.
 func useInformer() bool {
-	return strings.ToLower(strings.TrimSpace(os.Getenv(resolverUseInformerEnv))) == "true"
+	return !cache.Disabled()
 }
 
 // Serve-rate counters for the 0.30.96 falsifier. Package-level atomics;
