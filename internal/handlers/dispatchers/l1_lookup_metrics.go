@@ -66,7 +66,7 @@ var l1LookupCells sync.Map
 // they see at /debug/vars).
 //
 // LoadOrStore pattern matches phase1_pip_metrics.go's
-// incCohortCounter so a concurrent first-observation from N workers
+// incFailureCounter so a concurrent first-observation from N workers
 // converges on one cell.
 func recordL1Lookup(handlerKind, gvrString string, hit bool) {
 	if handlerKind == "" {

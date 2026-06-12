@@ -49,9 +49,6 @@ import (
 
 // Grand totals across all cohorts.
 var (
-	pipSeedRestactionsTotal atomic.Uint64
-	pipSeedWidgetsTotal     atomic.Uint64
-
 	// Ship A.3 / 0.30.179 — binding-set enumeration counters. The first
 	// two are the seed-loop's grand totals (restactions + widgets across
 	// every enumerated class); the third is the failure counter per
@@ -82,14 +79,6 @@ var (
 	pipSeedOperationalFailTotal atomic.Uint64
 )
 
-// Per-cohort counters. sync.Map keyed by cohort label, value is
-// *atomic.Uint64. Same shape as fallthroughCounters in the prior-art
-// meter.
-var (
-	pipSeedRestactionsByCohort sync.Map
-	pipSeedWidgetsByCohort     sync.Map
-)
-
 // Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
 // "cohort|name|gvr" (widgets) or "cohort|namespace/name" (restactions);
 // value is *atomic.Uint64. The composite key keeps the per-cohort and
@@ -113,8 +102,9 @@ const (
 	cohortStatusFailed  = "failed"
 )
 
-// incFailureCounter bumps the per-(cohort, target) failure counter.
-// Same lazy-allocation shape as incCohortCounter.
+// incFailureCounter bumps the per-(cohort, target) failure counter. Lazy
+// allocation on first observation via the LoadOrStore + Add pattern (same
+// shape as the fallthrough meter's recordFallthroughCounter prior art).
 func incFailureCounter(m *sync.Map, compositeKey string) {
 	if v, ok := m.Load(compositeKey); ok {
 		v.(*atomic.Uint64).Add(1)
@@ -142,24 +132,6 @@ func recordCohortSeedStatus(cohortLabel, status string) {
 	pipCohortSeedStatus.Store(cohortLabel, status)
 }
 
-// incCohortCounter increments the per-cohort counter for the given
-// label. The counter is lazily allocated on first observation; the
-// Loaded/Store pattern matches the fallthrough meter's
-// recordFallthroughCounter (LoadOrStore + Add).
-func incCohortCounter(m *sync.Map, label string) {
-	if v, ok := m.Load(label); ok {
-		v.(*atomic.Uint64).Add(1)
-		return
-	}
-	fresh := new(atomic.Uint64)
-	actual, loaded := m.LoadOrStore(label, fresh)
-	if loaded {
-		actual.(*atomic.Uint64).Add(1)
-		return
-	}
-	fresh.Add(1)
-}
-
 // pipMetricsOnce guards the expvar.Publish calls — same pattern as
 // fallthroughExpvarOnce (sync.Once prevents double-publish panic if
 // init() runs twice, e.g. in some test harnesses).
@@ -181,28 +153,18 @@ func init() {
 // init() and a test helper.
 func registerPIPMetrics() {
 	pipMetricsOnce.Do(func() {
-		expvar.Publish("snowplow_phase1_seed_restactions_total", expvar.Func(func() any {
-			return pipSeedRestactionsTotal.Load()
-		}))
-		expvar.Publish("snowplow_phase1_seed_widgets_total", expvar.Func(func() any {
-			return pipSeedWidgetsTotal.Load()
-		}))
-		expvar.Publish("snowplow_phase1_seed_restactions_by_cohort", expvar.Func(func() any {
-			out := map[string]uint64{}
-			pipSeedRestactionsByCohort.Range(func(k, v any) bool {
-				out[k.(string)] = v.(*atomic.Uint64).Load()
-				return true
-			})
-			return out
-		}))
-		expvar.Publish("snowplow_phase1_seed_widgets_by_cohort", expvar.Func(func() any {
-			out := map[string]uint64{}
-			pipSeedWidgetsByCohort.Range(func(k, v any) bool {
-				out[k.(string)] = v.(*atomic.Uint64).Load()
-				return true
-			})
-			return out
-		}))
+		// Task #101 (hygiene) — the four legacy seed totals
+		// (snowplow_phase1_seed_{restactions,widgets}_total and their two
+		// _by_cohort maps) DELETED. Their only incrementer was runPIPSeed
+		// (the legacy seed loop, PrewarmEngineEnabled()==false). Production
+		// runs the unified engine path (PrewarmEngineEnabled()==true), which
+		// bypasses runPIPSeed entirely (phase1_pip_seed.go:494, phase1_walk.go:409)
+		// — so these four counters were permanently zero in production
+		// (confirmed live: 0/0/{}/{} while prewarm_engine_processed_total>0).
+		// Always-zero expvars are misleading observability. The LIVE seed
+		// signals — the failure-classification family (rbac_deny /
+		// operational_fail / per-(cohort,target) maps / cohort_seed_status)
+		// published below — are populated on BOTH paths and stay.
 
 		// Ship 0.30.242 H.c-layered Phase 2b — binding-set classes /
 		// powerset-skipped counters DELETED. The underlying functions

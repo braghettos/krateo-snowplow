@@ -625,8 +625,6 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 	log.Info("phase1.seed.completed",
 		slog.String("subsystem", "cache"),
 		slog.Int("cohorts", len(cohorts)),
-		slog.Uint64("restactions_seeded_total", pipSeedRestactionsTotal.Load()),
-		slog.Uint64("widgets_seeded_total", pipSeedWidgetsTotal.Load()),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 	return nil
@@ -815,8 +813,6 @@ func seedCohort(ctx context.Context, cohort seedTarget,
 			)
 			continue
 		}
-		pipSeedRestactionsTotal.Add(1)
-		incCohortCounter(&pipSeedRestactionsByCohort, cohortLabel)
 		processedRestactions++
 	}
 
@@ -859,8 +855,6 @@ func seedCohort(ctx context.Context, cohort seedTarget,
 			)
 			continue
 		}
-		pipSeedWidgetsTotal.Add(1)
-		incCohortCounter(&pipSeedWidgetsByCohort, cohortLabel)
 		processedWidgets++
 	}
 
