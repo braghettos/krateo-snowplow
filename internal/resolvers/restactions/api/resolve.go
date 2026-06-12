@@ -324,6 +324,138 @@ func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string
 	}
 }
 
+// stageAction encodes what the per-stage endpoint resolution tells the
+// orchestrator to do next. The helper that resolves the endpoint is pure-ish
+// (it logs + writes its own C-2 empty result) and returns one of these; the
+// ORCHESTRATOR owns the recordStageTiming()-before-exit invariant and the
+// loop control-flow (continue / return dict). This keeps every stage-exit's
+// recordStageTiming() in ONE place (design §3.2 / §2.4).
+type stageAction int
+
+const (
+	stageProceed  stageAction = iota // endpoint resolved; continue the stage
+	stageContinue                    // skip to next stage (C-2: UAF SA-endpoint err; dict[id] already set)
+	stageReturn                      // truncate the resolve (R-2: non-UAF resolveOne err)
+)
+
+// resolveStageEndpoint resolves the dispatch Endpoint for one stage. UAF
+// stages use the snowplow-SA endpoint (cluster-wide read); non-UAF stages go
+// through the per-user clientconfig (or the named EndpointRef). It replaces
+// the inline P5e block verbatim, INCLUDING the two slog.Error sites and the
+// C-2 empty-result write — but NOT the recordStageTiming()/continue/return,
+// which the orchestrator runs based on the returned stageAction.
+//
+//   - UAF + SA-endpoint err → log; dict[id]={items:[]}; return (zero, stageContinue)
+//     (C-2: fail-closed-but-respond, the stage produces an empty result and
+//     the loop continues — downstream stages still run).
+//   - non-UAF + resolveOne err → log; return (zero, stageReturn)
+//     (R-2: the resolve truncates — the orchestrator returns r.dict).
+//   - success → return (ep, stageProceed).
+func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, stageAction) {
+	if uafActive {
+		saEP, saErr := dynamic.ServiceAccountEndpoint()
+		if saErr != nil {
+			r.log.Error("userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
+				slog.String("name", id), slog.Any("err", saErr))
+			// Fail-closed-but-respond: per Revision 5 atomic
+			// ship there is no toggle to fall back to the
+			// per-user path correctly (we'd leak the user
+			// bearer token to a SA-marked stage). Returning
+			// an empty result for this stage and continuing.
+			r.dict[id] = map[string]any{"items": []any{}}
+			return endpoints.Endpoint{}, stageContinue
+		}
+		return *saEP, stageProceed
+	}
+	resolved, err := r.mapper.resolveOne(r.ctx, apiCall.EndpointRef)
+	if err != nil {
+		r.log.Error("unable to resolve api endpoint reference",
+			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
+		return endpoints.Endpoint{}, stageReturn
+	}
+	return resolved, stageProceed
+}
+
+// collapseOrFanoutPlan builds the per-stage RequestOptions slice (the call
+// plan). It replaces the inline P5f+P5g+P5h block verbatim: createRequestOptions
+// (empty → the "empty request options" Warn + an empty return, which the
+// orchestrator treats as C-3), then the Ship D.5 cluster-list collapse
+// (rebinding tmp + setting the st timing fields), then the 0.30.92 lazy
+// informer register. st is the per-stage timing struct (a loop-local value,
+// passed by pointer) — its ClusterList* fields are written here exactly as
+// before. Returns tmp (possibly empty for C-3).
+func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
+	tmp := createRequestOptions(r.ctx, r.log, apiCall, r.dict)
+	if len(tmp) == 0 {
+		r.log.Warn("empty request options for http call", slog.Any("name", id))
+		return tmp
+	}
+
+	// Ship D.5 (0.30.152) — cluster-list-when-allowed iterator
+	// collapse. When the RA opts in AND the requester holds
+	// cluster-scope `list` on the target GVR AND
+	// cache + Ship B snapshot are ready, attemptClusterListCollapse
+	// pre-dispatches a SINGLE cluster-scope LIST, validates its
+	// shape (AC-D5.14), Puts the envelope under the identity-free
+	// apistage key, and returns a 1-element tmp slice. The existing
+	// worker loop then runs apistageContentServe which Get-hits the
+	// cache + applies the per-user gateContentEnvelope narrowing —
+	// no double-dispatch, no special-case in the worker.
+	//
+	// Default-off + RBAC-deny + shape-fail all yield
+	// useClusterList=false; tmp keeps its iterator fan-out and the
+	// path is byte-identical to pre-D.5 (AC-D5.6).
+	//
+	// Ship 0.30.192 — capture cluster_list outcome + deny gate for
+	// per-stage timing instrumentation. The third return value is
+	// the deny-gate number (0 = no deny, 2-7 = which gate); see
+	// cache/pip_stage_timing.go PIPStageTiming.ClusterListDenyGate
+	// for the value table.
+	//
+	// Ship S.1 — the per-RA opt-in field (ClusterListWhenAllowed) was
+	// removed. attemptClusterListCollapse is now reached for every
+	// iterator stage (its own gates 2-5 decide servability), so
+	// ClusterListAttempted is true whenever the resolver evaluates the
+	// gate. The old `ptr.Deref(apiCall.ClusterListWhenAllowed, false)`
+	// gate-attempt signal is gone with the field.
+	st.ClusterListAttempted = true
+	if newTmp, useClusterList, denyGate := attemptClusterListCollapse(
+		r.ctx, r.log, apiCall, r.dict, ep, r.apistageStore, r.apistageEnabled); useClusterList {
+		tmp = newTmp
+		st.ClusterListUsed = true
+		st.ClusterListDenyGate = denyGate // 0 on success
+	} else {
+		st.ClusterListUsed = false
+		st.ClusterListDenyGate = denyGate
+	}
+
+	// 0.30.92 widening: lazy-register the informer for every
+	// downstream apiserver GVR enumerated by this stage's request
+	// options. Without this, the 0.30.91 hook only fired for the
+	// entry-point RESTAction GVR (recorded in restactions.go's
+	// dispatcher) — downstream GVRs the resolver dispatches inner
+	// HTTP calls against (e.g. compositions, sidebar widgets,
+	// resourcesRefs targets) never received an informer, so the
+	// 0.30.8 dep-tracker DeleteFunc never fired and
+	// `evict_delete_total` stayed 0 after deliberate DELETE events
+	// (probe `/tmp/snowplow-runs/0.30.91/preflight/probe.log`,
+	// gates 1 + 4 FAIL).
+	//
+	// `call.Path` is the JQ-evaluated apiserver REST path
+	// (e.g. `/apis/composition.krateo.io/v1/namespaces/<ns>/
+	// githubscaffoldingwithcompositionpages`). `ParseAPIServerPathToGVR`
+	// extracts (Group, Version, Resource) and skips non-apiserver
+	// paths (external endpoints, malformed templated fragments).
+	// EnsureResourceType is idempotent + singleflight under rw.mu;
+	// duplicate calls within the loop are sub-microsecond no-ops.
+	//
+	// Timing instrumentation: if EnsureResourceType ever blocks
+	// longer than lazyRegisterSlowThreshold we emit a WARN so the
+	// 0.30.92 first-read-latency follow-up has a falsifier.
+	lazyRegisterInnerCallPaths(r.ctx, r.log, tmp)
+	return tmp
+}
+
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	if len(opts.Items) == 0 {
 		return map[string]any{}
@@ -380,12 +512,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// concurrency note).
 	r := newResolveRun(ctx, opts, log, user)
 	dict := r.dict
-	mapper := r.mapper
 	apistageEnabled := r.apistageEnabled
 	apistageStore := r.apistageStore
 	pipTimingSink := r.pipTimingSink
-	// stageErrSink is consumed only via r.recordItemError (r.stageErrSink); no
-	// local rebind is needed.
+	// stageErrSink (via r.recordItemError) and mapper (via
+	// r.resolveStageEndpoint) are consumed only through r.*; no local rebind
+	// is needed for them.
 
 	for _, id := range names {
 		// Get the api with this identifier
@@ -489,32 +621,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 		// Resolve the endpoint. UAF stages use the snowplow-SA
 		// endpoint; non-UAF stages go through the per-user
-		// clientconfig (or the named EndpointRef) as before.
-		var ep endpoints.Endpoint
-		if uafActive {
-			saEP, saErr := dynamic.ServiceAccountEndpoint()
-			if saErr != nil {
-				log.Error("userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
-					slog.String("name", id), slog.Any("err", saErr))
-				// Fail-closed-but-respond: per Revision 5 atomic
-				// ship there is no toggle to fall back to the
-				// per-user path correctly (we'd leak the user
-				// bearer token to a SA-marked stage). Returning
-				// an empty result for this stage and continuing.
-				dict[id] = map[string]any{"items": []any{}}
-				recordStageTiming()
-				continue
-			}
-			ep = *saEP
-		} else {
-			resolved, err := mapper.resolveOne(ctx, apiCall.EndpointRef)
-			if err != nil {
-				log.Error("unable to resolve api endpoint reference",
-					slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
-				recordStageTiming()
-				return dict
-			}
-			ep = resolved
+		// clientconfig (or the named EndpointRef) as before. The
+		// orchestrator owns the recordStageTiming()-before-exit on the
+		// two early-exit actions (C-2 stageContinue / R-2 stageReturn).
+		ep, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+		switch epAction {
+		case stageContinue:
+			recordStageTiming()
+			continue
+		case stageReturn:
+			recordStageTiming()
+			return dict
 		}
 		// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
 		// is the single largest transient-memory consumer (~1.94 GiB
@@ -528,75 +645,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			slog.String("name", id), slog.String("host", ep.ServerURL),
 			slog.Bool("uaf", uafActive))
 
-		tmp := createRequestOptions(ctx, log, apiCall, dict)
+		// Build the per-stage call plan: request options + Ship D.5
+		// cluster-list collapse + 0.30.92 lazy informer register (the
+		// stageTiming.ClusterList* fields are written inside). An empty
+		// tmp is C-3 (the "empty request options" Warn fired inside) —
+		// the orchestrator owns the recordStageTiming()+continue.
+		tmp := r.collapseOrFanoutPlan(id, apiCall, ep, &stageTiming)
 		if len(tmp) == 0 {
-			log.Warn("empty request options for http call", slog.Any("name", id))
 			recordStageTiming()
 			continue
 		}
-
-		// Ship D.5 (0.30.152) — cluster-list-when-allowed iterator
-		// collapse. When the RA opts in AND the requester holds
-		// cluster-scope `list` on the target GVR AND
-		// cache + Ship B snapshot are ready, attemptClusterListCollapse
-		// pre-dispatches a SINGLE cluster-scope LIST, validates its
-		// shape (AC-D5.14), Puts the envelope under the identity-free
-		// apistage key, and returns a 1-element tmp slice. The existing
-		// worker loop then runs apistageContentServe which Get-hits the
-		// cache + applies the per-user gateContentEnvelope narrowing —
-		// no double-dispatch, no special-case in the worker.
-		//
-		// Default-off + RBAC-deny + shape-fail all yield
-		// useClusterList=false; tmp keeps its iterator fan-out and the
-		// path is byte-identical to pre-D.5 (AC-D5.6).
-		//
-		// Ship 0.30.192 — capture cluster_list outcome + deny gate for
-		// per-stage timing instrumentation. The third return value is
-		// the deny-gate number (0 = no deny, 2-7 = which gate); see
-		// cache/pip_stage_timing.go PIPStageTiming.ClusterListDenyGate
-		// for the value table.
-		//
-		// Ship S.1 — the per-RA opt-in field (ClusterListWhenAllowed) was
-		// removed. attemptClusterListCollapse is now reached for every
-		// iterator stage (its own gates 2-5 decide servability), so
-		// ClusterListAttempted is true whenever the resolver evaluates the
-		// gate. The old `ptr.Deref(apiCall.ClusterListWhenAllowed, false)`
-		// gate-attempt signal is gone with the field.
-		stageTiming.ClusterListAttempted = true
-		if newTmp, useClusterList, denyGate := attemptClusterListCollapse(
-			ctx, log, apiCall, dict, ep, apistageStore, apistageEnabled); useClusterList {
-			tmp = newTmp
-			stageTiming.ClusterListUsed = true
-			stageTiming.ClusterListDenyGate = denyGate // 0 on success
-		} else {
-			stageTiming.ClusterListUsed = false
-			stageTiming.ClusterListDenyGate = denyGate
-		}
-
-		// 0.30.92 widening: lazy-register the informer for every
-		// downstream apiserver GVR enumerated by this stage's request
-		// options. Without this, the 0.30.91 hook only fired for the
-		// entry-point RESTAction GVR (recorded in restactions.go's
-		// dispatcher) — downstream GVRs the resolver dispatches inner
-		// HTTP calls against (e.g. compositions, sidebar widgets,
-		// resourcesRefs targets) never received an informer, so the
-		// 0.30.8 dep-tracker DeleteFunc never fired and
-		// `evict_delete_total` stayed 0 after deliberate DELETE events
-		// (probe `/tmp/snowplow-runs/0.30.91/preflight/probe.log`,
-		// gates 1 + 4 FAIL).
-		//
-		// `call.Path` is the JQ-evaluated apiserver REST path
-		// (e.g. `/apis/composition.krateo.io/v1/namespaces/<ns>/
-		// githubscaffoldingwithcompositionpages`). `ParseAPIServerPathToGVR`
-		// extracts (Group, Version, Resource) and skips non-apiserver
-		// paths (external endpoints, malformed templated fragments).
-		// EnsureResourceType is idempotent + singleflight under rw.mu;
-		// duplicate calls within the loop are sub-microsecond no-ops.
-		//
-		// Timing instrumentation: if EnsureResourceType ever blocks
-		// longer than lazyRegisterSlowThreshold we emit a WARN so the
-		// 0.30.92 first-read-latency follow-up has a falsifier.
-		lazyRegisterInnerCallPaths(ctx, log, tmp)
 
 		// 0.30.95 bounded-parallel inner-call iterator.
 		//
