@@ -271,7 +271,7 @@ func TestL2_B6_UIDDeterministicThroughMemo(t *testing.T) {
 // hammer EvaluateRBAC over overlapping tuples while a writer goroutine
 // republishes the snapshot (bumping PublishSeq) mid-flight. `go test
 // -race` is the load-bearing falsifier: the shard is SHARED mutable
-// state (unlike RequestAuthzMemo) and the RWMutex + atomic shard-swap is
+// state (unlike a per-request memo) and the RWMutex + atomic shard-swap is
 // the thing under test (feedback_shared_vs_copy_is_a_concurrency_change).
 // The verdict for each tuple is generation-invariant in this fixture
 // (the bindings never change), so every read MUST return the expected

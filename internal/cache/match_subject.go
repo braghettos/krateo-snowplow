@@ -53,8 +53,6 @@ const systemAuthenticatedGroup = "system:authenticated"
 // see header).
 //
 // Used by:
-//   - the per-request authz memo (request_authz_memo.go — Phase 2b) to
-//     carry the identity context once per request.
 //   - the prewarm enumerator (prewarm_enumeration.go — Phase 2b) as the
 //     representative tuple for each prewarm target.
 //   - pickRepresentativeFromSubjects — derives a SubjectIdentity from a

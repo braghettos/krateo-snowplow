@@ -77,7 +77,7 @@ func rbWithSubjects(ns, name string, subs ...rbacv1.Subject) *rbacv1.RoleBinding
 // internal/rbac import cycle (rbac imports cache, not the other way).
 // ─────────────────────────────────────────────────────────────────────
 
-// testOpts captures the same fields EvaluateOptions does for the four
+// testOpts captures the same fields rbac.EvaluateOptions does for the four
 // switch branches anySubjectMatches walks (Username, Groups; SA path is
 // derived from Username's canonical "system:serviceaccount:<ns>:<name>"
 // prefix). Mirrors evaluate.go but lives in the cache test file.

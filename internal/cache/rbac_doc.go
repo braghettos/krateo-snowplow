@@ -11,8 +11,8 @@
 // ── THE 7-FILE RBAC CLUSTER ─────────────────────────────────────────────
 //
 // These files form the RBAC cohesion cluster (they share the `rbac_` /
-// `bindings_by_gvr` / `match_subject` / `request_authz_memo` prefixes). One
-// line each; read the file header for the full contract.
+// `bindings_by_gvr` / `match_subject` prefixes). One line each; read the
+// file header for the full contract.
 //
 //   - rbac_snapshot.go        — the immutable published RBAC snapshot
 //                               (struct + typed conversions + subject
@@ -31,9 +31,6 @@
 //   - match_subject.go        — the SINGLE SOURCE OF TRUTH for binding-identity
 //                               derivation: SubjectIdentity, BindingUIDFrom{CRB,
 //                               RB}, pickRepresentativeFromSubjects.
-//   - request_authz_memo.go   — the per-/call RequestAuthzMemo (memoises
-//                               EvaluateRBAC verdicts within one request,
-//                               snapshot-coherent) + the EvaluateOptions mirror.
 //   - rbac_snapshot_expvar.go — the read-only expvar exposure of the snapshot
 //                               publish-sequence counter (snowplow_rbac_publish_seq).
 //
@@ -41,13 +38,18 @@
 // the Secrets cache (a different cohesion cluster); it CONSUMES rbac
 // (scheduleRBACRebuild) but is not part of it.
 //
-// Two functions the audit flagged as mis-filed have been relocated (Task
-// #333 pieces 2+3, both intra-package, behaviour-identical):
+// One function the audit flagged as mis-filed has been relocated (Task
+// #333 piece 2, intra-package, behaviour-identical):
 //   - pickRepresentativeFromSubjectKeys (prewarm_enumeration.go) now ADAPTS
 //     onto the match_subject.go SOT instead of re-implementing its kind-switch.
-//   - dispatchAPIStageKey moved OUT of request_authz_memo.go into resolved.go,
-//     next to ComputeKey / ResolvedKeyInputs — it is an L1-dispatch-key concern,
-//     not a memo concern (the memo is only one of its inputs).
+//
+// dispatchAPIStageKey (the Task #333 piece-3 relocation) was deleted in #176
+// (dead scaffolding; L2 memo absorbs repeats — see
+// docs/task-176-197-decisions-2026-06-12.md §1). The whole per-/call memo it
+// consumed (request_authz_memo.go) went with it: the snapshot-generation L2
+// memo's key is a superset of the per-request key and serves the same-request
+// repeats before the candidate walk, so the per-request memo's marginal win
+// was below the WIRE bar.
 //
 // ── PACKAGE-LEVEL SINGLETONS (process-wide state) ───────────────────────
 //

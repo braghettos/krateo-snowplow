@@ -91,10 +91,13 @@ type RBACSnapshot struct {
 	// reader who loads via Snapshot() observes a publish-seq that is
 	// coherent with the snapshot pointer.
 	//
-	// Load-bearing for the per-request authz memo (request_authz_memo.go,
-	// Phase 2b): the memo stamps the publish seq at construction and
-	// invalidates itself on mismatch. Without snap-coherent stamping the
-	// memo could read stale (snap N+1 contents but snap N seq) — design §5.3.
+	// Load-bearing for the L2 snapshot-generation authz memo
+	// (internal/rbac/snapshot_authz_memo.go, Ship L2 / Task #291): each
+	// memo shard is stamped with the PublishSeq it is valid for and is
+	// swapped out on mismatch. Without snap-coherent stamping the memo
+	// could read stale (snap N+1 contents but snap N seq). (The per-request
+	// memo that originally motivated this stamping was deleted in #176; the
+	// L2 memo now carries the same generation-binding contract.)
 	//
 	// 0 is a valid value (first publish stamps 1; the writer reads + adds
 	// in one operation against rbacSnapshotPublishSeq).

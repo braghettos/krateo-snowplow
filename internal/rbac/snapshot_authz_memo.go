@@ -9,13 +9,13 @@
 // a verdict that is identical across thousands of repetitions within and
 // across refilter passes / refresher cycles (design §0/§3).
 //
-// WHY NOT extend request_authz_memo.go (RequestAuthzMemo): that memo is
+// WHY NOT a per-/call-request memo (the original Phase-2b approach, the
+// per-request RequestAuthzMemo — deleted in #176): that memo was
 // per-/call-request, reborn every request and every refresher cycle, and
-// single-goroutine by design (request_authz_memo.go:103). It gives the
-// identity-free perpetual refresher nothing across cycles. L2 needs a
-// shared, generation-scoped, CONCURRENT memo. Per the design (§2) and PM
-// B2, RequestAuthzMemo is left UNTOUCHED; this is a sibling object that
-// lives in internal/rbac (not internal/cache) so it can read
+// single-goroutine by design. It gave the identity-free perpetual refresher
+// nothing across cycles. L2 needs a shared, generation-scoped, CONCURRENT
+// memo. Per the design (§2) this is a process-wide object that lives in
+// internal/rbac (not internal/cache) so it can read
 // *cache.RBACSnapshot.PublishSeq directly with no hook indirection
 // (design §4 placement note).
 //
@@ -33,7 +33,7 @@
 //     so no stale verdict can ever be served across a republish.
 //
 // CONCURRENCY (design §7 / PM B2 / feedback_shared_vs_copy_is_a_concurrency_change):
-// unlike RequestAuthzMemo this shard is SHARED MUTABLE state hit by many
+// unlike a per-request memo this shard is SHARED MUTABLE state hit by many
 // goroutines concurrently with snapshot republishes. The RWMutex guards
 // the map; the atomic.Pointer guards the shard swap. F2 (-race republish
 // hammer) is the hard gate on this file.
