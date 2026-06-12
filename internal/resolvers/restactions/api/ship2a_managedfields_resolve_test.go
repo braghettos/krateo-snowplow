@@ -84,14 +84,10 @@ func newF1WatcherWithManagedFields(t *testing.T) *cache.ResourceWatcher {
 	// #57: informer pivot is implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 	cache.ResetResolvedCacheForTest()
 	cache.ResetDepsForTest()
-	// NOTE: this mirrors the package's established newF1Watcher idiom
-	// exactly. ResetDepsForTest()/the watcher-stop teardown have a
-	// pre-existing harness race (a still-draining informer's OnAdd bridge
-	// reads cache.Deps() while a reset nils the singleton) that surfaces
-	// only under artificial -count stress overlapping watcher lifecycles;
-	// it is NOT a Ship 2a production path and reproduces on the untouched
-	// TestFalsifierPCORE2 at -count=20. The single-count `go test -race`
-	// gate (standard CI invocation) is clean.
+	// LIFO cleanup: the watcher Stop() registered below runs BEFORE this
+	// reset (t.Cleanup is LIFO), so the informer has fully drained before
+	// the Deps singleton is nilled — the OnAdd-bridge/reset interleave that
+	// #85+#331 closed cannot recur here.
 	t.Cleanup(func() {
 		cache.ResetResolvedCacheForTest()
 		cache.ResetDepsForTest()
@@ -127,7 +123,7 @@ func newF1WatcherWithManagedFields(t *testing.T) *cache.ResourceWatcher {
 	if rw == nil {
 		t.Fatalf("expected non-nil watcher under CACHE_ENABLED=true")
 	}
-	t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
+	t.Cleanup(rw.Stop) // #85: Stop() blocks until goroutine drain — no settle-sleep needed
 
 	added, syncCh := rw.EnsureResourceType(f1WidgetsGVR)
 	if !added {
