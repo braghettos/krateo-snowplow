@@ -354,6 +354,61 @@ def test_make_browser_context_skips_video_when_none(tmp_path):
     )
 
 
+# ─── Case 7b: make_browser_context forwards storage_state (Task #307) ────────
+
+
+def test_make_browser_context_forwards_storage_state():
+    """`storage_state=<captured>` → forwarded verbatim to
+    browser.new_context(storage_state=...).
+
+    This is what lets a per-page recording context start ALREADY
+    authenticated (browser.py:1049-1050): its first `goto` lands on the
+    target page with no `/login` drive filmed. The forwarded object must be
+    the SAME object passed in (no copy/transform — a Playwright storage_state
+    dict is opaque to the bench)."""
+    captured: dict = {}
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):
+            captured.update(kwargs)
+            return mock.MagicMock(name="BrowserContext")
+
+    storage_state = {"cookies": [{"name": "k", "value": "v"}],
+                     "origins": [{"origin": "http://x", "localStorage": []}]}
+    make_browser_context(FakeBrowser(), storage_state=storage_state)
+
+    assert "storage_state" in captured, (
+        f"new_context() did not receive storage_state; kwargs={captured!r}"
+    )
+    assert captured["storage_state"] is storage_state, (
+        f"storage_state must be forwarded verbatim (same object); "
+        f"got {captured['storage_state']!r}"
+    )
+
+
+def test_make_browser_context_omits_storage_state_when_none():
+    """`storage_state=None` (or omitted) → new_context() called WITHOUT the
+    kwarg at all — ABSENT, not present-with-None.
+
+    A present `storage_state=None` would be a no-op for Playwright today, but
+    asserting absence locks the `if storage_state is not None` guard
+    (browser.py:1049): a future Playwright that rejected None, or a default
+    that changed meaning, must not silently regress an unauthenticated
+    throwaway-login context into a pre-seeded one."""
+    captured: dict = {}
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):
+            captured.update(kwargs)
+            return mock.MagicMock(name="BrowserContext")
+
+    make_browser_context(FakeBrowser(), storage_state=None)
+    assert "storage_state" not in captured, (
+        f"new_context() received storage_state despite None — the guard must "
+        f"OMIT the kwarg, not pass None; kwargs={captured!r}"
+    )
+
+
 # ─── Case 8: terminal-state PASSes with zero skeletons ──────────────────────
 
 

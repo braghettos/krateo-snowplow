@@ -777,6 +777,14 @@ def _setup_users(ctx: StageContext) -> None:
         # stage_id ("S6" → [rel paths]); consumed by _run_stage to attach
         # each stage's videos to THAT stage's proof.
         ctx.user_pages.setdefault("__stage_videos__", {})  # type: ignore[arg-type]
+        # Task #310a — per-RUN storage-state login memo: created ONCE here (the
+        # recording driver) and threaded explicitly into _open_stage_recording_
+        # pages so each user's throwaway login fires at most once per run rather
+        # than once per STAGE. Per-RUN scope (lives only as long as this ctx →
+        # no cross-run token reuse, constraint (a)); NOT a module global
+        # (constraint (b)). {user: {"storage_state": <ss>|None,
+        # "captured_at": <monotonic>}}.
+        ctx.user_pages.setdefault("__storage_state_memo__", {})  # type: ignore[arg-type]
 
     for user_subject in user_subjects:
         pwd = creds.get(user_subject)
@@ -868,45 +876,56 @@ def _capture_video_path(page) -> Path | None:
     return None
 
 
-def _open_stage_recording_pages(pw_browser, videos_dir: Path,
-                                user: str, pwd: str) -> dict[str, dict]:
-    """Open recording BrowserContext(s) per scaling page (storage-state reuse).
+# Task #310a — per-run storage-state login memo.
+#
+# AUTHN issues an HS256 JWT with a fixed 24h TTL (empirically: exp-iat == 86400s,
+# decoded from a live admin /basic/login token 2026-06-12). A full bench run is
+# ~2.5h — well inside the TTL with a ~10× margin — so a single per-RUN capture
+# per user cannot expire mid-run under any realistic run budget. The age guard
+# below is therefore DEFENSE-IN-DEPTH, not a correctness requirement: its
+# threshold is set to a conservative fraction of the 24h TTL so that even a
+# pathologically long run (or a future AUTHN TTL reduction) re-captures a fresh
+# storage_state rather than letting recording pages silently 401. A memo entry
+# older than this is treated as a miss and re-captured (constraint (c)).
+_STORAGE_STATE_MAX_AGE_S = 4 * 3600  # 4h: ~1.6× the longest expected run, 1/6 TTL
 
-    Used per STAGE so each stage gets its own short-lived recording contexts
-    → one .webm per (stage, user, page). Returns {page_name: {ctx, page,
-    slug, make}} LAZY slots (page/ctx None until the `make` factory runs);
-    if the throwaway login fails the dict is empty. Never raises (best-effort
-    — a recording failure must not abort the stage measurement).
 
-    Task #307 (Diego 2026-06-10; ArchLazyDash / Option A 2026-06-11) — kill the
-    login/dashboard head AND the in-frame idle:
+def _acquire_storage_state(pw_browser, user: str, pwd: str,
+                           storage_memo: dict | None):
+    """Return an authenticated Playwright storage_state for `user`, or None.
 
-      1. STORAGE-STATE REUSE. Log in ONCE on a throwaway NON-recording context,
-         capture `context.storage_state()`, and create every per-page recording
-         context with `storage_state=<captured>`. Each recording context is then
-         already authenticated, so its FIRST `goto` (in browser_measure_navigation)
-         lands directly on its target page — no `/login` drive and no dashboard
-         landing is filmed. (Previously each recording context drove the login
-         form, so its `.webm` began on `/login` → dashboard.)
+    Task #310a — per-RUN login memo. Without a memo this performs the legacy
+    per-call behaviour: one throwaway NON-recording login → `storage_state()`
+    capture → close (so the existing per-stage fallback path stays reachable,
+    constraint (d)). With a memo it logs in AT MOST ONCE per user per run:
 
-      2. LAZY CONTEXTS — EVERY page (incl. Dashboard). No recording context is
-         created here. Each slot carries a zero-arg `make` factory (closing over
-         the captured storage_state + videos_dir) plus `page=None`, `ctx=None`.
-         `browser.browser_measure_stage` invokes that factory at THAT page's own
-         loop iteration, as the first statement of the iteration body, so the
-         context — and thus its video clock — does not exist until ITS nav
-         begins. For the Dashboard (the FIRST BROWSER_SCALING_PAGES entry) this
-         means its `.webm` starts at the /dashboard nav rather than filming the
-         in-frame `count_compositions()` header probe + cold-nav poll idle; the
-         Compositions context still materialises strictly AFTER the Dashboard
-         VERIFY/convergence poll completes. The factory writes the materialised
-         ctx/page back into the same slot dict, so the deferred finalize
-         (`_finalize_stage_videos`) and the subject content-gate
-         (`u_state["page"]`) read the live filmed page unchanged.
+      • Memo HIT (entry present, has a storage_state, and not aged past
+        `_STORAGE_STATE_MAX_AGE_S`): return the cached storage_state WITHOUT a
+        login — this is what collapses the ~24 redundant per-stage logins to one
+        per user.
+      • Memo MISS / aged-out entry / prior FAILED capture: perform a fresh
+        throwaway login + capture (constraint (c) fresh-capture fallback).
+
+    ONLY a SUCCESSFUL capture is written back into the memo. A FAILED capture
+    leaves the memo untouched, so the next stage retries with a fresh login
+    rather than serving a cached failure — matching the pre-fix behaviour where
+    a transient AUTHN blip on one stage did not suppress recording on the next
+    (constraint (c): a failed login must fall back to a fresh capture, never be
+    cached).
+
+    `storage_memo` is the per-RUN dict threaded from the recording driver
+    (`ctx.user_pages["__storage_state_memo__"]`); it is mutated in place. It is
+    NEVER a module global — passing None yields the un-memoised per-call path.
+    Never raises (a recording-capture failure must not abort the stage).
     """
-    pages: dict[str, dict] = {}
+    if storage_memo is not None:
+        entry = storage_memo.get(user)
+        if entry is not None and entry.get("storage_state") is not None:
+            age = time.monotonic() - entry.get("captured_at", 0.0)
+            if age <= _STORAGE_STATE_MAX_AGE_S:
+                return entry["storage_state"]
+            # Aged out → fall through to a fresh capture below.
 
-    # (1) One-time throwaway login → storage_state capture (NOT recorded).
     storage_state = None
     login_ctx = None
     try:
@@ -926,6 +945,70 @@ def _open_stage_recording_pages(pw_browser, videos_dir: Path,
                 login_ctx.close()
             except Exception:
                 pass
+
+    # Cache ONLY a successful capture (a failed login is NOT memoised so the
+    # next stage retries fresh — constraint (c)).
+    if storage_memo is not None and storage_state is not None:
+        storage_memo[user] = {"storage_state": storage_state,
+                              "captured_at": time.monotonic()}
+    return storage_state
+
+
+def _open_stage_recording_pages(pw_browser, videos_dir: Path,
+                                user: str, pwd: str,
+                                storage_memo: dict | None = None,
+                                ) -> dict[str, dict]:
+    """Open recording BrowserContext(s) per scaling page (storage-state reuse).
+
+    Used per STAGE so each stage gets its own short-lived recording contexts
+    → one .webm per (stage, user, page). Returns {page_name: {ctx, page,
+    slug, make}} LAZY slots (page/ctx None until the `make` factory runs);
+    if the throwaway login fails the dict is empty. Never raises (best-effort
+    — a recording failure must not abort the stage measurement).
+
+    Task #307 (Diego 2026-06-10; ArchLazyDash / Option A 2026-06-11) — kill the
+    login/dashboard head AND the in-frame idle:
+
+      1. STORAGE-STATE REUSE. Log in ONCE on a throwaway NON-recording context,
+         capture `context.storage_state()`, and create every per-page recording
+         context with `storage_state=<captured>`. Each recording context is then
+         already authenticated, so its FIRST `goto` (in browser_measure_navigation)
+         lands directly on its target page — no `/login` drive and no dashboard
+         landing is filmed. (Previously each recording context drove the login
+         form, so its `.webm` began on `/login` → dashboard.)
+
+         Task #310a — the storage_state capture is hoisted into a per-RUN memo
+         (`storage_memo`, threaded from the recording driver). With the memo the
+         throwaway login fires AT MOST ONCE per user per run instead of once per
+         STAGE per user (~24 redundant logins/run before). On a memo miss /
+         aged-out entry / failed cached login it falls back to a fresh capture;
+         `storage_memo=None` reproduces the legacy per-stage login. See
+         `_acquire_storage_state` for the hit/miss/age-guard contract.
+
+      2. LAZY CONTEXTS — EVERY page (incl. Dashboard). No recording context is
+         created here. Each slot carries a zero-arg `make` factory (closing over
+         the captured storage_state + videos_dir) plus `page=None`, `ctx=None`.
+         `browser.browser_measure_stage` invokes that factory at THAT page's own
+         loop iteration, as the first statement of the iteration body, so the
+         context — and thus its video clock — does not exist until ITS nav
+         begins. For the Dashboard (the FIRST BROWSER_SCALING_PAGES entry) this
+         means its `.webm` starts at the /dashboard nav rather than filming the
+         in-frame `count_compositions()` header probe + cold-nav poll idle; the
+         Compositions context still materialises strictly AFTER the Dashboard
+         VERIFY/convergence poll completes. The factory writes the materialised
+         ctx/page back into the same slot dict, so the deferred finalize
+         (`_finalize_stage_videos`) and the subject content-gate
+         (`u_state["page"]`) read the live filmed page unchanged.
+    """
+    pages: dict[str, dict] = {}
+
+    # (1) storage_state capture (NOT recorded). Task #310a: routed through the
+    # per-RUN login memo so each user logs in AT MOST ONCE per run; on a memo
+    # miss / aged-out entry / cached-login failure this falls back to a fresh
+    # throwaway login + capture (constraint (c)). `storage_memo=None` reproduces
+    # the legacy per-call login exactly (constraint (d) — fallback path stays
+    # reachable).
+    storage_state = _acquire_storage_state(pw_browser, user, pwd, storage_memo)
 
     if storage_state is None:
         # No auth → no recording pages (the stage still measures on the
@@ -1291,8 +1374,12 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
             page_factories = None
             measure_page = u_state.get("page")
             if recording:
+                # Task #310a — thread the per-RUN login memo (created in
+                # _setup_users) so this user's throwaway login is reused across
+                # all stages in the run instead of re-driven per stage.
                 stage_pages = _open_stage_recording_pages(
-                    pw_browser, videos_dir, u_name, u_state.get("pwd"))
+                    pw_browser, videos_dir, u_name, u_state.get("pwd"),
+                    storage_memo=ctx.user_pages.get("__storage_state_memo__"))
                 if stage_pages:
                     # Task #307 / ArchLazyDash: EVERY slot (incl. Dashboard) is
                     # lazy — page=None + a `make` factory. browser_measure_stage

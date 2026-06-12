@@ -10,6 +10,7 @@ Per docs/bench-restructure-path-b-plan-2026-06-02.md §C.7 + §G Block 4.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -937,6 +938,173 @@ def test_open_stage_lazy_factory_creates_recording_context_when_invoked(
     before = len(rvd_calls)
     assert dash["make"]() is pg
     assert len(rvd_calls) == before, "factory created a second context"
+
+
+def test_open_stage_login_fires_at_most_once_per_user_across_run(
+        tmp_path, monkeypatch):
+    """Task #310a falsifier: across a SIMULATED multi-stage recording run the
+    throwaway login factory (`browser.browser_login`) fires ≤1× per user when a
+    per-RUN memo is threaded — NOT once per stage.
+
+    Pre-fix `_open_stage_recording_pages` did a fresh throwaway login every time
+    it was called (once per STAGE per user) → ~stages×users redundant logins per
+    run. With the per-RUN `storage_memo` it logs in once per user and every
+    later stage reuses the cached storage_state with NO login.
+
+    Discriminator: count browser_login(user) calls keyed by user across N stage
+    opens that share ONE memo dict (exactly what _measure_all_users threads from
+    ctx.user_pages["__storage_state_memo__"]). Assert each user's count is ≤1
+    (and == 1, since each user does appear). Pre-fix this count == N_STAGES."""
+    login_calls: list[str] = []
+
+    def _counting_login(page, user, pwd):
+        login_calls.append(user)
+        return True
+
+    monkeypatch.setattr(phases.browser, "browser_login", _counting_login)
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, **kw: _FakeRecordingCtx())
+
+    pw_browser = _StageRecordingBrowser()
+    storage_memo: dict = {}            # the per-RUN memo (shared across stages)
+    users = ("admin", "cyberjoker")
+    n_stages = 6                       # S0,S1,S6,S8,... — a realistic run window
+
+    for _stage in range(n_stages):
+        for user in users:
+            pages = phases._open_stage_recording_pages(
+                pw_browser, tmp_path / "videos", user, f"pw-{user}",
+                storage_memo=storage_memo)
+            # Each open still yields the full lazy page set (auth came from the
+            # memo on stages > 0) — proving reuse did not break the contract.
+            assert set(pages) == {"Dashboard", "Compositions"}, sorted(pages)
+
+    from collections import Counter
+    per_user = Counter(login_calls)
+    for user in users:
+        assert per_user[user] <= 1, (
+            f"{user} logged in {per_user[user]}× across {n_stages} stages — "
+            f"memo did not collapse per-stage logins; calls={login_calls!r}")
+        assert per_user[user] == 1, (
+            f"{user} never logged in (expected exactly one per-run capture); "
+            f"calls={login_calls!r}")
+    # Total logins == #users, NOT #users × #stages.
+    assert len(login_calls) == len(users), (
+        f"expected exactly {len(users)} logins for the whole run, got "
+        f"{len(login_calls)}: {login_calls!r}")
+    # The memo holds one entry per user with a real storage_state.
+    assert set(storage_memo) == set(users)
+    for user in users:
+        assert storage_memo[user]["storage_state"] is not None
+
+
+def test_storage_memo_refreshes_after_age_guard_expiry(tmp_path, monkeypatch):
+    """Task #310a fallback-on-expiry: a memo entry older than
+    `_STORAGE_STATE_MAX_AGE_S` is treated as a miss and re-captured with a fresh
+    login, rather than serving a (potentially expired-JWT) stale storage_state
+    that would let recording pages silently 401.
+
+    The age guard is defense-in-depth (AUTHN TTL is 24h, a run ~2.5h), but it
+    MUST force a fresh capture once an entry ages past the threshold. We seed a
+    memo entry whose `captured_at` is older than the guard, then assert the next
+    open performs a fresh login and overwrites the entry's timestamp."""
+    login_calls: list[str] = []
+
+    def _counting_login(page, user, pwd):
+        login_calls.append(user)
+        return True
+
+    monkeypatch.setattr(phases.browser, "browser_login", _counting_login)
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, **kw: _FakeRecordingCtx())
+
+    pw_browser = _StageRecordingBrowser()
+    # Seed a STALE entry: captured_at far enough in the past to exceed the guard.
+    stale_ss = {"cookies": [{"name": "stale"}], "origins": []}
+    stale_at = time.monotonic() - (phases._STORAGE_STATE_MAX_AGE_S + 60)
+    storage_memo = {"admin": {"storage_state": stale_ss,
+                              "captured_at": stale_at}}
+
+    pages = phases._open_stage_recording_pages(
+        pw_browser, tmp_path / "videos", "admin", "pw-admin",
+        storage_memo=storage_memo)
+
+    assert set(pages) == {"Dashboard", "Compositions"}, sorted(pages)
+    # Aged-out → a FRESH login fired (the stale storage_state was NOT reused).
+    assert login_calls == ["admin"], (
+        f"aged-out memo entry must trigger exactly one fresh login; "
+        f"calls={login_calls!r}")
+    # The memo entry was refreshed: new (non-stale) storage_state + newer ts.
+    refreshed = storage_memo["admin"]
+    assert refreshed["storage_state"] is not stale_ss, (
+        "stale storage_state was served instead of re-captured")
+    assert refreshed["captured_at"] > stale_at, (
+        "memo timestamp was not refreshed after re-capture")
+
+    # A SECOND open within the window now reuses the fresh entry — no 2nd login.
+    pages2 = phases._open_stage_recording_pages(
+        pw_browser, tmp_path / "videos", "admin", "pw-admin",
+        storage_memo=storage_memo)
+    assert set(pages2) == {"Dashboard", "Compositions"}, sorted(pages2)
+    assert login_calls == ["admin"], (
+        f"fresh memo entry must be reused without a 2nd login; "
+        f"calls={login_calls!r}")
+
+
+def test_failed_login_is_not_memoised_and_next_stage_retries(
+        tmp_path, monkeypatch):
+    """Task #310a constraint (c): a FAILED capture must NOT be cached — the next
+    stage retries with a fresh login rather than serving a cached failure.
+
+    Pre-fix (and a naive memo that cached failures) a transient AUTHN blip on
+    one stage would suppress recording for the rest of the run. We make the
+    first login fail and the second succeed, then assert: (1) the failed capture
+    left the memo EMPTY (no entry written), (2) the second stage re-drove the
+    login (a 2nd browser_login call), (3) only the successful capture is
+    memoised, and (4) a third stage then reuses it with no further login."""
+    outcomes = iter([False, True])   # stage 0 login fails, stage 1 succeeds
+
+    login_calls: list[str] = []
+
+    def _flaky_login(page, user, pwd):
+        login_calls.append(user)
+        return next(outcomes)
+
+    monkeypatch.setattr(phases.browser, "browser_login", _flaky_login)
+    monkeypatch.setattr(phases.browser, "make_browser_context",
+                        lambda pw, **kw: _FakeRecordingCtx())
+
+    pw_browser = _StageRecordingBrowser()
+    storage_memo: dict = {}
+
+    # Stage 0: login fails → no recording pages, and NOTHING memoised.
+    pages0 = phases._open_stage_recording_pages(
+        pw_browser, tmp_path / "videos", "admin", "pw-admin",
+        storage_memo=storage_memo)
+    assert pages0 == {}, (
+        f"a failed login must yield no recording pages; got {sorted(pages0)}")
+    assert "admin" not in storage_memo, (
+        f"a FAILED capture must not be cached; memo={storage_memo!r}")
+    assert login_calls == ["admin"]
+
+    # Stage 1: must RETRY a fresh login (not serve a cached failure) → succeeds.
+    pages1 = phases._open_stage_recording_pages(
+        pw_browser, tmp_path / "videos", "admin", "pw-admin",
+        storage_memo=storage_memo)
+    assert set(pages1) == {"Dashboard", "Compositions"}, sorted(pages1)
+    assert login_calls == ["admin", "admin"], (
+        f"stage after a failed login must re-drive the login; "
+        f"calls={login_calls!r}")
+    assert storage_memo["admin"]["storage_state"] is not None
+
+    # Stage 2: now the successful capture is reused — no further login.
+    pages2 = phases._open_stage_recording_pages(
+        pw_browser, tmp_path / "videos", "admin", "pw-admin",
+        storage_memo=storage_memo)
+    assert set(pages2) == {"Dashboard", "Compositions"}, sorted(pages2)
+    assert login_calls == ["admin", "admin"], (
+        f"successful capture must be reused without a 3rd login; "
+        f"calls={login_calls!r}")
 
 
 def test_measure_all_users_produces_both_pages_named_by_stage(
