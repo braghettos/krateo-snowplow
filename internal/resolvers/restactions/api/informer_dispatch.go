@@ -318,6 +318,13 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// informers carry ObjectMeta only — no spec, no status. Serving
 	// such a read would return shape-incompatible bytes. The pivot
 	// MUST fall through to the apiserver for these GVRs.
+	//
+	// #342 — this gate is LIVE-but-always-FALSE in production: rw.IsMetadataOnly
+	// delegates to shouldUseMetadataOnly, which is constant-false by
+	// construction (no GVR reaches a `return true`). See the #197 RESOLUTION
+	// header at internal/cache/cache_mode.go for why it is inert-not-dormant
+	// and the KEEP-DOCUMENTED ruling. The gate is retained as a correctness
+	// guard should a future ship re-introduce a non-RBAC metadata-only route.
 	if rw.IsMetadataOnly(gvr) {
 		dispatchInformerFallthrough.Add(1)
 		// Ship D — F-2 sub-reason: metadata-only GVR (permanent
