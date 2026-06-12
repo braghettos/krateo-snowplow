@@ -64,6 +64,17 @@ type pagedListFixture struct {
 	server *httptest.Server
 	pages  []int // index → number of items on that page
 	calls  atomic.Int64
+
+	// onFirstRequest, when non-nil, deterministically synchronises the
+	// ctx-cancel test (Task #85). The handler invokes it ONCE — after it
+	// has received the page-0 request but BEFORE it writes the response
+	// body. The hook is expected to cancel the dispatch context and then
+	// release the returned channel; the handler blocks on that channel
+	// before responding, so the cancel is guaranteed to land WHILE the
+	// page-0 round-trip is in flight (client-go then aborts the body read
+	// with a `context canceled` error). nil for every other test, which
+	// keeps their fast unsynchronised behaviour unchanged.
+	onFirstRequest func() <-chan struct{}
 }
 
 // newPagedListFixture builds a TLS server that answers a fixed N-item
@@ -174,6 +185,18 @@ func newPagedListFixture(t *testing.T, totalItems int, pageSize int) (*pagedList
 		nextContinue := ""
 		if pageIdx+1 < len(fixture.pages) {
 			nextContinue = strconv.Itoa(pageIdx + 1)
+		}
+
+		// Task #85 — deterministic ctx-cancel synchronisation. On the
+		// FIRST (page-0) request, hand control to the test's hook which
+		// cancels the dispatch context, then block on the channel it
+		// returns before writing the body. By the time we write, the
+		// client request context is cancelled, so client-go aborts and
+		// nri.List(page 0) returns a `context canceled` error — landing
+		// the cancel at a DEFINED point (mid-page-0) with no wall-clock
+		// guard. Guard with `cont == ""` so it fires exactly once (page 0).
+		if fixture.onFirstRequest != nil && cont == "" {
+			<-fixture.onFirstRequest()
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -373,15 +396,40 @@ func TestInternalDispatchListPageLimit_PinnedAt500(t *testing.T) {
 }
 
 // TestInternalRESTConfigDispatch_PagedList_ContextCancelDuringWalk
-// proves the paged walk respects ctx.Done() between pages — the
+// proves the paged walk respects ctx cancellation mid-walk — the
 // behaviour that closes the Task #267 failure mode (the browser
-// cancelling mid-LIST should surface a clean ctx.Err(), not a hung
-// dispatcher).
+// cancelling mid-LIST should surface a clean `context canceled` error,
+// not a hung dispatcher, and not a falsely-complete list).
+//
+// CONTRACT (TRACED — internal_dispatch.go:345-354 + the client-go
+// transport): the paged walk has TWO cancel-observation points —
+//   (1) the explicit `select { case <-ctx.Done(): return ctx.Err() }` at
+//       the TOP of every loop iteration (between pages); and
+//   (2) the in-flight nri.List(ctx, opts) call itself, which client-go
+//       aborts when ctx cancels mid-request, returning an error whose
+//       chain contains "context canceled" (typically a *url.Error).
+// Either way the surfaced error chain contains "context canceled" and the
+// walk does NOT complete all pages. The dispatcher returns (nil, false,
+// err); resolve.go surfaces it as an HTTP 500 with the real error rather
+// than hanging — exactly the Task #267 closure.
+//
+// Task #85 — DETERMINISTIC SYNCHRONISATION (no wall-clock guard). The
+// pre-0.30.252 version slept 50 ms then cancelled, racing the walk: on a
+// fast machine the whole 5-page walk finished in ~15-19 ms BEFORE the
+// 50 ms cancel fired, so the walk returned nil and the test failed
+// deterministically; under -race the instrumentation slowed the walk past
+// 50 ms so the cancel sometimes landed mid-walk — a flaky 50 ms timing
+// variant. We now drive the cancel off a fixture hook: the server hands
+// control to us AFTER receiving the page-0 request but BEFORE writing its
+// body; we cancel, then release the server. The cancel is therefore
+// guaranteed to land while the page-0 round-trip is in flight, so
+// nri.List(page 0) aborts with "context canceled" — point (2) above — at
+// a defined synchronisation point, every run.
 func TestInternalRESTConfigDispatch_PagedList_ContextCancelDuringWalk(t *testing.T) {
 	resetInternalClientCacheForTest()
 	t.Cleanup(resetInternalClientCacheForTest)
 
-	const totalItems = 2500 // 5 pages — enough to ensure cancellation lands mid-walk
+	const totalItems = 2500 // 5 pages — the walk would complete were it not cancelled
 	pageSize := int(internalDispatchListPageLimit)
 	fixture, caPEM := newPagedListFixture(t, totalItems, pageSize)
 
@@ -394,14 +442,19 @@ func TestInternalRESTConfigDispatch_PagedList_ContextCancelDuringWalk(t *testing
 	}
 
 	ctx, cancel := context.WithCancel(cache.WithInternalRESTConfig(context.Background(), rc))
-	// Cancel immediately AFTER the first page (latency-wise) — the
-	// `select { case <-ctx.Done() }` between pages should bail out
-	// before the next request.
-	go func() {
-		// Yield enough that the first server round-trip lands.
-		time.Sleep(50 * time.Millisecond)
+	t.Cleanup(cancel)
+
+	// Deterministic cancel: when the server has received page 0 and is
+	// about to write the body, cancel the dispatch context, then unblock
+	// the server. cancelLandedCh closes once cancel() has returned so the
+	// server only proceeds AFTER the context is cancelled — guaranteeing
+	// nri.List(page 0) observes the cancellation.
+	cancelLandedCh := make(chan struct{})
+	fixture.onFirstRequest = func() <-chan struct{} {
 		cancel()
-	}()
+		close(cancelLandedCh)
+		return cancelLandedCh
+	}
 
 	_, _, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
 		RequestInfo: httpcall.RequestInfo{
@@ -419,10 +472,13 @@ func TestInternalRESTConfigDispatch_PagedList_ContextCancelDuringWalk(t *testing
 		t.Fatalf("FALSIFIER-CTX FAIL: expected context.Canceled (or a "+
 			"wrapper carrying \"context canceled\"), got %v", err)
 	}
+	// The walk MUST NOT have completed all pages. With the cancel landing
+	// mid-page-0 the dispatcher bails before requesting page 1, so the
+	// server saw strictly fewer than len(pages) requests.
 	if calls := fixture.calls.Load(); calls >= int64(len(fixture.pages)) {
-		t.Fatalf("FALSIFIER-CTX FAIL: paged walk completed all %d pages "+
-			"despite ctx.Cancel() — expected the walk to bail out "+
-			"mid-stream. calls=%d", len(fixture.pages), calls)
+		t.Fatalf("FALSIFIER-CTX FAIL: paged walk issued all %d page requests "+
+			"despite ctx cancellation — expected it to bail out mid-stream. "+
+			"calls=%d", len(fixture.pages), calls)
 	}
 }
 

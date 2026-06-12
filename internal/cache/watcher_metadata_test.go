@@ -101,6 +101,26 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "3600")
 
+	// Task #85 — start from a clean, CONSISTENTLY-WIRED deps↔L1 pair so
+	// this test is immune to a predecessor's teardown. This test relies on
+	// the metadata DELETE → DepTracker.OnDelete → resolvedCache.Delete
+	// eviction chain, which only works when Deps()'s store is wired to the
+	// live resolvedCache. The wiring (resolved.go: Deps().SetStore) runs
+	// once inside resolvedCacheOnce; a neighbouring test that called
+	// ResetDepsForTest() (e.g. TestFalsifierFR6_RemoveResourceTypeTearsDownOneGVR's
+	// t.Cleanup) leaves depsInstance=nil while resolvedCacheOnce is already
+	// consumed, so the next Deps() is a FRESH tracker with NO store and
+	// ResolvedCache() returns the cached instance WITHOUT re-wiring →
+	// OnDelete becomes a silent no-op → this test times out. Resetting
+	// BOTH here re-establishes the coupling deterministically. Cleanup
+	// restores the clean pair for the next test too.
+	cache.ResetDepsForTest()
+	cache.ResetResolvedCacheForTest()
+	t.Cleanup(func() {
+		cache.ResetDepsForTest()
+		cache.ResetResolvedCacheForTest()
+	})
+
 	// Build the watcher with the dynamic fake (used only for RBAC
 	// constructor-registered informers — none of those are
 	// metadata-only).
@@ -206,8 +226,22 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 func TestEnsureResourceType_RoutesCompositionToFullInformerByDefault(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 
+	// Task #85 — the dynamic fake MUST know the composition GVR's List
+	// kind. This test deliberately routes the composition GVR to the FULL
+	// dynamic informer (IsMetadataOnly=false asserted below), which spawns
+	// a client-go Reflector that LISTs composition. Without the List kind
+	// registered, that Reflector panics ("you must register resource to
+	// list kind ...") on its first LIST — in a BACKGROUND goroutine, after
+	// this test's synchronous assertions pass. At -count=1 the test ended
+	// before the panic re-fired; under -count load the panic landed and
+	// crashed the whole package binary (this was THE leaked-composition-
+	// Reflector source behind the Task #85 cross-test flake). Registering
+	// the List kind lets the Reflector LIST cleanly (empty list), and the
+	// drained rw.Stop() reaps its goroutine.
+	listKinds := rbacListKinds()
+	listKinds[compositionGVR] = "GitHubScaffoldingWithCompositionPagesList"
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		newTestScheme(), rbacListKinds())
+		newTestScheme(), listKinds)
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
 		t.Fatalf("NewResourceWatcher: %v", err)
@@ -215,10 +249,7 @@ func TestEnsureResourceType_RoutesCompositionToFullInformerByDefault(t *testing.
 	if rw == nil {
 		t.Fatalf("expected non-nil watcher")
 	}
-	t.Cleanup(func() {
-		rw.Stop()
-		time.Sleep(100 * time.Millisecond)
-	})
+	t.Cleanup(rw.Stop)
 
 	scheme := newMetaScheme()
 	metaCli := metadatafake.NewSimpleMetadataClient(scheme)

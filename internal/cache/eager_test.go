@@ -369,20 +369,24 @@ func TestMarkEagerSet_LazyFallbackFires(t *testing.T) {
 	}
 }
 
-// stopAndDrain calls rw.Stop and sleeps briefly so the informer
-// goroutines actually wind down before the next test begins. The
-// pre-existing TestNewResourceWatcher_DormantWhenCacheDisabled samples
-// runtime.NumGoroutine() at the START of its body — if our prior test's
-// informers are still draining, the dormant test reads a high baseline,
-// then a low post-call count, registering a NEGATIVE delta and failing.
-// 20 ms is the same headroom that pre-existing test already uses
-// internally.
+// stopAndDrain stops the watcher and (as of Task #85 / 0.30.252) returns
+// only once every informer goroutine the watcher spawned has exited —
+// rw.Stop() is now a synchronous drain (factory.Shutdown() +
+// goroutineWG.Wait()), so the prior `time.Sleep(20 ms)` non-deterministic
+// settle is no longer needed and has been removed. Retained as a named
+// wrapper for call-site readability and so a future blocking-teardown
+// nuance has a single seam.
+//
+// Historical note: the sleep existed because the pre-0.30.252 Stop() only
+// SIGNALLED the informer goroutines and returned, so a prior test's
+// informers could still be draining when the next test sampled
+// runtime.NumGoroutine() — producing a flaky delta. Making Stop() block
+// fixes that at the source.
 func stopAndDrain(rw *cache.ResourceWatcher) {
 	if rw == nil {
 		return
 	}
 	rw.Stop()
-	time.Sleep(20 * time.Millisecond)
 }
 
 // equalGVRs compares two GVR slices for value equality (order-sensitive

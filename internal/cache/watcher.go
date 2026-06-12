@@ -228,6 +228,39 @@ type ResourceWatcher struct {
 	restConfig *rest.Config
 
 	stopCh chan struct{}
+
+	// goroutineWG tracks the watcher-owned goroutines that are NOT
+	// reaped by factory.Shutdown() — i.e. everything this type spawns
+	// directly with `go`: the standalone (lazily-registered / navigation-
+	// discovered) informer Run goroutines, every per-GVR waitInformerSync
+	// sync-watcher, and the initial-RBAC-snapshot publisher. The factory-
+	// driven bootstrap informers are tracked by the factory's OWN
+	// WaitGroup and drained by factory.Shutdown() (client-go prior art:
+	// dynamicinformer.dynamicSharedInformerFactory.Shutdown does
+	// `defer wg.Wait()`); they are deliberately NOT double-counted here.
+	//
+	// Stop() closes the stop channels (signalling every goroutine to
+	// exit) THEN blocks on factory.Shutdown() + goroutineWG.Wait(), so
+	// after Stop() returns NO goroutine this watcher started is still
+	// running. This is the deterministic-teardown seam the cache test
+	// harness relies on (Task #85): pre-0.30.252 Stop() only SIGNALLED
+	// the goroutines and returned, so a still-draining informer event
+	// handler (depEventHandlers.func1 -> Deps().On{Add,Update,Delete})
+	// could read the deps singleton while a neighbouring test's
+	// ResetDepsForTest() wrote depsInstance=nil — a DATA RACE (and, when
+	// the leaked Reflector LISTed against a neighbour's fake client, a
+	// panic on the unknown GVR). It is also a production correctness
+	// improvement: a graceful shutdown should drain its goroutines, not
+	// merely signal them.
+	//
+	// Wrapped goroutines MUST observe a closed stop channel and return —
+	// every site that does `goroutineWG.Add(1)` is paired with a
+	// `defer goroutineWG.Done()` and an existing stopCh/per-GVR-stop
+	// exit path. Never call goroutineWG.Wait() while holding rw.mu (the
+	// goroutines take rw.mu.RLock on their exit paths — see
+	// waitAndPublishInitialRBACSnapshot, rbac_snapshot.go); Stop()
+	// releases rw.mu before waiting.
+	goroutineWG sync.WaitGroup
 }
 
 // NewResourceWatcher constructs a cluster-wide ResourceWatcher.
@@ -379,7 +412,11 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		if ch == nil {
 			continue
 		}
-		go waitInformerSync(gi.Informer().HasSynced, ch, rw.stopCh)
+		rw.goroutineWG.Add(1)
+		go func(hasSynced func() bool, ch chan struct{}) {
+			defer rw.goroutineWG.Done()
+			waitInformerSync(hasSynced, ch, rw.stopCh)
+		}(gi.Informer().HasSynced, ch)
 	}
 
 	// Ship B (0.30.138) — typed-RBAC snapshot wiring assertion. By this
@@ -400,7 +437,11 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	// Between cache=on activation and this publish, rbacSnap.Load()
 	// returns nil → EvaluateRBAC AC-B.8 degrade-to-deny fires. No
 	// silent-fall-through to UserCan (would violate Revision 1).
-	go waitAndPublishInitialRBACSnapshot(rw)
+	rw.goroutineWG.Add(1)
+	go func() {
+		defer rw.goroutineWG.Done()
+		waitAndPublishInitialRBACSnapshot(rw)
+	}()
 
 	slog.Info("cache.plumbing_present=true cache.routed=true rbac.informer_started=true",
 		slog.String("subsystem", "cache"),
@@ -829,10 +870,33 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// metadata-registers; only lazy EnsureResourceType does), so the
 	// "late registration" path is the only one. R6 (0.30.115): both
 	// goroutines are bound by the per-GVR stop channel.
+	//
+	// Task #85 — track BOTH goroutines in rw.goroutineWG so Stop() drains
+	// them deterministically. These standalone metadata-informer Run +
+	// sync-watcher goroutines are NOT tracked by rw.metaFactory (the
+	// metadata informer is constructed via NewFilteredMetadataInformer /
+	// metaFactory.ForResource but Run by THIS `go`, not by
+	// metaFactory.Start), so without this they outlive Stop() — the exact
+	// leaked-Reflector source behind the deps-reset race (a leaked
+	// composition-GVR metadata Reflector LISTing against a neighbour test's
+	// fake client panicked, and its event handlers raced ResetDepsForTest).
+	// The stopRequestedLocked() guard keeps Add ordered before Stop's Wait
+	// under rw.mu (see the dynamic late-registration path for the full
+	// rationale).
+	if rw.stopRequestedLocked() {
+		return
+	}
 	stop := rw.informerStop[gvr]
-	go gi.Informer().Run(stop)
 	ch := rw.syncCh[gvr]
-	go waitInformerSync(gi.Informer().HasSynced, ch, stop)
+	rw.goroutineWG.Add(2)
+	go func(inf clientcache.SharedIndexInformer) {
+		defer rw.goroutineWG.Done()
+		inf.Run(stop)
+	}(gi.Informer())
+	go func(hasSynced func() bool) {
+		defer rw.goroutineWG.Done()
+		waitInformerSync(hasSynced, ch, stop)
+	}(gi.Informer().HasSynced)
 }
 
 // EnsureResourceTypeMetadataOnly is the explicit, signature-preserving
@@ -1194,14 +1258,27 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// the invariant at boot.
 	rw.installWatchErrorHandler(gvr, gi)
 
-	if rw.started {
+	if rw.started && !rw.stopRequestedLocked() {
 		// Late registration after Start(): kick the new informer.
 		// R6 (0.30.115): bound by the per-GVR stop channel, NOT
 		// rw.stopCh, so RemoveResourceType can cancel this informer
 		// alone. Stop() closes every per-GVR channel still present, so
 		// global shutdown reaps this goroutine just as before.
+		//
+		// Task #85 — the stopRequestedLocked() guard makes goroutineWG.Add
+		// race-free against a concurrent Stop(): both this Add and Stop's
+		// rw.stopCh close happen under rw.mu, so either we spawn BEFORE
+		// Stop closes stopCh (Add happens-before Stop's Wait, counter > 0)
+		// or we observe the closed stopCh and skip (no Add). A WaitGroup
+		// Add starting from a zero counter never races the Wait. Skipping
+		// is correct on its own terms too: a freshly-spawned informer would
+		// see the already-closed stop channel and exit immediately anyway.
 		stop := rw.informerStop[gvr]
-		go gi.Informer().Run(stop)
+		rw.goroutineWG.Add(1)
+		go func(inf clientcache.SharedIndexInformer) {
+			defer rw.goroutineWG.Done()
+			inf.Run(stop)
+		}(gi.Informer())
 
 		// 0.30.9 Sub-scope B: spawn the sync-watcher for this GVR.
 		// The watcher polls HasSynced (cheap atomic load in
@@ -1211,8 +1288,17 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 		// exits on RemoveResourceType OR Stop(). WaitForCacheSync
 		// (client-go) uses the same polling primitive internally — we
 		// re-implement it here so we don't need to allocate a context.
+		//
+		// Task #85: both goroutines are tracked by rw.goroutineWG so
+		// Stop() drains them deterministically (the standalone informer
+		// Run is NOT factory-tracked, so factory.Shutdown() alone would
+		// not reap it).
 		ch := rw.syncCh[gvr]
-		go waitInformerSync(gi.Informer().HasSynced, ch, stop)
+		rw.goroutineWG.Add(1)
+		go func(hasSynced func() bool) {
+			defer rw.goroutineWG.Done()
+			waitInformerSync(hasSynced, ch, stop)
+		}(gi.Informer().HasSynced)
 
 		// 0.30.6 falsifier (plan §"Code-path falsifier"). If eager
 		// registration has already completed AND this GVR was in
@@ -1994,10 +2080,24 @@ func (rw *ResourceWatcher) everyPerGVRMapClearForTest(gvr schema.GroupVersionRes
 // closed + purged the ones it tore down). closePerGVRStopLocked's
 // closed-check makes a remaining-channel close a no-op if it somehow
 // raced shut, so global shutdown stays exactly-once.
-func (rw *ResourceWatcher) Stop() {
-	rw.mu.Lock()
-	defer rw.mu.Unlock()
+// stopRequestedLocked reports whether Stop() has already closed rw.stopCh
+// (i.e. the watcher is shutting down). Callers MUST hold rw.mu (read or
+// write). Task #85 — used by the late-registration path to skip spawning
+// new informer goroutines once shutdown has begun, which keeps
+// goroutineWG.Add ordered before Stop()'s Wait under rw.mu.
+func (rw *ResourceWatcher) stopRequestedLocked() bool {
+	select {
+	case <-rw.stopCh:
+		return true
+	default:
+		return false
+	}
+}
 
+func (rw *ResourceWatcher) Stop() {
+	// Phase 1 — signal every goroutine to exit. Done under rw.mu because
+	// it mutates / reads the per-GVR channel map.
+	rw.mu.Lock()
 	select {
 	case <-rw.stopCh:
 		// Already closed.
@@ -2012,6 +2112,32 @@ func (rw *ResourceWatcher) Stop() {
 	for gvr := range rw.informerStop {
 		rw.closePerGVRStopLocked(gvr)
 	}
+	factory := rw.factory
+	rw.mu.Unlock()
+
+	// Phase 2 — Task #85: BLOCK until every goroutine this watcher
+	// started has exited. MUST run with rw.mu released: the drained
+	// goroutines take rw.mu.RLock on their exit paths (e.g.
+	// waitAndPublishInitialRBACSnapshot snapshots the per-GVR sync
+	// channels under RLock), so waiting under the write lock would
+	// deadlock.
+	//
+	//   - factory.Shutdown() drains the factory-driven bootstrap
+	//     informers via the factory's own WaitGroup (client-go prior art:
+	//     dynamicSharedInformerFactory.Shutdown does `defer wg.Wait()`).
+	//     nil in modePassthrough (no factory was constructed).
+	//   - goroutineWG.Wait() drains the watcher-owned goroutines that the
+	//     factory does NOT track: the standalone informer Run goroutines,
+	//     the per-GVR sync-watchers, and the initial-RBAC-snapshot
+	//     publisher.
+	//
+	// After both return, no goroutine this watcher spawned is running, so
+	// a subsequent ResetDepsForTest() in a neighbouring test cannot race
+	// an in-flight depEventHandlers.func1 -> Deps() access.
+	if factory != nil {
+		factory.Shutdown()
+	}
+	rw.goroutineWG.Wait()
 }
 
 // global holds the cluster-wide ResourceWatcher singleton wired in

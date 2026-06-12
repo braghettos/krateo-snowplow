@@ -189,13 +189,29 @@ func (c *crdDiscovery) startCRDDiscoveryWorker() {
 // share the discovery code path (triggerCRDDiscovery); DELETE branches
 // to triggerCRDDelete (wired in commit-4).
 func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
-	c.eventsProcessed.Add(1)
 	switch ev.kind {
 	case crdLifecycleAdd, crdLifecycleUpdate:
 		triggerCRDDiscovery(ev.obj, ev.kind)
 	case crdLifecycleDelete:
 		triggerCRDDelete(ev.obj)
 	}
+	// Task #85: bump eventsProcessed AFTER the side-effect (discovery /
+	// delete) completes, not before. "Processed" must mean "the
+	// side-effect has run" — so eventsProcessed is a valid happens-before
+	// signal for the side-effect's observable state (e.g.
+	// navDiscoveredGroups via AddNavigationDiscoveredGroup at
+	// triggerCRDDiscovery -> discovery_lookup.go:352). Pre-0.30.252 the
+	// bump preceded the dispatch, so WaitCRDDiscoveryProcessedForTest
+	// (which polls eventsProcessed) could return BEFORE
+	// AddNavigationDiscoveredGroup ran, racing the assertions in
+	// TestCRDAdd_TriggersGroupDiscovery (and siblings) under -count load.
+	// The final per-event count is unchanged (still exactly one Add per
+	// event), so every EventsProcessed==N assertion still holds; the only
+	// difference is a sub-microsecond window where a dequeued event is not
+	// yet counted — benign for the /debug/vars `events_processed` gauge,
+	// and the gauge now reports fully-processed events, which is the more
+	// honest semantics.
+	c.eventsProcessed.Add(1)
 }
 
 // submitCRDLifecycleEvent enqueues a CRD lifecycle event (ADD / UPDATE

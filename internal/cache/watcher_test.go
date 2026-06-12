@@ -3,6 +3,7 @@ package cache_test
 import (
 	"context"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -284,19 +285,80 @@ func TestNewResourceWatcher_PassthroughMode_NonNilDynBuildsWatcher(t *testing.T)
 	defer rw.Stop()
 }
 
+// watcherGoroutineFrames are the stack-frame substrings that identify a
+// goroutine SPAWNED BY a cache ResourceWatcher's informer machinery — the
+// only goroutines this test's contract is about. We count goroutines
+// whose stack contains any of these frames instead of reading the
+// absolute runtime.NumGoroutine() delta.
+//
+// Task #85: the pre-0.30.252 test asserted `runtime.NumGoroutine()`
+// before==after around NewResourceWatcher. That is INHERENTLY racy in the
+// shared package test binary under -race: a NEIGHBOUR test's informer
+// goroutines that are still draining (or being spawned) during this
+// test's 50 ms settle window perturb the ABSOLUTE process-wide count, so
+// the delta is non-deterministic even though THIS watcher spawned nothing.
+// Attributing the count to watcher-owned stack frames makes the assertion
+// measure exactly the contract ("passthrough spawns no informer
+// goroutines") and immune to neighbour noise.
+var watcherGoroutineFrames = []string{
+	// client-go informer/reflector machinery (the factory-driven and
+	// standalone informer Run goroutines).
+	"client-go/tools/cache.(*sharedIndexInformer).Run",
+	"client-go/tools/cache.(*controller).Run",
+	"client-go/tools/cache.(*Reflector)",
+	"client-go/tools/cache.(*processorListener)",
+	"dynamic/dynamicinformer",
+	// snowplow watcher-owned goroutines (Task #85-tracked).
+	"internal/cache.waitInformerSync",
+	"internal/cache.waitAndPublishInitialRBACSnapshot",
+}
+
+// countWatcherGoroutines parses a full goroutine dump and returns how many
+// goroutines have a stack frame attributable to the cache watcher's
+// informer machinery (watcherGoroutineFrames). Robust to neighbour-test
+// goroutines: it only counts watcher-attributable stacks.
+func countWatcherGoroutines() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		for _, frame := range watcherGoroutineFrames {
+			if strings.Contains(g, frame) {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
 // TestNewResourceWatcher_PassthroughMode_NoGoroutinesSpawned is the
 // "no informer factory" contract for 0.30.71 passthrough mode. The
 // passthrough watcher MUST NOT spawn informer goroutines — its
 // Get/List methods route directly to apiserver via the dynamic
-// client. We measure delta and require it to be 0 (same bar the
-// pre-0.30.71 dormant test set).
+// client.
+//
+// Task #85: the assertion counts WATCHER-ATTRIBUTABLE goroutines (via
+// labeled stack frames) rather than the absolute runtime.NumGoroutine()
+// delta. The old absolute-delta assertion flaked under -race in the
+// shared package binary because a neighbour test's informer goroutines
+// draining/spawning during the settle window perturbed the process-wide
+// count. We assert the watcher-attributable count does not increase —
+// the exact contract, with no dependence on neighbour goroutines.
 func TestNewResourceWatcher_PassthroughMode_NoGoroutinesSpawned(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "false")
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		newTestScheme(), rbacListKinds())
 
-	before := runtime.NumGoroutine()
+	before := countWatcherGoroutines()
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
 		t.Fatalf("NewResourceWatcher: %v", err)
@@ -306,14 +368,18 @@ func TestNewResourceWatcher_PassthroughMode_NoGoroutinesSpawned(t *testing.T) {
 	}
 	defer rw.Stop()
 
+	// Give any (erroneously) spawned watcher goroutine time to appear in
+	// the dump, then assert the watcher-attributable count did not grow.
+	// Unlike the old absolute NumGoroutine() delta this is deterministic:
+	// it cannot be perturbed by neighbour tests' goroutines.
 	runtime.Gosched()
 	time.Sleep(50 * time.Millisecond)
 	runtime.Gosched()
 
-	after := runtime.NumGoroutine()
-	delta := after - before
-	if delta != 0 {
-		t.Fatalf("passthrough mode goroutine delta = %d (want 0); before=%d after=%d", delta, before, after)
+	after := countWatcherGoroutines()
+	if after > before {
+		t.Fatalf("passthrough mode spawned %d watcher-attributable goroutine(s) (want 0); "+
+			"before=%d after=%d", after-before, before, after)
 	}
 }
 
