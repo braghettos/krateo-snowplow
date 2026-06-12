@@ -15,11 +15,13 @@
 //     gate: the memoised CRV validates a real document byte-identically to a
 //     fresh-compiled CRV (same accept + same reject + same error string).
 //
-// NOTE on the package's pre-existing #312 failure: TestExtractOpenAPISchemaFromCRD
-// (extract_test.go) fails+panics on stale testdata ("schema OpenAPI v3 not
-// found for version: v1") — OUT OF SCOPE for this ship. The panic aborts the
-// package test binary, so these tests are run/scored with `-run` filtered to
-// the Task-#323 names (the stash-proof discrimination); see the deliverable.
+// NOTE (Task #312, resolved): TestExtractOpenAPISchemaFromCRD (extract_test.go)
+// previously failed+SIGSEGV'd on a stale fixture ("schema OpenAPI v3 not found
+// for version: v1") — its CRD stopped at openAPIV3Schema.type while the contract
+// drills into properties.spec.properties.widgetData — and the panic poisoned the
+// whole package binary, forcing a `-run` filter to score these tests. That
+// fixture is now corrected and the nil-deref site is require-guarded, so the
+// package runs GREEN as a FULL PACKAGE with no -run filter.
 
 package schema
 

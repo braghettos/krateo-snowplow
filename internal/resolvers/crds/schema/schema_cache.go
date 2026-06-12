@@ -131,9 +131,15 @@ var crdSchemaMemo sync.Map // map[runtimeschema.GroupVersionResource]*apiextensi
 var crdSchemaMemoGen atomic.Uint64
 
 // crdSchemaMemo counters — observability for the falsifier (hit/miss ratio,
-// reset count) and the fenced-store drop count. atomic for lock-free reads;
-// PROFILE-ONLY this ship — NOT exposed via expvar/'/debug/vars'. Test-only
-// snapshot below.
+// reset count) and the fenced-store drop count. atomic for lock-free reads.
+// Task #326 — exposed via the snowplow_crd_schema_memo_* expvar family
+// (schema_cache_metrics.go), Disabled()-gated like the rest of the snowplow_*
+// counters:
+//   crdSchemaMemoHits         -> snowplow_crd_schema_memo_hits_total
+//   crdSchemaMemoMisses       -> snowplow_crd_schema_memo_misses_total
+//   crdSchemaMemoStaleDropped -> snowplow_crd_schema_memo_stale_dropped_total
+//   crdSchemaMemoResets       -> snowplow_crd_schema_memo_invalidations_total
+// Test-only snapshot below (crdSchemaMemoStats).
 var (
 	crdSchemaMemoHits         atomic.Uint64
 	crdSchemaMemoMisses       atomic.Uint64
@@ -230,12 +236,11 @@ func InvalidateCRDSchemaMemo() {
 	})
 }
 
-// CRDSchemaMemoStats is a read-only snapshot of the memo counters. TEST-ONLY
-// surface (the falsifier asserts hit/miss/reset/stale-drop transitions); NOT
-// wired to expvar/'/debug/vars' in this ship — observability is profile-only
-// (the validation run asserts extractOpenAPISchemaFromCRD ≈ 0 under the drain
-// focus, NOT an expvar hit-rate). Wiring snowplow_crd_schema_memo_* counters
-// is a tracked follow-up.
+// CRDSchemaMemoStats is a read-only snapshot of the memo counters. Consumed by
+// the falsifier (asserts hit/miss/reset/stale-drop transitions) AND, as of
+// Task #326, by the expvar publishers in schema_cache_metrics.go which surface
+// these four counters via the snowplow_crd_schema_memo_* family at
+// /debug/vars (Resets is published as snowplow_crd_schema_memo_invalidations_total).
 type CRDSchemaMemoStats struct {
 	Hits         uint64
 	Misses       uint64

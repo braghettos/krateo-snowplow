@@ -16,7 +16,11 @@ func TestMapVerbs(t *testing.T) {
 		{"Put", []string{"update"}},
 		{"gEt", []string{"get"}},
 		{"get", []string{"get"}},
-		{"", []string{"create", "delete", "get", "update"}},
+		// Empty verb => the full kubeToREST key set. "patch" was added to
+		// the verb map in #115 (verbs.go:38/47); this expectation predates
+		// that commit and is updated here to the shipped 5-verb behavior
+		// (sorted: create, delete, get, patch, update). Task #312.
+		{"", []string{"create", "delete", "get", "patch", "update"}},
 	}
 
 	for _, tc := range table {

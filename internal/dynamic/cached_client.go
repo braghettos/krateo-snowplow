@@ -77,6 +77,7 @@ package dynamic
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
@@ -85,6 +86,52 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 )
+
+// SA-discovery singleton observability counters (Task #326). atomic for
+// lock-free reads; exposed via the snowplow_sa_discovery_* expvar family
+// (cached_client_metrics.go), Disabled()-gated like the rest.
+//
+//   - saDiscoveryBuilds:        bumped once per SUCCESSFUL buildSADiscoveryState
+//     (= one discovery download paid). In production this is ~1 per process
+//     lifetime; a climbing value means the rc identity is churning (rebuild
+//     path) or InvalidateSADiscovery is being mis-wired to rebuild.
+//   - saDiscoveryInvalidations: bumped once per InvalidateSADiscovery that
+//     actually resets a live mapper (the CRD-lifecycle bridge fired).
+//   - saDiscoveryFallbacks:     bumped every time SharedSADiscoveryClient
+//     returns an error (nil rc / construction failure) — i.e. every time the
+//     ValidateObjectStatus caller (schema.go:124) falls back to a per-call
+//     dynamic.NewClient. The fallback Warn fires schema-side, but the counter
+//     lives here with its two siblings so the SA-discovery subsystem is the
+//     single source of truth for its own metrics (mirrors phase1_pip_metrics
+//     keeping the seed counters co-located). A non-zero value is the
+//     post-deploy signal that the caching win is silently evaporating back to
+//     per-call discovery downloads.
+var (
+	saDiscoveryBuilds        atomic.Uint64
+	saDiscoveryInvalidations atomic.Uint64
+	saDiscoveryFallbacks     atomic.Uint64
+)
+
+// SADiscoveryStats is a read-only snapshot of the SA-discovery singleton
+// counters. Consumed by the expvar publishers (cached_client_metrics.go) and
+// the metrics test. Mirrors schema.CRDSchemaMemoStats / the refresher snapshot
+// shape.
+type SADiscoveryStats struct {
+	Builds        uint64
+	Invalidations uint64
+	Fallbacks     uint64
+}
+
+// SADiscoveryStatsSnapshot returns the current SA-discovery counters. Exported
+// because the expvar publishers register lazy Funcs that read it at scrape
+// time and the metrics test asserts monotonic transitions through it.
+func SADiscoveryStatsSnapshot() SADiscoveryStats {
+	return SADiscoveryStats{
+		Builds:        saDiscoveryBuilds.Load(),
+		Invalidations: saDiscoveryInvalidations.Load(),
+		Fallbacks:     saDiscoveryFallbacks.Load(),
+	}
+}
 
 // saDiscoveryState is the process-singleton cached discovery client +
 // the typed mapper handle needed to call Reset(). The client field is
@@ -133,6 +180,7 @@ var (
 // Goroutine-safe.
 func SharedSADiscoveryClient(rc *rest.Config) (Client, error) {
 	if rc == nil {
+		saDiscoveryFallbacks.Add(1) // caller falls back to per-call dynamic.NewClient
 		return nil, fmt.Errorf("dynamic.SharedSADiscoveryClient: nil *rest.Config")
 	}
 
@@ -159,6 +207,7 @@ func SharedSADiscoveryClient(rc *rest.Config) (Client, error) {
 	if err != nil {
 		// Do NOT cache on failure — a transient boot-time construction
 		// error must not poison the process lifetime.
+		saDiscoveryFallbacks.Add(1) // caller falls back to per-call dynamic.NewClient
 		return nil, err
 	}
 	saDiscoveryInstance = st
@@ -205,6 +254,7 @@ func buildSADiscoveryState(rc *rest.Config) (*saDiscoveryState, error) {
 		converter:       runtime.DefaultUnstructuredConverter,
 	}
 
+	saDiscoveryBuilds.Add(1) // one discovery download paid (Task #326)
 	return &saDiscoveryState{rc: rc, client: cli, mapper: mapper}, nil
 }
 
@@ -231,6 +281,7 @@ func InvalidateSADiscovery() {
 	if st == nil || st.mapper == nil {
 		return
 	}
+	saDiscoveryInvalidations.Add(1) // count only resets that hit a live mapper (Task #326)
 	st.mapper.Reset()
 }
 
@@ -241,4 +292,9 @@ func resetSADiscoveryForTest() {
 	saDiscoveryMu.Lock()
 	saDiscoveryInstance = nil
 	saDiscoveryMu.Unlock()
+	// Task #326 — zero the observability counters too so each test sees a
+	// fresh baseline (mirrors resetCRDSchemaMemoForTest clearing its counters).
+	saDiscoveryBuilds.Store(0)
+	saDiscoveryInvalidations.Store(0)
+	saDiscoveryFallbacks.Store(0)
 }
