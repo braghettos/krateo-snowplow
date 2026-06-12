@@ -124,6 +124,47 @@ var metadataOnlyGVRSeed = []gvrPattern{}
 // Keyed by schema.GroupVersionResource (struct comparable in Go).
 var annotatedGVRs sync.Map // map[schema.GroupVersionResource]struct{}
 
+// #197 RESOLUTION (2026-06-12, docs/task-176-197-decisions-2026-06-12.md §2):
+// this predicate is PERMANENTLY constant-false in production — it is NOT
+// "wired but inert pending an upstream annotation."
+//
+//   - WHY INERT: Rule 2 (`!isStreamingException`) returns false for every
+//     non-RBAC GVR BEFORE the annotation (Rule 3) and seed (Rule 4) checks
+//     are ever reached. The only streaming exceptions are the 4 typed-RBAC
+//     GVRs (strip.go init populates typedResourceOverrides with exactly
+//     rbacTypedGVRs), and Rule 1 already returns false for those. So no GVR
+//     can reach a `return true`: RBAC GVRs exit at Rule 1, every other GVR
+//     exits at Rule 2. Rules 3 and 4 are structurally unreachable, and the
+//     Rule-4 seed is empty anyway (metadataOnlyGVRSeed, asserted by
+//     cache_mode_test.go:TestStaticSeedIsEmpty).
+//
+//   - THE AUDIT-A RATIONALE IS FACTUALLY WRONG: docs/audit-clean-code-2026-06-09.md
+//     keeps this path as a "forward-compat seam pending an upstream
+//     annotation (krateo.io/cache-mode: metadata)." That premise is false.
+//     Shipping the annotation would populate annotatedGVRs, but Rule 3 (the
+//     annotation check) is UNREACHABLE — the H5 routing inversion (the
+//     Rule-2 block above, ~lines 174-185) structurally severed the
+//     annotation path. The seam is dead, not dormant; the annotation cannot
+//     reactivate it. (Also: project_no_upstream_authority — we do not gate
+//     architecture on upstream annotation cadence regardless.)
+//
+//   - TRUE REACTIVATION CONDITION: a future ship must re-introduce a
+//     non-RBAC streaming exception (make isStreamingException true for some
+//     non-RBAC GVR) AND keep that GVR off the bytes path — only then can a
+//     GVR pass Rule 2 and reach Rules 3/4. Shipping the annotation alone is
+//     necessary-but-not-sufficient and, by itself, does nothing.
+//
+//   - REMOVAL DECISION RECORD: evaluated 2026-06-12, ruled KEEP-DOCUMENTED
+//     on cost/benefit. Removal is ~600-800 LOC across 6 production files —
+//     it drags the DiscoverMetadataOnlyAnnotations discovery subsystem and
+//     the metaClient/metaFactory infra with it, including a ~200-LOC edit
+//     inside watcher.go (the highest-blast-radius file; the #85 teardown
+//     -race lives in the exact goroutine-spawn block that would be removed)
+//     — for ZERO behavior change and with no near-term consumer. The full
+//     staged REMOVE plan (the defensible alternative) is preserved at
+//     docs/task-176-197-decisions-2026-06-12.md §2.6 and tracked as
+//     #197-removal. Until then this is inert-by-construction.
+//
 // shouldUseMetadataOnly returns true when the GVR should be routed onto
 // the PartialObjectMetadata informer (10× smaller per-object footprint;
 // satisfies the DepTracker but NOT typed-RBAC nor resolver GetObject
