@@ -103,3 +103,78 @@ func ResetSADiscoveryInvalidatorForTest() {
 	saDiscoveryInvalidator = nil
 	saDiscoveryInvalidatorMu.Unlock()
 }
+
+// --- Task #323 (#318-R2 Commit 2-B): sibling trampoline for the per-GVR -----
+// --- compiled-CRD-schema memo (internal/resolvers/crds/schema) --------------
+//
+// SAME indirection, SAME bridge sites, SAME ordering as the SA-discovery hook
+// above — ONE trampoline file, two consumers. crds/schema is ABOVE cache in
+// the import graph (schema.go imports cache; never the reverse), so cache
+// cannot import the schema package to clear its memo directly. main.go injects
+// the invalidator at startup next to SetSADiscoveryInvalidator:
+//
+//	cache.SetCRDSchemaInvalidator(crdschema.InvalidateCRDSchemaMemo)
+//
+// The bridge fires invalidateCRDSchemaMemo() right after invalidateSADiscovery()
+// at the END of triggerCRDDiscovery (ADD/UPDATE) + triggerCRDDelete (DELETE) —
+// AFTER DiscoverGroupResources / teardown — so the next ValidateObjectStatus
+// for a new/changed/removed GVR recompiles from fresh CRD bytes. A second
+// callback rather than overloading saDiscoveryInvalidator keeps each
+// consumer's wiring independently nil-checkable + warn-once observable, and
+// keeps the two resets explicitly co-located + co-ordered at the bridge sites.
+
+// saCRDSchemaInvalidator is the process-wide CRD-schema-memo reset callback
+// wired by main.go to crdschema.InvalidateCRDSchemaMemo. nil until
+// SetCRDSchemaInvalidator is called — invalidateCRDSchemaMemo soft-no-ops when
+// unset (cache-off / test paths that do not stand up the schema memo).
+//
+// Guarded by its own mutex (sibling to saDiscoveryInvalidatorMu) to avoid
+// lock-ordering risk — same rationale as processSARCMu.
+var (
+	saCRDSchemaInvalidatorMu sync.RWMutex
+	saCRDSchemaInvalidator   func()
+)
+
+// SetCRDSchemaInvalidator records the process-wide CRD-schema-memo reset
+// callback. Called ONCE by main.go's cache-init block, next to
+// SetSADiscoveryInvalidator. Subsequent calls overwrite — production never
+// re-invokes; tests may. nil f is accepted (stores nil).
+func SetCRDSchemaInvalidator(f func()) {
+	saCRDSchemaInvalidatorMu.Lock()
+	saCRDSchemaInvalidator = f
+	saCRDSchemaInvalidatorMu.Unlock()
+}
+
+// saCRDSchemaNilHookWarnOnce rate-limits the unwired-hook warning to one line
+// per process life.
+var saCRDSchemaNilHookWarnOnce sync.Once
+
+// invalidateCRDSchemaMemo fires the wired CRD-schema-memo reset callback.
+// Called at the END of triggerCRDDiscovery (ADD/UPDATE) + triggerCRDDelete
+// (DELETE), AFTER invalidateSADiscovery(). A nil hook means main.go's wiring
+// line was dropped: warn loudly (once), mirroring the sibling above. Cheap:
+// RLock + nil-check + call. Safe for concurrent use.
+func invalidateCRDSchemaMemo() {
+	saCRDSchemaInvalidatorMu.RLock()
+	f := saCRDSchemaInvalidator
+	saCRDSchemaInvalidatorMu.RUnlock()
+	if f == nil {
+		saCRDSchemaNilHookWarnOnce.Do(func() {
+			slog.Warn("cache.crd_discovery.crd_schema_invalidator_unwired",
+				slog.String("subsystem", "cache"),
+				slog.String("hint", "SetCRDSchemaInvalidator was not called at "+
+					"startup — the per-GVR compiled-CRD-schema memo will NOT reset on "+
+					"CRD lifecycle events. Check main.go wiring "+
+					"(cache.SetCRDSchemaInvalidator(crdschema.InvalidateCRDSchemaMemo))."))
+		})
+		return
+	}
+	f()
+}
+
+// ResetCRDSchemaInvalidatorForTest zeros the hook. TEST-ONLY.
+func ResetCRDSchemaInvalidatorForTest() {
+	saCRDSchemaInvalidatorMu.Lock()
+	saCRDSchemaInvalidator = nil
+	saCRDSchemaInvalidatorMu.Unlock()
+}

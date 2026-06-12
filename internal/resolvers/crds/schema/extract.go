@@ -8,6 +8,16 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
+// compileCRDSchemaFn is the package-private seam over the compile step
+// (extractOpenAPISchemaFromCRD + buildValidationFromSchemaData) that the
+// Task #323 RED/GREEN falsifier counts to prove per-call recompiles drop from
+// N to 1 once the per-GVR memo (schema_cache.go) is engaged. Production code
+// path is unchanged: the variable is initialised once to
+// extractOpenAPISchemaFromCRD and is only reassigned by test code. Mirrors
+// discoveryClientForConfigFn (internal/dynamic/cached_client.go:176) and
+// inClusterConfigFn (internal/dynamic/sa_client.go).
+var compileCRDSchemaFn = extractOpenAPISchemaFromCRD
+
 func extractOpenAPISchemaFromCRD(crd map[string]any, version string) (*apiextensions.CustomResourceValidation, error) {
 	versions, found, err := unstructured.NestedSlice(crd, "spec", "versions")
 	if err != nil {

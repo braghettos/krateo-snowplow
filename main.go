@@ -29,6 +29,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	crdschema "github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -240,6 +241,16 @@ func main() {
 					// Same set-once-at-startup lifecycle as
 					// SetProcessSARestConfig above; soft no-op if unset.
 					cache.SetSADiscoveryInvalidator(idynamic.InvalidateSADiscovery)
+
+					// Task #323 (#318-R2 Commit 2-B) — wire the per-GVR
+					// compiled-CRD-schema memo reset callback so the SAME
+					// CRD-lifecycle bridge resets the schema memo in lockstep
+					// with the SA-discovery cache (fired right after
+					// invalidateSADiscovery in triggerCRDDiscovery/Delete).
+					// Same set-once-at-startup lifecycle; soft no-op if unset.
+					// crds/schema is above cache in the import graph, so the
+					// trampoline lives in cache and main.go injects the impl.
+					cache.SetCRDSchemaInvalidator(crdschema.InvalidateCRDSchemaMemo)
 
 					// Ship 0.30.122 R4 Lever 1: wire the in-cluster
 					// *rest.Config so the composition GVR's streaming

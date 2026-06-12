@@ -70,6 +70,31 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 			}}
 	}
 
+	// Task #323 (#318-R2 Commit 2-B) — per-GVR compiled-schema memo. On a
+	// hit, skip the CRD GET + extractOpenAPISchemaFromCRD +
+	// buildValidationFromSchemaData recompute (TRACED 0.91% of the 0.30.258
+	// drain profile — they are a pure function of (CRD bytes, version),
+	// invariant per GVR across a window) and go straight to the per-object
+	// validateCustomResource below. The memo is reset on any CRD lifecycle
+	// event via the EXISTING 0.30.233 bridge (InvalidateCRDSchemaMemo wired
+	// in main.go) AND fenced by a generation counter so an inflight miss-fill
+	// (this call) cannot re-install a schema compiled from pre-reset bytes —
+	// so a hit cannot serve a stale schema for a changed GVR even under a
+	// concurrent CRD install (architect A1; schema_cache.go header).
+	// Placed AFTER the status.widgetData-absent NotFound guard above so a
+	// memo hit NEVER bypasses the fail-closed NotFound path (never-change-
+	// output: a widgetData-absent object returns NotFound on hit AND miss).
+	if crv, hit := lookupCRDSchema(gvr); hit {
+		return validateCustomResource(crv, widgetData)
+	}
+
+	// MISS — snapshot the memo generation BEFORE the CRD GET below. If a CRD
+	// lifecycle reset (InvalidateCRDSchemaMemo) lands during the GET+compile
+	// window, the generation moves and storeCRDSchema drops the (potentially
+	// stale-bytes) install, so the next call recompiles from fresh bytes
+	// (architect A1 generation fence).
+	gen := currentSchemaGen()
+
 	// Ship 0.30.231 (2026-06-01) — inlined CRD GET. The deleted
 	// internal/resolvers/crds.Get helper wrapped the same two-line
 	// dynamic.NewClient + Get call below; inlining removes the
@@ -123,10 +148,17 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 		crd = map[string]any{}
 	}
 
-	crv, err := extractOpenAPISchemaFromCRD(crd, gvr.Version)
+	// Miss — compile the CRV (the 0.91% extract + v1->internal build) and
+	// memoise it per GVR. compileCRDSchemaFn is the package-private seam the
+	// RED/GREEN falsifier counts (per-call recompile N -> 1 with the memo);
+	// it is initialised once to extractOpenAPISchemaFromCRD and only
+	// reassigned by test code (mirrors discoveryClientForConfigFn,
+	// dynamic/cached_client.go:176).
+	crv, err := compileCRDSchemaFn(crd, gvr.Version)
 	if err != nil {
 		return err
 	}
+	storeCRDSchema(gvr, crv, gen)
 
 	return validateCustomResource(crv, widgetData)
 }

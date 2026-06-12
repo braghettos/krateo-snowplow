@@ -374,6 +374,14 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	// ADD/UPDATE. Soft no-op when the dynamic singleton is unwired
 	// (discovery_invalidation_hook.go).
 	invalidateSADiscovery()
+
+	// Task #323 (#318-R2 Commit 2-B) — reset the per-GVR compiled-CRD-schema
+	// memo (crds/schema) in lockstep with the discovery cache, AFTER
+	// DiscoverGroupResources, so the next ValidateObjectStatus for the
+	// new/changed GVR recompiles from fresh CRD bytes (a CRD UPDATE that
+	// changes the schema MUST invalidate; this is that path). Soft no-op when
+	// the schema-memo invalidator is unwired (discovery_invalidation_hook.go).
+	invalidateCRDSchemaMemo()
 }
 
 // triggerCRDDelete handles a CRD DELETE event: derive the GVRs that
@@ -500,6 +508,13 @@ func triggerCRDDelete(obj interface{}) {
 	// no-op when the dynamic singleton is unwired
 	// (discovery_invalidation_hook.go).
 	invalidateSADiscovery()
+
+	// Task #323 (#318-R2 Commit 2-B) — reset the per-GVR compiled-CRD-schema
+	// memo (crds/schema) in lockstep, AFTER teardown, so the next
+	// ValidateObjectStatus for a just-deleted GVR recompiles (and then misses
+	// at the CRD GET -> error to the caller, not a stale-positive schema).
+	// Soft no-op when the schema-memo invalidator is unwired.
+	invalidateCRDSchemaMemo()
 
 	// NOTE: navDiscoveredGroups stays append-only. See doc-comment
 	// above + spec §11.2 OQ1 worked-examples deep-dive — the
