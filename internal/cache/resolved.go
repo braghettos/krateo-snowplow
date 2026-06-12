@@ -28,6 +28,7 @@ package cache
 
 import (
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -689,6 +690,51 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	h.Write([]byte{0})
 
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// dispatchAPIStageKey computes the L1 cell key for an apistage layer
+// given a memo + a stage descriptor. Internal helper — design §5.4
+// names it dispatchAPIStageKey. It lives HERE, alongside ComputeKey /
+// ResolvedKeyInputs (the L1-dispatch-key machinery it wraps), rather
+// than with the memo: the key derivation is a dispatch-key concern, and
+// the memo is only one of its inputs (it supplies the BindingUID).
+//
+// SCAFFOLDING-ONLY in Ship 0.30.242 Phase 2b (Path B). No production
+// callers in 2b — apistage.go computes its BindingUID via direct
+// rbac.EvaluateRBAC. The function is in place so Phase 3's memo
+// plumbing can switch sites with a 1-line change. Build-clean goal:
+// the dispatcher entry sites construct ResolvedKeyInputs with
+// BindingUID and call ComputeKey directly; this helper exists for the
+// Phase 3 wire-up.
+//
+// The stage parameter is the API stage's per-stage discriminator
+// string (Stage field on ResolvedKeyInputs — design §3.1). It
+// captures the stage id + canonical filter-hash + predecessor-output
+// hash; the apistage caller already builds it.
+func dispatchAPIStageKey(
+	memo *RequestAuthzMemo, ctx context.Context,
+	group, version, resource, namespace, name, stage string,
+	perPage, page int, extras map[string]any,
+	uafOpts EvaluateOptions,
+) string {
+	var bindingUID string
+	if memo != nil {
+		_, uid, _ := memo.EvaluateOrLookup(ctx, uafOpts)
+		bindingUID = uid
+	}
+	return ComputeKey(ResolvedKeyInputs{
+		CacheEntryClass: CacheEntryClassApistage,
+		Group:           group,
+		Version:         version,
+		Resource:        resource,
+		Namespace:       namespace,
+		Name:            name,
+		BindingUID:      bindingUID,
+		Stage:           stage,
+		PerPage:         perPage,
+		Page:            page,
+		Extras:          extras,
+	})
 }
 
 // canonicaliseExtras emits a sorted-key JSON encoding of m. Nested

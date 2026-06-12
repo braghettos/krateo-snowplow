@@ -37,6 +37,7 @@
 package cache
 
 import (
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -137,36 +138,31 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 	return out
 }
 
-// pickRepresentativeFromSubjectKeys is the index-domain mirror of
-// pickRepresentativeFromSubjects. It accepts []subjectKey (the
-// projection bindings_by_gvr.go stores on bindingEntry) and produces a
-// SubjectIdentity. Same contract as the SOT helper:
+// pickRepresentativeFromSubjectKeys is the index-domain adapter onto the
+// SOT pickRepresentativeFromSubjects (match_subject.go). It accepts
+// []subjectKey (the projection bindings_by_gvr.go stores on bindingEntry),
+// re-types each into the rbacv1.Subject shape the SOT consumes, and
+// delegates — so the User/Group/ServiceAccount → SubjectIdentity contract
+// lives in exactly ONE place.
 //
-//   - User-kind: SubjectIdentity{Username: name}
-//   - Group-kind: SubjectIdentity{Groups: [name]}
-//   - ServiceAccount-kind: SubjectIdentity{Username: "system:serviceaccount:<ns>:<name>"}
-//   - empty: zero value
-//
-// Could call the rbacv1.Subject SOT helper if we re-typed the subjects
-// here; staying in the index domain avoids the round-trip allocation.
+// The subjectKey.Kind values are the rbac/v1 kind strings recorded by
+// subjectsFromRBAC (only User / Group / ServiceAccount are projected), so
+// the round-trip is loss-free: the SOT's rbacv1.{User,Group,ServiceAccount}Kind
+// switch matches each re-typed Subject byte-for-byte. The earlier copy
+// duplicated that kind-switch in the index domain to dodge this small
+// allocation; the DRY win outweighs allocating a short Subject slice on the
+// (cold) prewarm-enumeration path.
 func pickRepresentativeFromSubjectKeys(subjects []subjectKey) SubjectIdentity {
-	for _, s := range subjects {
-		switch s.Kind {
-		case "User":
-			if s.Name != "" {
-				return SubjectIdentity{Username: s.Name}
-			}
-		case "Group":
-			if s.Name != "" {
-				return SubjectIdentity{Groups: []string{s.Name}}
-			}
-		case "ServiceAccount":
-			if s.Name != "" && s.Namespace != "" {
-				return SubjectIdentity{
-					Username: "system:serviceaccount:" + s.Namespace + ":" + s.Name,
-				}
-			}
-		}
+	if len(subjects) == 0 {
+		return SubjectIdentity{}
 	}
-	return SubjectIdentity{}
+	retyped := make([]rbacv1.Subject, 0, len(subjects))
+	for _, s := range subjects {
+		retyped = append(retyped, rbacv1.Subject{
+			Kind:      s.Kind,
+			Name:      s.Name,
+			Namespace: s.Namespace,
+		})
+	}
+	return pickRepresentativeFromSubjects(retyped)
 }
