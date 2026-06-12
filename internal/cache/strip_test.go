@@ -33,9 +33,15 @@ func TestStrip_DropsManagedFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transform returned error: %v", err)
 	}
-	stripped, ok := out.(*unstructured.Unstructured)
+	// Shape-agnostic: under CACHE_ENABLED=true the non-RBAC strip path
+	// stores a *bytesObject (strip.go:300), under the default convention
+	// (CACHE_ENABLED unset) it stores *unstructured.Unstructured. Decode
+	// whichever via the production decode-on-access helper and assert on
+	// the comparable Unstructured — the strip policy is identical on both
+	// store shapes.
+	stripped, ok := decodeBytesObject(out)
 	if !ok {
-		t.Fatalf("transform returned non-unstructured: %T", out)
+		t.Fatalf("transform returned undecodable value: %T", out)
 	}
 	if mf := stripped.GetManagedFields(); len(mf) != 0 {
 		t.Fatalf("managedFields not dropped: %v", mf)
@@ -61,8 +67,17 @@ func TestStrip_DropsLastAppliedAnnotation(t *testing.T) {
 		},
 	}}
 
-	out, _ := tf(uns)
-	stripped := out.(*unstructured.Unstructured)
+	out, err := tf(uns)
+	if err != nil {
+		t.Fatalf("transform returned error: %v", err)
+	}
+	// Shape-agnostic decode (see TestStrip_DropsManagedFields): handles
+	// both the *bytesObject store shape (CACHE_ENABLED=true) and the
+	// *unstructured.Unstructured shape (default convention).
+	stripped, ok := decodeBytesObject(out)
+	if !ok {
+		t.Fatalf("transform returned undecodable value: %T", out)
+	}
 	annos := stripped.GetAnnotations()
 	if _, present := annos["kubectl.kubernetes.io/last-applied-configuration"]; present {
 		t.Fatalf("last-applied-configuration not dropped: %v", annos)
@@ -99,8 +114,17 @@ func TestStrip_PreservesSpecStatusLabels(t *testing.T) {
 		},
 	}}
 
-	out, _ := tf(uns)
-	stripped := out.(*unstructured.Unstructured)
+	out, err := tf(uns)
+	if err != nil {
+		t.Fatalf("transform returned error: %v", err)
+	}
+	// Shape-agnostic decode (see TestStrip_DropsManagedFields): under
+	// CACHE_ENABLED=true the non-RBAC strip path stores a *bytesObject;
+	// under the default convention it stores *unstructured.Unstructured.
+	stripped, ok := decodeBytesObject(out)
+	if !ok {
+		t.Fatalf("transform returned undecodable value: %T", out)
+	}
 
 	// Labels preserved.
 	if got := stripped.GetLabels()["team"]; got != "infra" {
@@ -165,7 +189,15 @@ func TestStrip_IdempotentOnAlreadyStripped(t *testing.T) {
 	if err2 != nil {
 		t.Fatalf("second transform error: %v", err2)
 	}
-	stripped := out2.(*unstructured.Unstructured)
+	// Shape-agnostic decode (see TestStrip_DropsManagedFields): under
+	// CACHE_ENABLED=true out1 is a *bytesObject; re-feeding it to tf hits
+	// the *unstructured.Unstructured guard (strip.go:217) and is returned
+	// unchanged, so out2 is that same *bytesObject. decodeBytesObject
+	// handles both store shapes.
+	stripped, ok := decodeBytesObject(out2)
+	if !ok {
+		t.Fatalf("transform returned undecodable value: %T", out2)
+	}
 	if stripped.GetAnnotations()["keep-me"] != "yes" {
 		t.Fatalf("idempotent re-strip lost keep-me annotation")
 	}
@@ -480,8 +512,18 @@ func TestStrip_DropsEmptyAnnotationMap(t *testing.T) {
 		},
 	}}
 
-	out, _ := tf(uns)
-	stripped := out.(*unstructured.Unstructured)
+	out, err := tf(uns)
+	if err != nil {
+		t.Fatalf("transform returned error: %v", err)
+	}
+	// Shape-agnostic decode (see TestStrip_DropsManagedFields). On the
+	// *bytesObject path SetAnnotations(nil) drops the annotations key
+	// before marshalling, so the decoded form has nil annotations too —
+	// the sole-key-drop contract survives the round-trip.
+	stripped, ok := decodeBytesObject(out)
+	if !ok {
+		t.Fatalf("transform returned undecodable value: %T", out)
+	}
 	if got := stripped.GetAnnotations(); got != nil && len(got) != 0 {
 		t.Fatalf("expected empty/nil annotations after sole-key drop, got %v", got)
 	}
