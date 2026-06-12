@@ -863,6 +863,332 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	return nil
 }
 
+// runStage orchestrates ONE api stage (P5a-P5k of the original inline loop).
+// It returns stop=true when the resolve must terminate and the orchestrator
+// should `return r.dict` (the three truncating exits: R-1 caller-cancel, R-2
+// endpoint-resolve err, R-3 g.Wait() hard error); stop=false means "move to
+// the next stage" (normal completion + the three continues: C-1 apiMap miss,
+// C-2 UAF SA-endpoint err, C-3 empty request options).
+//
+// CENTRALISED INVARIANT (design §2.4): every stage-exit that is not the
+// pre-timing C-1 (apiMap miss, which returns before BeginStage so it commits
+// no PIP stage — preserved exactly) calls recordStageTiming() exactly once
+// before returning, so pipTimingSink.EndStage commits the in-flight stage.
+// Keeping all of runStage's returns in one method makes that invariant
+// auditable in a single place (and immune to "forgot recordStageTiming on a
+// new exit path"). recordStageTiming stays a per-stage closure (it closes over
+// the per-stage stageStart/stageTiming — NOT lifted to a method/field, which
+// would re-introduce per-stage state as struct state).
+//
+// The per-stage mutable primitives (dictMu, g, gctx, itemErrs, iterStart,
+// wireVerbose) are method-locals here, bundled into the method-local stageCtx
+// — never resolveRun fields (the concurrency flag / PM CONDITION 2).
+func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop bool) {
+	// Get the api with this identifier
+	apiCall, ok := apiMap[id]
+	if !ok {
+		r.log.Warn("api not found in apiMap", slog.Any("name", id))
+		return false
+	}
+	if apiCall.Headers == nil {
+		apiCall.Headers = []string{headerAcceptJSON}
+	}
+
+	// Ship 0.30.192 — per-stage timing recorder. stageTiming is a
+	// stack-local value; recordStageTiming closes over it and the
+	// outer pipTimingSink. On a nil sink (production /call path)
+	// recordStageTiming is still called (one nil-receiver no-op);
+	// no behavioural change. Stage early-exits (continue / return
+	// dict) MUST call recordStageTiming() first so the failed
+	// stage's wall-clock is captured for cost attribution.
+	//
+	// Ship 0.30.193 — register the stage with the sink so workers'
+	// AccumulateContentServe / AccumulateMemoPopulate /
+	// AccumulateDefensive calls (called from concurrent goroutines
+	// inside the iterator errgroup) can accumulate into THIS
+	// stage's struct. BeginStage takes a *PIPStageTiming pointer;
+	// recordStageTiming calls EndStage which COMMITS the in-flight
+	// stage to the sink's stages slice. A nil sink makes both
+	// BeginStage and EndStage no-ops.
+	stageStart := time.Now()
+	stageTiming := cache.PIPStageTiming{StageID: id}
+	r.pipTimingSink.BeginStage(&stageTiming)
+	recordStageTiming := func() {
+		stageTiming.ElapsedMs = time.Since(stageStart).Milliseconds()
+		if r.pipTimingSink != nil {
+			// Ship 0.30.193 — sink-aware finalisation. EndStage
+			// commits the in-flight stage; Append is no longer
+			// invoked because the stage is already tracked under
+			// the sink's current pointer. The previously-set
+			// ElapsedMs / IteratorElapsedMs / ClusterListUsed /
+			// ClusterListDenyGate fields are captured by the
+			// EndStage copy.
+			r.pipTimingSink.EndStage()
+		}
+	}
+
+	// Ship 0.30.257 (#313) — genuine-cancellation guard (design
+	// §2.1.1 Option C-A). The iterator errgroup no longer cancels
+	// gctx on a per-ITEM hard error (workers record into itemErrs and
+	// return nil — see the worker branches + post-g.Wait() join
+	// below), so the ONLY thing that aborts the resolve early is a
+	// GENUINE caller cancellation (client disconnect / deadline)
+	// propagating through the request ctx. We removed the WORKER as a
+	// cancellation SOURCE, not the parent-ctx machinery: a cancelled
+	// caller still cancels gctx (errgroup.WithContext derives gctx from
+	// ctx) so each in-flight dispatch fails fast, and THIS guard at the
+	// stage-loop top makes the cancellation abort downstream STAGES
+	// promptly instead of resolving them against a dead ctx. Cheap (one
+	// atomic load) and inert on the happy path.
+	if err := r.ctx.Err(); err != nil {
+		r.log.Debug("api.Resolve: caller context cancelled; aborting remaining stages",
+			slog.String("name", id), slog.Any("err", err))
+		recordStageTiming()
+		return true
+	}
+
+	// Tag 0.30.9 Sub-scope A: detect userAccessFilter.
+	// When set, the dispatch uses snowplow's ServiceAccount
+	// endpoint (cluster-wide read) — NOT the per-user
+	// clientconfig — and the response is in-process-refiltered
+	// per object through EvaluateRBAC. When unset, the dispatch
+	// path is unchanged from 0.30.8 (per-user-token via the
+	// endpointReferenceMapper). Per Revision 5 (binding): atomic
+	// ship — no gate flag. Portal RestActions opt in by adding
+	// the userAccessFilter stanza; the resolver branches
+	// per-stage.
+	uafActive := apiCall.UserAccessFilter != nil
+
+	// User-bearer-token append: only for non-UAF stages. When
+	// UAF is active the SA endpoint carries the SA token (no
+	// user-bearer override needed); appending the user token
+	// here would route the call through the user's credentials
+	// instead of the SA's — breaking the entire UAF mechanism.
+	if !uafActive {
+		if accessToken, _ := xcontext.AccessToken(r.ctx); accessToken != "" {
+			if apiCall.EndpointRef == nil || ptr.Deref(apiCall.ExportJWT, false) {
+				// 0.30.164: stage-local Headers — never write the user
+				// bearer back into the shared CR slice (the CR is marshaled
+				// into the /call response body at restactions.go:149; an
+				// in-place append leaked the JWT to the wire — see
+				// /tmp/snowplow-runs/ship-307/before/.../call-namespaces.json).
+				stageHeaders := make([]string, len(apiCall.Headers), len(apiCall.Headers)+1)
+				copy(stageHeaders, apiCall.Headers)
+				stageHeaders = append(stageHeaders,
+					fmt.Sprintf("Authorization: Bearer %s", accessToken))
+				local := *apiCall
+				local.Headers = stageHeaders
+				apiCall = &local
+			}
+		}
+	}
+
+	// Resolve the endpoint. UAF stages use the snowplow-SA
+	// endpoint; non-UAF stages go through the per-user
+	// clientconfig (or the named EndpointRef) as before. The
+	// orchestrator owns the recordStageTiming()-before-exit on the
+	// two early-exit actions (C-2 stageContinue / R-2 stageReturn).
+	ep, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+	switch epAction {
+	case stageContinue:
+		recordStageTiming()
+		return false
+	case stageReturn:
+		recordStageTiming()
+		return true
+	}
+	// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
+	// is the single largest transient-memory consumer (~1.94 GiB
+	// alloc_space on the 50K bench: it stringifies every HTTP response
+	// body, including the multi-MB compositions LIST). The blanket
+	// `ep.Debug = opts.Verbose` set here is REMOVED — Debug is now
+	// decided PER-CALL inside the g.Go worker (R1-a: never for a K8s
+	// collection LIST) and additionally gated on RESOLVER_VERBOSE_WIRE_DUMP
+	// (R1-b: an operator kill-switch, default off). See the worker below.
+	r.log.Debug("resolved endpoint for api call",
+		slog.String("name", id), slog.String("host", ep.ServerURL),
+		slog.Bool("uaf", uafActive))
+
+	// Build the per-stage call plan: request options + Ship D.5
+	// cluster-list collapse + 0.30.92 lazy informer register (the
+	// stageTiming.ClusterList* fields are written inside). An empty
+	// tmp is C-3 (the "empty request options" Warn fired inside) —
+	// the orchestrator owns the recordStageTiming()+continue.
+	tmp := r.collapseOrFanoutPlan(id, apiCall, ep, &stageTiming)
+	if len(tmp) == 0 {
+		recordStageTiming()
+		return false
+	}
+
+	// 0.30.95 bounded-parallel inner-call iterator.
+	//
+	// Pre-0.30.95 the inner-call loop was sequential — N inner calls
+	// against the apiserver paid N × per-call latency. The architect's
+	// 0.30.95 design replaces it with a bounded errgroup whose width
+	// is iterParallelism() (GOMAXPROCS default, env-overridable, hard
+	// cap 32). dictMu serialises all writes against `dict` from
+	// concurrent goroutines (jsonHandler closure + error-branch
+	// inline). gctx flows into httpcall.Do so the first hard-error
+	// cancels in-flight peers when ContinueOnError=false.
+	//
+	// Edge type 3 dep-recording stays INLINE before g.Go (per the
+	// 0.30.94 contract — sync.Map under the hood, safe to call from
+	// the parent goroutine, no need to record from inside the worker).
+	//
+	// The success-branch log's `depth` field is computed by
+	// depthForLog (support.go) — a mapDepth full-tree walk of dict.
+	// Ship #6 gates that walk behind the Debug level; when it DOES
+	// run (Debug on) it reads dict under dictMu, serialising against
+	// concurrent jsonHandler writes. On the common (Info) path
+	// neither the walk nor the lock runs.
+	var dictMu sync.Mutex
+	g, gctx := errgroup.WithContext(r.ctx)
+	g.SetLimit(iterParallelism(r.ctx))
+
+	// Ship 0.30.257 (#313) — per-item error slots (design §2.1 / §3.2).
+	// One slot per iterator item, index-aligned with tmp. Each worker
+	// writes ONLY its own itemErrs[i] (disjoint indices) and returns nil
+	// on a per-item hard error, so the errgroup ctx is never cancelled by
+	// a per-item failure → the remaining items proceed (Option C-A; the
+	// SetLimit bound is unchanged). The slice backing array is allocated
+	// HERE, before any g.Go, and never grown — disjoint-index writes to a
+	// pre-sized slice are data-race-free without a lock (same property as
+	// a pre-sized array; proven by TestResolve_IteratorErrorCollection_Race
+	// under -race). The shared dict[errorKey] accumulation (W-A) is a
+	// SEPARATE concern and stays under dictMu.
+	itemErrs := make([]error, len(tmp))
+
+	// Ship 0.30.192 — record iterator fan-out cost. tmp slice
+	// length is the call count (1 after cluster-list collapse,
+	// N per-NS after the iterator path); iterStart anchors the
+	// wall-clock that g.Wait() closes below.
+	stageTiming.IteratorCalls = len(tmp)
+	iterStart := time.Now()
+
+	// Ship 0.30.121 R1-b — the operator kill-switch. Compute once per
+	// stage: verbose is permitted ONLY when the RESTAction asked for it
+	// (opts.Verbose) AND the env flag explicitly enables the wire-dump.
+	// Default off => wireVerbose is false => no call ever gets Debug.
+	wireVerbose := r.opts.Verbose && verboseWireDumpEnabled()
+
+	// The per-stage mutable bundle handed to each iterator worker. Built
+	// here, discarded at the end of this stage iteration — NEVER a
+	// resolveRun field (the concurrency flag / PM CONDITION 2). A pointer
+	// to it is shared by all of THIS stage's workers (the same read-only
+	// sharing the inline closure had; dictMu guards dict).
+	sc := &stageCtx{
+		id:          id,
+		apiCall:     apiCall,
+		dictMu:      &dictMu,
+		g:           g,
+		gctx:        gctx,
+		itemErrs:    itemErrs,
+		iterStart:   iterStart,
+		wireVerbose: wireVerbose,
+		ep:          ep,
+		calls:       tmp,
+	}
+
+	for i := range tmp {
+		call := tmp[i]
+
+		// Edge type 3 dep recording — see 0.30.94 ship for full
+		// rationale. cache.Deps() is sync.Map-backed; idempotent
+		// LoadOrStore; safe from this (parent-goroutine) site — kept
+		// INLINE here (NOT inside the worker) so its dep.recorded Debug
+		// line preserves its pre-extraction emit order.
+		//
+		// Ship F1 (0.30.119): the dep edge attaches to whatever L1
+		// key the request path threaded (the per-user resolved-output
+		// key). The CONTENT-keyed api-stage entry records its OWN dep
+		// edge inside the worker, keyed by the per-call content key
+		// (gvr,ns,[name]) — so an informer event on a K8s call's GVR
+		// dirty-marks the matching content entry and the refresher
+		// re-dispatches that one call.
+		if l1Key := cache.L1KeyFromContext(r.ctx); l1Key != "" && !cache.Disabled() {
+			if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
+				if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
+					if name == "" {
+						cache.Deps().RecordList(l1Key, gvr, ns)
+					} else {
+						cache.Deps().Record(l1Key, gvr, ns, name)
+					}
+					r.log.Debug("dep.recorded",
+						slog.String("subsystem", "cache"),
+						slog.String("edge_type", "innerCall"),
+						slog.String("gvr", gvr.String()),
+						slog.String("ns", ns),
+						slog.String("name", name),
+						slog.String("l1_key", l1Key),
+					)
+				}
+			}
+		}
+
+		// i is captured explicitly (per-iteration under Go 1.22+ loop
+		// semantics) and passed as dispatchOneCall's arg → itemErrs[i] is
+		// this item's disjoint slot (design Risk R1).
+		i := i
+		g.Go(func() error {
+			return r.dispatchOneCall(sc, i)
+		})
+	}
+
+	// Ship 0.30.257 (#313) — post-fan-out handling. With Option C-A
+	// the three per-ITEM hard-error branches record into itemErrs[i]
+	// and return nil, so g.Wait() NO LONGER returns non-nil for a
+	// per-item dispatch failure (the stage runs all items + downstream
+	// stages run — the central #313 behaviour change). g.Wait() can
+	// still return non-nil for a NON-per-item worker error: a response
+	// HANDLER failure (feedBytes / feedValue / inner returning a decode
+	// error — NOT in #313's scope) or a genuine ctx-cancellation
+	// surfacing through such a handler. For THOSE we preserve the
+	// pre-0.30.257 short-circuit + truncated-dict return verbatim.
+	if err := g.Wait(); err != nil {
+		r.log.Debug("api stage short-circuited on hard error",
+			slog.String("name", id), slog.Any("err", err))
+		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
+		recordStageTiming()
+		return true
+	}
+	stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
+
+	// Ship 0.30.257 (#313) — per-item errors recorded by the worker
+	// branches above do NOT cancel the stage; they were collected into
+	// itemErrs (disjoint indices) and the matching dict[errorKey]
+	// accumulating-slice entries (W-A) already carry them on the wire.
+	// errors.Join folds them into a single errors.Is-inspectable
+	// aggregate (preserving the %w wraps the worker branches set) for a
+	// Debug diagnostic line ONLY — api.Resolve still returns a map, never
+	// an error (trace §2.2). The wire result is "all successful items +
+	// the accumulated per-item errors under errorKey". The refresher /
+	// request-path Cache-A guards (keyed on stageErrSink.Count(), bumped
+	// above) decide whether the partial-with-errors result is PERSISTED.
+	if joined := errors.Join(itemErrs...); joined != nil {
+		r.log.Debug("api stage had per-item errors (continuing)",
+			slog.String("name", id), slog.Any("err", joined))
+	}
+
+	// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
+	// applyUserAccessFilter call was DELETED; UAF now runs per-worker
+	// inside jsonHandlerCore on the raw envelope. See
+	// refilter_layering_test.go for the permanent regression gate.
+
+	// Ship F1 (0.30.119): the api-stage L1 is now CONTENT-keyed —
+	// the per-K8s-call Put happens inside the g.Go worker (each call
+	// stores its own raw envelope under its (gvr,ns,[name]) content
+	// key). There is NO per-stage Put here — the Ship E per-stage
+	// entry is gone; an iterator stage produces N content entries,
+	// one per call, assembled into dict[id] by the N jsonHandler
+	// merges exactly as before.
+
+	// Ship 0.30.192 — emit per-stage timing on normal completion.
+	// Records ElapsedMs (stage-total wall-clock) + IteratorElapsedMs
+	// (g.Wait()-bounded fan-out cost) for the cohort timing log line.
+	recordStageTiming()
+	return false
+}
+
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	if len(opts.Items) == 0 {
 		return map[string]any{}
@@ -918,315 +1244,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// per-stage mutable primitives stay loop-local (see the resolveRun
 	// concurrency note).
 	r := newResolveRun(ctx, opts, log, user)
-	dict := r.dict
-	pipTimingSink := r.pipTimingSink
-	// mapper (r.resolveStageEndpoint), apistageStore/apistageEnabled
-	// (r.dispatchOneCall), and stageErrSink (r.recordItemError) are consumed
-	// only through r.*; no local rebind is needed for them.
-
+	// Each api stage runs through runStage in topological order. runStage
+	// returns stop=true on a truncating exit (R-1 caller-cancel, R-2 endpoint
+	// err, R-3 g.Wait hard error) — the orchestrator then returns the
+	// (truncated) dict; stop=false advances to the next stage. runStage owns
+	// the recordStageTiming()-before-every-exit invariant internally.
 	for _, id := range names {
-		// Get the api with this identifier
-		apiCall, ok := apiMap[id]
-		if !ok {
-			log.Warn("api not found in apiMap", slog.Any("name", id))
-			continue
+		if r.runStage(id, apiMap) {
+			return r.dict
 		}
-		if apiCall.Headers == nil {
-			apiCall.Headers = []string{headerAcceptJSON}
-		}
-
-		// Ship 0.30.192 — per-stage timing recorder. stageTiming is a
-		// stack-local value; recordStageTiming closes over it and the
-		// outer pipTimingSink. On a nil sink (production /call path)
-		// recordStageTiming is still called (one nil-receiver no-op);
-		// no behavioural change. Stage early-exits (continue / return
-		// dict) MUST call recordStageTiming() first so the failed
-		// stage's wall-clock is captured for cost attribution.
-		//
-		// Ship 0.30.193 — register the stage with the sink so workers'
-		// AccumulateContentServe / AccumulateMemoPopulate /
-		// AccumulateDefensive calls (called from concurrent goroutines
-		// inside the iterator errgroup) can accumulate into THIS
-		// stage's struct. BeginStage takes a *PIPStageTiming pointer;
-		// recordStageTiming calls EndStage which COMMITS the in-flight
-		// stage to the sink's stages slice. A nil sink makes both
-		// BeginStage and EndStage no-ops.
-		stageStart := time.Now()
-		stageTiming := cache.PIPStageTiming{StageID: id}
-		pipTimingSink.BeginStage(&stageTiming)
-		recordStageTiming := func() {
-			stageTiming.ElapsedMs = time.Since(stageStart).Milliseconds()
-			if pipTimingSink != nil {
-				// Ship 0.30.193 — sink-aware finalisation. EndStage
-				// commits the in-flight stage; Append is no longer
-				// invoked because the stage is already tracked under
-				// the sink's current pointer. The previously-set
-				// ElapsedMs / IteratorElapsedMs / ClusterListUsed /
-				// ClusterListDenyGate fields are captured by the
-				// EndStage copy.
-				pipTimingSink.EndStage()
-			}
-		}
-
-		// Ship 0.30.257 (#313) — genuine-cancellation guard (design
-		// §2.1.1 Option C-A). The iterator errgroup no longer cancels
-		// gctx on a per-ITEM hard error (workers record into itemErrs and
-		// return nil — see the worker branches + post-g.Wait() join
-		// below), so the ONLY thing that aborts the resolve early is a
-		// GENUINE caller cancellation (client disconnect / deadline)
-		// propagating through the request ctx. We removed the WORKER as a
-		// cancellation SOURCE, not the parent-ctx machinery: a cancelled
-		// caller still cancels gctx (errgroup.WithContext derives gctx from
-		// ctx) so each in-flight dispatch fails fast, and THIS guard at the
-		// stage-loop top makes the cancellation abort downstream STAGES
-		// promptly instead of resolving them against a dead ctx. Cheap (one
-		// atomic load) and inert on the happy path.
-		if err := ctx.Err(); err != nil {
-			log.Debug("api.Resolve: caller context cancelled; aborting remaining stages",
-				slog.String("name", id), slog.Any("err", err))
-			recordStageTiming()
-			return dict
-		}
-
-		// Tag 0.30.9 Sub-scope A: detect userAccessFilter.
-		// When set, the dispatch uses snowplow's ServiceAccount
-		// endpoint (cluster-wide read) — NOT the per-user
-		// clientconfig — and the response is in-process-refiltered
-		// per object through EvaluateRBAC. When unset, the dispatch
-		// path is unchanged from 0.30.8 (per-user-token via the
-		// endpointReferenceMapper). Per Revision 5 (binding): atomic
-		// ship — no gate flag. Portal RestActions opt in by adding
-		// the userAccessFilter stanza; the resolver branches
-		// per-stage.
-		uafActive := apiCall.UserAccessFilter != nil
-
-		// User-bearer-token append: only for non-UAF stages. When
-		// UAF is active the SA endpoint carries the SA token (no
-		// user-bearer override needed); appending the user token
-		// here would route the call through the user's credentials
-		// instead of the SA's — breaking the entire UAF mechanism.
-		if !uafActive {
-			if accessToken, _ := xcontext.AccessToken(ctx); accessToken != "" {
-				if apiCall.EndpointRef == nil || ptr.Deref(apiCall.ExportJWT, false) {
-					// 0.30.164: stage-local Headers — never write the user
-					// bearer back into the shared CR slice (the CR is marshaled
-					// into the /call response body at restactions.go:149; an
-					// in-place append leaked the JWT to the wire — see
-					// /tmp/snowplow-runs/ship-307/before/.../call-namespaces.json).
-					stageHeaders := make([]string, len(apiCall.Headers), len(apiCall.Headers)+1)
-					copy(stageHeaders, apiCall.Headers)
-					stageHeaders = append(stageHeaders,
-						fmt.Sprintf("Authorization: Bearer %s", accessToken))
-					local := *apiCall
-					local.Headers = stageHeaders
-					apiCall = &local
-				}
-			}
-		}
-
-		// Resolve the endpoint. UAF stages use the snowplow-SA
-		// endpoint; non-UAF stages go through the per-user
-		// clientconfig (or the named EndpointRef) as before. The
-		// orchestrator owns the recordStageTiming()-before-exit on the
-		// two early-exit actions (C-2 stageContinue / R-2 stageReturn).
-		ep, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
-		switch epAction {
-		case stageContinue:
-			recordStageTiming()
-			continue
-		case stageReturn:
-			recordStageTiming()
-			return dict
-		}
-		// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
-		// is the single largest transient-memory consumer (~1.94 GiB
-		// alloc_space on the 50K bench: it stringifies every HTTP response
-		// body, including the multi-MB compositions LIST). The blanket
-		// `ep.Debug = opts.Verbose` set here is REMOVED — Debug is now
-		// decided PER-CALL inside the g.Go worker (R1-a: never for a K8s
-		// collection LIST) and additionally gated on RESOLVER_VERBOSE_WIRE_DUMP
-		// (R1-b: an operator kill-switch, default off). See the worker below.
-		log.Debug("resolved endpoint for api call",
-			slog.String("name", id), slog.String("host", ep.ServerURL),
-			slog.Bool("uaf", uafActive))
-
-		// Build the per-stage call plan: request options + Ship D.5
-		// cluster-list collapse + 0.30.92 lazy informer register (the
-		// stageTiming.ClusterList* fields are written inside). An empty
-		// tmp is C-3 (the "empty request options" Warn fired inside) —
-		// the orchestrator owns the recordStageTiming()+continue.
-		tmp := r.collapseOrFanoutPlan(id, apiCall, ep, &stageTiming)
-		if len(tmp) == 0 {
-			recordStageTiming()
-			continue
-		}
-
-		// 0.30.95 bounded-parallel inner-call iterator.
-		//
-		// Pre-0.30.95 the inner-call loop was sequential — N inner calls
-		// against the apiserver paid N × per-call latency. The architect's
-		// 0.30.95 design replaces it with a bounded errgroup whose width
-		// is iterParallelism() (GOMAXPROCS default, env-overridable, hard
-		// cap 32). dictMu serialises all writes against `dict` from
-		// concurrent goroutines (jsonHandler closure + error-branch
-		// inline). gctx flows into httpcall.Do so the first hard-error
-		// cancels in-flight peers when ContinueOnError=false.
-		//
-		// Edge type 3 dep-recording stays INLINE before g.Go (per the
-		// 0.30.94 contract — sync.Map under the hood, safe to call from
-		// the parent goroutine, no need to record from inside the worker).
-		//
-		// The success-branch log's `depth` field is computed by
-		// depthForLog (support.go) — a mapDepth full-tree walk of dict.
-		// Ship #6 gates that walk behind the Debug level; when it DOES
-		// run (Debug on) it reads dict under dictMu, serialising against
-		// concurrent jsonHandler writes. On the common (Info) path
-		// neither the walk nor the lock runs.
-		var dictMu sync.Mutex
-		g, gctx := errgroup.WithContext(ctx)
-		g.SetLimit(iterParallelism(ctx))
-
-		// Ship 0.30.257 (#313) — per-item error slots (design §2.1 / §3.2).
-		// One slot per iterator item, index-aligned with tmp. Each worker
-		// writes ONLY its own itemErrs[i] (disjoint indices) and returns nil
-		// on a per-item hard error, so the errgroup ctx is never cancelled by
-		// a per-item failure → the remaining items proceed (Option C-A; the
-		// SetLimit bound is unchanged). The slice backing array is allocated
-		// HERE, before any g.Go, and never grown — disjoint-index writes to a
-		// pre-sized slice are data-race-free without a lock (same property as
-		// a pre-sized array; proven by TestResolve_IteratorErrorCollection_Race
-		// under -race). The shared dict[errorKey] accumulation (W-A) is a
-		// SEPARATE concern and stays under dictMu.
-		itemErrs := make([]error, len(tmp))
-
-		// Ship 0.30.192 — record iterator fan-out cost. tmp slice
-		// length is the call count (1 after cluster-list collapse,
-		// N per-NS after the iterator path); iterStart anchors the
-		// wall-clock that g.Wait() closes below.
-		stageTiming.IteratorCalls = len(tmp)
-		iterStart := time.Now()
-
-		// Ship 0.30.121 R1-b — the operator kill-switch. Compute once per
-		// stage: verbose is permitted ONLY when the RESTAction asked for it
-		// (opts.Verbose) AND the env flag explicitly enables the wire-dump.
-		// Default off => wireVerbose is false => no call ever gets Debug.
-		wireVerbose := opts.Verbose && verboseWireDumpEnabled()
-
-		// The per-stage mutable bundle handed to each iterator worker. Built
-		// here, discarded at the end of this stage iteration — NEVER a
-		// resolveRun field (the concurrency flag / PM CONDITION 2). A pointer
-		// to it is shared by all of THIS stage's workers (the same read-only
-		// sharing the inline closure had; dictMu guards dict).
-		sc := &stageCtx{
-			id:          id,
-			apiCall:     apiCall,
-			dictMu:      &dictMu,
-			g:           g,
-			gctx:        gctx,
-			itemErrs:    itemErrs,
-			iterStart:   iterStart,
-			wireVerbose: wireVerbose,
-			ep:          ep,
-			calls:       tmp,
-		}
-
-		for i := range tmp {
-			call := tmp[i]
-
-			// Edge type 3 dep recording — see 0.30.94 ship for full
-			// rationale. cache.Deps() is sync.Map-backed; idempotent
-			// LoadOrStore; safe from this (parent-goroutine) site — kept
-			// INLINE here (NOT inside the worker) so its dep.recorded Debug
-			// line preserves its pre-extraction emit order.
-			//
-			// Ship F1 (0.30.119): the dep edge attaches to whatever L1
-			// key the request path threaded (the per-user resolved-output
-			// key). The CONTENT-keyed api-stage entry records its OWN dep
-			// edge inside the worker, keyed by the per-call content key
-			// (gvr,ns,[name]) — so an informer event on a K8s call's GVR
-			// dirty-marks the matching content entry and the refresher
-			// re-dispatches that one call.
-			if l1Key := cache.L1KeyFromContext(ctx); l1Key != "" && !cache.Disabled() {
-				if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
-					if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
-						if name == "" {
-							cache.Deps().RecordList(l1Key, gvr, ns)
-						} else {
-							cache.Deps().Record(l1Key, gvr, ns, name)
-						}
-						log.Debug("dep.recorded",
-							slog.String("subsystem", "cache"),
-							slog.String("edge_type", "innerCall"),
-							slog.String("gvr", gvr.String()),
-							slog.String("ns", ns),
-							slog.String("name", name),
-							slog.String("l1_key", l1Key),
-						)
-					}
-				}
-			}
-
-			// i is captured explicitly (per-iteration under Go 1.22+ loop
-			// semantics) and passed as dispatchOneCall's arg → itemErrs[i] is
-			// this item's disjoint slot (design Risk R1).
-			i := i
-			g.Go(func() error {
-				return r.dispatchOneCall(sc, i)
-			})
-		}
-
-		// Ship 0.30.257 (#313) — post-fan-out handling. With Option C-A
-		// the three per-ITEM hard-error branches record into itemErrs[i]
-		// and return nil, so g.Wait() NO LONGER returns non-nil for a
-		// per-item dispatch failure (the stage runs all items + downstream
-		// stages run — the central #313 behaviour change). g.Wait() can
-		// still return non-nil for a NON-per-item worker error: a response
-		// HANDLER failure (feedBytes / feedValue / inner returning a decode
-		// error — NOT in #313's scope) or a genuine ctx-cancellation
-		// surfacing through such a handler. For THOSE we preserve the
-		// pre-0.30.257 short-circuit + truncated-dict return verbatim.
-		if err := g.Wait(); err != nil {
-			log.Debug("api stage short-circuited on hard error",
-				slog.String("name", id), slog.Any("err", err))
-			stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
-			recordStageTiming()
-			return dict
-		}
-		stageTiming.IteratorElapsedMs = time.Since(iterStart).Milliseconds()
-
-		// Ship 0.30.257 (#313) — per-item errors recorded by the worker
-		// branches above do NOT cancel the stage; they were collected into
-		// itemErrs (disjoint indices) and the matching dict[errorKey]
-		// accumulating-slice entries (W-A) already carry them on the wire.
-		// errors.Join folds them into a single errors.Is-inspectable
-		// aggregate (preserving the %w wraps the worker branches set) for a
-		// Debug diagnostic line ONLY — api.Resolve still returns a map, never
-		// an error (trace §2.2). The wire result is "all successful items +
-		// the accumulated per-item errors under errorKey". The refresher /
-		// request-path Cache-A guards (keyed on stageErrSink.Count(), bumped
-		// above) decide whether the partial-with-errors result is PERSISTED.
-		if joined := errors.Join(itemErrs...); joined != nil {
-			log.Debug("api stage had per-item errors (continuing)",
-				slog.String("name", id), slog.Any("err", joined))
-		}
-
-		// Ship 0.30.235 — the pre-0.30.235 post-g.Wait()
-		// applyUserAccessFilter call was DELETED; UAF now runs per-worker
-		// inside jsonHandlerCore on the raw envelope. See
-		// refilter_layering_test.go for the permanent regression gate.
-
-		// Ship F1 (0.30.119): the api-stage L1 is now CONTENT-keyed —
-		// the per-K8s-call Put happens inside the g.Go worker (each call
-		// stores its own raw envelope under its (gvr,ns,[name]) content
-		// key). There is NO per-stage Put here — the Ship E per-stage
-		// entry is gone; an iterator stage produces N content entries,
-		// one per call, assembled into dict[id] by the N jsonHandler
-		// merges exactly as before.
-
-		// Ship 0.30.192 — emit per-stage timing on normal completion.
-		// Records ElapsedMs (stage-total wall-clock) + IteratorElapsedMs
-		// (g.Wait()-bounded fan-out cost) for the cohort timing log line.
-		recordStageTiming()
 	}
 
 	// Ship 2a (0.30.209) — the per-serve removeManagedFields(dict) walk is
@@ -1234,16 +1260,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// materialisation sites (parseListEnvelope, validateClusterListShape,
 	// gateGetEnvelope, gateListEnvelope→parseListEnvelope), where the item
 	// map is still private. With the Ship 2a SHALLOW envelope, this walk
-	// `delete(v, "managedFields")`'d the SHARED entry.Items maps in place,
-	// racing concurrent serves' reads (the -race in
+	// delete(v, "managedFields") wrote the SHARED entry.Items maps in place,
+	// racing concurrent serves reads (the -race in
 	// TestResolve_ConcurrentRequestsDoNotCrossPollinate). Stripping at
-	// load means dict's only maps here are the fresh per-serve outer
-	// envelope + jq-constructed objects (never carry managedFields), so
-	// the walk is both unsafe (shared write) and unnecessary. Dropping it
-	// also removes a per-serve O(nodes) full-tree traversal (perf win).
+	// load means dict only carries the fresh per-serve outer envelope +
+	// jq-constructed objects (never managedFields), so the walk is both
+	// unsafe (shared write) and unnecessary. Dropping it also removes a
+	// per-serve O(nodes) full-tree traversal (perf win).
 	//delete(dict, "slice")
 
-	return dict
+	return r.dict
 }
 
 // lazyRegisterInnerCallPaths walks the per-stage RequestOptions slice
