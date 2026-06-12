@@ -162,8 +162,9 @@ var annotatedGVRs sync.Map // map[schema.GroupVersionResource]struct{}
 //     -race lives in the exact goroutine-spawn block that would be removed)
 //     — for ZERO behavior change and with no near-term consumer. The full
 //     staged REMOVE plan (the defensible alternative) is preserved at
-//     docs/task-176-197-decisions-2026-06-12.md §2.6 and tracked as
-//     #197-removal. Until then this is inert-by-construction.
+//     docs/task-176-197-decisions-2026-06-12.md §2.6 (the record there;
+//     no removal ticket is open, by ruling). Until then this is
+//     inert-by-construction.
 //
 // shouldUseMetadataOnly returns true when the GVR should be routed onto
 // the PartialObjectMetadata informer (10× smaller per-object footprint;
