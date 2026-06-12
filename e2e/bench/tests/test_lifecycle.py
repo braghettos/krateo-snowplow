@@ -384,3 +384,37 @@ def test_set_cache_via_helm_pins_kube_context(monkeypatch):
     assert "--kube-context" in argv
     assert argv[argv.index("--kube-context") + 1] == \
         cluster_mod.CANONICAL_GKE_CONTEXT
+
+
+# ─── Task #216: one-shot RESTAction count snapshot (telemetry) ──────────────
+
+
+def test_restaction_count_snapshot_one_shot_none_safe(monkeypatch):
+    """Task #216: restaction_count_snapshot() replaces the deleted blocking
+    wait_for_restaction_steady_state. It is ONE kubectl call (no loop, no
+    timeout, no stability streak), returns the line count on rc==0, and
+    None on kubectl failure (never raises into S6)."""
+    monkeypatch.setattr(lifecycle_mod, "log", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def _ok(*a, **kw):
+        calls["n"] += 1
+        return (0, "restaction/a\nrestaction/b\n\nrestaction/c\n", "")
+
+    monkeypatch.setattr(lifecycle_mod, "kubectl", _ok)
+    # Blank lines are not counted; exactly one kubectl invocation (no poll loop).
+    assert lifecycle_mod.restaction_count_snapshot() == 3
+    assert calls["n"] == 1
+
+    # rc != 0 -> None (FAIL-soft telemetry, never blocks/raises).
+    monkeypatch.setattr(lifecycle_mod, "kubectl",
+                        lambda *a, **kw: (1, "", "boom"))
+    assert lifecycle_mod.restaction_count_snapshot() is None
+
+
+def test_wait_for_restaction_steady_state_is_deleted():
+    """Task #216 regression guard: the blocking wait is gone from the module
+    and its public __all__ export (no dead blocking code left behind)."""
+    assert not hasattr(lifecycle_mod, "wait_for_restaction_steady_state")
+    assert "wait_for_restaction_steady_state" not in lifecycle_mod.__all__
+    assert "restaction_count_snapshot" in lifecycle_mod.__all__

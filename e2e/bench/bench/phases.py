@@ -1677,8 +1677,15 @@ def stage_s6_scale_compositions(ctx: StageContext) -> StageProof:
             pie_stop.set()
             pie_thread.join(timeout=10)
 
-        lifecycle.wait_for_restaction_steady_state(
-            timeout=600, target_per_ns=120, polling_interval=10)
+        # Task #216 (Diego ratified): the blocking 600s
+        # wait_for_restaction_steady_state pre-wait is DELETED — it added up
+        # to 600s of RESTAction-count-stability polling to the SCORED S6 poll,
+        # and its return was discarded. The install-settling signal it was a
+        # blocking proxy for is captured REPORT-ONLY by `conv_settle_s6` below
+        # (cluster_count_stable). To preserve the RESTAction-reconcile flavour
+        # as telemetry, take a single non-blocking RESTAction-count snapshot at
+        # measure-start (no loop, no timeout) — pure telemetry.
+        restaction_count_at_measure = lifecycle.restaction_count_snapshot()
         results = _measure_all_users(c, 6, f"{c.scale} compositions")
         # Task #334 (original): settle the install-timing-sensitive S6
         # convergence-mass first-poll. REPORT-ONLY — records a separate
@@ -1696,6 +1703,11 @@ def stage_s6_scale_compositions(ctx: StageContext) -> StageProof:
             "conv_discrimination": _collect_conv_discrimination(results),
             # Task #334 (original, report-only): S6 first-poll settle metric.
             "conv_settle_s6": conv_settle_s6,
+            # Task #216 (report-only): one-shot RESTAction count at S6
+            # measure-start, replacing the deleted blocking steady-state wait
+            # (the RESTAction-reconcile signal demoted to telemetry, not lost).
+            # None on snapshot failure.
+            "restaction_count_at_measure": restaction_count_at_measure,
             "__passed__": True,
         }
 

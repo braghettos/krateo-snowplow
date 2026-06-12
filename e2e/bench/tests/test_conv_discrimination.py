@@ -293,8 +293,11 @@ def test_s6_proof_persists_conv_discrimination_and_settle(tmp_path, monkeypatch)
     monkeypatch.setattr(phases.cluster, "count_compositions", lambda: 50000)
     monkeypatch.setattr(phases.lifecycle, "deploy_compositions_parallel",
                         lambda *a, **k: None)
-    monkeypatch.setattr(phases.lifecycle, "wait_for_restaction_steady_state",
-                        lambda *a, **k: None)
+    # Task #216: the blocking wait_for_restaction_steady_state is gone; S6 now
+    # takes a one-shot restaction_count_snapshot() instead. Stub it to keep the
+    # stage hermetic (no cluster kubectl) and to assert it lands in the proof.
+    monkeypatch.setattr(phases.lifecycle, "restaction_count_snapshot",
+                        lambda *a, **k: 6000)
     monkeypatch.setattr(phases.browser, "wait_for_compositions",
                         lambda *a, **k: None)
     monkeypatch.setattr(phases.browser, "_poll_piechart_progression",
@@ -340,6 +343,9 @@ def test_s6_proof_persists_conv_discrimination_and_settle(tmp_path, monkeypatch)
     assert "conv_settle_s6" in pd
     assert pd["conv_settle_s6"]["sample_count"] == phases._S6_SETTLE_SAMPLES
     assert pd["conv_settle_s6"]["cluster_count_stable"] is True
+    # Task #216: the one-shot RESTAction count snapshot replaces the deleted
+    # blocking wait and lands in the proof as report-only telemetry.
+    assert pd["restaction_count_at_measure"] == 6000
 
     # ... and they are persisted into state.json under stage_proofs.S6.proof.
     state = json.loads((tmp_path / "state.json").read_text())

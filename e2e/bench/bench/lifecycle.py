@@ -987,56 +987,28 @@ def delete_all_clientconfigs():
     log(f"Deleted {len(secrets)} clientconfig secrets")
 
 
-# ─── RESTAction steady-state poll ────────────────────────────────────────────
+# ─── RESTAction count snapshot (one-shot telemetry) ──────────────────────────
+#
+# Task #216 (Diego ratified, 2026-06-12): the blocking
+# `wait_for_restaction_steady_state` (up to 600s of count-stability polling
+# whose return was discarded) is DELETED. The install-settling signal it was a
+# blocking proxy for is captured REPORT-ONLY by S6's `conv_settle_s6`
+# (cluster_count_stable). The RESTAction-reconcile flavour is preserved as
+# telemetry by this single non-blocking count snapshot (the same count logic
+# the deleted wait used, with no loop / no timeout / no return-bool semantics).
 
-def wait_for_restaction_steady_state(timeout=600, target_per_ns=120,
-                                     polling_interval=10, min_total=None):
-    """Wait until RESTAction reconciliation has caught up post-deploy.
-
-    Strategy: poll the cluster-wide RESTAction count; exit when either
-      (a) the count has been STABLE across 3 consecutive polls, OR
-      (b) the count is >= `min_total` if provided.
-
-    Returns True if stability was reached, False on timeout.
-    """
-    last_count = -1
-    stable_polls = 0
-    deadline = time.time() + timeout
-    start = time.time()
-    log(f"Waiting for RESTAction reconciliation steady state "
-        f"(timeout={timeout}s, target_per_ns={target_per_ns}, "
-        f"min_total={min_total}) ...")
-    while time.time() < deadline:
-        rc, out, _ = kubectl(
-            "get", "restactions.templates.krateo.io",
-            "-A", "--no-headers", "-o", "name", timeout_secs=60)
-        if rc == 0:
-            count = len([line for line in out.splitlines() if line.strip()])
-        else:
-            count = -1
-        if count == last_count and count > 0:
-            stable_polls += 1
-            if stable_polls >= 3:
-                elapsed = int(time.time() - start)
-                log(f"  RESTAction count stable at {count} after {elapsed}s; "
-                    f"proceeding")
-                return True
-            if min_total is not None and count >= min_total:
-                elapsed = int(time.time() - start)
-                log(f"  RESTAction count={count} >= min_total={min_total} "
-                    f"after {elapsed}s; proceeding")
-                return True
-        else:
-            stable_polls = 0
-        last_count = count
-        elapsed = int(time.time() - start)
-        log(f"  RESTAction reconciliation ... count={count} "
-            f"(stable_streak={stable_polls}, {elapsed}s elapsed)")
-        time.sleep(polling_interval)
-    elapsed = int(time.time() - start)
-    log(f"  RESTAction reconciliation TIMEOUT at count={last_count} "
-        f"after {elapsed}s; proceeding anyway")
-    return False
+def restaction_count_snapshot():
+    """One-shot cluster-wide RESTAction count. Pure telemetry — no loop, no
+    timeout, no stability wait. Returns the int count, or None on kubectl
+    failure (so a transient cluster hiccup never blocks or raises into S6)."""
+    rc, out, _ = kubectl(
+        "get", "restactions.templates.krateo.io",
+        "-A", "--no-headers", "-o", "name", timeout_secs=60)
+    if rc != 0:
+        return None
+    count = len([line for line in out.splitlines() if line.strip()])
+    log(f"  RESTAction count snapshot (telemetry): {count}")
+    return count
 
 
 # ─── Composition deploy ──────────────────────────────────────────────────────
@@ -1552,7 +1524,7 @@ __all__ = [
     "cleanup_rogue_rbac",
     "delete_all_clientconfigs",
     "wait_for_crd",
-    "wait_for_restaction_steady_state",
+    "restaction_count_snapshot",
     "deploy_compositions_parallel",
     "delete_one_composition",
     "wait_for_composition_gone",
