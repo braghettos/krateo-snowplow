@@ -456,6 +456,413 @@ func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep 
 	return tmp
 }
 
+// stageCtx is the per-STAGE mutable bundle: the values that are re-created
+// each stage iteration and passed to the iterator workers. It is built inside
+// the stage loop and discarded at the end of that iteration — it is
+// DELIBERATELY NOT a resolveRun field (the concurrency flag, design §3 /
+// PM CONDITION 2): dictMu/g/gctx/itemErrs/iterStart/wireVerbose are per-stage
+// and would alias across stages or outlive their stage if promoted to fields.
+// id/apiCall/ep/calls are the per-stage data the worker reads. A pointer to
+// one stageCtx is shared by all of THIS stage's workers (the same sharing the
+// inline closure had — read-only for ep/calls/id/apiCall; dictMu guards dict;
+// itemErrs[i] is a disjoint pre-sized slot).
+type stageCtx struct {
+	id          string
+	apiCall     *templates.API
+	dictMu      *sync.Mutex
+	g           *errgroup.Group
+	gctx        context.Context
+	itemErrs    []error
+	iterStart   time.Time
+	wireVerbose bool
+	ep          endpoints.Endpoint
+	calls       []httpcall.RequestOptions
+}
+
+// dispatchOneCall is one iterator item's worker — the body the stage loop
+// hands to sc.g.Go. It moves the P5j per-call setup (the R1-a verbose Endpoint
+// copy + the three dictMu-protected feed closures) AND the 4-branch dispatch
+// cascade (in-process nested /call → informer pivot / apistage-content →
+// internal-rest-config → httpcall.Do) verbatim. i is passed explicitly (NOT
+// captured) so itemErrs[i] is the item's disjoint slot (design Risk R1).
+//
+// ctx vs gctx (design Risk R2, TRACED): the dispatchers + handlers receive
+// sc.gctx (the errgroup ctx, so a cancelled peer aborts in-flight calls);
+// depthForLog receives the OUTER r.ctx (it only reads the DEBUG env gate, and
+// the inline worker passed the outer ctx at every site — preserved exactly).
+//
+// Returns error ONLY for a response-HANDLER failure (feed* returning a
+// decode/jq err) — per-item hard errors are recorded into sc.itemErrs[i] via
+// recordItemError and return nil (Option C-A), so g.Wait() does not cancel the
+// stage on them.
+func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
+	id := sc.id
+	apiCall := sc.apiCall
+	dictMu := sc.dictMu
+	gctx := sc.gctx
+	itemErrs := sc.itemErrs
+	dict := r.dict
+
+	call := sc.calls[i]
+	// Ship 0.30.121 R1-a — per-call verbose decision. `sc.ep` is shared
+	// across every call of this stage; setting Debug in place would race the
+	// concurrent workers. When this call wants the wire-dump, take a SHALLOW
+	// COPY of the Endpoint value and flip Debug on the copy, so peers keep the
+	// un-Debugged shared Endpoint. A K8s collection LIST never wants it
+	// (callWantsWireDump returns false) — that suppresses the ~1.94 GiB
+	// DumpResponse alloc_space line.
+	if callWantsWireDump(sc.wireVerbose, call.Path) {
+		epCopy := sc.ep
+		epCopy.Debug = true
+		call.Endpoint = &epCopy
+	} else {
+		call.Endpoint = &sc.ep
+	}
+	// Wrap jsonHandler so every dict[id] mutation goes through
+	// dictMu. Three forms — Ship 0.30.128 P-CORE-1/2:
+	//   * inner (io.ReadCloser) — the genuine httpcall.Do HTTP-body
+	//     path; set as call.ResponseHandler.
+	//   * innerBytes ([]byte) — an in-memory dispatch result whose
+	//     bytes are already materialised (informer-served, nested
+	//     /call, internal-rest-config); skips the redundant
+	//     io.ReadAll copy.
+	//   * innerValue (any) — an apistage content-cache hit whose
+	//     gated envelope is already a decoded structured value;
+	//     skips both the marshal and the unmarshal.
+	// Ship 0.30.235 — UAF spec + stage name plumbed in so
+	// jsonHandlerCore can run the refilter on the RAW envelope
+	// BEFORE the stage filter projects items. The pre-0.30.235
+	// post-g.Wait() applyUserAccessFilter call is DELETED.
+	// Ship K / 0.30.245 — `dict` plumbs the resolver's
+	// accumulated stage-output dict into jsonHandlerCore so the
+	// UAF refilter's resolveUAFResources evaluates
+	// resourcesFrom against UPSTREAM stage outputs (e.g.
+	// `.crds` from a prior stage). Same map as `out`; refilter
+	// reads BEFORE the merge so the current stage is absent
+	// (correct — resourcesFrom never references the stage it
+	// gates). Pre-Ship-K passed only `pig` (per-stage scope) →
+	// resourcesFrom returned [] → 0-count regression on the
+	// multi-stage compositions-list RA.
+	hOpts := jsonHandlerOptions{
+		key:         id,
+		out:         dict,
+		dict:        dict,
+		filter:      apiCall.Filter,
+		uaf:         apiCall.UserAccessFilter,
+		apiCallName: apiCall.Name,
+	}
+	inner := jsonHandler(gctx, hOpts)
+	innerBytesFn := jsonHandlerBytes(gctx, hOpts)
+	innerValueFn := jsonHandlerValue(gctx, hOpts)
+	call.ResponseHandler = func(r io.ReadCloser) error {
+		dictMu.Lock()
+		defer dictMu.Unlock()
+		return inner(r)
+	}
+	// feedBytes / feedValue are the dictMu-protected in-memory
+	// equivalents the readerFromBytes call sites below use instead
+	// of call.ResponseHandler(readerFromBytes(...)).
+	feedBytes := func(b []byte) error {
+		dictMu.Lock()
+		defer dictMu.Unlock()
+		return innerBytesFn(b)
+	}
+	feedValue := func(v any) error {
+		dictMu.Lock()
+		defer dictMu.Unlock()
+		return innerValueFn(v)
+	}
+
+	r.log.Debug("calling api", slog.String("name", id),
+		slog.String("host", call.Endpoint.ServerURL),
+		slog.String("path", call.Path),
+	)
+
+	// Ship 0.30.123 (#155) — in-process nested /call. This is
+	// the FIRST dispatch branch (before the informer pivot,
+	// before httpcall.Do). When the stage's `path` is a
+	// /call?resource=...&apiVersion=... loopback into snowplow's
+	// OWN /call endpoint, resolve the referenced RESTAction
+	// IN-PROCESS — no HTTP request, no Authorization header,
+	// identity carried by the WithUserInfo already on ctx. This
+	// lets a JWT-less / SA-credentialed resolve complete an
+	// exportJwt loopback stage (the 0.30.120 poison) and is the
+	// hard prerequisite for F2's startup SA-prewarm.
+	//
+	// Three structural gates, ALL must hold or the branch is
+	// skipped and the call falls through to the informer pivot
+	// / httpcall.Do exactly as 0.30.121:
+	//   1. RESOLVER_INPROCESS_NESTED_CALL enabled (default true);
+	//   2. the resolver seam is wired (nestedCallResolver != nil
+	//      — the second structural fallback);
+	//   3. the call is a GET whose path parses as a /call
+	//      loopback (objects.ParseCallPathToObjectRef — SHAPE only,
+	//      no resource/name/host literal).
+	// On a nested error: honour ContinueOnError / ErrorKey
+	// exactly as the HTTP path, AND bump the 0.30.120 stage-error
+	// sink so layer (b)'s Put-gate still sees the failure.
+	if inprocessNestedCallEnabled() && nestedCallResolver != nil &&
+		ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
+		if ref, isLoopback := objects.ParseCallPathToObjectRef(call.Path); isLoopback {
+			statusRaw, nerr := nestedCallResolver(gctx, ref,
+				r.opts.PerPage, r.opts.Page, r.opts.Extras)
+			if nerr != nil {
+				r.log.Error("nested /call resolution failed",
+					slog.String("name", id),
+					slog.String("path", call.Path),
+					slog.String("dispatch", "in-process-nested-call"),
+					slog.String("error", nerr.Error()))
+				// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
+				// deduplicated into recordItemError. The %w-wrapped
+				// cause is built ONLY when !ContinueOnError (lazy,
+				// preserving the wrap verb) and lands in itemErrs[i];
+				// BOTH ContinueOnError cases accumulate + Bump + fall
+				// through (the historical ContinueOnError=false
+				// fast-abort is intentionally retired per #313).
+				var itemErr error
+				if !call.ContinueOnError {
+					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, nerr)
+				}
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, nerr.Error(), nerr.Error(), itemErr)
+				// Fall through to the success-log line either way,
+				// mirroring the prior ContinueOnError contract.
+			} else {
+				// The in-process result IS the referenced
+				// RESTAction's Status.Raw — byte-identical to the
+				// HTTP /call response body. Feed the in-memory
+				// bytes directly (Ship 0.30.128 P-CORE-1 — no
+				// io.ReadAll copy).
+				if err := feedBytes(statusRaw); err != nil {
+					return err
+				}
+			}
+			// Ship #6 — depthForLog runs mapDepth (under dictMu)
+			// ONLY when Debug is enabled; on the common path it
+			// returns the sentinel and does no work / takes no lock.
+			depth := depthForLog(r.ctx, r.log, dictMu, dict)
+			dispatch := "in-process-nested-call"
+			if nerr != nil {
+				dispatch = "in-process-nested-call-error"
+			}
+			r.log.Info("api successfully resolved",
+				slog.String("name", id),
+				slog.String("host", call.Endpoint.ServerURL),
+				slog.String("path", call.Path),
+				slog.Int("depth", depth),
+				slog.String("dispatch", dispatch),
+			)
+			return nil
+		}
+	}
+
+	// 0.30.95 resolver pivot — dispatch GET reads to the
+	// informer cache when the cache subsystem is on. #57:
+	// implicit-on-cache — resolverUseInformer() now folds to
+	// !cache.Disabled() (the standalone RESOLVER_USE_INFORMER
+	// flag was retired). Cache OFF: this branch is byte-
+	// identical to the apiserver path (R-FALSE-1 invariant).
+	//
+	// The pivot returns served=true ONLY when the call is
+	// safely cache-servable (GET, parseable apiserver path,
+	// cache=on, full-Unstructured informer, synced). All
+	// other shapes (write verbs, subresources, external
+	// URLs, metadata-only GVRs, pre-sync, 404) fall through
+	// to the apiserver branch below unchanged.
+	//
+	// Ship F1 (0.30.119) — content-keyed api-stage L1. When
+	// apistageEnabled, the pivot-served raw envelope is
+	// cached identity-free under the per-call content key
+	// (gvr, namespace, name-or-empty):
+	//
+	//   1. content Get(contentKey) — HIT: use the stored raw
+	//      envelope, skip the dispatch entirely. MISS:
+	//      dispatch UN-GATED (WithApistageContentResolve makes
+	//      dispatchViaInformer skip its inline RBAC gate) and
+	//      Put the raw envelope under contentKey.
+	//   2. GATE the raw envelope (hit OR miss) with the
+	//      REQUEST identity — gateContentEnvelope runs
+	//      filterListByRBAC/filterGetByRBAC, the single F1
+	//      gate site. served=false here is fail-closed (no
+	//      identity / GET denied) → fall through to apiserver.
+	//   3. feed the GATED envelope to call.ResponseHandler →
+	//      jsonHandler/apiCall.Filter → dict[id], unchanged.
+	//
+	// The content entry holds only un-gated content; the
+	// per-user narrowing is the fresh per-request gate at
+	// step 2 — no cross-user leak, the hit path is gated too.
+	// Flag-off (apistageEnabled false) this is byte-identical
+	// to the 0.30.118 pivot path.
+	if resolverUseInformer() {
+		if r.apistageEnabled {
+			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call); ok {
+				if served {
+					// Ship 0.30.128 P-CORE-2: the gated envelope
+					// is already a decoded structured value —
+					// feed it direct (no marshal, no unmarshal).
+					if err := feedValue(gatedVal); err != nil {
+						return err
+					}
+					// Ship #6 — see depthForLog (support.go).
+					depth := depthForLog(r.ctx, r.log, dictMu, dict)
+					r.log.Info("api successfully resolved",
+						slog.String("name", id),
+						slog.String("host", call.Endpoint.ServerURL),
+						slog.String("path", call.Path),
+						slog.Int("depth", depth),
+						slog.String("dispatch", "apistage-content"),
+					)
+					return nil
+				}
+				// served=false — fail-closed (no identity / GET
+				// denied): fall through to the apiserver branch,
+				// whose per-user token narrows correctly.
+			}
+			// ok=false — the content layer could not serve this
+			// call (not pivot-servable: write verb, external URL,
+			// metadata-only GVR, pre-sync). Fall through.
+		} else if raw, served := dispatchViaInformer(gctx, call); served {
+			// Informer-served bytes are in memory — feed direct
+			// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy).
+			if err := feedBytes(raw); err != nil {
+				return err
+			}
+			// Ship #6 — see depthForLog (support.go).
+			depth := depthForLog(r.ctx, r.log, dictMu, dict)
+			r.log.Info("api successfully resolved",
+				slog.String("name", id),
+				slog.String("host", call.Endpoint.ServerURL),
+				slog.String("path", call.Path),
+				slog.Int("depth", depth),
+				slog.String("dispatch", "informer"),
+			)
+			return nil
+		}
+	}
+
+	// 0.30.104 Phase-1 TLS-CA fix — when an internal-dispatch
+	// *rest.Config is on the context (Phase 1's SA-credentialed
+	// startup walk attaches its rest.InClusterConfig() config
+	// via cache.WithInternalRESTConfig), route apiserver-path
+	// GET/LIST calls through a client-go dynamic client built
+	// from that *rest.Config instead of plumbing's httpcall.Do.
+	//
+	// WHY: plumbing's httpcall.Do builds the HTTP client from
+	// the Endpoint shape; its tlsConfigFor installs a custom CA
+	// pool ONLY in the HasCertAuth() branch. The snowplow SA
+	// endpoint is TOKEN-auth, so the SA's cluster CA is dropped
+	// and the apiserver TLS handshake fails with
+	// "x509: certificate signed by unknown authority" — Phase 1
+	// never discovers the composition GVR. The context-carried
+	// *rest.Config is the rest.InClusterConfig() value, which
+	// carries the cluster CA verbatim; client-go's transport
+	// installs it correctly. See internal_dispatch.go.
+	//
+	// BEHAVIOR-NEUTRAL: ordinary per-user requests never set
+	// cache.WithInternalRESTConfig, so dispatchViaInternalRESTConfig
+	// returns served=false for them and this block is a no-op —
+	// the path is byte-identical to pre-0.30.104.
+	//
+	// A non-nil err here is the REAL apiserver error (a 403, a
+	// genuine connectivity fault). We do NOT fall through to
+	// httpcall.Do on error — that would just re-hit the broken
+	// plumbing TLS path and mask the real error behind a second
+	// x509 failure. We surface it exactly as an httpcall.Do
+	// StatusFailure: write call.ErrorKey under dictMu, then
+	// honour ContinueOnError.
+	if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
+		if ierr != nil {
+			r.log.Error("api call response failure", slog.String("name", id),
+				slog.String("host", call.Endpoint.ServerURL),
+				slog.String("path", call.Path),
+				slog.String("dispatch", "internal-rest-config"),
+				slog.String("error", ierr.Error()))
+			// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
+			// deduplicated into recordItemError. The %w-wrapped cause
+			// moves from g.Wait() to itemErrs[i], built lazily only
+			// when !ContinueOnError. We STILL must NOT fall through to
+			// httpcall.Do here (the internal dispatcher OWNED this
+			// call; re-hitting plumbing's broken TLS path would mask
+			// the real error behind a second x509 failure) — the
+			// success-log line + return below covers both the error
+			// and the fed-bytes case.
+			var itemErr error
+			if !call.ContinueOnError {
+				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
+			}
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+		} else {
+			// internal-rest-config dispatch result is in memory
+			// — feed direct (Ship 0.30.128 P-CORE-1).
+			if err := feedBytes(raw); err != nil {
+				return err
+			}
+		}
+		// Ship #6 — see depthForLog (support.go).
+		depth := depthForLog(r.ctx, r.log, dictMu, dict)
+		dispatch := "internal-rest-config"
+		if ierr != nil {
+			dispatch = "internal-rest-config-error"
+		}
+		r.log.Info("api successfully resolved",
+			slog.String("name", id),
+			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("path", call.Path),
+			slog.Int("depth", depth),
+			slog.String("dispatch", dispatch),
+		)
+		return nil
+	}
+
+	res := httpcall.Do(gctx, call)
+	if res.Status == response.StatusFailure {
+		r.log.Error("api call response failure", slog.String("name", id),
+			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("path", call.Path),
+			slog.String("error", res.Message))
+
+		asMap, mapErr := response.AsMap(res)
+		if mapErr != nil {
+			r.log.Warn("unable to encode status as dict", slog.Any("err", mapErr))
+		}
+
+		// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
+		// deduplicated into recordItemError. The accumulated VALUE
+		// is the asMap (when AsMap succeeded) else the raw message
+		// string — distinct from the Bump message (always
+		// res.Message), so the two are passed separately. res.Message
+		// is a string (not an error), so the item error wraps it
+		// with %s (mirrors the pre-0.30.257 g.Wait()-returned shape),
+		// built lazily only when !ContinueOnError; it nonetheless
+		// aggregates via errors.Join at post-g.Wait().
+		var accumVal any = res.Message
+		if len(asMap) > 0 {
+			accumVal = asMap
+		}
+		var itemErr error
+		if !call.ContinueOnError {
+			itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, res.Message)
+		}
+		r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, accumVal, res.Message, itemErr)
+		// Fall through to the success-log line (preserves
+		// pre-0.30.95 behaviour where the
+		// "successfully resolved" line emitted on every
+		// non-hard-error call).
+	}
+
+	// Ship #6 — depthForLog runs mapDepth (the full-tree walk)
+	// under dictMu ONLY when Debug is enabled — serialising the
+	// read against concurrent jsonHandler writes. On the common
+	// (Info) path it does no work and takes no lock.
+	depth := depthForLog(r.ctx, r.log, dictMu, dict)
+	r.log.Info("api successfully resolved",
+		slog.String("name", id),
+		slog.String("host", call.Endpoint.ServerURL),
+		slog.String("path", call.Path),
+		slog.Int("depth", depth),
+	)
+	return nil
+}
+
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	if len(opts.Items) == 0 {
 		return map[string]any{}
@@ -512,12 +919,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// concurrency note).
 	r := newResolveRun(ctx, opts, log, user)
 	dict := r.dict
-	apistageEnabled := r.apistageEnabled
-	apistageStore := r.apistageStore
 	pipTimingSink := r.pipTimingSink
-	// stageErrSink (via r.recordItemError) and mapper (via
-	// r.resolveStageEndpoint) are consumed only through r.*; no local rebind
-	// is needed for them.
+	// mapper (r.resolveStageEndpoint), apistageStore/apistageEnabled
+	// (r.dispatchOneCall), and stageErrSink (r.recordItemError) are consumed
+	// only through r.*; no local rebind is needed for them.
 
 	for _, id := range names {
 		// Get the api with this identifier
@@ -707,81 +1112,32 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// Default off => wireVerbose is false => no call ever gets Debug.
 		wireVerbose := opts.Verbose && verboseWireDumpEnabled()
 
+		// The per-stage mutable bundle handed to each iterator worker. Built
+		// here, discarded at the end of this stage iteration — NEVER a
+		// resolveRun field (the concurrency flag / PM CONDITION 2). A pointer
+		// to it is shared by all of THIS stage's workers (the same read-only
+		// sharing the inline closure had; dictMu guards dict).
+		sc := &stageCtx{
+			id:          id,
+			apiCall:     apiCall,
+			dictMu:      &dictMu,
+			g:           g,
+			gctx:        gctx,
+			itemErrs:    itemErrs,
+			iterStart:   iterStart,
+			wireVerbose: wireVerbose,
+			ep:          ep,
+			calls:       tmp,
+		}
+
 		for i := range tmp {
 			call := tmp[i]
-			// Ship 0.30.121 R1-a — per-call verbose decision. `ep` is shared
-			// across every tmp[] call of this stage; setting ep.Debug in
-			// place would race the concurrent g.Go workers. When this call
-			// wants the wire-dump, take a SHALLOW COPY of the Endpoint value
-			// and flip Debug on the copy, so peers keep the un-Debugged
-			// shared Endpoint. A K8s collection LIST never wants it
-			// (callWantsWireDump returns false) — that suppresses the
-			// ~1.94 GiB DumpResponse alloc_space line.
-			if callWantsWireDump(wireVerbose, call.Path) {
-				epCopy := ep
-				epCopy.Debug = true
-				call.Endpoint = &epCopy
-			} else {
-				call.Endpoint = &ep
-			}
-			// Wrap jsonHandler so every dict[id] mutation goes through
-			// dictMu. Three forms — Ship 0.30.128 P-CORE-1/2:
-			//   * inner (io.ReadCloser) — the genuine httpcall.Do HTTP-body
-			//     path; set as call.ResponseHandler.
-			//   * innerBytes ([]byte) — an in-memory dispatch result whose
-			//     bytes are already materialised (informer-served, nested
-			//     /call, internal-rest-config); skips the redundant
-			//     io.ReadAll copy.
-			//   * innerValue (any) — an apistage content-cache hit whose
-			//     gated envelope is already a decoded structured value;
-			//     skips both the marshal and the unmarshal.
-			// Ship 0.30.235 — UAF spec + stage name plumbed in so
-			// jsonHandlerCore can run the refilter on the RAW envelope
-			// BEFORE the stage filter projects items. The pre-0.30.235
-			// post-g.Wait() applyUserAccessFilter call is DELETED.
-			// Ship K / 0.30.245 — `dict` plumbs the resolver's
-			// accumulated stage-output dict into jsonHandlerCore so the
-			// UAF refilter's resolveUAFResources evaluates
-			// resourcesFrom against UPSTREAM stage outputs (e.g.
-			// `.crds` from a prior stage). Same map as `out`; refilter
-			// reads BEFORE the merge so the current stage is absent
-			// (correct — resourcesFrom never references the stage it
-			// gates). Pre-Ship-K passed only `pig` (per-stage scope) →
-			// resourcesFrom returned [] → 0-count regression on the
-			// multi-stage compositions-list RA.
-			hOpts := jsonHandlerOptions{
-				key:         id,
-				out:         dict,
-				dict:        dict,
-				filter:      apiCall.Filter,
-				uaf:         apiCall.UserAccessFilter,
-				apiCallName: apiCall.Name,
-			}
-			inner := jsonHandler(gctx, hOpts)
-			innerBytesFn := jsonHandlerBytes(gctx, hOpts)
-			innerValueFn := jsonHandlerValue(gctx, hOpts)
-			call.ResponseHandler = func(r io.ReadCloser) error {
-				dictMu.Lock()
-				defer dictMu.Unlock()
-				return inner(r)
-			}
-			// feedBytes / feedValue are the dictMu-protected in-memory
-			// equivalents the readerFromBytes call sites below use instead
-			// of call.ResponseHandler(readerFromBytes(...)).
-			feedBytes := func(b []byte) error {
-				dictMu.Lock()
-				defer dictMu.Unlock()
-				return innerBytesFn(b)
-			}
-			feedValue := func(v any) error {
-				dictMu.Lock()
-				defer dictMu.Unlock()
-				return innerValueFn(v)
-			}
 
 			// Edge type 3 dep recording — see 0.30.94 ship for full
 			// rationale. cache.Deps() is sync.Map-backed; idempotent
-			// LoadOrStore; safe from this (parent-goroutine) site.
+			// LoadOrStore; safe from this (parent-goroutine) site — kept
+			// INLINE here (NOT inside the worker) so its dep.recorded Debug
+			// line preserves its pre-extraction emit order.
 			//
 			// Ship F1 (0.30.119): the dep edge attaches to whatever L1
 			// key the request path threaded (the per-user resolved-output
@@ -810,295 +1166,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 			}
 
+			// i is captured explicitly (per-iteration under Go 1.22+ loop
+			// semantics) and passed as dispatchOneCall's arg → itemErrs[i] is
+			// this item's disjoint slot (design Risk R1).
+			i := i
 			g.Go(func() error {
-				log.Debug("calling api", slog.String("name", id),
-					slog.String("host", call.Endpoint.ServerURL),
-					slog.String("path", call.Path),
-				)
-
-				// Ship 0.30.123 (#155) — in-process nested /call. This is
-				// the FIRST dispatch branch (before the informer pivot,
-				// before httpcall.Do). When the stage's `path` is a
-				// /call?resource=...&apiVersion=... loopback into snowplow's
-				// OWN /call endpoint, resolve the referenced RESTAction
-				// IN-PROCESS — no HTTP request, no Authorization header,
-				// identity carried by the WithUserInfo already on ctx. This
-				// lets a JWT-less / SA-credentialed resolve complete an
-				// exportJwt loopback stage (the 0.30.120 poison) and is the
-				// hard prerequisite for F2's startup SA-prewarm.
-				//
-				// Three structural gates, ALL must hold or the branch is
-				// skipped and the call falls through to the informer pivot
-				// / httpcall.Do exactly as 0.30.121:
-				//   1. RESOLVER_INPROCESS_NESTED_CALL enabled (default true);
-				//   2. the resolver seam is wired (nestedCallResolver != nil
-				//      — the second structural fallback);
-				//   3. the call is a GET whose path parses as a /call
-				//      loopback (objects.ParseCallPathToObjectRef — SHAPE only,
-				//      no resource/name/host literal).
-				// On a nested error: honour ContinueOnError / ErrorKey
-				// exactly as the HTTP path, AND bump the 0.30.120 stage-error
-				// sink so layer (b)'s Put-gate still sees the failure.
-				if inprocessNestedCallEnabled() && nestedCallResolver != nil &&
-					ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
-					if ref, isLoopback := objects.ParseCallPathToObjectRef(call.Path); isLoopback {
-						statusRaw, nerr := nestedCallResolver(gctx, ref,
-							opts.PerPage, opts.Page, opts.Extras)
-						if nerr != nil {
-							log.Error("nested /call resolution failed",
-								slog.String("name", id),
-								slog.String("path", call.Path),
-								slog.String("dispatch", "in-process-nested-call"),
-								slog.String("error", nerr.Error()))
-							// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
-							// deduplicated into recordItemError. The %w-wrapped
-							// cause is built ONLY when !ContinueOnError (lazy,
-							// preserving the wrap verb) and lands in itemErrs[i];
-							// BOTH ContinueOnError cases accumulate + Bump + fall
-							// through (the historical ContinueOnError=false
-							// fast-abort is intentionally retired per #313).
-							var itemErr error
-							if !call.ContinueOnError {
-								itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, nerr)
-							}
-							r.recordItemError(&dictMu, itemErrs, id, i, call.ErrorKey, nerr.Error(), nerr.Error(), itemErr)
-							// Fall through to the success-log line either way,
-							// mirroring the prior ContinueOnError contract.
-						} else {
-							// The in-process result IS the referenced
-							// RESTAction's Status.Raw — byte-identical to the
-							// HTTP /call response body. Feed the in-memory
-							// bytes directly (Ship 0.30.128 P-CORE-1 — no
-							// io.ReadAll copy).
-							if err := feedBytes(statusRaw); err != nil {
-								return err
-							}
-						}
-						// Ship #6 — depthForLog runs mapDepth (under dictMu)
-						// ONLY when Debug is enabled; on the common path it
-						// returns the sentinel and does no work / takes no lock.
-						depth := depthForLog(ctx, log, &dictMu, dict)
-						dispatch := "in-process-nested-call"
-						if nerr != nil {
-							dispatch = "in-process-nested-call-error"
-						}
-						log.Info("api successfully resolved",
-							slog.String("name", id),
-							slog.String("host", call.Endpoint.ServerURL),
-							slog.String("path", call.Path),
-							slog.Int("depth", depth),
-							slog.String("dispatch", dispatch),
-						)
-						return nil
-					}
-				}
-
-				// 0.30.95 resolver pivot — dispatch GET reads to the
-				// informer cache when the cache subsystem is on. #57:
-				// implicit-on-cache — resolverUseInformer() now folds to
-				// !cache.Disabled() (the standalone RESOLVER_USE_INFORMER
-				// flag was retired). Cache OFF: this branch is byte-
-				// identical to the apiserver path (R-FALSE-1 invariant).
-				//
-				// The pivot returns served=true ONLY when the call is
-				// safely cache-servable (GET, parseable apiserver path,
-				// cache=on, full-Unstructured informer, synced). All
-				// other shapes (write verbs, subresources, external
-				// URLs, metadata-only GVRs, pre-sync, 404) fall through
-				// to the apiserver branch below unchanged.
-				//
-				// Ship F1 (0.30.119) — content-keyed api-stage L1. When
-				// apistageEnabled, the pivot-served raw envelope is
-				// cached identity-free under the per-call content key
-				// (gvr, namespace, name-or-empty):
-				//
-				//   1. content Get(contentKey) — HIT: use the stored raw
-				//      envelope, skip the dispatch entirely. MISS:
-				//      dispatch UN-GATED (WithApistageContentResolve makes
-				//      dispatchViaInformer skip its inline RBAC gate) and
-				//      Put the raw envelope under contentKey.
-				//   2. GATE the raw envelope (hit OR miss) with the
-				//      REQUEST identity — gateContentEnvelope runs
-				//      filterListByRBAC/filterGetByRBAC, the single F1
-				//      gate site. served=false here is fail-closed (no
-				//      identity / GET denied) → fall through to apiserver.
-				//   3. feed the GATED envelope to call.ResponseHandler →
-				//      jsonHandler/apiCall.Filter → dict[id], unchanged.
-				//
-				// The content entry holds only un-gated content; the
-				// per-user narrowing is the fresh per-request gate at
-				// step 2 — no cross-user leak, the hit path is gated too.
-				// Flag-off (apistageEnabled false) this is byte-identical
-				// to the 0.30.118 pivot path.
-				if resolverUseInformer() {
-					if apistageEnabled {
-						if gatedVal, served, ok := apistageContentServe(gctx, apistageStore, call); ok {
-							if served {
-								// Ship 0.30.128 P-CORE-2: the gated envelope
-								// is already a decoded structured value —
-								// feed it direct (no marshal, no unmarshal).
-								if err := feedValue(gatedVal); err != nil {
-									return err
-								}
-								// Ship #6 — see depthForLog (support.go).
-								depth := depthForLog(ctx, log, &dictMu, dict)
-								log.Info("api successfully resolved",
-									slog.String("name", id),
-									slog.String("host", call.Endpoint.ServerURL),
-									slog.String("path", call.Path),
-									slog.Int("depth", depth),
-									slog.String("dispatch", "apistage-content"),
-								)
-								return nil
-							}
-							// served=false — fail-closed (no identity / GET
-							// denied): fall through to the apiserver branch,
-							// whose per-user token narrows correctly.
-						}
-						// ok=false — the content layer could not serve this
-						// call (not pivot-servable: write verb, external URL,
-						// metadata-only GVR, pre-sync). Fall through.
-					} else if raw, served := dispatchViaInformer(gctx, call); served {
-						// Informer-served bytes are in memory — feed direct
-						// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy).
-						if err := feedBytes(raw); err != nil {
-							return err
-						}
-						// Ship #6 — see depthForLog (support.go).
-						depth := depthForLog(ctx, log, &dictMu, dict)
-						log.Info("api successfully resolved",
-							slog.String("name", id),
-							slog.String("host", call.Endpoint.ServerURL),
-							slog.String("path", call.Path),
-							slog.Int("depth", depth),
-							slog.String("dispatch", "informer"),
-						)
-						return nil
-					}
-				}
-
-				// 0.30.104 Phase-1 TLS-CA fix — when an internal-dispatch
-				// *rest.Config is on the context (Phase 1's SA-credentialed
-				// startup walk attaches its rest.InClusterConfig() config
-				// via cache.WithInternalRESTConfig), route apiserver-path
-				// GET/LIST calls through a client-go dynamic client built
-				// from that *rest.Config instead of plumbing's httpcall.Do.
-				//
-				// WHY: plumbing's httpcall.Do builds the HTTP client from
-				// the Endpoint shape; its tlsConfigFor installs a custom CA
-				// pool ONLY in the HasCertAuth() branch. The snowplow SA
-				// endpoint is TOKEN-auth, so the SA's cluster CA is dropped
-				// and the apiserver TLS handshake fails with
-				// "x509: certificate signed by unknown authority" — Phase 1
-				// never discovers the composition GVR. The context-carried
-				// *rest.Config is the rest.InClusterConfig() value, which
-				// carries the cluster CA verbatim; client-go's transport
-				// installs it correctly. See internal_dispatch.go.
-				//
-				// BEHAVIOR-NEUTRAL: ordinary per-user requests never set
-				// cache.WithInternalRESTConfig, so dispatchViaInternalRESTConfig
-				// returns served=false for them and this block is a no-op —
-				// the path is byte-identical to pre-0.30.104.
-				//
-				// A non-nil err here is the REAL apiserver error (a 403, a
-				// genuine connectivity fault). We do NOT fall through to
-				// httpcall.Do on error — that would just re-hit the broken
-				// plumbing TLS path and mask the real error behind a second
-				// x509 failure. We surface it exactly as an httpcall.Do
-				// StatusFailure: write call.ErrorKey under dictMu, then
-				// honour ContinueOnError.
-				if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
-					if ierr != nil {
-						log.Error("api call response failure", slog.String("name", id),
-							slog.String("host", call.Endpoint.ServerURL),
-							slog.String("path", call.Path),
-							slog.String("dispatch", "internal-rest-config"),
-							slog.String("error", ierr.Error()))
-						// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
-						// deduplicated into recordItemError. The %w-wrapped cause
-						// moves from g.Wait() to itemErrs[i], built lazily only
-						// when !ContinueOnError. We STILL must NOT fall through to
-						// httpcall.Do here (the internal dispatcher OWNED this
-						// call; re-hitting plumbing's broken TLS path would mask
-						// the real error behind a second x509 failure) — the
-						// success-log line + return below covers both the error
-						// and the fed-bytes case.
-						var itemErr error
-						if !call.ContinueOnError {
-							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
-						}
-						r.recordItemError(&dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
-					} else {
-						// internal-rest-config dispatch result is in memory
-						// — feed direct (Ship 0.30.128 P-CORE-1).
-						if err := feedBytes(raw); err != nil {
-							return err
-						}
-					}
-					// Ship #6 — see depthForLog (support.go).
-					depth := depthForLog(ctx, log, &dictMu, dict)
-					dispatch := "internal-rest-config"
-					if ierr != nil {
-						dispatch = "internal-rest-config-error"
-					}
-					log.Info("api successfully resolved",
-						slog.String("name", id),
-						slog.String("host", call.Endpoint.ServerURL),
-						slog.String("path", call.Path),
-						slog.Int("depth", depth),
-						slog.String("dispatch", dispatch),
-					)
-					return nil
-				}
-
-				res := httpcall.Do(gctx, call)
-				if res.Status == response.StatusFailure {
-					log.Error("api call response failure", slog.String("name", id),
-						slog.String("host", call.Endpoint.ServerURL),
-						slog.String("path", call.Path),
-						slog.String("error", res.Message))
-
-					asMap, mapErr := response.AsMap(res)
-					if mapErr != nil {
-						log.Warn("unable to encode status as dict", slog.Any("err", mapErr))
-					}
-
-					// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
-					// deduplicated into recordItemError. The accumulated VALUE
-					// is the asMap (when AsMap succeeded) else the raw message
-					// string — distinct from the Bump message (always
-					// res.Message), so the two are passed separately. res.Message
-					// is a string (not an error), so the item error wraps it
-					// with %s (mirrors the pre-0.30.257 g.Wait()-returned shape),
-					// built lazily only when !ContinueOnError; it nonetheless
-					// aggregates via errors.Join at post-g.Wait().
-					var accumVal any = res.Message
-					if len(asMap) > 0 {
-						accumVal = asMap
-					}
-					var itemErr error
-					if !call.ContinueOnError {
-						itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, res.Message)
-					}
-					r.recordItemError(&dictMu, itemErrs, id, i, call.ErrorKey, accumVal, res.Message, itemErr)
-					// Fall through to the success-log line (preserves
-					// pre-0.30.95 behaviour where the
-					// "successfully resolved" line emitted on every
-					// non-hard-error call).
-				}
-
-				// Ship #6 — depthForLog runs mapDepth (the full-tree walk)
-				// under dictMu ONLY when Debug is enabled — serialising the
-				// read against concurrent jsonHandler writes. On the common
-				// (Info) path it does no work and takes no lock.
-				depth := depthForLog(ctx, log, &dictMu, dict)
-				log.Info("api successfully resolved",
-					slog.String("name", id),
-					slog.String("host", call.Endpoint.ServerURL),
-					slog.String("path", call.Path),
-					slog.Int("depth", depth),
-				)
-				return nil
+				return r.dispatchOneCall(sc, i)
 			})
 		}
 

@@ -226,7 +226,15 @@ func TestDepthForLog_AC3_CommonPathTakesNoLock(t *testing.T) {
 // Exactly 5 mapDepth call sites existed in resolve.go; all 5 are now
 // routed through depthForLog. This test greps resolve.go's source and
 // asserts: zero ungated `mapDepth(` CALL sites remain, and there are
-// exactly 5 depthForLog(ctx, ...) call sites.
+// exactly 5 depthForLog(r.ctx, ...) call sites.
+//
+// Task #330 Commit 4: the 5 sites moved into (*resolveRun).dispatchOneCall,
+// where the OUTER context is r.ctx (the resolve-invariant field), so the
+// outer-ctx argument is spelled `r.ctx` instead of the bare `ctx`. The AC-6
+// invariant is UNCHANGED (5 gated sites, all passing the outer ctx, zero
+// ungated mapDepth); only the receiver-qualified spelling of that outer ctx
+// updates with the extraction. depthForLog still receives the outer ctx (NOT
+// gctx) at every site — the gated-DEBUG behaviour is byte-identical.
 func TestDepthForLog_AC6_AllFiveSitesGated(t *testing.T) {
 	src, err := os.ReadFile("resolve.go")
 	if err != nil {
@@ -244,9 +252,11 @@ func TestDepthForLog_AC6_AllFiveSitesGated(t *testing.T) {
 			"every site must route through depthForLog", len(mapDepthCall))
 	}
 
-	// Exactly 5 depthForLog(ctx, ...) call sites.
-	calls := regexp.MustCompile(`depthForLog\(ctx,`).FindAllString(codeOnly, -1)
+	// Exactly 5 depthForLog(r.ctx, ...) call sites — the outer-ctx form
+	// after the #330 dispatchOneCall extraction (the worker receives the
+	// resolve-invariant outer ctx as r.ctx; depthForLog must NOT get gctx).
+	calls := regexp.MustCompile(`depthForLog\(r\.ctx,`).FindAllString(codeOnly, -1)
 	if len(calls) != 5 {
-		t.Fatalf("AC-6 FAIL: found %d depthForLog(ctx, ...) call sites in resolve.go, want exactly 5", len(calls))
+		t.Fatalf("AC-6 FAIL: found %d depthForLog(r.ctx, ...) call sites in resolve.go, want exactly 5", len(calls))
 	}
 }
