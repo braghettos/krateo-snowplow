@@ -287,6 +287,43 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 	}
 }
 
+// recordItemError is the Ship 0.30.257 (#313) per-item hard-error triad,
+// deduplicated from the three worker error branches (in-process-nested-call /
+// internal-rest-config / httpcall.Do). It performs, in order:
+//
+//  1. W-A: accumulate accumVal under the shared dict[errKey] (the per-item
+//     errors accumulating-slice), holding mu across the append — the caller's
+//     stage-local dictMu (the lock is taken WITHOUT defer, matching the
+//     explicit Lock()/Unlock() the three inline error blocks used).
+//  2. Layer (b): Bump the stage-error sink with (id, bumpMsg) so the error-
+//     aware Put-gate / request-path Cache-A guard see the failure. Nil-
+//     receiver-safe (no sink on the request path).
+//  3. Option C-A: record itemErr into this item's disjoint slot itemErrs[i].
+//     itemErr is nil when the caller's call.ContinueOnError was true (the
+//     caller builds it ONLY inside its `!ContinueOnError` gate, preserving
+//     the lazy fmt.Errorf and — critically — the per-site %w (nested /
+//     internal-rest-config, wrapping an error) vs %s (httpcall, formatting
+//     res.Message string) wrapping verbatim).
+//
+// accumVal and bumpMsg are SEPARATE params because the httpcall branch
+// accumulates the asMap (a map, when AsMap succeeded) while it Bumps the
+// res.Message string — the two are not always the same value (the other two
+// branches pass <err>.Error() for both).
+//
+// CONCURRENCY: runs inside the iterator errgroup worker; mu serialises the
+// dict[errKey] append against peer workers, and itemErrs[i] is a disjoint
+// pre-sized slot (no lock needed — same property the inline code relied on).
+// Exercised under -race by TestResolve_IteratorErrorCollection_Race.
+func (r *resolveRun) recordItemError(mu *sync.Mutex, itemErrs []error, id string, i int, errKey string, accumVal any, bumpMsg string, itemErr error) {
+	mu.Lock()
+	accumulateErrorKey(r.dict, errKey, accumVal)
+	mu.Unlock()
+	r.stageErrSink.Bump(id, bumpMsg)
+	if itemErr != nil {
+		itemErrs[i] = itemErr
+	}
+}
+
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	if len(opts.Items) == 0 {
 		return map[string]any{}
@@ -346,8 +383,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	mapper := r.mapper
 	apistageEnabled := r.apistageEnabled
 	apistageStore := r.apistageStore
-	stageErrSink := r.stageErrSink
 	pipTimingSink := r.pipTimingSink
+	// stageErrSink is consumed only via r.recordItemError (r.stageErrSink); no
+	// local rebind is needed.
 
 	for _, id := range names {
 		// Get the api with this identifier
@@ -754,38 +792,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								slog.String("path", call.Path),
 								slog.String("dispatch", "in-process-nested-call"),
 								slog.String("error", nerr.Error()))
-							dictMu.Lock()
-							// Ship 0.30.257 (#313) W-A: accumulate per-item
-							// errors under the shared errorKey (no last-wins).
-							accumulateErrorKey(dict, call.ErrorKey, nerr.Error())
-							dictMu.Unlock()
-							// Layer (b) backstop (0.30.120): record the stage
-							// error on the refresher's sink (nil on the
-							// request path) so the error-aware Put-gate still
-							// sees a nested-/call failure. #301: Bump captures
-							// stage name + err for the decline-log sample
-							// (nil-receiver-safe). UNCHANGED by #313 — the
-							// refresher Put-gate (resolve_populate.go:242) and
-							// the request-path Cache-A guard both key on this
-							// Bump's Count(), so it MUST still fire.
-							stageErrSink.Bump(id, nerr.Error())
-							// Ship 0.30.257 (#313) Option C-A: a per-item hard
-							// error NO LONGER cancels gctx. Record it into this
-							// item's disjoint slot and return nil so the
-							// remaining iterator items proceed (the errgroup
-							// SetLimit bound is unchanged; only the per-item
-							// cancel is removed). The %w-wrapped cause is
-							// preserved — it now lands in itemErrs[i] (errors.Join
-							// at post-g.Wait() makes it errors.Is-inspectable)
-							// instead of g.Wait(). ContinueOnError no longer
-							// changes the control flow here: BOTH cases record +
-							// fall through (the historical ContinueOnError=false
-							// fast-abort is intentionally retired per the #313
-							// directive — iteration continues past per-item
-							// errors regardless).
+							// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
+							// deduplicated into recordItemError. The %w-wrapped
+							// cause is built ONLY when !ContinueOnError (lazy,
+							// preserving the wrap verb) and lands in itemErrs[i];
+							// BOTH ContinueOnError cases accumulate + Bump + fall
+							// through (the historical ContinueOnError=false
+							// fast-abort is intentionally retired per #313).
+							var itemErr error
 							if !call.ContinueOnError {
-								itemErrs[i] = fmt.Errorf("api %s item %d failed: %w", id, i, nerr)
+								itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, nerr)
 							}
+							r.recordItemError(&dictMu, itemErrs, id, i, call.ErrorKey, nerr.Error(), nerr.Error(), itemErr)
 							// Fall through to the success-log line either way,
 							// mirroring the prior ContinueOnError contract.
 						} else {
@@ -938,31 +956,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							slog.String("path", call.Path),
 							slog.String("dispatch", "internal-rest-config"),
 							slog.String("error", ierr.Error()))
-						dictMu.Lock()
-						// Ship 0.30.257 (#313) W-A: accumulate per-item errors
-						// under the shared errorKey (no last-wins).
-						accumulateErrorKey(dict, call.ErrorKey, ierr.Error())
-						dictMu.Unlock()
-						// Ship 0.30.120 layer (b): record the stage error on
-						// the refresher's sink (nil on the request path).
-						// #301: Bump captures stage name + err for the
-						// decline-log sample (nil-receiver-safe). UNCHANGED by
-						// #313 — the refresher Put-gate + request-path Cache-A
-						// guard both key on this Bump's Count().
-						stageErrSink.Bump(id, ierr.Error())
-						// Ship 0.30.257 (#313) Option C-A: a per-item hard error
-						// no longer cancels gctx — record into the item's
-						// disjoint slot and fall through so remaining items
-						// proceed. The %w-wrapped cause moves from g.Wait() to
-						// itemErrs[i]. We STILL must NOT fall through to
+						// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
+						// deduplicated into recordItemError. The %w-wrapped cause
+						// moves from g.Wait() to itemErrs[i], built lazily only
+						// when !ContinueOnError. We STILL must NOT fall through to
 						// httpcall.Do here (the internal dispatcher OWNED this
 						// call; re-hitting plumbing's broken TLS path would mask
 						// the real error behind a second x509 failure) — the
 						// success-log line + return below covers both the error
 						// and the fed-bytes case.
+						var itemErr error
 						if !call.ContinueOnError {
-							itemErrs[i] = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
+							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 						}
+						r.recordItemError(&dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
 					} else {
 						// internal-rest-config dispatch result is in memory
 						// — feed direct (Ship 0.30.128 P-CORE-1).
@@ -998,37 +1005,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						log.Warn("unable to encode status as dict", slog.Any("err", mapErr))
 					}
 
-					dictMu.Lock()
-					// Ship 0.30.257 (#313) W-A: accumulate per-item errors
-					// under the shared errorKey (no last-wins). The recorded
-					// VALUE is unchanged per item — the asMap (when AsMap
-					// succeeded) else the raw message string; W-A only changes
-					// the container scalar→accumulating-slice.
+					// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
+					// deduplicated into recordItemError. The accumulated VALUE
+					// is the asMap (when AsMap succeeded) else the raw message
+					// string — distinct from the Bump message (always
+					// res.Message), so the two are passed separately. res.Message
+					// is a string (not an error), so the item error wraps it
+					// with %s (mirrors the pre-0.30.257 g.Wait()-returned shape),
+					// built lazily only when !ContinueOnError; it nonetheless
+					// aggregates via errors.Join at post-g.Wait().
+					var accumVal any = res.Message
 					if len(asMap) > 0 {
-						accumulateErrorKey(dict, call.ErrorKey, asMap)
-					} else {
-						accumulateErrorKey(dict, call.ErrorKey, res.Message)
+						accumVal = asMap
 					}
-					dictMu.Unlock()
-					// Ship 0.30.120 layer (b): record the stage error on the
-					// refresher's sink (nil on the request path) — covers both
-					// the asMap and res.Message ErrorKey-write branches above.
-					// #301: Bump captures stage name + err for the decline-log
-					// sample (nil-receiver-safe). UNCHANGED by #313 — the
-					// refresher Put-gate + request-path Cache-A guard both key
-					// on this Bump's Count().
-					stageErrSink.Bump(id, res.Message)
-
-					// Ship 0.30.257 (#313) Option C-A: a per-item hard error no
-					// longer cancels gctx — record it into this item's disjoint
-					// slot and fall through so the remaining iterator items
-					// proceed. res.Message is a string (not an error), so the
-					// item error wraps it with %s (mirrors the pre-0.30.257
-					// g.Wait()-returned shape); the error nonetheless aggregates
-					// via errors.Join at post-g.Wait().
+					var itemErr error
 					if !call.ContinueOnError {
-						itemErrs[i] = fmt.Errorf("api %s item %d failed: %s", id, i, res.Message)
+						itemErr = fmt.Errorf("api %s item %d failed: %s", id, i, res.Message)
 					}
+					r.recordItemError(&dictMu, itemErrs, id, i, call.ErrorKey, accumVal, res.Message, itemErr)
 					// Fall through to the success-log line (preserves
 					// pre-0.30.95 behaviour where the
 					// "successfully resolved" line emitted on every
