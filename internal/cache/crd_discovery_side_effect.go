@@ -194,6 +194,23 @@ func (c *crdDiscovery) processEvent(ev crdDiscoveryEvent) {
 		triggerCRDDiscovery(ev.obj, ev.kind)
 	case crdLifecycleDelete:
 		triggerCRDDelete(ev.obj)
+	default:
+		// Ship L review note (#200) — defensive default for the closed
+		// crdLifecycleKind enum. submitCRDLifecycleEvent is the only
+		// enqueue site and always passes a named constant, so an unknown
+		// kind here is structurally unreachable today. The default makes
+		// that contract explicit: an out-of-range kind from a future
+		// mis-wiring is logged (not silently no-op'd) while the worker
+		// stays alive and the event still counts as processed below. No
+		// side-effect fires — there is no safe default action for an
+		// unknown lifecycle event.
+		slog.Error("cache.crd_discovery.unknown_kind",
+			slog.String("subsystem", "cache"),
+			slog.String("kind", crdLifecycleKindString(ev.kind)),
+			slog.String("hint", "processEvent received an out-of-range crdLifecycleKind — "+
+				"submitCRDLifecycleEvent must always enqueue a named constant. "+
+				"This indicates a wiring regression; the worker continues."),
+		)
 	}
 	// Task #85: bump eventsProcessed AFTER the side-effect (discovery /
 	// delete) completes, not before. "Processed" must mean "the

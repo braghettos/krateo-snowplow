@@ -441,6 +441,162 @@ func TestCRDDelete_TearsDownInformer_DeletedFinalStateUnknown(t *testing.T) {
 	}
 }
 
+// TestCRDDelete_NoFalseTeardownOfUnrelatedInformer — Ship L+1 backlog test
+// gap (#200a): the CRD DELETE bridge must tear down ONLY the GVRs derived
+// from the deleted CRD's own spec, and MUST NOT tear down served state for
+// resources snowplow holds for OTHER (non-deleted) CRDs.
+//
+// This is the SOFT (negative-isolation) companion to
+// TestCRDDelete_TearsDownInformer_BytesObject. That test asserts the
+// POSITIVE: the deleted CRD's informer is gone. This test pins the missing
+// NEGATIVE assertion: a DELETE for CRD-A's group must leave CRD-B's
+// informer running. Without it, a regression that made triggerCRDDelete
+// sweep too broadly (e.g. tearing down by group-prefix, or clearing the
+// whole informers map) would pass the positive test while silently
+// dropping unrelated served state — exactly the kind of over-broad
+// teardown the 0.30.246 bridge's per-served-version derivation is designed
+// to prevent (RemoveResourceType acts on the exact GVR only;
+// deletePerGVRStateLocked at watcher.go:1436 deletes one map key).
+func TestCRDDelete_NoFalseTeardownOfUnrelatedInformer(t *testing.T) {
+	withCleanCRDDiscovery(t)
+
+	fake := &fakeDiscoveryForCRD{
+		group:   "composition.krateo.io",
+		version: "v1-2-2",
+		res: []metav1.APIResource{
+			{Name: "githubscaffoldingwithcompositionpages", Kind: "GHSCP", Namespaced: true},
+		},
+	}
+	installFakeDiscoveryForCRD(t, fake)
+	SetProcessSARestConfig(&rest.Config{Host: "https://fake.test"})
+
+	crdGVR := CRDGVRForTest()
+	rw := newGateWatcher()
+	ch := make(chan struct{})
+	close(ch)
+	rw.syncCh[crdGVR] = ch
+	handlers := rw.depEventHandlers(crdGVR)
+
+	// The CRD that WILL be deleted declares only targetGVR.
+	targetGVR := schema.GroupVersionResource{
+		Group:    "composition.krateo.io",
+		Version:  "v1-2-2",
+		Resource: "githubscaffoldingwithcompositionpages",
+	}
+	// A SEPARATE GVR snowplow also serves — a different group entirely, NOT
+	// covered by the deleted CRD's spec. Stands in for "served state for an
+	// unrelated CRD that must survive the DELETE".
+	bystanderGVR := schema.GroupVersionResource{
+		Group:    "other.example.io",
+		Version:  "v1",
+		Resource: "widgets",
+	}
+
+	// Pre-populate BOTH informers (sentinel nil values exercise the
+	// teardown path without spinning real informers — same technique as
+	// TestCRDDelete_TearsDownInformer_BytesObject).
+	rw.informers = map[schema.GroupVersionResource]informers.GenericInformer{}
+	rw.informers[targetGVR] = nil
+	rw.informers[bystanderGVR] = nil
+
+	SetGlobal(rw)
+	t.Cleanup(func() { SetGlobal(nil) })
+
+	// DELETE the CRD that declares ONLY targetGVR's group/plural/version.
+	bo := crdBytesObjMultiVersion(t, "ghscp.composition.krateo.io",
+		"composition.krateo.io", "githubscaffoldingwithcompositionpages",
+		[]versionSpec{{Name: "v1-2-2", Served: true}})
+	handlers.DeleteFunc(bo)
+
+	// Wait for the deleted CRD's informer to be torn down (the positive
+	// half — proves the DELETE actually ran).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rw.mu.RLock()
+		_, targetGone := rw.informers[targetGVR]
+		rw.mu.RUnlock()
+		if !targetGone {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rw.mu.RLock()
+	_, targetStillRegistered := rw.informers[targetGVR]
+	_, bystanderStillRegistered := rw.informers[bystanderGVR]
+	rw.mu.RUnlock()
+
+	if targetStillRegistered {
+		t.Fatalf("precondition: deleted CRD's informer %s was NOT torn down — "+
+			"the DELETE side-effect did not run. Counters: %s",
+			targetGVR, crdDiscoveryStatsString())
+	}
+	// THE no-false-teardown assertion: the unrelated informer MUST survive.
+	if !bystanderStillRegistered {
+		t.Fatalf("#200a FAIL: CRD DELETE for %s falsely tore down the unrelated "+
+			"informer %s. The teardown must be scoped to the deleted CRD's own "+
+			"served GVRs only — never other served state. Counters: %s",
+			targetGVR, bystanderGVR, crdDiscoveryStatsString())
+	}
+
+	// Exactly one teardown was processed; no skip/panic.
+	s := CRDDiscoveryStatsSnapshot()
+	if s.DeletesProcessed < 1 {
+		t.Fatalf("#200a: DeletesProcessed=%d want >=1", s.DeletesProcessed)
+	}
+	if s.PanicsRecovered != 0 {
+		t.Errorf("#200a: PanicsRecovered=%d want 0", s.PanicsRecovered)
+	}
+}
+
+// TestProcessEvent_UnknownKind_DefensiveDefault — #200b: the
+// crdLifecycleKind switch in processEvent has a defensive default for an
+// out-of-range kind. submitCRDLifecycleEvent only ever enqueues a named
+// constant, so this branch is structurally unreachable in production; the
+// test drives it directly to lock the contract: an unknown kind must NOT
+// panic, must NOT fire any ADD/UPDATE/DELETE side-effect, and must still
+// count the event as processed (the worker stays alive).
+func TestProcessEvent_UnknownKind_DefensiveDefault(t *testing.T) {
+	withCleanCRDDiscovery(t)
+	// No SA rc / no Global watcher set — if the default branch wrongly fell
+	// through to triggerCRDDiscovery or triggerCRDDelete, those would still
+	// be soft-safe, so we assert on the counters that DISCRIMINATE the
+	// branches instead: discovery/delete counters MUST stay zero.
+	c := crdDiscoverySingleton()
+	before := CRDDiscoveryStatsSnapshot()
+
+	// An out-of-range crdLifecycleKind (the enum has 0..2; 99 is invalid).
+	c.processEvent(crdDiscoveryEvent{obj: nil, kind: crdLifecycleKind(99)})
+
+	after := CRDDiscoveryStatsSnapshot()
+
+	// Processed counter advances exactly once (the event was drained).
+	if after.EventsProcessed != before.EventsProcessed+1 {
+		t.Fatalf("EventsProcessed = %d, want %d (the default branch must still "+
+			"count the event as processed)", after.EventsProcessed, before.EventsProcessed+1)
+	}
+	// NO side-effect fired: neither the ADD/UPDATE discovery path nor the
+	// DELETE path ran.
+	if after.DiscoveryInvoked != before.DiscoveryInvoked {
+		t.Errorf("DiscoveryInvoked moved (%d→%d) — the unknown-kind default must "+
+			"NOT invoke discovery", before.DiscoveryInvoked, after.DiscoveryInvoked)
+	}
+	if after.DiscoverySkippedNG != before.DiscoverySkippedNG {
+		t.Errorf("DiscoverySkippedNG moved (%d→%d) — the unknown-kind default must "+
+			"NOT route through triggerCRDDiscovery at all", before.DiscoverySkippedNG, after.DiscoverySkippedNG)
+	}
+	if after.DeletesProcessed != before.DeletesProcessed ||
+		after.DeleteSkippedNG != before.DeleteSkippedNG {
+		t.Errorf("DELETE counters moved — the unknown-kind default must NOT route "+
+			"through triggerCRDDelete")
+	}
+	// No panic was recovered (the default is a clean log+return, not a crash).
+	if after.PanicsRecovered != before.PanicsRecovered {
+		t.Errorf("PanicsRecovered moved (%d→%d) — the default branch must not panic",
+			before.PanicsRecovered, after.PanicsRecovered)
+	}
+}
+
 // --- Commit-5 — expvar /debug/vars exposure ----------------------------------
 
 // TestCRDDiscoveryExpvarHandler — Ship L (0.30.246) closes followup #143.
