@@ -669,6 +669,13 @@ var seedCohortFn = seedCohort
 // also captured (a recover() in the same defer prevents the goroutine
 // from crashing the errgroup). All instrumentation fields are uniform
 // across cohorts (feedback_no_special_cases): no per-cohort branching.
+//
+// LEGACY SEED PATH (#341 ruling 2026-06-12): reached ONLY when
+// PREWARM_ENGINE_ENABLED=false — the documented single-knob back-out
+// lever for the unified prewarm engine (0.30.247/248); prod runs =true.
+// Kept per the #57 lever framework; deliberately NOT unified with the
+// engine's seedScopeYielding (independent by design, so the lever stays
+// a clean revert). Do not refactor or delete while the lever stands.
 func seedCohort(ctx context.Context, cohort seedTarget,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {

@@ -474,7 +474,10 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		}
 	}
 
-	// Prefer the engine when enabled; else the legacy PIP seed.
+	// Prefer the engine when enabled; else the legacy PIP seed — the
+	// engine's documented back-out lever (#341 ruling 2026-06-12):
+	// PREWARM_ENGINE_ENABLED=false flips production back to runPIPSeed/
+	// seedCohort in one helm --set. See seedCohort's header.
 	seedFn := pipSeed
 	if engineSeed != nil {
 		seedFn = engineSeed
