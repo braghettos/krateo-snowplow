@@ -515,18 +515,29 @@ def login_all():
     return tokens
 
 
-def http_get(path, token, base_url=None, timeout=120, retries=3):
+def http_get(path, token, base_url=None, timeout=120, retries=3,
+             headers=None):
     """GET `path` against snowplow with Bearer auth + gzip decode.
 
     Returns (elapsed_ms, http_code, body_bytes). Retries up to `retries`
     times on connection failure (code==0); HTTP errors return their
     status code without retry.
+
+    `headers` (optional dict) is merged on top of the always-present
+    Authorization + Accept-Encoding pair — callers that need a request
+    header (e.g. verify_serve_stale's `X-Krateo-TraceId` for the
+    SECONDARY pod-log correlation source — plumbing v0.9.3
+    server/use/logger.go:17 binds that header into the request's slog
+    logger, so it lands on every `resolved_cache.lookup` line) supply it
+    here. Defaults to None → existing callers are byte-for-byte
+    unaffected.
     """
     url = (base_url or SNOWPLOW) + path
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": "Bearer " + token, "Accept-Encoding": "gzip"},
-    )
+    req_headers = {"Authorization": "Bearer " + token,
+                   "Accept-Encoding": "gzip"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, headers=req_headers)
     elapsed_ms = 0
     code = 0
     body = b""

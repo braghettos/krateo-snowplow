@@ -6,14 +6,24 @@ under PM AUTHORIZE-with-tightening 2026-06-02 (Diego's
 feedback_l1_hit_miss_via_metrics_not_timing +
 feedback_mutation_serves_stale_while_refresh).
 
-The harness fires THREE probes around a single `kubectl patch` annotation
-mutation on a randomly chosen composition:
+The harness fires N UNSCORED warm-up probes (#159 — so the first scored
+probe never eats a cold-fill miss), then THREE scored probes around a
+single mutation of a BENCH-OWNED fixture's echo field:
 
-    T-1s   probe   (steady-state, pre-mutation)
-    MUTATE         (kubectl patch — adds an annotation marker)
-    T+50ms probe   (refresh-in-flight: cache MUST serve STALE)
-    T+10s  probe   (post-refresh: cache MUST carry the new marker;
+    (warm-up × N)  (unscored; fill the cold per-cohort L1 cell)
+    T-1s   probe   (steady-state, pre-mutation; body carries setup_marker)
+    MUTATE         (patch the fixture echo field -> mutate_marker)
+    T+50ms probe   (refresh-in-flight: cache MUST serve STALE — i.e. the
+                    body still carries setup_marker, NOT mutate_marker)
+    T+10s  probe   (post-refresh: cache MUST carry mutate_marker;
                     widened from 5s for the #318-R1a refresher rate-floor)
+
+#159 DEFECT-2 fix: the default `widget-echo` target uses a bench-owned
+`Button` whose `spec.widgetData.label` scalar echoes verbatim into the
+served /call body (S8bc-proven). The prior `compositions-list` target
+GET the RESTAction CR definition (~1537B) — a body that can NEVER carry
+a composition mutation, so the marker assertion was structurally
+always-FAIL. See _TARGET_REGISTRY for the live-confirmed shape evidence.
 
 Two independent sources confirm L1 hit/miss verdict per probe:
 
@@ -35,16 +45,33 @@ INDETERMINATE_INFORMER_NOT_ACKED.
 Output: JSON bundle at /tmp/snowplow-runs/<tag>/verify-serve-stale-<ts>.json
 plus an ANSI-coloured stdout summary that mirrors cli.py:_setup_logger.
 
-Exit codes:
-    0 — PASS (all probes hit; T-1s body == T+50ms body; T+10s carries
-        marker; miss_delta == 0; informer ACK'd)
-    1 — INDETERMINATE (window slip / informer not ACK'd / kubectl logs
-        unavailable / sources disagree / cache OFF)
-    2 — FAIL_<reason> (any probe shows miss / sync cold-fill spike /
-        refresh did not complete)
-    3 — non-GKE context (inherits cli.py:_gke_context_guard)
+VERDICT MATRIX (#159 PM review C1, 2026-06-12 §1). THE CONTRACT is
+"the customer never ate a cold miss AND freshness arrived by T+10s" — NOT
+"the body was literally stale at +50ms". Serving fresh EARLY (the refresh
+beat the probe RTT) is strictly-better, not a defect.
 
-Spec — design doc §3 Q1-Q6 + §4 LOC budget + §5 falsifier + §6 risks.
+    0 — PASS: every probe HTTP 200 + informer ACK'd + mid offset in-window
+        + miss_delta == 0 (no cold miss) + every probe a SECONDARY hit
+        + T+10s carries the mutate_marker and differs from pre (bounded
+        freshness). The bundle records mid_observation ∈ {served_stale,
+        served_fresh_early} INFORMATIONALLY — it is NEVER gated on.
+    1 — INDETERMINATE: window slip / informer not ACK'd / log filter
+        unavailable / cache OFF / debug-vars unreachable / login / setup /
+        patch failed; OR INDETERMINATE_MID_BODY_UNEXPECTED (mid body
+        changed but carries NEITHER the pre snapshot NOR the new marker —
+        a real "something else mutated the entry" anomaly, not a
+        serve-stale FAIL).
+    2 — FAIL: FAIL_HTTP_<code>_ON_<window> / FAIL_SYNC_COLD_FILL_ON_MID
+        (miss_delta != 0 — THE serve-stale violation) / FAIL_SOURCES_DISAGREE
+        / FAIL_REFRESH_NOT_COMPLETED_BY_10S (post lacks marker or == pre).
+    3 — non-GKE context (inherits cli.py:_gke_context_guard).
+
+(RETIRED #159 C1: FAIL_STALE_NOT_SERVED_ON_MID — the over-strict
+literal-stale-at-+50ms mapping; its real-anomaly residue moved to
+INDETERMINATE_MID_BODY_UNEXPECTED.)
+
+Spec — design doc §3 Q1-Q6 + §4 LOC budget + §5 falsifier + §6 risks;
+#159 PM review docs/ship-159-pm-review-2026-06-12.md §1 (verdict re-map).
 """
 
 from __future__ import annotations
@@ -53,7 +80,6 @@ import hashlib
 import json
 import os
 import queue
-import random
 import subprocess
 import sys
 import threading
@@ -64,43 +90,189 @@ import uuid
 from pathlib import Path
 
 from bench import browser, cluster
-from bench.cluster import (COMP_GVR, COMP_RES, NS, kubectl,
-                           kubectl_context_args)
+from bench.cluster import NS, kubectl, kubectl_context_args
 
 # ─── Constants ──────────────────────────────────────────────────────────────
-
-# /call URL builder for compositions-list — identical to
-# phases.py:_phase8_poll_via_snowplow so we re-use the proven path
-# (design Q2).
-_COMPOSITIONS_LIST_PATH = (
-    "/call?apiVersion=templates.krateo.io%2Fv1"
-    "&resource=restactions&name=compositions-list"
-    "&namespace=krateo-system"
-)
-
-# expvar /debug/vars cell key for restactions/compositions-list class —
-# format is "<handlerKind>|<gvrString>" per
-# dispatchers/l1_lookup_metrics.go:74-75. GVR.String() emits
-# "<group>/<version>, Resource=<resource>" verbatim per apimachinery
-# v0.35.3 pkg/runtime/schema/group_version.go:114-116:
-#   strings.Join([]string{Group, "/", Version, ", Resource=", Resource}, "")
-# (PM tightening #1, 2026-06-02 — original draft used the wrong shape
-# "<group>/<version>, <resource>" without the "Resource=" prefix, which
-# would have made every live run miss the cell.)
-_RESTACTIONS_CELL_KEY = (
-    "restactions|templates.krateo.io/v1, Resource=restactions")
 
 # When the mid-probe overshoots this many ms past T_mutate we emit
 # INDETERMINATE_MID_WINDOW_SLIPPED per design Q4 + risk register R2.
 _MID_WINDOW_HARD_LIMIT_MS = 2000
 
-# Targets enumerated by --target. Today only compositions-list is wired;
-# the enum keeps future expansion (dashboard-piechart, compositions-page)
-# additive per feedback_no_special_cases.
+# Default count of UNSCORED warm-up probes (#159 v1.1). Tunable via
+# --warmup; one is enough to fill a cold per-cohort cell, but the
+# default of 2 gives margin against a single transport hiccup.
+_DEFAULT_WARMUP_PROBES = 2
+
+# ─── Target abstraction (#159 DEFECT 2 fix — mistargeted marker) ──────────────
+#
+# THE DEFECT (live-confirmed against 0.30.261 on 2026-06-12): the prior
+# `compositions-list` target GET'd
+#   /call?…resource=restactions&name=compositions-list&namespace=krateo-system
+# whose body is the RESTAction CR DEFINITION itself
+#   {"kind":"RESTAction",…,"spec":{"api":[…],"filter":…}}   (1537 B)
+# — the RA's OWN metadata/spec, NOT a serialized composition collection.
+# A composition-annotation marker can therefore NEVER appear in that body,
+# so the T+10s marker-presence assertion was structurally ALWAYS-FAIL.
+# (The post-#300/C1 chart did NOT collapse the RA /call output to an
+# aggregate; `restactions` /call serves the raw manifest.)
+#
+# THE FIX (Task #159 option (b) — the S8bc echo-field pattern, which the
+# bench already proves works): a BENCH-OWNED `Button` widget with a plain
+# `spec.widgetData.label` scalar and NO apiRef / widgetDataTemplate routes
+# to the per-cohort `widgets` L1 cell — the exact cell a customer /call
+# hits — and echoes that scalar VERBATIM into the served /call body
+# (internal/resolvers/widgets/resolve.go:182-238;
+#  phases.py:2195-2230 _widget_fixture_yaml prior art). A `kubectl patch`
+# of `spec.widgetData.label` v1->v2 therefore changes the served body and
+# gives a GUARANTEED-PRESENT, patchable marker. The dirty-mark flows
+# through the recordWidgetDeps self-dep on the `buttons` GVR (the same
+# path S8b exercises), so the informer-ACK gate fires on
+# `cache_event.consumed gvr=widgets.templates.krateo.io/v1beta1,
+#  Resource=buttons`.
+#
+# Each target is fully self-describing (path/cell_key/gvr_string +
+# setup/mutate/cleanup hooks) so the harness body and verdict logic never
+# special-case a target (feedback_no_special_cases). New targets are
+# purely additive.
+
+# Bench widget fixture — group/version/plural + the per-cohort `widgets`
+# cell key. Mirrors phases.py:_WIDGET_FIXTURE_GVR so S8b and this verifier
+# agree on the GVR shape.
+_WIDGET_GROUP = "widgets.templates.krateo.io"
+_WIDGET_VERSION = "v1beta1"
+_WIDGET_PLURAL = "buttons"
+_WIDGET_FIXTURE_NS = "bench-ns-01"
+_WIDGET_FIXTURE_NAME = "bench-vss-widget-probe"
+
+# expvar /debug/vars cell key — "<handlerKind>|<gvrString>" per
+# dispatchers/l1_lookup_metrics.go. GVR.String() emits
+# "<group>/<version>, Resource=<resource>" verbatim per apimachinery
+# pkg/runtime/schema/group_version.go (the ", Resource=" prefix is
+# load-bearing — the prior compositions cell key proved that shape).
+_WIDGET_CELL_KEY = (
+    f"widgets|{_WIDGET_GROUP}/{_WIDGET_VERSION}, Resource={_WIDGET_PLURAL}")
+
+# GVR.String() shape for the informer-ACK watcher (matches deps.go's
+# slog.String("gvr", gvr.String())).
+_WIDGET_GVR_STRING = (
+    f"{_WIDGET_GROUP}/{_WIDGET_VERSION}, Resource={_WIDGET_PLURAL}")
+
+
+def _widget_call_path(name: str, ns: str) -> str:
+    """Build the snowplow /call query path for a widget CR (mirrors
+    phases.py:_call_url_for — apiVersion is `<group>/<version>`,
+    url-encoded)."""
+    api_version_enc = f"{_WIDGET_GROUP}/{_WIDGET_VERSION}".replace("/", "%2F")
+    return (f"/call?apiVersion={api_version_enc}"
+            f"&resource={_WIDGET_PLURAL}&name={name}&namespace={ns}")
+
+
+_WIDGET_PROBE_PATH = _widget_call_path(_WIDGET_FIXTURE_NAME,
+                                       _WIDGET_FIXTURE_NS)
+
+
+def _widget_fixture_yaml(label: str) -> str:
+    """Bench Button fixture: a plain widget whose `spec.widgetData.label`
+    scalar echoes verbatim into the served /call body (the marker carrier).
+
+    No apiRef / widgetDataTemplate → routes to the per-cohort `widgets`
+    L1 cell and is NOT RBAC-sensitive (widgets.go dispatcher ->
+    isRBACSensitiveApiRefWidget). Identical shape to
+    phases.py:_widget_fixture_yaml (S8b prior art).
+    """
+    return f"""\
+---
+apiVersion: {_WIDGET_GROUP}/{_WIDGET_VERSION}
+kind: Button
+metadata:
+  name: {_WIDGET_FIXTURE_NAME}
+  namespace: {_WIDGET_FIXTURE_NS}
+spec:
+  widgetData:
+    actions: {{}}
+    clickActionId: nop
+    type: text
+    label: "{label}"
+"""
+
+
+def _widget_namespace_yaml() -> str:
+    """A bare Namespace doc for the bench fixture namespace.
+
+    Server-side-applied idempotently before the Button so the fixture has
+    a home even on a freshly-drained cluster where the phase6 lifecycle
+    (which normally creates bench-ns-*) has not run. Bench-owned and
+    bench-named — the feedback_never_kubectl_apply "bench-internal kubectl
+    is exempt" carve-out applies (same as the S8b/S8c fixtures).
+    """
+    return f"""\
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {_WIDGET_FIXTURE_NS}
+"""
+
+
+def _setup_widget_target(marker: str) -> tuple[str, str]:
+    """Ensure the bench namespace, then create the bench Button fixture
+    with `label=<marker>`.
+
+    Returns (namespace, name) — the mutation coordinates. The fixture is
+    applied with the marker ALREADY as its label so the pre/mid scored
+    bodies carry it (steady state). The MUTATION (later) flips the label
+    to a fresh marker so the post body must change. Raises _VerifyError on
+    apply failure.
+
+    The PRIME GET happens implicitly via the warm-up probes + the T-1s
+    scored probe; we only need apply here.
+    """
+    ns_ok, ns_diag = cluster.k8s_apply_yaml(_widget_namespace_yaml())
+    if not ns_ok:
+        raise _VerifyError(
+            f"widget fixture namespace apply failed: {ns_diag}")
+    ok, diag = cluster.k8s_apply_yaml(_widget_fixture_yaml(marker))
+    if not ok:
+        raise _VerifyError(f"widget fixture apply failed: {diag}")
+    return _WIDGET_FIXTURE_NS, _WIDGET_FIXTURE_NAME
+
+
+def _mutate_widget_label(ns: str, name: str,
+                         marker: str) -> tuple[int, float, str]:
+    """Flip the bench Button's `spec.widgetData.label` to `<marker>`.
+
+    Returns (rc, t_mutate_monotonic, stderr) — the uniform mutate-hook
+    contract every target implements, so the harness body stays
+    target-agnostic. rc=0 on success. t_mutate is captured AFTER the
+    apiserver acknowledged the patch (k8s_patch_cr_spec is synchronous).
+    """
+    ok, diag = cluster.k8s_patch_cr_spec(
+        _WIDGET_GROUP, _WIDGET_VERSION, _WIDGET_PLURAL, ns, name,
+        {"widgetData": {"label": marker}})
+    return (0 if ok else 1), time.monotonic(), ("" if ok else diag)
+
+
+def _cleanup_widget_target(ns: str, name: str) -> bool:
+    """Delete the bench Button fixture. Returns True on success/404."""
+    return cluster.k8s_delete_custom(
+        _WIDGET_GROUP, _WIDGET_VERSION, _WIDGET_PLURAL, ns, name)
+
+
+# Targets enumerated by --target. `widget-echo` is the wired default — its
+# /call body provably carries the patchable marker (live-confirmed). New
+# targets are purely additive per feedback_no_special_cases; each supplies
+# its own path/cell_key/gvr_string + setup/mutate/cleanup hooks.
 _TARGET_REGISTRY = {
-    "compositions-list": {
-        "path": _COMPOSITIONS_LIST_PATH,
-        "cell_key": _RESTACTIONS_CELL_KEY,
+    "widget-echo": {
+        "path": _WIDGET_PROBE_PATH,
+        "cell_key": _WIDGET_CELL_KEY,
+        "gvr_string": _WIDGET_GVR_STRING,
+        "setup_fn": _setup_widget_target,
+        "mutate_fn": _mutate_widget_label,
+        "cleanup_fn": _cleanup_widget_target,
+        # The marker carrier is the widget LABEL itself; the post-mutation
+        # body must contain the NEW label and the pre/mid bodies the OLD.
+        "marker_is_label": True,
     },
 }
 
@@ -192,9 +364,19 @@ def _probe(target_path: str, token: str, trace_id: str,
 
     Per design Q3: direct urllib HTTP (no Playwright), bench-managed JWT,
     X-Krateo-TraceId header for log correlation.
+
+    #159 DEFECT 1 fix (API DRIFT): the probe attaches the trace id via the
+    `headers=` param of browser.http_get (added #159) under the
+    plumbing-canonical header name `X-Krateo-TraceId`
+    (plumbing v0.9.3 context/context.go:21 LabelKrateoTraceId; the server's
+    logger middleware server/use/logger.go:17 binds it onto the request's
+    slog logger so every `resolved_cache.lookup` line carries it as
+    `traceId`). The pre-#159 call passed a non-existent `trace_id=` kwarg
+    and only ran via an injected adapter.
     """
     ms, code, body = browser.http_get(
-        target_path, token, timeout=timeout, retries=1, trace_id=trace_id)
+        target_path, token, timeout=timeout, retries=1,
+        headers={"X-Krateo-TraceId": trace_id})
     sha = hashlib.sha256(body or b"").hexdigest()
     return {
         "trace_id": trace_id,
@@ -206,68 +388,29 @@ def _probe(target_path: str, token: str, trace_id: str,
     }
 
 
-# ─── Target picker (random composition) ─────────────────────────────────────
+def _warmup_probes(target_path: str, token: str, count: int,
+                   probe_fn, log=print) -> int:
+    """Fire `count` UNSCORED warm-up /calls before the first scored probe.
 
+    #159 v1.1 scope: the first scored probe must never eat a cold-fill
+    miss (an empty per-cohort L1 cell → synchronous resolve → the PRIMARY
+    `miss_delta == 0` invariant would trip on a benign first-touch). The
+    warm-ups run BEFORE `vars_before` is snapshotted, so their misses are
+    excluded from the scored counter window.
 
-def _pick_target_composition(rng: random.Random) -> tuple[str, str]:
-    """Choose one random composition for the mutation.
-
-    Returns (namespace, name). Raises _VerifyError if none exist.
-
-    Per design Q1: a composition annotation patch dirty-marks the
-    compositions-list LIST-dep — ANY composition in the cluster works;
-    a random pick avoids hot-spotting one object across runs.
+    Each warm-up uses its own throwaway trace id (never scored, never
+    log-correlated). Returns the number of warm-ups that returned HTTP 200
+    (diagnostic only — a warm-up that 404s/500s does not abort the run;
+    the scored probes' own HTTP-code gate is the load-bearing check).
     """
-    rc, out, _ = kubectl(
-        "get", f"{COMP_RES}.{COMP_GVR}",
-        "-A", "--no-headers",
-        "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
-    if rc != 0 or not out.strip():
-        raise _VerifyError(
-            "no compositions found cluster-wide — cannot mutate")
-    rows = []
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) >= 2:
-            rows.append((parts[0], parts[1]))
-    if not rows:
-        raise _VerifyError("composition list parsed empty")
-    return rng.choice(rows)
-
-
-def _patch_composition_marker(ns: str, name: str,
-                              marker: str) -> tuple[int, float, str]:
-    """Add annotation `snowplow-bench/verify-serve-stale-marker=<marker>`.
-
-    Returns (rc, t_mutate_monotonic, stderr). t_mutate is captured AFTER
-    the kubectl call returns — i.e. apiserver wrote-and-acknowledged.
-
-    Per design Q1: ADD-on-existing-object annotation flows through
-    deps_watch.go OnAdd/OnUpdate → dirty-marks compositions-list
-    LIST-scope dependents.
-    """
-    patch = json.dumps({"metadata": {"annotations": {
-        "snowplow-bench/verify-serve-stale-marker": marker,
-    }}})
-    rc, _, err = kubectl(
-        "patch", f"{COMP_RES}.{COMP_GVR}", name,
-        "-n", ns, "--type=merge", "-p", patch)
-    return rc, time.monotonic(), err
-
-
-def _remove_composition_marker(ns: str, name: str) -> bool:
-    """Cleanup: set the marker annotation to null (removes it).
-
-    Returns True on rc=0. Not load-bearing for verdict — operators can
-    re-run safely with the marker left in place.
-    """
-    patch = json.dumps({"metadata": {"annotations": {
-        "snowplow-bench/verify-serve-stale-marker": None,
-    }}})
-    rc, _, _ = kubectl(
-        "patch", f"{COMP_RES}.{COMP_GVR}", name,
-        "-n", ns, "--type=merge", "-p", patch)
-    return rc == 0
+    ok = 0
+    for i in range(max(0, count)):
+        wu = probe_fn(target_path, token, f"bench-vss-warmup-{i}")
+        if wu.get("code") == 200:
+            ok += 1
+    if count > 0:
+        log(f"warmup       ... fired {count} unscored probe(s), {ok} ok")
+    return ok
 
 
 # ─── Pod log filter (post-hoc SECONDARY) ────────────────────────────────────
@@ -448,8 +591,10 @@ class _InformerAckWatcher(threading.Thread):
 def _marker_in_body(body: bytes, marker: str) -> bool:
     """True if `marker` appears anywhere in `body` (UTF-8 decoded).
 
-    Per design §3 Q1: the annotation value is the marker string itself
-    and surfaces in the compositions-list response body.
+    For the widget-echo target the marker is the widget's
+    `spec.widgetData.label` scalar, which echoes verbatim into the served
+    /call body — so a substring scan is exact (live-confirmed against
+    0.30.261 on 2026-06-12: the resolved Button body embeds the label).
     """
     if not body or not marker:
         return False
@@ -467,77 +612,99 @@ def _decide_verdict(probes: list[dict],
                     hit_delta: int,
                     log_events: dict,
                     informer_ack: str,
-                    cell_inexact: bool) -> tuple[str, int]:
-    """Apply the verdict matrix from design §2 + §5.
+                    cell_inexact: bool) -> tuple[str, int, str | None]:
+    """Apply the verdict matrix (#159 PM review C1, 2026-06-12 §1).
 
-    Returns (verdict_string, exit_code). Verdict strings match the
-    falsifier table cases exactly so the meta-tests can grep on them.
+    Returns (verdict_string, exit_code, mid_observation). Verdict strings
+    match the falsifier table cases exactly so the meta-tests can grep on
+    them. `mid_observation` ("served_stale" | "served_fresh_early") is set
+    only on PASS (informational — NEVER gated on); None otherwise.
+
+    THE CONTRACT (per feedback_mutation_serves_stale_while_refresh): the
+    cache must NOT block or do a synchronous cold-fill MISS during a
+    refresh. Serving fresh EARLY (the refresh beat the probe RTT) is
+    strictly-better, NOT a defect. So PASS = "customer never ate a cold
+    miss (miss_delta==0) AND freshness arrived by T+10s". The literal
+    stale-body-at-+50ms state is recorded informationally, not gated.
+    The retired FAIL_STALE_NOT_SERVED_ON_MID was an over-strict mapping
+    that graded a better-than-contract outcome as a hard FAIL.
     """
     pre, mid, post = probes
 
     # Hard-fail HTTP codes first.
     for p in probes:
         if p["code"] != 200:
-            return (f"FAIL_HTTP_{p['code']}_ON_{p['window']}", 2)
+            return (f"FAIL_HTTP_{p['code']}_ON_{p['window']}", 2, None)
 
     # PM Q3 — Option A informer-ack gate (INDETERMINATE if mid fires
     # before deps_watch logged the dirty-mark for the patched object).
     if informer_ack == "NOT_ACKED":
-        return ("INDETERMINATE_INFORMER_NOT_ACKED", 1)
+        return ("INDETERMINATE_INFORMER_NOT_ACKED", 1, None)
 
     # Window slip: design Q4 + risk register R2.
     if abs(mid["offset_ms"]) > _MID_WINDOW_HARD_LIMIT_MS:
-        return ("INDETERMINATE_MID_WINDOW_SLIPPED", 1)
+        return ("INDETERMINATE_MID_WINDOW_SLIPPED", 1, None)
 
-    # PRIMARY counter assertion: miss_delta must be 0 across all probes.
+    # PRIMARY counter assertion — the load-bearing no-cold-miss invariant.
+    # miss_delta != 0 is the REAL serve-stale violation (a synchronous
+    # cold-fill on the mutation path); stays a hard FAIL.
     if miss_delta != 0:
-        return ("FAIL_SYNC_COLD_FILL_ON_MID", 2)
+        return ("FAIL_SYNC_COLD_FILL_ON_MID", 2, None)
 
     # SECONDARY log presence per probe — primary already passed.
     missing = [p["window"] for p in probes
                if not log_events.get(p["trace_id"])]
     if missing:
-        return (f"INDETERMINATE_LOG_FILTER_UNAVAILABLE", 1)
+        return ("INDETERMINATE_LOG_FILTER_UNAVAILABLE", 1, None)
 
     # Sources-disagree: PRIMARY says no miss but a per-probe log line
     # has hit:false.
     for p in probes:
         for ev in log_events.get(p["trace_id"], []):
             if ev.get("hit") is False:
-                return ("FAIL_SOURCES_DISAGREE", 2)
+                return ("FAIL_SOURCES_DISAGREE", 2, None)
 
-    # Refresh contract: pre body must equal mid body, and post must
-    # differ from pre AND carry the marker.
-    if pre["body_sha256"] != mid["body_sha256"]:
-        return ("FAIL_STALE_NOT_SERVED_ON_MID", 2)
+    # ── Bounded-freshness (load-bearing): the refresh MUST have arrived
+    #    by T+10s — the post body carries the new marker AND differs from
+    #    the pre snapshot. Otherwise the refresh never completed. ─────────
+    if (not post["marker_present"]
+            or post["body_sha256"] == pre["body_sha256"]):
+        return ("FAIL_REFRESH_NOT_COMPLETED_BY_10S", 2, None)
+
+    # ── Mid-window classification (#159 C1 §1) ──────────────────────────
+    # served_stale       — mid == pre snapshot AND no marker (canonical
+    #                       serve-stale; refresh had not yet swapped).
+    # served_fresh_early — mid already carries the marker (refresh beat the
+    #                       probe RTT; strictly-better than stale — the
+    #                       idle-cluster smoke case).
+    # Neither — mid body CHANGED but does NOT carry the just-written marker:
+    #           a genuine "something else mutated the entry" anomaly worth a
+    #           human look, but NOT a serve-stale FAIL → INDETERMINATE.
     if mid["marker_present"]:
-        # Stale window should NOT carry the just-written marker.
-        return ("FAIL_STALE_NOT_SERVED_ON_MID", 2)
-    if post["body_sha256"] == pre["body_sha256"]:
-        return ("FAIL_REFRESH_NOT_COMPLETED_BY_5S", 2)
-    if not post["marker_present"]:
-        return ("FAIL_REFRESH_NOT_COMPLETED_BY_5S", 2)
-
-    # All checks pass.
-    return ("PASS", 0)
+        return ("PASS", 0, "served_fresh_early")
+    if pre["body_sha256"] == mid["body_sha256"]:
+        return ("PASS", 0, "served_stale")
+    return ("INDETERMINATE_MID_BODY_UNEXPECTED", 1, None)
 
 
 # ─── Public entry point ─────────────────────────────────────────────────────
 
 
-def run_verify_serve_stale(user: str = "cyberjoker",
-                           target: str = "compositions-list",
+def run_verify_serve_stale(user: str = "admin",
+                           target: str = "widget-echo",
                            tag: str | None = None,
                            run_dir: Path | None = None,
                            rng_seed: int | None = None,
+                           warmup: int = _DEFAULT_WARMUP_PROBES,
                            log=print,
                            section=print,
                            # I/O stub hooks for the falsifier:
                            _probe_fn=None,
                            _snapshot_fn=None,
                            _grep_fn=None,
-                           _pick_target_fn=None,
+                           _setup_fn=None,
                            _patch_fn=None,
+                           _cleanup_fn=None,
                            _ack_fn=None,
                            _sleep_fn=None) -> tuple[int, dict]:
     """Run the 3-probe serve-stale-while-refresh verifier.
@@ -546,9 +713,30 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     returns the exit code; cli.cmd_verify_serve_stale is the only
     production caller.
 
+    #159 C2: `user` defaults to "admin". The widget-echo fixture lives in
+    bench-ns-01; cyberjoker has NO RBAC there standalone (FAIL_HTTP_403)
+    unless an active phase6 lifecycle has granted a rolebinding into that
+    namespace. admin exercises the IDENTICAL `widgets` L1 cell + dirty-mark
+    → refresh mechanism (the cache layer is subject-agnostic), so this is a
+    contract gate, not a north-star scorer. cyberjoker stays selectable.
+
     All I/O is parameterised via the `_*_fn` stub hooks (defaults wired
-    to the real helpers). The falsifier meta-tests inject deterministic
-    stubs — no cluster contact.
+    to the target's registry hooks). The falsifier meta-tests inject
+    deterministic stubs — no cluster contact.
+
+    #159 mechanism (DEFECT 2 fix): the mutation target is fully described
+    by the registry entry (path / cell_key / gvr_string + setup/mutate/
+    cleanup hooks). The default `widget-echo` target creates a bench-owned
+    Button whose `spec.widgetData.label` echoes into the served /call body
+    — a guaranteed-present, patchable marker. TWO markers drive the
+    contract: `setup_marker` (the initial label, present in the pre/mid
+    steady-state bodies) and `mutate_marker` (the post-mutation label,
+    which MUST appear only in the T+10s body). `marker_present` on every
+    probe is scanned against the `mutate_marker`.
+
+    #159 warm-up scope: `warmup` UNSCORED /calls fire after fixture setup
+    but BEFORE the scored `vars_before` baseline snapshot, so the first
+    scored probe never eats a cold-fill miss.
     """
     target_cfg = _TARGET_REGISTRY.get(target)
     if target_cfg is None:
@@ -559,30 +747,25 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     probe_fn = _probe_fn or _probe
     snapshot_fn = _snapshot_fn or _snapshot_debug_vars
     grep_fn = _grep_fn or _grep_pod_logs_for_traces
-    pick_fn = _pick_target_fn or _pick_target_composition
-    patch_fn = _patch_fn or _patch_composition_marker
+    setup_fn = _setup_fn or target_cfg["setup_fn"]
+    patch_fn = _patch_fn or target_cfg["mutate_fn"]
+    cleanup_fn = _cleanup_fn or target_cfg["cleanup_fn"]
     sleep_fn = _sleep_fn or time.sleep
     ack_fn = _ack_fn  # None → real _InformerAckWatcher
 
-    # Pre-flight: /debug/vars reachable AND publishes the cell?
+    # Pre-flight: /debug/vars reachable AND publishes the cell? (Reachability
+    # + CACHE_ENABLED gate — the SCORED counter baseline is re-snapshotted
+    # AFTER the warm-ups below.)
     try:
-        vars_before = snapshot_fn()
+        vars_preflight = snapshot_fn()
     except _VerifyError as e:
         return 1, {"verdict": "INDETERMINATE_DEBUG_VARS_UNREACHABLE",
                    "error": str(e), "exit_code": 1}
-    if "snowplow_dispatch_l1_lookups" not in (vars_before or {}):
+    if "snowplow_dispatch_l1_lookups" not in (vars_preflight or {}):
         # Risk register R8 — CACHE_ENABLED=false.
         return 1, {"verdict": "INDETERMINATE_CACHE_OFF",
                    "exit_code": 1,
                    "reason": "snowplow_dispatch_l1_lookups not published"}
-
-    # Pick the mutation target.
-    rng = random.Random(rng_seed)
-    try:
-        ns, name = pick_fn(rng)
-    except _VerifyError as e:
-        return 1, {"verdict": "INDETERMINATE_NO_TARGET_FOUND",
-                   "error": str(e), "exit_code": 1}
 
     # JWT for the chosen user.
     tokens = browser.login_all()
@@ -591,7 +774,15 @@ def run_verify_serve_stale(user: str = "cyberjoker",
         return 1, {"verdict": "INDETERMINATE_LOGIN_FAILED",
                    "user": user, "exit_code": 1}
 
-    marker = f"verify-serve-stale-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    # Two-marker model (see docstring). setup_marker is the initial widget
+    # label (pre/mid steady-state); mutate_marker is the post label.
+    # rng_seed is reserved for future multi-target random selection; the
+    # widget-echo target uses a fixed bench-owned fixture name (no random
+    # pick), so it does not consume the seed today.
+    _ = rng_seed
+    stamp = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    setup_marker = f"vss-v1-{stamp}"
+    mutate_marker = f"vss-v2-{stamp}"
     run_id = uuid.uuid4().hex[:6]
     tid_pre = f"bench-vss-{run_id}-pre"
     tid_mid = f"bench-vss-{run_id}-mid"
@@ -601,7 +792,30 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     cell_key = target_cfg["cell_key"]
 
     section(f"verify-serve-stale ({user} / {target}) — tag={tag or 'unset'}")
-    log(f"target composition: ns={ns} name={name} marker={marker}")
+
+    # ── Fixture setup (establishes the pre/mid steady-state body) ───────
+    try:
+        ns, name = setup_fn(setup_marker)
+    except _VerifyError as e:
+        return 1, {"verdict": "INDETERMINATE_SETUP_FAILED",
+                   "error": str(e), "exit_code": 1}
+    log(f"target: ns={ns} name={name} "
+        f"setup_marker={setup_marker} mutate_marker={mutate_marker}")
+
+    # ── WARM-UP (#159): unscored /calls fill the cold per-cohort cell ──
+    # Fires AFTER setup (fixture exists) and BEFORE the scored vars_before
+    # snapshot, so the first scored probe's resolve is a HIT, not a
+    # synchronous cold-fill miss that would trip the PRIMARY
+    # `miss_delta == 0` invariant on a benign first touch.
+    warmup_ok = _warmup_probes(target_path, token, warmup, probe_fn, log=log)
+
+    # ── SCORED baseline: re-snapshot /debug/vars AFTER the warm-ups ────
+    try:
+        vars_before = snapshot_fn()
+    except _VerifyError as e:
+        cleanup_fn(ns, name)
+        return 1, {"verdict": "INDETERMINATE_DEBUG_VARS_UNREACHABLE",
+                   "error": str(e), "exit_code": 1}
 
     # ── Subscribe to deps_watch log stream BEFORE the mutation ─────────
     # PM Option A (mandatory): start `kubectl logs --since=10s -f` BEFORE
@@ -610,20 +824,15 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     # window so the kubectl-side stream-attach race is non-load-bearing.
     watcher = None
     if ack_fn is None:
-        # gvr_string format matches what snowplow's slog emits, which is
-        # schema.GroupVersionResource.String() VERBATIM. Per apimachinery
-        # v0.35.3 pkg/runtime/schema/group_version.go:114-116:
-        #   strings.Join([]string{Group, "/", Version,
-        #                         ", Resource=", Resource}, "")
-        # producing "<group>/<version>, Resource=<resource>".
-        # COMP_GVR = "composition.krateo.io"; bench compositions live
-        # under composition_yaml's "v1-2-2" version (cluster.py:574-578).
-        # PM tightening #1 (2026-06-02): the original ", <resource>" shape
-        # (no "Resource=" prefix) would NOT match any real log line and
-        # would force INDETERMINATE_INFORMER_NOT_ACKED on every live run.
-        comp_gvr_string = (
-            f"{COMP_GVR}/v1-2-2, Resource={COMP_RES}")
-        watcher = _InformerAckWatcher(comp_gvr_string, ns, name)
+        # gvr_string is the target's GVR.String() VERBATIM, matching what
+        # snowplow's slog emits (deps.go: slog.String("gvr", gvr.String())).
+        # Per apimachinery pkg/runtime/schema/group_version.go:
+        #   "<group>/<version>, Resource=<resource>"
+        # The ", Resource=" prefix is load-bearing — without it no real log
+        # line matches and every run forces INDETERMINATE_INFORMER_NOT_ACKED
+        # (PM tightening #1, 2026-06-02). The widget-echo target supplies
+        # "widgets.templates.krateo.io/v1beta1, Resource=buttons".
+        watcher = _InformerAckWatcher(target_cfg["gvr_string"], ns, name)
         watcher.start()
         # Grace for the kubectl logs -f subprocess to attach.
         sleep_fn(0.30)
@@ -634,7 +843,7 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     pre = probe_fn(target_path, token, tid_pre)
     pre["window"] = "pre"
     pre["offset_ms"] = -1000  # nominal; pre fires at t0
-    pre["marker_present"] = _marker_in_body(pre["body_bytes"], marker)
+    pre["marker_present"] = _marker_in_body(pre["body_bytes"], mutate_marker)
     log(f"T-1s probe   ... code={pre['code']} body_sha={pre['body_sha256'][:8]}"
         f"... trace={tid_pre} ({pre['http_ms']}ms)")
 
@@ -642,11 +851,12 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     target_mutate = t0 + 1.000
     sleep_fn(max(0.0, target_mutate - time.monotonic()))
 
-    # ── MUTATE ─────────────────────────────────────────────────────────
-    rc, t_mutate, err = patch_fn(ns, name, marker)
+    # ── MUTATE (flip the echo field to the mutate_marker) ───────────────
+    rc, t_mutate, err = patch_fn(ns, name, mutate_marker)
     if rc != 0:
         if watcher is not None:
             watcher.stop()
+        cleanup_fn(ns, name)
         return 1, {"verdict": "INDETERMINATE_PATCH_FAILED",
                    "error": err, "exit_code": 1}
     log(f"MUTATE       ... rc={rc} t_mutate=+{(t_mutate - t0):.3f}s")
@@ -659,7 +869,7 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     # ACK is a hard gate — NOT_ACKED → INDETERMINATE_INFORMER_NOT_ACKED.
     if ack_fn is not None:
         # Stub injection path (used by the meta-falsifier).
-        informer_ack = ack_fn(ns, name, marker, t_mutate)
+        informer_ack = ack_fn(ns, name, mutate_marker, t_mutate)
     elif watcher is not None:
         # seen_by blocks until either the dirty-mark line is observed or
         # the deadline (time.monotonic() — i.e. NOW, since we already
@@ -675,7 +885,7 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     mid = probe_fn(target_path, token, tid_mid)
     mid["window"] = "mid"
     mid["offset_ms"] = actual_mid_offset_ms
-    mid["marker_present"] = _marker_in_body(mid["body_bytes"], marker)
+    mid["marker_present"] = _marker_in_body(mid["body_bytes"], mutate_marker)
     log(f"T+50ms probe ... code={mid['code']} body_sha={mid['body_sha256'][:8]}"
         f"... trace={tid_mid} (offset=+{actual_mid_offset_ms}ms, "
         f"informer={informer_ack})")
@@ -693,7 +903,7 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     post = probe_fn(target_path, token, tid_post)
     post["window"] = "post"
     post["offset_ms"] = actual_post_offset_ms
-    post["marker_present"] = _marker_in_body(post["body_bytes"], marker)
+    post["marker_present"] = _marker_in_body(post["body_bytes"], mutate_marker)
     log(f"T+10s probe  ... code={post['code']} body_sha={post['body_sha256'][:8]}"
         f"... trace={tid_post} (offset=+{actual_post_offset_ms}ms, "
         f"marker={'present' if post['marker_present'] else 'ABSENT'})")
@@ -702,6 +912,7 @@ def run_verify_serve_stale(user: str = "cyberjoker",
     try:
         vars_after = snapshot_fn()
     except _VerifyError as e:
+        cleanup_fn(ns, name)
         return 1, {"verdict": "INDETERMINATE_DEBUG_VARS_UNREACHABLE",
                    "error": str(e), "exit_code": 1}
     miss_delta, hit_delta, cell_inexact = _cell_delta(
@@ -719,15 +930,16 @@ def run_verify_serve_stale(user: str = "cyberjoker",
         log(f"pod log filter failed: {e}")
         log_events = {tid_pre: [], tid_mid: [], tid_post: []}
 
-    # ── Cleanup ────────────────────────────────────────────────────────
-    cleanup_ok = _remove_composition_marker(ns, name)
-    log(f"CLEANUP      ... annotation removed={cleanup_ok}")
+    # ── Cleanup (target-owned: delete the bench fixture) ───────────────
+    cleanup_ok = cleanup_fn(ns, name)
+    log(f"CLEANUP      ... fixture removed={cleanup_ok}")
 
     # ── Verdict ────────────────────────────────────────────────────────
-    verdict, exit_code = _decide_verdict(
+    verdict, exit_code, mid_observation = _decide_verdict(
         [pre, mid, post], miss_delta, hit_delta,
         log_events, informer_ack, cell_inexact)
-    section(f"VERDICT: {verdict}")
+    section(f"VERDICT: {verdict}"
+            f"{f' (mid={mid_observation})' if mid_observation else ''}")
 
     # ── Bundle ─────────────────────────────────────────────────────────
     def _strip_body(p: dict) -> dict:
@@ -743,9 +955,15 @@ def run_verify_serve_stale(user: str = "cyberjoker",
         "mutation": {
             "namespace": ns,
             "name": name,
-            "marker": marker,
+            "setup_marker": setup_marker,
+            "mutate_marker": mutate_marker,
             "patch_rc": rc,
         },
+        "warmup": {"requested": warmup, "http_200": warmup_ok},
+        # #159 C1: informational classification of the mid-window state on
+        # PASS — "served_stale" (canonical) | "served_fresh_early" (refresh
+        # beat the probe RTT). None on non-PASS verdicts. NEVER gated on.
+        "mid_observation": mid_observation,
         "probes": [_strip_body(pre), _strip_body(mid), _strip_body(post)],
         "l1_lookups": {
             "class": cell_key,
@@ -776,7 +994,7 @@ def run_verify_serve_stale(user: str = "cyberjoker",
             for tid in (tid_pre, tid_mid, tid_post)
             for ev in log_events.get(tid, [])
         ),
-        "cleanup": {"annotation_removed": cleanup_ok},
+        "cleanup": {"fixture_removed": cleanup_ok},
     }
 
     if run_dir is not None:

@@ -45,6 +45,7 @@ __all__ = [
     "cmd_phase6",
     "cmd_phase7",
     "cmd_phase8",
+    "cmd_verify_serve_stale",
     "cmd_report",
     "verify_deployed_image",
 ]
@@ -754,6 +755,41 @@ def cmd_phase8(args) -> int:
         return 1
 
 
+def cmd_verify_serve_stale(args) -> int:
+    """Run the serve-stale-while-refresh verifier (#159).
+
+    Goes through _gke_context_guard first (the verifier mutates a
+    bench-owned fixture). Returns the verifier's own exit code:
+        0 PASS / 1 INDETERMINATE / 2 FAIL_* / 3 non-GKE.
+    """
+    _gke_context_guard(allow_non_gke=getattr(args, "allow_non_gke", False))
+    from bench import verify_serve_stale
+    run_dir = getattr(args, "run_dir", None) or _default_run_dir(args)
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        exit_code, _bundle = verify_serve_stale.run_verify_serve_stale(
+            user=getattr(args, "user", "admin"),
+            target=getattr(args, "target", "widget-echo"),
+            tag=getattr(args, "tag", None),
+            run_dir=Path(run_dir),
+            warmup=getattr(args, "warmup", None)
+            if getattr(args, "warmup", None) is not None
+            else verify_serve_stale._DEFAULT_WARMUP_PROBES,
+            log=log,
+            section=section,
+        )
+        return int(exit_code)
+    except verify_serve_stale._VerifyError as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}verify-serve-stale ERROR: {e}{RESET}\n")
+        return 1
+    except Exception as e:
+        sys.stderr.write(
+            f"{RED}{BOLD}verify-serve-stale FAILED: "
+            f"{type(e).__name__}: {e}{RESET}\n")
+        return 1
+
+
 # ─── cmd_report (Block 4) ───────────────────────────────────────────────────
 
 
@@ -922,6 +958,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p_p8.add_argument("--tag", default=None)
     p_p8.add_argument("--run-dir", dest="run_dir", default=None)
     p_p8.set_defaults(func=cmd_phase8)
+
+    # ─── verify-serve-stale (#159) ──────────────────────────────────────
+    p_vss = sub.add_parser(
+        "verify-serve-stale",
+        help="Serve-stale-while-refresh contract verifier "
+             "(3 probes around one bench-fixture mutation).",
+    )
+    p_vss.add_argument("--tag", default=None,
+                       help="Image tag context (logged + run-dir).")
+    p_vss.add_argument(
+        "--user", default="admin",
+        help="Subject identity for the scored /call probes (default admin). "
+             "cyberjoker is selectable but requires an active phase6 "
+             "lifecycle granting a rolebinding into the bench fixture "
+             "namespace bench-ns-01; standalone cyberjoker runs FAIL 403. "
+             "The cache layer is subject-agnostic — admin exercises the "
+             "identical widgets L1 cell + dirty-mark/refresh path.")
+    p_vss.add_argument(
+        "--target", default="widget-echo",
+        help="Mutation target (default widget-echo — a bench-owned Button "
+             "whose spec.widgetData.label echoes into the /call body).")
+    p_vss.add_argument(
+        "--warmup", type=int, default=None,
+        help="Unscored warm-up /calls before the first scored probe "
+             "(default 2). 0 disables.")
+    p_vss.add_argument("--run-dir", dest="run_dir", default=None)
+    p_vss.set_defaults(func=cmd_verify_serve_stale)
 
     # ─── report ─────────────────────────────────────────────────────────
     p_rep = sub.add_parser(
