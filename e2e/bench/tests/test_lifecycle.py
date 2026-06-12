@@ -89,10 +89,18 @@ def test_destructive_clean_guard_truth_table(
 # ─── cluster_dirty_state aggregation (10) ───────────────────────────────────
 
 def test_cluster_dirty_state_aggregates_all_categories(monkeypatch):
-    """cluster_dirty_state() returns the full 10-category dict."""
+    """cluster_dirty_state() returns the full 12-category dict.
+
+    Task #275 / #276-B.1 added two categories: `bench_namespaces_terminating`
+    (Terminating bench-ns the `bench_namespaces` counter excludes) and
+    `comp_panels` (cluster-wide composition-panel CRs).
+    """
 
     # Patch all the count helpers to fixed values.
     monkeypatch.setattr(lifecycle_mod, "count_bench_ns", lambda: 3)
+    monkeypatch.setattr(lifecycle_mod, "count_bench_ns_terminating", lambda: 2)
+    monkeypatch.setattr(lifecycle_mod, "count_compositions_with_panels_ready",
+                        lambda target_ns=None: 41)
     monkeypatch.setattr(lifecycle_mod, "count_compositions", lambda: 7)
     monkeypatch.setattr(lifecycle_mod, "_crd_exists", lambda crd: True)
     # `_count` / `_count_match` / `_count_bench_argo` live in cluster.py;
@@ -113,12 +121,15 @@ def test_cluster_dirty_state_aggregates_all_categories(monkeypatch):
 
     state = cluster_dirty_state()
     assert set(state.keys()) == {
-        "bench_namespaces", "compositions", "compositiondefinitions",
+        "bench_namespaces", "bench_namespaces_terminating", "comp_panels",
+        "compositions", "compositiondefinitions",
         "argo_apps_bench", "ogen_repoes", "git_repoes",
         "bench_clusterroles", "bench_clusterrolebindings",
         "bench_roles_namespaced", "bench_rolebindings_namespaced",
     }
     assert state["bench_namespaces"] == 3
+    assert state["bench_namespaces_terminating"] == 2
+    assert state["comp_panels"] == 41
     assert state["compositions"] == 7
     assert state["compositiondefinitions"] == 1
     assert state["argo_apps_bench"] == 13
@@ -130,9 +141,34 @@ def test_cluster_dirty_state_aggregates_all_categories(monkeypatch):
     assert state["bench_rolebindings_namespaced"] == 29
 
 
+def test_cluster_dirty_state_comp_panels_none_coerces_to_zero(monkeypatch):
+    """Task #275: a transport failure in count_compositions_with_panels_ready
+    (returns None) must coerce to 0 — a flaky k8s client must NEVER
+    false-positive the cluster as dirty on the new comp_panels counter.
+    """
+    monkeypatch.setattr(lifecycle_mod, "count_bench_ns", lambda: 0)
+    monkeypatch.setattr(lifecycle_mod, "count_bench_ns_terminating", lambda: 0)
+    monkeypatch.setattr(lifecycle_mod, "count_compositions_with_panels_ready",
+                        lambda target_ns=None: None)
+    monkeypatch.setattr(lifecycle_mod, "count_compositions", lambda: 0)
+    monkeypatch.setattr(lifecycle_mod, "_crd_exists", lambda crd: True)
+    monkeypatch.setattr(lifecycle_mod, "_count", lambda res: 0)
+    monkeypatch.setattr(lifecycle_mod, "_count_bench_argo", lambda: 0)
+    monkeypatch.setattr(
+        lifecycle_mod, "_count_match",
+        lambda res, name_prefix="", ns_prefix="": 0)
+    state = cluster_dirty_state()
+    assert state["comp_panels"] == 0
+    # The whole dict is clean → assert_clean would short-circuit.
+    assert {k: v for k, v in state.items() if v > 0} == {}
+
+
 def test_cluster_dirty_state_zeros_compositions_when_crd_missing(monkeypatch):
     """If the composition CRD is missing, compositions count is 0 (no kubectl call)."""
     monkeypatch.setattr(lifecycle_mod, "count_bench_ns", lambda: 0)
+    monkeypatch.setattr(lifecycle_mod, "count_bench_ns_terminating", lambda: 0)
+    monkeypatch.setattr(lifecycle_mod, "count_compositions_with_panels_ready",
+                        lambda target_ns=None: 0)
     monkeypatch.setattr(lifecycle_mod, "_crd_exists", lambda crd: False)
     # Whoever calls count_compositions when CRD missing is a bug — fail loudly:
     monkeypatch.setattr(lifecycle_mod, "count_compositions",

@@ -118,6 +118,20 @@ class IncompatibleStateSchema(Exception):
     """Raised when state.json carries a future-major schema version."""
 
 
+class PhantomCompPanelAbort(RuntimeError):
+    """Raised at S3 start when the cluster carries composition-panel CRs
+    with NO live bench namespace — i.e. residual phantom panels from a
+    prior incomplete clean (Task #275 root cause).
+
+    This is a HARD, LOUD abort, NOT a soft warn: a RuntimeError raised
+    inside the S3 `_work` propagates through `_run_stage` (which persists a
+    failed StageProof + state.json) and out through `run_phase6` →
+    `cmd_phase6` returns exit code 1. The run dies with a red banner so the
+    operator cleans the residue before any S1/S2 measurement can be
+    silently corrupted by phantom Compositions cards.
+    """
+
+
 # ─── Module-level scale/smoke env (mirrors worktree 62-64) ──────────────────
 
 
@@ -1577,8 +1591,71 @@ def stage_s2_one_ns_compdef(ctx: StageContext) -> StageProof:
 # ─── S3: 20 namespaces ──────────────────────────────────────────────────────
 
 
+def _assert_no_phantom_comp_panels() -> dict:
+    """S3-start phantom-panel sentinel (Task #275 prevention gap #276-B.1).
+
+    The #275 root cause was residual `Terminating` composition-panel CRs
+    from a prior incomplete clean: `count_bench_ns()` excludes Terminating
+    namespaces so the bench believed the cluster was clean, while the
+    apiserver still held composition-panel CRs that the admin /compositions
+    datagrid rendered as phantom cards (some failing widgetData resolution).
+
+    At S3 start — the first stage that ramps namespaces, run AFTER S1/S2
+    have already taken zero-state baselines — verify cluster-wide that
+    there are NO composition-panel CRs while NO live (Active) bench
+    namespace exists. That combination can ONLY be prior-run residue
+    (a legitimate run materializes panels only after S4 deploys
+    compositions into live namespaces). If found, HALT the run loudly.
+
+    Queries the SAME direct-apiserver mechanism the trace named
+    (`count_compositions_with_panels_ready(target_ns=None)`,
+    cluster.py) — NOT through snowplow, so it reflects true apiserver
+    state including Terminating-phase residue.
+
+    Returns a small diagnostic dict (folded into the S3 proof on the
+    happy path). Raises PhantomCompPanelAbort when residue is found.
+
+    None-safety: `count_compositions_with_panels_ready` returns None on a
+    transport / client failure. None means "could not determine" — we do
+    NOT abort on None (no false-positive on a flaky k8s client); we record
+    it and proceed (S3's own measurements still run).
+    """
+    live_ns = cluster.count_bench_ns()
+    comp_panels = cluster.count_compositions_with_panels_ready(target_ns=None)
+    diag = {
+        "live_bench_ns": live_ns,
+        "comp_panels_cluster_wide": comp_panels,
+    }
+    if comp_panels is None:
+        lifecycle.log(
+            "  S3 phantom-panel sentinel: comp-panel count unavailable "
+            "(transport failure) — proceeding without the check")
+        return diag
+    if comp_panels > 0 and live_ns == 0:
+        # Surface the masking diagnostic the trace named so the operator
+        # sees WHY: Terminating bench-ns the usable-ns counter hides.
+        terminating = cluster.count_bench_ns_terminating()
+        diag["bench_ns_terminating"] = terminating
+        msg = (
+            f"S3 ABORT — {comp_panels} composition-panel CR(s) present with "
+            f"0 live bench namespaces ({terminating} Terminating). These are "
+            f"phantom panels from a prior incomplete clean (Task #275): the "
+            f"admin /compositions datagrid would render them as cards and "
+            f"silently corrupt the S1/S2 zero-state baselines. Run "
+            f"`python -m bench check` / clean the cluster before re-running."
+        )
+        lifecycle.log(msg)
+        raise PhantomCompPanelAbort(msg)
+    return diag
+
+
 def stage_s3_20_ns(ctx: StageContext) -> StageProof:
     def _work(c: StageContext) -> dict:
+        # Task #275 / #276-B.1: HARD abort if the cluster carries phantom
+        # composition-panel CRs with no live bench namespace (prior-run
+        # Terminating residue). Runs FIRST, before any new namespace is
+        # created, so the check sees the true prior-run baseline.
+        sentinel = _assert_no_phantom_comp_panels()
         _ = _snapshot_l1_ready_ts(c)
         lifecycle.create_bench_namespaces(2, 20)
         lifecycle.wait_for_bench_namespaces(20)
@@ -1588,6 +1665,7 @@ def stage_s3_20_ns(ctx: StageContext) -> StageProof:
         return {
             "ns_count": cluster.count_bench_ns(),
             "measurement_count": len(results),
+            "phantom_panel_sentinel": sentinel,
             "__passed__": True,
         }
 

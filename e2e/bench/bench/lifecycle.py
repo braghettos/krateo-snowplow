@@ -41,8 +41,10 @@ from bench.cluster import (
     _parse_ns_name,
     composition_yaml,
     count_bench_ns,
+    count_bench_ns_terminating,
     count_compositions,
     count_compositions_in_ns,
+    count_compositions_with_panels_ready,
     ensure_composition_controller,
     force_finalize_namespace,
     k8s_bulk_delete_clusterscope,
@@ -1272,9 +1274,29 @@ def cluster_dirty_state():
     Categories with count > 0 indicate the cluster is not in a state
     suitable for a fresh test run. This is the ground-truth signal used
     by assert_clean to decide whether to call clean_environment().
+
+    Task #275 / #276-B.1: two categories close the masking the
+    S3-silent-death trace named (docs/task-275-s3-silent-death-trace):
+
+      - `bench_namespaces_terminating` — the prior run's bench-ns-* go
+        Terminating while their child CRs garbage-collect. The
+        `bench_namespaces` counter EXCLUDES Terminating (it is the
+        "usable bench ns" signal), so without this sibling the dirty
+        diagnostic was blind to in-flight namespace GC — the exact
+        masking that let phantom composition-panel CRs survive unseen.
+      - `comp_panels` — cluster-wide `panels.widgets.templates.krateo.io`
+        carrying the `krateo.io/portal-page=compositions` label. These
+        are the phantom CRs the admin /compositions datagrid renders as
+        cards; residual ones from a prior incomplete clean drove the
+        Task #275 F-4-style apparent cache staleness. `None` (transport
+        failure) coerces to 0 so a flaky k8s client never false-positives
+        the cluster as dirty.
     """
+    comp_panels = count_compositions_with_panels_ready(target_ns=None)
     return {
         "bench_namespaces": count_bench_ns(),
+        "bench_namespaces_terminating": count_bench_ns_terminating(),
+        "comp_panels": comp_panels or 0,
         "compositions": count_compositions() if _crd_exists(f"{COMP_RES}.{COMP_GVR}") else 0,
         "compositiondefinitions": _count("compositiondefinitions.core.krateo.io"),
         "argo_apps_bench": _count_bench_argo(),

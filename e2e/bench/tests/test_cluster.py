@@ -795,6 +795,58 @@ def test_count_comp_panels_never_touches_subprocess(
         target_ns="bench-ns-01") is None
 
 
+# ─── Task #275 / #276-B.1 — count_bench_ns_terminating ──────────────────────
+#
+# The sibling count_bench_ns() EXCLUDES Terminating namespaces; this
+# counter makes the Terminating residue (the #275 masking) visible.
+# `kubectl get ns --no-headers` prints the phase in the STATUS column:
+#   bench-ns-01   Terminating   12m
+#   bench-ns-02   Active        12m
+
+
+def test_count_bench_ns_terminating_counts_only_terminating(mock_kubectl):
+    """Counts bench-ns-* in Terminating phase; ignores Active bench-ns and
+    non-bench namespaces (Terminating or not)."""
+    mock_kubectl.replies = [(0, (
+        "bench-ns-01   Terminating   12m\n"
+        "bench-ns-02   Terminating   12m\n"
+        "bench-ns-03   Active        12m\n"
+        "krateo-system Active        40d\n"
+        "kube-system   Terminating   40d\n"   # non-bench Terminating: ignored
+    ), "")]
+    import bench.cluster as cluster_mod
+    assert cluster_mod.count_bench_ns_terminating() == 2
+
+
+def test_count_bench_ns_terminating_zero_when_all_active(mock_kubectl):
+    """When every bench-ns is Active, the Terminating counter is 0 (the
+    healthy steady state); the sibling count_bench_ns() would report 3."""
+    mock_kubectl.replies = [(0, (
+        "bench-ns-01   Active   12m\n"
+        "bench-ns-02   Active   12m\n"
+        "bench-ns-03   Active   12m\n"
+    ), "")]
+    import bench.cluster as cluster_mod
+    assert cluster_mod.count_bench_ns_terminating() == 3 - 3  # == 0
+
+
+def test_count_bench_ns_terminating_complements_count_bench_ns(mock_kubectl):
+    """The two counters partition the bench-ns set: Active goes to
+    count_bench_ns(), Terminating goes to count_bench_ns_terminating().
+    Proves the exact masking the #275 trace named — count_bench_ns() sees
+    only the 1 Active, the Terminating counter exposes the hidden 2."""
+    out = (
+        "bench-ns-01   Terminating   12m\n"
+        "bench-ns-02   Terminating   12m\n"
+        "bench-ns-03   Active        12m\n"
+    )
+    # Two identical replies — one per counter call (the fixture pops).
+    mock_kubectl.replies = [(0, out, ""), (0, out, "")]
+    import bench.cluster as cluster_mod
+    assert cluster_mod.count_bench_ns() == 1
+    assert cluster_mod.count_bench_ns_terminating() == 2
+
+
 # ─── Task #250 Block 2b re-gate v2 — SDK-symbol presence + (ok, diag) shape ──
 #
 # Why this test exists: the hermetic tests above monkeypatch

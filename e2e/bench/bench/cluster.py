@@ -957,6 +957,28 @@ def count_bench_ns():
                 if "bench-ns-" in line and "Terminating" not in line])
 
 
+def count_bench_ns_terminating():
+    """Count bench-ns-* namespaces in the Terminating phase.
+
+    The sibling `count_bench_ns()` EXCLUDES Terminating namespaces (it is
+    the "how many usable bench namespaces exist" signal). That exclusion is
+    exactly the masking the Task #275 trace named: between two runs, the
+    prior run's bench-ns-* go Terminating while the apiserver garbage-
+    collects their child CRs (panels included), but `count_bench_ns()`
+    reports 0 → the bench believes the cluster is clean while phantom
+    composition-panel CRs are still live.
+
+    This counter makes the Terminating residue VISIBLE to
+    `cluster_dirty_state()` so pre-clean verification stops being blind to
+    the in-flight namespace GC. `kubectl get ns --no-headers` prints the
+    phase in the STATUS column, so a Terminating bench namespace appears as
+    `bench-ns-NN   Terminating   <age>`.
+    """
+    rc, out, _ = kubectl("get", "ns", "--no-headers")
+    return len([line for line in out.strip().split("\n")
+                if "bench-ns-" in line and "Terminating" in line])
+
+
 # ── Compositions-page panel widgets (Task #250 Block 2b / re-gate fix) ────
 #
 # Empirical ground-truth (kubectl probe 2026-06-05 on

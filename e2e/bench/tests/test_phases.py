@@ -2810,3 +2810,180 @@ def test_run_stage_skips_log_attach_when_streamer_disabled(
     # No artifact entry referencing pod_logs/.
     assert not any("pod_logs" in a for a in proof.artifacts), \
         f"unexpected pod_logs artifact when opted out: {proof.artifacts}"
+
+
+# ─── Task #275 / #276-B.1 — S3-start phantom-panel sentinel ─────────────────
+#
+# The #275 root cause: residual Terminating composition-panel CRs from a
+# prior incomplete clean, masked because count_bench_ns() excludes
+# Terminating namespaces. _assert_no_phantom_comp_panels() queries the
+# direct-apiserver comp-panel count and HALTS loudly when panels exist with
+# NO live bench namespace. All four branches are exercised; the full-stage
+# test proves the abort propagates through _run_stage as a real failure.
+
+
+def test_phantom_panel_sentinel_passes_on_clean_cluster(monkeypatch):
+    """0 comp-panels + 0 live ns (fresh clean cluster) → no abort, returns
+    a diagnostic dict."""
+    from bench import phases as phases_mod
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns", lambda: 0)
+    monkeypatch.setattr(
+        phases_mod.cluster, "count_compositions_with_panels_ready",
+        lambda target_ns=None: 0)
+    diag = phases_mod._assert_no_phantom_comp_panels()
+    assert diag == {"live_bench_ns": 0, "comp_panels_cluster_wide": 0}
+
+
+def test_phantom_panel_sentinel_passes_when_live_ns_present(monkeypatch):
+    """Panels present BUT live bench namespaces also present (legitimate
+    mid-run state) → no abort. A real run materializes panels only after
+    S4 deploys into live namespaces, so panels+live-ns is normal."""
+    from bench import phases as phases_mod
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns", lambda: 20)
+    monkeypatch.setattr(
+        phases_mod.cluster, "count_compositions_with_panels_ready",
+        lambda target_ns=None: 143)
+    diag = phases_mod._assert_no_phantom_comp_panels()
+    assert diag == {"live_bench_ns": 20, "comp_panels_cluster_wide": 143}
+
+
+def test_phantom_panel_sentinel_aborts_on_phantom_residue(monkeypatch):
+    """Panels present + 0 live bench ns → HARD abort (PhantomCompPanelAbort).
+    This is the exact #275 residue signature. The abort message surfaces the
+    Terminating-ns masking diagnostic."""
+    from bench import phases as phases_mod
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns", lambda: 0)
+    monkeypatch.setattr(
+        phases_mod.cluster, "count_compositions_with_panels_ready",
+        lambda target_ns=None: 124)
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns_terminating",
+                        lambda: 49)
+    with pytest.raises(phases_mod.PhantomCompPanelAbort) as ei:
+        phases_mod._assert_no_phantom_comp_panels()
+    msg = str(ei.value)
+    assert "124 composition-panel" in msg
+    assert "0 live bench namespaces" in msg
+    assert "49 Terminating" in msg
+    assert "Task #275" in msg
+
+
+def test_phantom_panel_sentinel_does_not_abort_on_transport_failure(
+        monkeypatch):
+    """count_compositions_with_panels_ready returns None (transport / client
+    failure) → "could not determine", NOT an abort. A flaky k8s client must
+    never false-positive the run into a hard halt."""
+    from bench import phases as phases_mod
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns", lambda: 0)
+    monkeypatch.setattr(
+        phases_mod.cluster, "count_compositions_with_panels_ready",
+        lambda target_ns=None: None)
+    # count_bench_ns_terminating must NOT even be consulted on the None path.
+    def _tripwire():
+        raise AssertionError(
+            "count_bench_ns_terminating called on the None/unknown path")
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns_terminating",
+                        _tripwire)
+    diag = phases_mod._assert_no_phantom_comp_panels()
+    assert diag == {"live_bench_ns": 0, "comp_panels_cluster_wide": None}
+
+
+def test_stage_s3_aborts_and_persists_failed_proof_on_phantom_panels(
+        tmp_path, monkeypatch):
+    """Full-stage integration: when S3 starts on a cluster with phantom
+    comp-panels, stage_s3_20_ns must (a) raise PhantomCompPanelAbort out
+    through _run_stage, AND (b) persist a failed StageProof + state.json
+    BEFORE the re-raise — so the next invocation can see the abort. It must
+    also NOT create any new namespaces (the sentinel runs first)."""
+    from bench import phases as phases_mod
+
+    monkeypatch.setenv("BENCH_NO_PER_STAGE_LOGS", "1")
+
+    # Phantom-residue signature: 124 panels, 0 live ns, 49 Terminating.
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns", lambda: 0)
+    monkeypatch.setattr(
+        phases_mod.cluster, "count_compositions_with_panels_ready",
+        lambda target_ns=None: 124)
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns_terminating",
+                        lambda: 49)
+
+    # Tripwire: namespace creation / measurement must NEVER run — the
+    # sentinel halts before any mutation.
+    def _ns_tripwire(*a, **kw):
+        raise AssertionError("create_bench_namespaces ran past the sentinel")
+    monkeypatch.setattr(phases_mod.lifecycle, "create_bench_namespaces",
+                        _ns_tripwire)
+    monkeypatch.setattr(phases_mod, "_measure_all_users",
+                        lambda *a, **kw: pytest.fail(
+                            "_measure_all_users ran past the sentinel"))
+    monkeypatch.setattr(phases_mod, "_snapshot_l1_ready_ts", lambda c: 0)
+
+    ctx = StageContext(
+        tag="0.30.264", scale=50000,
+        run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        cache_mode="ON",
+    )
+    with pytest.raises(phases_mod.PhantomCompPanelAbort):
+        phases_mod.stage_s3_20_ns(ctx)
+
+    # A failed S3 proof must be persisted (proof.json on disk).
+    proof_path = tmp_path / "proofs" / "S3.json"
+    assert proof_path.exists(), "failed S3 proof not persisted before re-raise"
+    persisted = json.loads(proof_path.read_text())
+    assert persisted["stage_id"] == "S3"
+    assert persisted["passed"] is False
+    assert persisted["proof"]["error"] == "PhantomCompPanelAbort"
+
+    # state.json must record the failed stage too.
+    state_path = tmp_path / "state.json"
+    assert state_path.exists()
+    state = json.loads(state_path.read_text())
+    assert "S3" in state.get("stage_proofs", {})
+    assert state["stage_proofs"]["S3"]["passed"] is False
+
+
+def test_stage_s3_folds_sentinel_diag_into_proof_on_happy_path(
+        tmp_path, monkeypatch):
+    """When the cluster is clean, S3 proceeds normally and folds the
+    sentinel diagnostic into its proof under `phantom_panel_sentinel`."""
+    from bench import phases as phases_mod
+
+    monkeypatch.setenv("BENCH_NO_PER_STAGE_LOGS", "1")
+
+    # Clean cluster at sentinel time: 0 panels, 0 live ns.
+    panel_calls = {"n": 0}
+
+    def _panels(target_ns=None):
+        panel_calls["n"] += 1
+        return 0
+    monkeypatch.setattr(
+        phases_mod.cluster, "count_compositions_with_panels_ready", _panels)
+    # count_bench_ns: 0 at sentinel time, 20 after namespaces created (the
+    # proof's ns_count reads it again). A simple stateful stub.
+    ns_state = {"n": 0}
+    monkeypatch.setattr(phases_mod.cluster, "count_bench_ns",
+                        lambda: ns_state["n"])
+
+    def _create(start, end):
+        ns_state["n"] = 20
+    monkeypatch.setattr(phases_mod.lifecycle, "create_bench_namespaces",
+                        _create)
+    monkeypatch.setattr(phases_mod.lifecycle, "wait_for_bench_namespaces",
+                        lambda n: None)
+    monkeypatch.setattr(phases_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(phases_mod, "_post_mutation_pause", lambda mode: None)
+    monkeypatch.setattr(phases_mod, "_snapshot_l1_ready_ts", lambda c: 0)
+    monkeypatch.setattr(phases_mod, "_measure_all_users",
+                        lambda *a, **kw: [{"user": "admin", "pages": {}}])
+
+    ctx = StageContext(
+        tag="0.30.264", scale=50000,
+        run_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        cache_mode="ON",
+    )
+    proof = phases_mod.stage_s3_20_ns(ctx)
+    assert proof.passed is True
+    sentinel = proof.proof["phantom_panel_sentinel"]
+    assert sentinel == {"live_bench_ns": 0, "comp_panels_cluster_wide": 0}
+    assert proof.proof["ns_count"] == 20
