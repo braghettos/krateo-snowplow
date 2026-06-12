@@ -56,6 +56,39 @@ def _stub_deploy_fingerprint(monkeypatch):
                         lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def _stub_conv_discrimination_probes(monkeypatch):
+    """Task #334a: browser_measure_stage's VERIFY block now snapshots
+    `snowplow_refresher_completed_total` (HTTP /debug/vars) and fetches a
+    bounded pod-log window (`kubectl logs --since-time`) to assemble the
+    convergence-cell discrimination tuple. Unit tests must never reach the
+    live cluster — neutralise BOTH seams so the tuple fails soft to all-None
+    (the same path a cache-off pod takes).
+
+    - `_snowplow_pod_log_window` is brand-new and only called from the VERIFY
+      path → stub straight to None.
+    - `read_snowplow_expvar_int` is a SHARED helper with its own dedicated
+      unit tests (test_browser.py) that pass an explicit `base_url=` to drive
+      a mocked transport. We delegate to the REAL function ONLY when a
+      `base_url` is supplied (those unit tests); the VERIFY-path callers pass
+      no base_url and get None. test_phases_s8bc re-binds the attribute
+      explicitly and so overrides this wrapper entirely (fixtures apply
+      before the test body).
+    """
+    import bench.browser as browser_mod
+    _real_expvar = browser_mod.read_snowplow_expvar_int
+
+    def _expvar_or_none(key, *, base_url=None, timeout=10):
+        if base_url is not None:
+            return _real_expvar(key, base_url=base_url, timeout=timeout)
+        return None
+
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int",
+                        _expvar_or_none)
+    monkeypatch.setattr(browser_mod, "_snowplow_pod_log_window",
+                        lambda *a, **k: None)
+
+
 @pytest.fixture
 def reset_k8s_state():
     """Reset bench.cluster k8s-client module globals between tests.

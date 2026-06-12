@@ -43,6 +43,7 @@ import base64
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -88,6 +89,8 @@ __all__ = [
     # Task #250 Block 2 — Phase 6 S8/S9 probes
     "read_snowplow_expvar_int",
     "count_user_compositions_in_ns",
+    # Task #334a — convergence-cell discrimination tuple (report-only)
+    "capture_conv_discrimination",
 ]
 
 
@@ -298,6 +301,168 @@ def read_snowplow_expvar_int(key, *, base_url=None, timeout=10):
         except (ValueError, OverflowError):
             return None
     return None
+
+
+# ─── Task #334a: convergence-cell discrimination tuple ──────────────────────
+#
+# Telemetry-ONLY (report-only). Attached alongside `convergence_ms` at every
+# S6/S7/S8 convergence recording site so post-run analysis can discriminate
+# "flat slope + high churn = cluster-state" (a slow-but-healthy convergence
+# driven by controller-install churn) from "dropped slope = code regression"
+# (the refresher stopped draining). This NEVER feeds compute_verdict — see the
+# proof in the dev report: only conv_s8_p99 (convergence_p99_for_stage, which
+# reads nav["convergence_ms"]) gates; this is an additive sibling key.
+#
+# Field sourcing (each None-safe; cache-OFF runs publish no expvars):
+#   (a) dep_dirty_mark_total — the ABSOLUTE dirty-mark counter snapshot near
+#       window-open. NOT a /debug/vars expvar: it is emitted ONLY in the
+#       periodic `resolved_cache.summary` slog line (resolved.go:1303,
+#       Deps().Stats().DirtyMarkTotal, default cadence 300s). Sourced by
+#       grepping the streamed pod-log window for the LAST `dep_dirty_mark_total=N`
+#       token. CAVEAT (flagged for architect): the 300s emission cadence means
+#       this snapshot can lag the true mutation-land instant by up to one
+#       summary interval; it is the most-recent value visible in the window.
+#   (b) refresh_completed slope — the WIRED expvar
+#       `snowplow_refresher_completed_total` (refresher_metrics.go:70). Two
+#       snapshots (window-open + window-close) -> (delta / window_seconds).
+#       Same prior-art mechanism as the S8b/S8c Probe-A (phases.py:2444-2473).
+#   (c) addupdate_events_in_window — count of `cache_event.consumed` dirty-mark
+#       (non-delete) lines with type in {ADD, UPDATE, CRD_ADD} (deps.go:549/745,
+#       onChange + dirtyMarkResourceType) inside the window, from the same
+#       streamed pod-log fetch as (a).
+
+
+# cache_event.consumed `type` values that represent an ADD/UPDATE dirty-mark
+# (NOT a delete): onChange emits ADD/UPDATE (deps.go:524/551); CRD_ADD comes
+# from dirtyMarkResourceType (deps.go:697/745). DELETE / CRD_DELETE are
+# excluded — they are eviction/delete events, not the churn signal field (c)
+# measures.
+_CONV_ADDUPDATE_EVENT_TYPES = ("ADD", "UPDATE", "CRD_ADD")
+
+
+def _snowplow_pod_log_window(since_iso=None, *, tail=None, timeout=15):
+    """Fetch snowplow pod-log text for a bounded window (NOT -f / streaming).
+
+    A point-in-time `kubectl logs` snapshot used by the convergence
+    discrimination tuple to read counters that are slog-only (not on
+    /debug/vars). Mirrors the existing `kubectl logs --tail` call at
+    wait_for_l1_warmup (line ~701) and storm.pod_logs_since.
+
+    `since_iso` bounds the window via `--since-time` (RFC3339); `tail`
+    bounds by line count. At least one SHOULD be set; if both are None we
+    fall back to a 2000-line tail so the call is still bounded.
+
+    CAVEAT (#334-A review): the 2000-line tail cap applies even with
+    since_iso set, so a verify window exceeding 2000 lines truncates and
+    undercounts field (c). Acceptable because (c) is a RELATIVE signal
+    with the same ceiling on both compared runs; if a window legitimately
+    exceeds the cap, raise/drop `tail` — `--since-time` is the real
+    window delimiter.
+
+    Returns the decoded log text, or None on any transport failure
+    (kubectl missing, non-zero rc) — callers FAIL SOFT to None fields.
+    """
+    from bench.cluster import kubectl  # deferred — matches line ~689 style
+    args = ["logs", "deployment/snowplow", "-n", NS, "-c", "snowplow"]
+    if since_iso:
+        args.append(f"--since-time={since_iso}")
+    args.append(f"--tail={tail if tail is not None else 2000}")
+    # cluster.kubectl uses `timeout_secs` (not `timeout`); pass it so the
+    # window fetch is bounded. Fall back to a bare call if a test seam stubs
+    # kubectl with a narrower signature.
+    try:
+        rc, out, _ = kubectl(*args, timeout_secs=timeout)
+    except TypeError:
+        try:
+            rc, out, _ = kubectl(*args)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if rc != 0 or not out:
+        return None
+    return out
+
+
+def _parse_last_dep_dirty_mark_total(log_text):
+    """Return the LAST `dep_dirty_mark_total=N` integer in `log_text`, or None.
+
+    The token appears in the periodic `resolved_cache.summary` slog line
+    (resolved.go:1303). slog text-handler renders it as
+    `dep_dirty_mark_total=12345`. We take the LAST occurrence (closest to
+    window-close). Returns None when the token is absent (no summary line
+    emitted in the window — short window or cache-off).
+    """
+    if not log_text:
+        return None
+    last = None
+    for m in re.finditer(r"dep_dirty_mark_total=(\d+)", log_text):
+        last = m.group(1)
+    if last is None:
+        return None
+    try:
+        return int(last)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _count_addupdate_events(log_text):
+    """Count `cache_event.consumed` ADD/UPDATE/CRD_ADD lines in `log_text`.
+
+    Cheap line scan: a line counts iff it carries the `cache_event.consumed`
+    message AND a `type=<X>` token whose X is in _CONV_ADDUPDATE_EVENT_TYPES.
+    Returns None when `log_text` is None (transport failure), else the int
+    count (0 when no matching lines — a real, distinguishable value).
+    """
+    if log_text is None:
+        return None
+    count = 0
+    for line in log_text.splitlines():
+        if "cache_event.consumed" not in line:
+            continue
+        m = re.search(r"\btype=(\w+)", line)
+        if m and m.group(1) in _CONV_ADDUPDATE_EVENT_TYPES:
+            count += 1
+    return count
+
+
+def capture_conv_discrimination(window_start_iso, window_seconds,
+                                refresher_completed_before,
+                                refresher_completed_after,
+                                *, log_text=None):
+    """Build the Task #334a convergence-cell discrimination tuple (report-only).
+
+    All fields are None-safe. Returns a dict with:
+      dep_dirty_mark_total          — (a) last in-window summary-line value, or None.
+      refresh_completed_before/after — (b) raw expvar snapshots (or None).
+      refresh_completed_slope_per_s  — (b) (after-before)/window_seconds, or None
+                                       when either snapshot is None or window<=0.
+      addupdate_events_in_window     — (c) count, or None when the log is
+                                       unavailable.
+      window_seconds                 — the verify-window width used for the slope.
+
+    `log_text` is the pre-fetched pod-log window (so the caller fetches once and
+    reuses it for (a) and (c); tests inject it directly). When None and a
+    `window_start_iso` is given, the log is fetched here via
+    `_snowplow_pod_log_window`.
+    """
+    if log_text is None and window_start_iso:
+        log_text = _snowplow_pod_log_window(since_iso=window_start_iso)
+
+    slope = None
+    if (refresher_completed_before is not None
+            and refresher_completed_after is not None
+            and window_seconds is not None and window_seconds > 0):
+        slope = (refresher_completed_after - refresher_completed_before) / window_seconds
+
+    return {
+        "dep_dirty_mark_total": _parse_last_dep_dirty_mark_total(log_text),
+        "refresh_completed_before": refresher_completed_before,
+        "refresh_completed_after": refresher_completed_after,
+        "refresh_completed_slope_per_s": slope,
+        "addupdate_events_in_window": _count_addupdate_events(log_text),
+        "window_seconds": window_seconds,
+    }
 
 
 def count_user_compositions_in_ns(user, token, ns):
@@ -2042,6 +2207,16 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                 last_cluster_check = time.time()
                 matched = False
 
+                # Task #334a (report-only): snapshot the refresher-completed
+                # expvar + an RFC3339 window-open stamp. Window-close snapshot
+                # + pod-log fetch happen after convergence below; the assembled
+                # discrimination tuple is attached to `m` alongside
+                # convergence_ms. None-safe (cache-off / unreadable expvar).
+                conv_disc_since_iso = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(verify_start))
+                conv_disc_refresher_before = read_snowplow_expvar_int(
+                    "snowplow_refresher_completed_total")
+
                 poll_num = 0
                 while time.time() < deadline:
                     poll_num += 1
@@ -2110,6 +2285,30 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                 m["convergence_ms"] = convergence_ms if matched else -1
                 api_str = f"{api_count}" if api_count >= 0 else "?"
                 ui_str = f"{ui_count}" if ui_count >= 0 else "?"
+
+                # Task #334a (report-only): window-close refresher snapshot +
+                # one bounded pod-log fetch over [verify_start, now]; assemble
+                # the discrimination tuple and attach it to the nav dict
+                # alongside convergence_ms. Sibling key — NOT read by
+                # convergence_p99_for_stage / compute_verdict. Best-effort: any
+                # failure leaves None fields (it never aborts the stage).
+                try:
+                    conv_disc_refresher_after = read_snowplow_expvar_int(
+                        "snowplow_refresher_completed_total")
+                    conv_disc_log = _snowplow_pod_log_window(
+                        since_iso=conv_disc_since_iso)
+                    m["conv_discrimination"] = capture_conv_discrimination(
+                        conv_disc_since_iso,
+                        max(time.time() - verify_start, 0.0),
+                        conv_disc_refresher_before,
+                        conv_disc_refresher_after,
+                        log_text=conv_disc_log)
+                except Exception as e:
+                    _log(f"    conv_discrimination capture failed "
+                         f"({type(e).__name__}: {e}); recording None tuple")
+                    m["conv_discrimination"] = capture_conv_discrimination(
+                        None, None, conv_disc_refresher_before, None,
+                        log_text=None)
 
                 if not matched:
                     # ConvergenceTimeout — replaces the source-script's

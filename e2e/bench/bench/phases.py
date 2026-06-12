@@ -30,6 +30,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import statistics
 import subprocess
 import threading
 import time
@@ -1101,6 +1102,140 @@ def _first_stage_label(ctx: StageContext) -> str:
     return "S0"
 
 
+def _collect_conv_discrimination(results: list[dict]) -> dict:
+    """Task #334a (report-only): surface the convergence-cell discrimination
+    tuples from a stage's measurement entries into the stage proof, so
+    post-run analysis reads them directly (without walking
+    all_results[*].pages[*].navigations).
+
+    browser.browser_measure_stage attaches `conv_discrimination` to the
+    Dashboard nav dict that also carries `convergence_ms` (the VERIFY-window
+    convergence). This collects ALL such tuples per user (admin + the
+    RBAC-scoped subject), keyed by user. Returns an empty dict when no tuple
+    is present (e.g. a non-Dashboard-only stage, or cache-off pods where the
+    capture recorded all-None fields — those tuples are still surfaced so the
+    None-ness is itself the cache-off signal).
+
+    Purely additive: this does NOT feed convergence_p99_for_stage /
+    compute_verdict (those read nav["convergence_ms"], untouched here).
+    """
+    by_user: dict[str, list[dict]] = {}
+    for entry in results or []:
+        if not isinstance(entry, dict):
+            continue
+        user = entry.get("user") or "<unknown>"
+        for _page_name, pg in (entry.get("pages") or {}).items():
+            for nav in (pg.get("navigations") or []):
+                if not isinstance(nav, dict):
+                    continue
+                tup = nav.get("conv_discrimination")
+                if isinstance(tup, dict):
+                    by_user.setdefault(user, []).append(tup)
+    return by_user
+
+
+# Task #334 (the original): S6 convergence-mass first-poll settle.
+#
+# The S6 convergence-mass metric (convergence_mass_s6_p99 — REPORT-ONLY; only
+# conv_s8_p99 gates, see ledger.compute_verdict / convergence_p99_for_stage)
+# is a SINGLE first-poll wall-clock anchored at the VERIFY-window open. It is
+# sensitive to install-completion timing: when verify_start fires while the
+# composition count is still climbing, the convergence chases a moving target
+# (the #335 trace recorded S6 71.9s vs 24.8s SAME-CODE — cluster-state, not a
+# regression). This adds a SETTLE DISCIPLINE recorded as a SEPARATE report-only
+# proof field `conv_settle_s6`; it NEVER mutates nav["convergence_ms"] (the
+# field convergence_p99_for_stage reads), so the S6/S7/S8 verdict inputs are
+# untouched. It records BOTH disciplines the task allows (discard-first AND
+# median-of-N) so the scoring choice stays open for the gating half (#334b,
+# Diego-gated).
+_S6_SETTLE_SAMPLES = 5
+_S6_SETTLE_INTERVAL_S = 3.0
+
+
+def _s6_settle_convergence(ctx: StageContext,
+                           *,
+                           samples: int = _S6_SETTLE_SAMPLES,
+                           interval_s: float = _S6_SETTLE_INTERVAL_S) -> dict:
+    """Re-sample the admin convergence-equality predicate N times AFTER S6's
+    primary measurement, to settle the install-timing-sensitive first-poll
+    wall-clock. REPORT-ONLY.
+
+    Each sample records the admin piechart api_count vs cluster truth
+    (cluster.count_compositions) and whether they are equal — the same
+    predicate browser_measure_stage's admin VERIFY poll uses
+    (verify_against_cluster path). The settle signal is whether the cluster
+    count has STOPPED changing (install complete) and the spread of the
+    per-sample elapsed-to-equal.
+
+    Returns a dict (always JSON-serialisable, fields None-safe):
+      samples:               [{i, t_ms, api_count, cluster_count, equal}, ...]
+      median_ms:             median t_ms across EQUAL samples (the median-of-N
+                             discipline), or None if no sample reached equality.
+      discard_first_ms:      first EQUAL sample's t_ms AFTER discarding sample 0
+                             (the discard-first-sample discipline), or None.
+      cluster_count_stable:  True iff cluster_count was identical across all
+                             samples (install settled — variance source gone).
+      equal_count:           how many samples saw api==cluster.
+      sample_count:          how many samples were taken.
+
+    No admin token (cache-off pre-login / harness edge) → a None-filled dict
+    with an explicit reason; never raises into the stage.
+    """
+    token = ctx.admin_token or (ctx.tokens or {}).get("admin")
+    base = {
+        "samples": [],
+        "median_ms": None,
+        "discard_first_ms": None,
+        "cluster_count_stable": None,
+        "equal_count": 0,
+        "sample_count": 0,
+    }
+    if not token:
+        base["reason"] = "no_admin_token"
+        return base
+
+    t0 = time.time()
+    rows: list[dict] = []
+    for i in range(max(samples, 0)):
+        try:
+            api_count = browser.verify_composition_count_api(token)
+        except Exception:
+            api_count = -1
+        try:
+            cluster_count = cluster.count_compositions()
+        except Exception:
+            cluster_count = -1
+        equal = (api_count >= 0 and cluster_count >= 0
+                 and api_count == cluster_count)
+        rows.append({
+            "i": i,
+            "t_ms": int((time.time() - t0) * 1000),
+            "api_count": api_count,
+            "cluster_count": cluster_count,
+            "equal": equal,
+        })
+        if i < samples - 1:
+            time.sleep(interval_s)
+
+    equal_t = [r["t_ms"] for r in rows if r["equal"]]
+    # discard-first-sample: drop sample 0, take the first remaining EQUAL.
+    discard_first = next(
+        (r["t_ms"] for r in rows[1:] if r["equal"]), None)
+    cluster_counts = [r["cluster_count"] for r in rows
+                      if r["cluster_count"] >= 0]
+    stable = (len(cluster_counts) == len(rows) and len(set(cluster_counts)) == 1
+              if rows else None)
+
+    return {
+        "samples": rows,
+        "median_ms": int(statistics.median(equal_t)) if equal_t else None,
+        "discard_first_ms": discard_first,
+        "cluster_count_stable": stable,
+        "equal_count": len(equal_t),
+        "sample_count": len(rows),
+    }
+
+
 def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
                        deleted_ns=None) -> list[dict]:
     """Run browser_measure_stage on every (user, page); return entries.
@@ -1458,11 +1593,22 @@ def stage_s6_scale_compositions(ctx: StageContext) -> StageProof:
         lifecycle.wait_for_restaction_steady_state(
             timeout=600, target_per_ns=120, polling_interval=10)
         results = _measure_all_users(c, 6, f"{c.scale} compositions")
+        # Task #334 (original): settle the install-timing-sensitive S6
+        # convergence-mass first-poll. REPORT-ONLY — records a separate
+        # `conv_settle_s6` proof field; does NOT touch nav["convergence_ms"]
+        # (the field convergence_p99_for_stage reads), so the verdict inputs
+        # are unchanged. S6 conv is report-only (only conv_s8_p99 gates).
+        conv_settle_s6 = _s6_settle_convergence(c)
         return {
             "ns_count": s5_ns_end,
             "comps_per_ns": s6_comps_per_ns,
             "compositions_actual": cluster.count_compositions(),
             "measurement_count": len(results),
+            # Task #334a (report-only): per-user convergence discrimination
+            # tuples for this stage; does NOT feed compute_verdict.
+            "conv_discrimination": _collect_conv_discrimination(results),
+            # Task #334 (original, report-only): S6 first-poll settle metric.
+            "conv_settle_s6": conv_settle_s6,
             "__passed__": True,
         }
 
@@ -1489,6 +1635,9 @@ def stage_s7_delete_one_comp(ctx: StageContext) -> StageProof:
             "ns": "bench-ns-01",
             "name": "bench-app-01-01",
             "measurement_count": len(results),
+            # Task #334a (report-only): per-user convergence discrimination
+            # tuples for this stage; does NOT feed compute_verdict.
+            "conv_discrimination": _collect_conv_discrimination(results),
             "__passed__": True,
         }
 
@@ -1987,6 +2136,9 @@ def stage_s8_add_rb_to_populated_ns(ctx: StageContext) -> StageProof:
             "content_card_present": cj_card_present,
             "cj_widget_error_count": cj_widget_errors,
             "measurement_count": len(results),
+            # Task #334a (report-only): per-user convergence discrimination
+            # tuples for this stage; does NOT feed compute_verdict.
+            "conv_discrimination": _collect_conv_discrimination(results),
             "__passed__": (
                 prop_ok
                 and cj_card_present
