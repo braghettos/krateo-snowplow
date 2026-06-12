@@ -1371,9 +1371,12 @@ func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource
 //
 // Pre-Ship-0.5 wired into the CRD-watch's DeleteFunc; Ship 0.5
 // (0.30.223, v6) deleted that wiring along with the CRD informer.
-// Currently the only RemoveResourceType caller is unit-test fixtures
-// (R6 self-heal coverage). The CRD-DELETE periodic-sweep follow-up
-// (#117) will re-wire it post-Ship-2.
+// Re-wired at Ship L (0.30.246): the CRD-DELETE event bridge calls this
+// from triggerCRDDelete (crd_discovery_side_effect.go) for each served
+// GVR of the deleted CRD; unit-test fixtures (R6 self-heal coverage)
+// also exercise it. The #117 periodic sweep was closed superseded
+// (2026-06-12) — the event bridge + the 30s discovery refresher cover
+// CRD removal.
 //
 // Idempotent (AC-R6.1): a second call for the same GVR, or a call for an
 // unknown GVR, is a no-op — closePerGVRStopLocked tolerates a missing /

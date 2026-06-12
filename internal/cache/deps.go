@@ -697,8 +697,10 @@ func (d *DepTracker) OnResourceTypeAvailable(gvr schema.GroupVersionResource) in
 	return d.dirtyMarkResourceType("CRD_ADD", gvr, matched)
 }
 
-// OnResourceTypeRemoved is invoked by the CRD-watch when a CRD is removed
-// at runtime. D2 (Ship D, 0.30.114).
+// OnResourceTypeRemoved is invoked by the CRD-DELETE event bridge
+// (triggerCRDDelete, crd_discovery_side_effect.go) when a CRD is removed
+// at runtime — the original CRD-watch was deleted at v6 (0.30.223); the
+// bridge replaced it at Ship L (0.30.246). D2 (Ship D, 0.30.114).
 //
 // Unlike OnDelete (a single object's DELETE), a CRD removal is a
 // TYPE-removal — every L1 entry that LIST-depends on the GVR, OR

@@ -16,10 +16,11 @@
 //
 // LAG TRADEOFF — accepted per Diego 2026-06-01. CRD CREATE detected
 // on the NEXT walker pass under that group (bounded by Phase 1 +
-// widget/RESTAction CRUD re-walks). CRD DELETE unbounded — composition
-// informer stays until pod restart; LIST/WATCH against a deleted CRD
-// produces apiserver 404 (no-cache equivalent). Periodic sweep
-// followup #117, post-Ship 2.
+// widget/RESTAction CRUD re-walks). CRD DELETE is event-driven since
+// Ship L (0.30.246): the CRD-meta informer's DeleteFunc feeds
+// triggerCRDDelete, which tears the informer down and dirty-marks
+// dependents; the 30s discovery refresher retracts servability as a
+// backstop. The #117 periodic sweep was closed superseded (2026-06-12).
 //
 // PRESERVED: the navigation-discovered group set (renamed accessors,
 // load-bearing for watcher.go:749/:1064 removable-discriminator) +
@@ -56,9 +57,9 @@ import (
 // LOAD-BEARING for watcher.go's removable-discriminator at :749 +
 // :1064: a GVR is removable (gets a standalone informer, not a
 // shared-factory one) iff its group is in this set. Composition GVRs
-// MUST be removable so RemoveResourceType can tear them down on the
-// periodic sweep (followup #117) without affecting unrelated
-// informers.
+// MUST be removable so RemoveResourceType can tear them down via the
+// CRD-DELETE event bridge (Ship L/0.30.246; the #117 periodic sweep
+// was closed superseded) without affecting unrelated informers.
 //
 // Guarded by navDiscoveredGroupsMu (its own mutex, not rw.mu —
 // callers may be inside rw.mu when they consult IsNavigationDiscoveredGroup).

@@ -399,6 +399,17 @@ func encodeResolvedJSON(res any) ([]byte, error) {
 // writeResolvedJSON writes the canonical Content-Type + 200 + payload.
 // We deliberately do NOT log here on errors writing to the wire — a
 // client disconnect mid-write is normal and not actionable.
+//
+// MEMORY CEILING (#99, ruled CLOSE-DOCUMENTED 2026-06-12): payload is
+// held fully in heap before this single Write. The largest payload today
+// is the admin compositions-list at ~12.9 MB (49K compositions;
+// transient, 0.05 mix-weight). Bounded and harmless at current traffic.
+// Do NOT convert to chunked/http.ResponseController streaming: naive
+// streaming on large payloads caused a 22-38x warm-latency regression
+// (0.30.176, feedback_no_naive_compression_middleware) and there is no
+// streaming-write prior art in this package. If a payload ever exceeds a
+// few tens of MB, cache PRE-ENCODED bytes at the value layer rather than
+// streaming the write.
 func writeResolvedJSON(wri http.ResponseWriter, payload []byte) {
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)

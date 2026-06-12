@@ -323,10 +323,12 @@ func (rw *ResourceWatcher) RegisterMetaQuerySeeds() int {
 // source of truth and also bounds a pathological never-stabilizing loop.
 //
 // INVARIANT the count-equality test depends on: the registered-informer
-// set is append-only during Phase 1 — RemoveResourceType is wired only
-// to the CRD-DELETE path (followup #117, post-Ship 2), which is dormant
-// during Phase 1's bounded walk. So an unchanged COUNT across a pass
-// implies an unchanged SET. If a future change adds an in-Phase-1
+// set is append-only during Phase 1 in practice — RemoveResourceType is
+// wired to the CRD-DELETE event bridge (live since Ship L/0.30.246; the
+// #117 periodic sweep was closed superseded 2026-06-12), which fires
+// during Phase 1 only if a CRD is deleted mid-walk (rare; a delete in
+// that window could make COUNT-equality mask a set change for one pass).
+// So an unchanged COUNT across a pass implies an unchanged SET. If a future change adds an in-Phase-1
 // de-registration path, this proxy breaks and the loop must compare
 // the GVR set, not the count.
 //
