@@ -900,6 +900,23 @@ func validateClusterListShape(gvr schema.GroupVersionResource, raw []byte) (enve
 	}, true, ""
 }
 
+// materialiseClusterListItemsFn is the package-private seam over the
+// single envelope-items materialisation pass (decodeClusterListItems'
+// real body). Task #328 RED/GREEN falsifier counts invocations of THIS
+// pass to prove the Path 3.1 Bug 1 hoist invariant: the materialisation
+// runs EXACTLY ONCE on the happy path (at the call site, after the shape
+// check) and ZERO times on the envelope-reject path — N items must never
+// trigger a per-item materialisation pass INSIDE validateClusterListShape.
+//
+// Production code path is unchanged: the variable is initialised once to
+// materialiseClusterListItems and is only reassigned by test code (which
+// swaps in a counting wrapper). There is NO atomic / counter on the
+// production hot path — the indirection is a single function-pointer call
+// the production binary never reassigns. Mirrors compileCRDSchemaFn
+// (internal/resolvers/crds/schema/extract.go:19) and
+// discoveryClientForConfigFn (internal/dynamic/cached_client.go:225).
+var materialiseClusterListItemsFn = materialiseClusterListItems
+
 // decodeClusterListItems materialises the deferred per-item bytes from a
 // validated envelopeShape into the parsedListEnvelope form that
 // apistage's content-gate / ResolvedEntry consumes. Per-item decode +
@@ -917,7 +934,19 @@ func validateClusterListShape(gvr schema.GroupVersionResource, raw []byte) (enve
 // a shape-check failure. Item materialisation is the cell-fresh-populate
 // path; subsequent reads of the cell skip this work via the stored
 // ResolvedEntry.Items slice.
+//
+// Task #328 — the body is dispatched through materialiseClusterListItemsFn
+// (the count seam) so the hoist invariant is regression-testable. This is
+// a behaviour-identical pass-through: production wires the real
+// materialiseClusterListItems and pays only one function-pointer hop.
 func decodeClusterListItems(shape envelopeShape) (parsedListEnvelope, string) {
+	return materialiseClusterListItemsFn(shape)
+}
+
+// materialiseClusterListItems is the real (countable) materialisation
+// pass. Body is verbatim the pre-#328 decodeClusterListItems body — the
+// #328 change is purely the function-var indirection, no logic change.
+func materialiseClusterListItems(shape envelopeShape) (parsedListEnvelope, string) {
 	items := make([]*unstructured.Unstructured, 0, len(shape.rawItems))
 	for _, rawIt := range shape.rawItems {
 		var it map[string]any

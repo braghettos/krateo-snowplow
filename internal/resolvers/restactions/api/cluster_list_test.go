@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -314,13 +315,20 @@ func TestValidateClusterListShape_DetectsNilItemInSample(t *testing.T) {
 }
 
 // Path 3.1 Bug 1 (architect-mandated correction) — verify the
-// shape-check fast path is O(envelope-fields + sample-K) and stays far
-// inside the AC-D5.14 10ms budget. Pre-Path-3.1 a 44K-item input took
+// shape-check fast path rejects a non-List envelope WITHOUT triggering
+// the per-item materialisation pass. Pre-Path-3.1 a 44K-item input took
 // 1.3-1.5s; the partial 0.30.217 fix (deferred RawMessage) still
 // materialised every item inside validateClusterListShape and so kept
 // the per-call cost folded into the shape-check budget. The architect
 // correction (this ship) hoists materialisation out — the shape check
 // now skips per-item decode entirely.
+//
+// Task #328 — the regression tooth is the MECHANISM (materialisation
+// invocation count), not a wall-clock budget. Wall-clock on a 10K-item
+// pure-CPU op is inherently flaky under -race / CI instrumentation
+// (proven: 50-82ms under -race vs a 50ms guard). The invariant the guard
+// was a proxy for is: the envelope-reject path performs ZERO full
+// materialisation passes. We assert that directly.
 func TestValidateClusterListShape_FastEnvelopeReject(t *testing.T) {
 	// Build a 10K-item envelope where the ENVELOPE kind does not end in
 	// "List" — the function MUST reject at the envelope check without
@@ -336,23 +344,23 @@ func TestValidateClusterListShape_FastEnvelopeReject(t *testing.T) {
 		"kind":       "ConfigMap", // does NOT end in List
 		"items":      items,
 	})
-	start := time.Now()
+
+	count := countClusterListMaterialisations(t)
+
 	_, ok, reason := validateClusterListShape(testShapeGVR, raw)
-	elapsed := time.Since(start)
 	if ok {
 		t.Fatalf("expected envelope-level reject on kind=ConfigMap")
 	}
 	if !strings.Contains(reason, "kind-not-list") {
 		t.Fatalf("expected kind-not-list reason; got %q", reason)
 	}
-	// Envelope-level reject must be FAR under the 10ms budget — even on
-	// a 10K-item envelope, json.RawMessage defers per-item decode so we
-	// only pay the slice-index walk. 50ms hard guard so CI noise on
-	// busy machines doesn't false-positive.
-	if elapsed > 50*time.Millisecond {
-		t.Fatalf("Path 3.1 Bug 1 envelope-reject path took %v (>50ms); fast-path regressed", elapsed)
+	// MECHANISM assertion (Task #328): the envelope-reject path MUST NOT
+	// run the materialisation pass at all — it rejects at the envelope
+	// kind check, before any per-item decode. A regression that materialises
+	// items before (or instead of) the envelope check would make this >0.
+	if got := count(); got != 0 {
+		t.Fatalf("Path 3.1 Bug 1 envelope-reject regressed: materialisation pass invoked %d time(s) on a non-List envelope; want 0 (reject must skip materialisation entirely)", got)
 	}
-	t.Logf("Path 3.1 Bug 1 envelope-reject path: 10K items, %v elapsed", elapsed)
 }
 
 func TestValidateClusterListShape_MalformedJSON(t *testing.T) {
@@ -420,12 +428,20 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 }
 
 // Ship 0.30.217 Path 3.1 Bug 1 (architect-mandated correction) — the
-// shape check must NOT pay the per-item decode cost. This test scales
-// the input to a 10K-item happy-path envelope and asserts that
-// validateClusterListShape stays under the 50ms hard guard (was
-// hundreds-of-ms pre-correction). decodeClusterListItems separately
-// IS allowed to be slow on this input — its cost is the
-// fresh-populate-once cost paid outside the shape budget.
+// shape check must NOT pay the per-item decode cost: validateClusterListShape
+// defers items as []json.RawMessage and the materialisation pass runs
+// ONCE at the call site, separately. This test scales the input to a
+// 10K-item happy-path envelope and asserts the MECHANISM: the shape check
+// triggers ZERO materialisation passes (N items must NOT mean N
+// materialisations), and the single explicit decodeClusterListItems call
+// is the ONE and ONLY materialisation.
+//
+// Task #328 — replaces the former wall-clock guards (50ms hard budget on a
+// 10K-item pure-CPU op) with the materialisation-count tooth. Wall-clock
+// was always a proxy for "the shape check did not fold per-item decode into
+// its budget"; under -race / CI instrumentation the pure-CPU op runs
+// 50-82ms and the proxy false-positives (proven 2026-06-12). The call count
+// IS the regression tooth and is instrumentation-invariant.
 func TestValidateClusterListShape_HoistedMaterialisation(t *testing.T) {
 	items := make([]any, 0, 10000)
 	for i := 0; i < 10000; i++ {
@@ -441,39 +457,43 @@ func TestValidateClusterListShape_HoistedMaterialisation(t *testing.T) {
 		"kind":       "GithubScaffoldingWithCompositionPagesList",
 		"items":      items,
 	})
-	start := time.Now()
+
+	count := countClusterListMaterialisations(t)
+
 	shape, ok, reason := validateClusterListShape(testShapeGVR, raw)
-	shapeElapsed := time.Since(start)
 	if !ok {
 		t.Fatalf("validateClusterListShape: unexpected ok=false; reason=%q", reason)
 	}
 	if len(shape.rawItems) != 10000 {
 		t.Fatalf("expected 10K deferred items; got %d", len(shape.rawItems))
 	}
-	// Architect mandate: shape budget excludes materialisation. A
-	// 10K-item happy-path envelope must stay well under 50ms in the
-	// shape check itself.
-	if shapeElapsed > 50*time.Millisecond {
-		t.Fatalf("Path 3.1 Bug 1 architect-correction regressed: validateClusterListShape took %v on 10K-item happy-path envelope (>50ms hard guard)", shapeElapsed)
+	// MECHANISM assertion #1 (Task #328): the shape check is HOISTED — it
+	// must defer per-item decode entirely. A 10K-item happy-path envelope
+	// must trigger ZERO materialisation passes inside validateClusterListShape.
+	// (Pre-correction the shape check materialised every item; that regression
+	// would make this >0 — see /tmp/snowplow-328/red-proof.txt.)
+	if got := count(); got != 0 {
+		t.Fatalf("Path 3.1 Bug 1 hoist regressed: validateClusterListShape triggered %d materialisation pass(es) on a 10K-item happy-path envelope; want 0 (items must stay deferred — N items must NOT mean N materialisations)", got)
 	}
-	t.Logf("Path 3.1 Bug 1 architect-correction: validateClusterListShape on 10K-item happy-path envelope = %v", shapeElapsed)
 
-	// Materialisation is a separately-timed step; we record its cost
-	// for the diff-review gate but do not assert a tight budget — it
-	// is the fresh-populate-once cost the architect mandate moves
-	// out of the shape budget. The point is that the per-call shape
-	// check above stayed fast even though this materialisation step
-	// is heavier work.
-	matStart := time.Now()
+	// Materialisation is the separately-invoked, call-site step. It runs
+	// the heavier per-item work the architect mandate moves OUT of the
+	// shape budget. It must be invoked EXACTLY ONCE for the whole 10K-item
+	// slice — one pass over the deferred items, never one-pass-per-item.
 	parsed, decodeErr := decodeClusterListItems(shape)
-	matElapsed := time.Since(matStart)
 	if decodeErr != "" {
 		t.Fatalf("decodeClusterListItems: unexpected error=%q", decodeErr)
 	}
 	if len(parsed.items) != 10000 {
 		t.Fatalf("decodeClusterListItems: expected 10K items; got %d", len(parsed.items))
 	}
-	t.Logf("Path 3.1 Bug 1 architect-correction: decodeClusterListItems on 10K-item envelope = %v", matElapsed)
+	// MECHANISM assertion #2 (Task #328): after validateClusterListShape
+	// (0 passes) + one decodeClusterListItems call, the total materialisation
+	// count is EXACTLY 1. This pins "parse the envelope ONCE, materialise
+	// ONCE" — N=10000 items resolve in a single materialisation pass.
+	if got := count(); got != 1 {
+		t.Fatalf("Path 3.1 Bug 1 hoist regressed: expected exactly 1 materialisation pass for the 10K-item happy path (shape-check 0 + one explicit decode); got %d", got)
+	}
 }
 
 // ---------- Cluster-scope path construction ----------
@@ -788,4 +808,30 @@ func mustJSON(t *testing.T, v any) []byte {
 func clusterListLogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	return discardLogger()
+}
+
+// countClusterListMaterialisations installs a counting wrapper over the
+// materialiseClusterListItemsFn seam (cluster_list.go) for the duration of
+// the test, restoring the real function on cleanup. It returns a closure
+// that reports how many times the materialisation PASS has been invoked so
+// far — the Task #328 mechanism tooth for the Path 3.1 Bug 1 hoist invariant
+// (the shape check must defer items; materialisation runs once at the call
+// site, never per-item, never inside validateClusterListShape).
+//
+// The wrapper delegates to the real materialiseClusterListItems so the
+// materialised output (and any error) is byte-identical to production —
+// only the invocation is observed. atomic.Int64 keeps the counter
+// race-clean even though the budget tests drive it single-goroutine.
+// Mirrors the swap-and-restore idiom of installFakeCachedDiscovery
+// (internal/dynamic/cached_client_test.go:106).
+func countClusterListMaterialisations(t *testing.T) func() int {
+	t.Helper()
+	var n atomic.Int64
+	orig := materialiseClusterListItemsFn
+	materialiseClusterListItemsFn = func(shape envelopeShape) (parsedListEnvelope, string) {
+		n.Add(1)
+		return orig(shape)
+	}
+	t.Cleanup(func() { materialiseClusterListItemsFn = orig })
+	return func() int { return int(n.Load()) }
 }
