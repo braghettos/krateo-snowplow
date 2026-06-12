@@ -757,18 +757,21 @@ def _hermetic_make_ctx(pw_browser, *, record_video_dir=None, **kw):
     return pw_browser.new_context(record_video_dir=record_video_dir)
 
 
-def _materialise(page_factories):
+def _materialise(page_slots):
     """Invoke every lazy slot factory — mirrors the real browser_measure_stage
-    materialising each page at its own loop iteration (Task #307)."""
-    for _pn, make in (page_factories or {}).items():
-        make()
+    materialising each page at its own loop iteration (Task #307). #310b: the
+    factory now lives in the unified slot under `slot["make"]`."""
+    for _pn, slot in (page_slots or {}).items():
+        make = slot.get("make") if isinstance(slot, dict) else None
+        if callable(make):
+            make()
 
 
 def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
     """Wire browser.make_browser_context / browser_login / browser_measure_stage
     so _measure_all_users' per-stage recording path runs hermetically.
 
-    Returns the list capturing (stage_num, user, pages_by_name keys) per
+    Returns the list capturing (stage_num, user, slot keys) per
     browser_measure_stage call. `measure_raises` (an exception or None) lets a
     test force a ConvergenceTimeout-shaped failure to prove the partial video
     is still finalized.
@@ -783,20 +786,16 @@ def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
 
     def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
                       token=None, user="admin", verify_against_cluster=True,
-                      deleted_ns=None, pages_by_name=None,
-                      page_factories=None):
+                      deleted_ns=None, page_slots=None):
         # Task #307 / A1-full: mirror real browser_measure_stage — materialise
-        # any lazy page by invoking its factory, so the deferred-finalize +
+        # any lazy page by invoking its slot factory, so the deferred-finalize +
         # content-gate path sees the live page (the real function does this
-        # at the page's loop iteration, after VERIFY).
-        materialised_keys = sorted(pages_by_name) if pages_by_name else None
-        if page_factories:
-            _materialise(page_factories)
-            if pages_by_name is not None:
-                materialised_keys = sorted(
-                    set(pages_by_name) | set(page_factories))
+        # at the page's loop iteration, after VERIFY). #310b: one slot map.
+        slot_keys = sorted(page_slots) if page_slots else None
+        if page_slots:
+            _materialise(page_slots)
         calls.append({"stage_num": stage_num, "user": user,
-                      "pages_by_name_keys": materialised_keys})
+                      "page_slot_keys": slot_keys})
         if measure_raises is not None:
             raise measure_raises
         return {"stage": stage_num, "pages": {}}
@@ -807,12 +806,13 @@ def _install_stage_recording_fakes(monkeypatch, *, measure_raises=None):
 
 def _stub_measure_materializing(stage_num):
     """A `browser_measure_stage` stub that — like the real function under
-    Task #307 / A1-full — materialises any LAZY page by invoking its factory
-    at measure time. Tests whose content gate inspects the subject's deferred
-    Compositions page MUST use this (a bare no-op stub leaves the lazy slot's
-    page None → the gate would falsely see an empty/None page)."""
-    def _measure(page, *a, page_factories=None, **k):
-        _materialise(page_factories)
+    Task #307 / A1-full — materialises any LAZY page by invoking its slot
+    factory at measure time. Tests whose content gate inspects the subject's
+    deferred Compositions page MUST use this (a bare no-op stub leaves the lazy
+    slot's page None → the gate would falsely see an empty/None page). #310b:
+    one slot map under `page_slots`."""
+    def _measure(page, *a, page_slots=None, **k):
+        _materialise(page_slots)
         return {"stage": stage_num, "pages": {}}
     return _measure
 
@@ -1265,16 +1265,16 @@ def test_subject_deferred_video_finalized_on_convergence_timeout(
 
 
 def test_measure_all_users_non_recording_uses_single_page(tmp_path, monkeypatch):
-    """Non-recording run: NO per-stage contexts opened, pages_by_name=None,
+    """Non-recording run: NO per-stage contexts opened, page_slots=None,
     measurement runs on the single persistent page (zero behavioural change).
+    #310b: the no-video path passes a None slot map (was pages_by_name=None).
     """
     calls = []
 
     def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
                       token=None, user="admin", verify_against_cluster=True,
-                      deleted_ns=None, pages_by_name=None, page_factories=None):
-        calls.append({"user": user, "pages_by_name": pages_by_name,
-                      "page": page, "page_factories": page_factories})
+                      deleted_ns=None, page_slots=None):
+        calls.append({"user": user, "page_slots": page_slots, "page": page})
         return {"stage": stage_num, "pages": {}}
 
     def _boom_ctx(*a, **k):
@@ -1291,42 +1291,50 @@ def test_measure_all_users_non_recording_uses_single_page(tmp_path, monkeypatch)
                               "token": "tok", "record_video": False}},
     )
     phases._measure_all_users(ctx, 6, "S6 desc")
-    assert calls[0]["pages_by_name"] is None
+    assert calls[0]["page_slots"] is None
     assert calls[0]["page"] is persistent_page
     assert "__stage_videos__" not in ctx.user_pages
 
 
 def test_measure_all_users_all_lazy_selects_persistent_page_and_both_factories(
         tmp_path, monkeypatch):
-    """Falsifier F-measure (Task #307 / ArchLazyDash): with EVERY recording
-    slot now lazy (page=None), `_measure_all_users` selects
-    `measure_page == u_state["page"]` (the persistent non-recording page) as the
-    `page` arg to browser_measure_stage — NOT an eager slot page — and passes a
-    `page_factories` mapping that now includes BOTH Dashboard AND Compositions,
-    with `pages_by_name` mapping both to None.
+    """Falsifier F-measure (Task #307 / ArchLazyDash; #310b slot-map form): with
+    EVERY recording slot now lazy (slot["page"]=None), `_measure_all_users`
+    selects `measure_page == u_state["page"]` (the persistent non-recording
+    page) as the `page` arg to browser_measure_stage — NOT an eager slot page —
+    and passes ONE `page_slots` map that includes BOTH Dashboard AND
+    Compositions, each slot routing lazy (slot["page"] is None) with a callable
+    `slot["make"]`.
 
     Pre-fix the Dashboard slot was EAGER (page non-None), so the `next(...)`
-    selection picked that live Dashboard page as `measure_page` and
-    page_factories carried ONLY Compositions. Post-fix the selection falls
-    through to the persistent page (None for a recording user, which is correct:
-    every page is materialised on its own lazy context inside
-    browser_measure_stage, so the page arg is only the no-recording fallback).
+    selection picked that live Dashboard page as `measure_page` and the slot map
+    carried a non-None Dashboard page. Post-fix the selection falls through to
+    the persistent page (None for a recording user, which is correct: every page
+    is materialised on its own lazy context inside browser_measure_stage, so the
+    page arg is only the no-recording fallback).
 
-    Discriminators that flip on revert: (a) "Dashboard" in page_factories;
-    (b) Dashboard maps to None in pages_by_name; (c) the `page` arg is the
-    persistent u_state["page"] fallback, not a live Dashboard page object.
+    Discriminators that flip on revert (#310b collapses the prior two parallel
+    dicts into this single slot map): (a) BOTH "Dashboard" + "Compositions"
+    present in page_slots, each with a callable make; (b) every slot's
+    routing-sentinel page is None (lazy); (c) the `page` arg is the persistent
+    u_state["page"] fallback, not a live Dashboard page object.
     """
     captured: dict = {}
 
     def _fake_measure(page, stage_num, stage_desc, cache_mode, *,
                       token=None, user="admin", verify_against_cluster=True,
-                      deleted_ns=None, pages_by_name=None, page_factories=None):
+                      deleted_ns=None, page_slots=None):
         captured["page"] = page
-        captured["pages_by_name"] = pages_by_name
-        captured["factory_keys"] = (sorted(page_factories)
-                                    if page_factories else None)
+        captured["slot_keys"] = sorted(page_slots) if page_slots else None
+        captured["slot_pages"] = ({pn: slot.get("page")
+                                   for pn, slot in page_slots.items()}
+                                  if page_slots else None)
+        captured["slot_makes_callable"] = (
+            {pn: callable(slot.get("make"))
+             for pn, slot in page_slots.items()}
+            if page_slots else None)
         # Mirror the real function: materialise every lazy page at measure.
-        _materialise(page_factories)
+        _materialise(page_slots)
         return {"stage": stage_num, "pages": {}}
 
     # Real _open_stage_recording_pages (hermetic ctx factory), real lazy slots.
@@ -1345,15 +1353,20 @@ def test_measure_all_users_all_lazy_selects_persistent_page_and_both_factories(
 
     phases._measure_all_users(ctx, 6, "S6 desc")
 
-    # (a) page_factories now carries BOTH pages (Dashboard is lazy too).
-    assert captured["factory_keys"] == ["Compositions", "Dashboard"], (
-        f"page_factories must include BOTH Dashboard + Compositions (all lazy); "
-        f"got {captured['factory_keys']!r}")
-    # (b) pages_by_name maps every page (incl. Dashboard) to None at selection.
-    assert captured["pages_by_name"] == {"Dashboard": None,
-                                         "Compositions": None}, (
-        f"all slots lazy → pages_by_name all-None; got "
-        f"{captured['pages_by_name']!r}")
+    # (a) page_slots now carries BOTH pages (Dashboard is lazy too), each with a
+    # callable factory.
+    assert captured["slot_keys"] == ["Compositions", "Dashboard"], (
+        f"page_slots must include BOTH Dashboard + Compositions (all lazy); "
+        f"got {captured['slot_keys']!r}")
+    assert captured["slot_makes_callable"] == {"Dashboard": True,
+                                               "Compositions": True}, (
+        f"every slot must carry a callable factory; got "
+        f"{captured['slot_makes_callable']!r}")
+    # (b) every slot routes LAZY at selection — its sentinel page is None.
+    assert captured["slot_pages"] == {"Dashboard": None,
+                                      "Compositions": None}, (
+        f"all slots lazy → every slot['page'] None at selection; got "
+        f"{captured['slot_pages']!r}")
     # (c) the page arg is the persistent non-recording fallback (u_state["page"],
     # None for a recording user), NOT a live eager Dashboard page object.
     assert captured["page"] is persistent, (

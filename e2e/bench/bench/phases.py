@@ -772,7 +772,7 @@ def _setup_users(ctx: StageContext) -> None:
     -----------------------------
     NOT recording (`ctx.video == "none"`): open ONE persistent browser
     context + page per user (one login, reused across all stages) — the
-    cheap legacy shape. `pages_by_name` is absent in `_measure_all_users`
+    cheap legacy shape. `page_slots` is None in `_measure_all_users`
     so `browser_measure_stage` uses the single page exactly as before (zero
     behavioural change).
 
@@ -1400,8 +1400,7 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
             # at that page's own nav. The single persistent page is used only
             # for the non-recording path (and as a pure fallback).
             stage_pages: dict[str, dict] = {}
-            pages_by_name = None
-            page_factories = None
+            page_slots = None
             measure_page = u_state.get("page")
             if recording:
                 # Task #310a — thread the per-RUN login memo (created in
@@ -1412,14 +1411,15 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
                     storage_memo=ctx.user_pages.get("__storage_state_memo__"))
                 if stage_pages:
                     # Task #307 / ArchLazyDash: EVERY slot (incl. Dashboard) is
-                    # lazy — page=None + a `make` factory. browser_measure_stage
-                    # calls each factory at that page's own loop iteration and
-                    # the materialised page lands back in the slot;
-                    # `measure_page` stays the persistent non-recording page
-                    # (a pure fallback on the recording path).
-                    pages_by_name = {pn: None for pn in stage_pages}
-                    page_factories = {pn: pp["make"]
-                                      for pn, pp in stage_pages.items()}
+                    # lazy — page=None + a `make` factory. #310b: hand
+                    # browser_measure_stage the slot map DIRECTLY (one structure
+                    # carrying both the routing sentinel `slot["page"]` and the
+                    # shadow factory `slot["make"]`) instead of two derived
+                    # parallel dicts. The factory it invokes at each page's own
+                    # loop iteration writes the materialised page back into the
+                    # SAME slot; `measure_page` stays the persistent
+                    # non-recording page (a pure fallback on the recording path).
+                    page_slots = stage_pages
 
             # Architect Option A (content-gate correctness): the S8/S9
             # CONTENT asserts run in the stage's `_work` AFTER this function
@@ -1447,8 +1447,7 @@ def _measure_all_users(ctx: StageContext, stage_num, stage_desc,
                     token=u_state["token"], user=u_name,
                     verify_against_cluster=(u_name == "admin"),
                     deleted_ns=deleted_ns,
-                    pages_by_name=pages_by_name,
-                    page_factories=page_factories)
+                    page_slots=page_slots)
                 if r:
                     r["user"] = u_name
                     out.append(r)

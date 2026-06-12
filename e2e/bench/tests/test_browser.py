@@ -1565,19 +1565,41 @@ def test_scroll_capture_never_raises_when_evaluate_throws(fake_page, page_path):
     assert isinstance(n, int)
 
 
-def test_both_pages_scrolled_per_stage_via_pages_by_name(monkeypatch, tmp_path):
+# ─── #310b: slot-map helpers for browser_measure_stage's page_slots param ───
+#
+# #310b collapsed the prior parallel `pages_by_name` + `page_factories` dicts
+# into ONE slot map {page_name: {"page": <live|None>, "make": <factory|None>}}.
+# These builders construct that shape so the tests below exercise the SAME
+# routing + lazy-materialise intents through the collapsed structure.
+
+
+def _live_slot(page):
+    """A slot with a live page (the routing sentinel resolves directly to it —
+    no factory). Mirrors the legacy `pages_by_name[name] = <live page>`."""
+    return {"page": page, "make": None}
+
+
+def _lazy_slot(make):
+    """A LAZY slot: page=None (routing sentinel → route into the factory) +
+    a zero-arg `make` factory. Mirrors the legacy `pages_by_name[name] = None`
+    paired with `page_factories[name] = make`."""
+    return {"page": None, "make": make}
+
+
+def test_both_pages_scrolled_per_stage_via_page_slots(monkeypatch, tmp_path):
     """FIX 1 + FIX 2 under the per-page (representative AND all) recording
-    path: browser_measure_stage with `pages_by_name` measures each page on
+    path: browser_measure_stage with a `page_slots` map measures each page on
     its OWN page object, and the filmed-nav scroll fires for BOTH — the
     dashboard page gets the dashboard scroll idiom, the compositions page
     gets the stepped datagrid scroll. This is the per-stage guarantee the
     `--video all` clean re-run depends on (every stage's navs, both pages,
-    scrolled), since the scroll is mode-independent and pages_by_name is set
+    scrolled), since the scroll is mode-independent and page_slots is set
     for both representative and all.
 
-    Falsifier: if browser_measure_stage ignored pages_by_name (measured both
-    on the single `page`), the compositions FakePage's evaluate_log would be
-    empty — no scroll, no nav.
+    #310b: each slot carries the live page directly (slot["page"]). Falsifier:
+    if browser_measure_stage ignored page_slots (measured both on the single
+    `page`), the compositions FakePage's evaluate_log would be empty — no
+    scroll, no nav.
     """
     from tests.conftest import FakePage
 
@@ -1592,14 +1614,15 @@ def test_both_pages_scrolled_per_stage_via_pages_by_name(monkeypatch, tmp_path):
 
     dash_page = FakePage(call_count=16, ui_count=42)
     comp_page = FakePage(call_count=30, ui_count=42)
-    pages_by_name = {"Dashboard": dash_page, "Compositions": comp_page}
+    page_slots = {"Dashboard": _live_slot(dash_page),
+                  "Compositions": _live_slot(comp_page)}
 
     browser_measure_stage(
         dash_page, stage_num=6, stage_desc="S6 all-mode",
         cache_mode="ON", token="tok", num_navs=1, user="admin",
         verify_against_cluster=True, verify_timeout=5, verify_interval=0,
         screenshots_dir=tmp_path / "ss",
-        pages_by_name=pages_by_name)
+        page_slots=page_slots)
 
     # Dashboard page filmed-nav scrolled (its own object, not comp_page).
     dash_scrolls = _scroll_js_indices(dash_page.evaluate_log)
@@ -1610,7 +1633,7 @@ def test_both_pages_scrolled_per_stage_via_pages_by_name(monkeypatch, tmp_path):
     comp_scrolls = _scroll_js_indices(comp_page.evaluate_log)
     assert len(comp_scrolls) >= 2, (
         "compositions page (its own recording context) was not step-scrolled "
-        f"— pages_by_name not honoured?; log={comp_page.evaluate_log!r}")
+        f"— page_slots not honoured?; log={comp_page.evaluate_log!r}")
     # The compositions page issued a /call waterfall read of its OWN (proves it
     # was actually navigated/measured, not skipped).
     assert any("GAP_MS" in js for js in comp_page.evaluate_log), (
@@ -1675,17 +1698,18 @@ def test_A1_compositions_page_goto_log_has_no_login_no_dashboard(
     dash_page = FakePage(call_count=16, ui_count=42)
     comp_page = FakePage(call_count=30, ui_count=42)
 
-    # Lazy wiring: Compositions has no live page; a factory returns comp_page
-    # ONLY when invoked (mirrors _open_stage_recording_pages' deferred slot).
-    pages_by_name = {"Dashboard": dash_page, "Compositions": None}
-    page_factories = {"Compositions": lambda: comp_page}
+    # Lazy wiring (#310b slot map): Dashboard has a live page; Compositions is a
+    # LAZY slot — page=None + a factory returning comp_page ONLY when invoked
+    # (mirrors _open_stage_recording_pages' deferred slot).
+    page_slots = {"Dashboard": _live_slot(dash_page),
+                  "Compositions": _lazy_slot(lambda: comp_page)}
 
     browser_measure_stage(
         dash_page, stage_num=6, stage_desc="S6 A1",
         cache_mode="ON", token="tok", num_navs=1, user="admin",
         verify_against_cluster=True, verify_timeout=5, verify_interval=0,
         screenshots_dir=tmp_path / "ss",
-        pages_by_name=pages_by_name, page_factories=page_factories)
+        page_slots=page_slots)
 
     comp_gotos = [u for (u, _kw) in comp_page.goto_log]
     assert comp_gotos, "Compositions page was never navigated (factory not run?)"
@@ -1740,8 +1764,8 @@ def test_A1_compositions_context_created_after_dashboard_verify(
         cache_mode="ON", token="tok", num_navs=1, user="admin",
         verify_against_cluster=True, verify_timeout=5, verify_interval=0,
         screenshots_dir=tmp_path / "ss",
-        pages_by_name={"Dashboard": dash_page, "Compositions": None},
-        page_factories={"Compositions": _make_comp})
+        page_slots={"Dashboard": _live_slot(dash_page),
+                    "Compositions": _lazy_slot(_make_comp)})
 
     # The factory ran exactly once (lazy, not eager).
     assert factory_calls["n"] == 1, (
@@ -1756,8 +1780,8 @@ def test_A1_compositions_context_created_after_dashboard_verify(
 
 def test_browser_measure_stage_materializes_lazy_dashboard_and_verifies_on_it(
         monkeypatch, tmp_path):
-    """B1 invariant lock (Task #307 / ArchLazyDash): when the DASHBOARD arrives
-    LAZY (pages_by_name["Dashboard"]=None + a factory in page_factories),
+    """B1 invariant lock (Task #307 / ArchLazyDash; #310b slot-map form): when
+    the DASHBOARD arrives LAZY (its slot has page=None + a callable make),
     browser_measure_stage materialises it as the FIRST statement of the
     Dashboard iteration and the VERIFY read (`verify_composition_count_ui`) runs
     on the lazily-materialised dashboard page — NOT on the shared/fallback page.
@@ -1796,15 +1820,14 @@ def test_browser_measure_stage_materializes_lazy_dashboard_and_verifies_on_it(
         dash_factory_calls["n"] += 1
         return dash_page
 
-    # ALL slots lazy: pages_by_name maps both to None; factories materialise.
+    # ALL slots lazy (#310b): each slot has page=None; factories materialise.
     browser_measure_stage(
         shared_page, stage_num=6, stage_desc="S6 F-B'",
         cache_mode="ON", token="tok", num_navs=1, user="admin",
         verify_against_cluster=True, verify_timeout=5, verify_interval=0,
         screenshots_dir=tmp_path / "ss",
-        pages_by_name={"Dashboard": None, "Compositions": None},
-        page_factories={"Dashboard": _make_dash,
-                        "Compositions": lambda: comp_page})
+        page_slots={"Dashboard": _lazy_slot(_make_dash),
+                    "Compositions": _lazy_slot(lambda: comp_page)})
 
     # (a) The Dashboard factory ran exactly once (lazy, not eager).
     assert dash_factory_calls["n"] == 1, (
@@ -1849,14 +1872,15 @@ def test_lazy_factory_failure_falls_back_to_shared_page(monkeypatch, tmp_path):
     def _boom():
         raise RuntimeError("lazy dashboard context create failed")
 
-    # Both factories raise; nav_page must fall back to shared_page each time.
+    # Both slot factories raise; nav_page must fall back to shared_page each
+    # time (#310b: the make lives in the slot).
     result = browser_measure_stage(
         shared_page, stage_num=6, stage_desc="S6 fallback",
         cache_mode="ON", token="tok", num_navs=1, user="admin",
         verify_against_cluster=True, verify_timeout=5, verify_interval=0,
         screenshots_dir=tmp_path / "ss",
-        pages_by_name={"Dashboard": None, "Compositions": None},
-        page_factories={"Dashboard": _boom, "Compositions": _boom})
+        page_slots={"Dashboard": _lazy_slot(_boom),
+                    "Compositions": _lazy_slot(_boom)})
 
     # Stage still produced results (did not abort on the factory failure).
     assert result and "pages" in result, result

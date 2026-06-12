@@ -2198,8 +2198,7 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
                           verify_interval: int = 3,
                           screenshots_dir: Path | None = None,
                           deleted_ns=None,
-                          pages_by_name: dict | None = None,
-                          page_factories: dict | None = None):
+                          page_slots: dict | None = None):
     """Navigate browser to each page num_navs times, return timing data.
 
     Expects an already-logged-in page object and an admin JWT token.
@@ -2223,19 +2222,31 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
     persists a stage proof with passed=False + convergence_timeout=true,
     then re-raises to abort the run with exit 4.
 
-    `pages_by_name` + `page_factories` (Task #267 FIX 2 + #307 ArchLazyDash —
-    film both pages, lazily): in the recording path phases passes
-    `pages_by_name` as {page_name: None} (a routing sentinel — no live pages)
-    and `page_factories` as {page_name: zero-arg factory}. Each factory is
-    invoked at ITS page's loop iteration below and creates that page's
-    dedicated recording BrowserContext (Playwright records exactly one .webm
-    per context), so the dashboard context's video contains only dashboard
-    navs and the compositions context's only compositions navs — and neither
-    context (nor its video clock) exists before its own nav. When both are
-    None (every unit test + the no-video path), the single `page` argument is
-    used for every page_name, exactly as before. The VERIFY/convergence/
-    content block runs in the Dashboard branch on the materialised page, so
-    its logic is untouched.
+    `page_slots` (Task #267 FIX 2 + #307 ArchLazyDash + #310b — film both
+    pages, lazily): ONE slot map {page_name: slot} the recording path passes
+    (the same map `phases._open_stage_recording_pages` returns). Each `slot`
+    is a dict carrying BOTH the routing sentinel and the shadow factory that
+    used to live in the parallel `pages_by_name` / `page_factories` dicts:
+
+      slot["page"] — the routing sentinel: None means "lazy, no live page
+                     yet" (route into the factory); a live page object means
+                     "measure on this page directly".
+      slot["make"] — a zero-arg factory invoked at ITS page's loop iteration
+                     below; it creates that page's dedicated recording
+                     BrowserContext (Playwright records exactly one .webm per
+                     context) and writes the materialised page back into the
+                     SAME slot — so the dashboard context's video contains
+                     only dashboard navs and the compositions context's only
+                     compositions navs, and neither context (nor its video
+                     clock) exists before its own nav.
+
+    When `page_slots` is None (every unit test's no-video path) OR a given
+    page_name has no slot, the single `page` argument is used for that
+    page_name, exactly as before. The VERIFY/convergence/content block runs
+    in the Dashboard branch on the materialised page, so its logic is
+    untouched. #310b collapsed the prior two parallel dicts (pages_by_name +
+    page_factories, keyed identically by page_name) into this one slot map —
+    same routing + lazy-materialise semantics, one structure.
     """
     ns_count, comp_count = _count_bench_ns(), _count_compositions()
     _log(f"Cluster: {ns_count} bench ns, {comp_count} compositions")
@@ -2247,13 +2258,15 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
 
     pages_data = {}
     for page_name, page_path in BROWSER_SCALING_PAGES:
-        # Recording path: pages_by_name maps every page to None (lazy slots),
-        # so this resolves None and routes into the factory branch below.
-        # No-video path: pages_by_name is None → the shared `page` is used.
-        nav_page = (pages_by_name or {}).get(page_name, page)
+        # #310b: ONE slot map. Recording path supplies a slot per page whose
+        # `page` is the routing sentinel (None → lazy) and whose `make` is the
+        # shadow factory. No-video path: page_slots is None (or this page has
+        # no slot) → the shared `page` is used.
+        slot = (page_slots or {}).get(page_name)
+        nav_page = slot.get("page") if slot else page
 
         # Task #307 / ArchLazyDash: a LAZY page (now EVERY page, incl. the
-        # Dashboard) has nav_page None here and a factory in `page_factories`.
+        # Dashboard) has nav_page None here and a `make` factory in its slot.
         # Materialise it NOW — at this page's loop iteration, which is the FIRST
         # statement of the iteration body (before the per-page nav loop and the
         # Dashboard VERIFY/convergence block below). So each page's recording
@@ -2264,9 +2277,9 @@ def browser_measure_stage(page, stage_num, stage_desc, cache_mode,
         # the Dashboard VERIFY poll (falsifiers F-B / F-B′). The factory is
         # best-effort; on failure we fall back to the shared `page` so the
         # stage still measures (no recording for that page).
-        if nav_page is None and page_factories and page_name in page_factories:
+        if nav_page is None and slot and callable(slot.get("make")):
             try:
-                nav_page = page_factories[page_name]()
+                nav_page = slot["make"]()
             except Exception as e:
                 _log(f"    WARNING: lazy recording-context create for "
                      f"{page_name} failed ({type(e).__name__}: {e}); "
