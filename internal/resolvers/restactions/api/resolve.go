@@ -18,6 +18,7 @@ import (
 	"github.com/krateoplatformops/plumbing/env"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
+	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
@@ -181,56 +182,41 @@ func accumulateErrorKey(dict map[string]any, key string, value any) {
 	dict[key] = []any{existing, value}
 }
 
-func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
-	if len(opts.Items) == 0 {
-		return map[string]any{}
-	}
+// resolveRun bundles the resolve-INVARIANT state for a single Resolve call:
+// values written ONCE by newResolveRun and constant for the whole resolve.
+// It is unexported, built one-per-call, and NEVER shared across goroutines
+// (each concurrent Resolve builds its own). Mirrors the newPhase1Walker
+// constructor-with-positional-required-args precedent (design §1 / §3.1).
+//
+// CONCURRENCY (feedback_shared_vs_copy_is_a_concurrency_change): the per-STAGE
+// mutable primitives (dictMu, g, gctx, itemErrs, iterStart, wireVerbose) are
+// DELIBERATELY NOT fields here — they are re-created each stage and would
+// either outlive their stage or alias across stages if promoted to fields.
+// They stay method-/loop-local. The only mutated field is `dict`, which is
+// already the shared-across-goroutines serve map today, guarded by the
+// stage-local dictMu (unchanged). Net: zero new sharing — PROVEN by the
+// unchanged -race corpus (TestResolve_ConcurrentRequestsDoNotCrossPollinate,
+// TestShip2a_FullResolve_ManagedFields_Race, etc.).
+type resolveRun struct {
+	ctx             context.Context
+	log             *slog.Logger
+	opts            ResolveOptions            // verbatim caller opts (RC already non-nil)
+	dict            map[string]any            // the shared serve map (guarded per-stage by dictMu)
+	mapper          endpointReferenceMapper   // per-user endpoint reference resolver
+	apistageEnabled bool                      // F1 content-keyed api-stage L1 gate (read once)
+	apistageStore   *cache.ResolvedCacheStore // nil when apistage disabled / store unavailable
+	stageErrSink    *cache.StageErrorSink     // nil on the request path (refresher-only)
+	pipTimingSink   *cache.PIPStageTimingSink // nil on the request path (PIP-seed-only)
+}
 
-	if opts.RC == nil {
-		var err error
-		opts.RC, err = rest.InClusterConfig()
-		if err != nil {
-			return map[string]any{}
-		}
-	}
-
-	log := xcontext.Logger(ctx)
-	log.Info("pagination options", slog.Int("page", opts.Page), slog.Int("perPage", opts.PerPage))
-
-	// Cache routing gate. At 0.30.1 cache.Disabled() defaults to true
-	// and Watcher is nil — every API call takes the apiserver branch.
-	// The 0.30.2 ship lands the cache-served branch keyed off Watcher.
-	if cache.Disabled() || opts.Watcher == nil {
-		log.Debug("api.Resolve: cache disabled or watcher unset; using apiserver branch",
-			slog.Bool("cache_disabled", cache.Disabled()),
-			slog.Bool("watcher_nil", opts.Watcher == nil))
-	}
-
-	user, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		log.Error("unable to fetch user info from context", slog.Any("err", err))
-		return map[string]any{}
-	}
-
-	// Sort API by Depends
-	names, err := topologicalSort(opts.Items)
-	if err != nil {
-		log.Error("unable to sorted api by deps", slog.Any("error", err))
-		return map[string]any{}
-	}
-	log.Debug("sorted api by deps", slog.Any("names", names))
-
-	apiMap := make(map[string]*templates.API, len(opts.Items))
-	for _, id := range names {
-		for _, el := range opts.Items {
-			if el.Name == id {
-				apiMap[id] = el
-				break
-			}
-		}
-	}
-	log.Debug("created api map", slog.Int("total", len(apiMap)))
-
+// newResolveRun builds the per-call resolveRun. user is already resolved by
+// the caller (Resolve owns the R-pre3 UserInfo-error early-exit, so the
+// constructor never has to surface that error). The constructor performs
+// P2(mapper)/P3(dict)/P4(gate+sinks) of the original inline flow verbatim —
+// including the "base dict for api resolver" Info log at the end of dict
+// construction, which MUST fire after the caller's "created api map" Debug
+// log (slog event order is gated).
+func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, user jwtutil.UserInfo) *resolveRun {
 	// Endpoints reference mapper
 	mapper := endpointReferenceMapper{
 		authnNS:  opts.AuthnNS,
@@ -287,6 +273,81 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// install no sink; pipTimingSink is nil and every recorder branch
 	// below is a nil-receiver no-op (no behavioural change).
 	pipTimingSink := cache.PIPStageTimingSinkFrom(ctx)
+
+	return &resolveRun{
+		ctx:             ctx,
+		log:             log,
+		opts:            opts,
+		dict:            dict,
+		mapper:          mapper,
+		apistageEnabled: apistageEnabled,
+		apistageStore:   apistageStore,
+		stageErrSink:    stageErrSink,
+		pipTimingSink:   pipTimingSink,
+	}
+}
+
+func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
+	if len(opts.Items) == 0 {
+		return map[string]any{}
+	}
+
+	if opts.RC == nil {
+		var err error
+		opts.RC, err = rest.InClusterConfig()
+		if err != nil {
+			return map[string]any{}
+		}
+	}
+
+	log := xcontext.Logger(ctx)
+	log.Info("pagination options", slog.Int("page", opts.Page), slog.Int("perPage", opts.PerPage))
+
+	// Cache routing gate. At 0.30.1 cache.Disabled() defaults to true
+	// and Watcher is nil — every API call takes the apiserver branch.
+	// The 0.30.2 ship lands the cache-served branch keyed off Watcher.
+	if cache.Disabled() || opts.Watcher == nil {
+		log.Debug("api.Resolve: cache disabled or watcher unset; using apiserver branch",
+			slog.Bool("cache_disabled", cache.Disabled()),
+			slog.Bool("watcher_nil", opts.Watcher == nil))
+	}
+
+	user, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		log.Error("unable to fetch user info from context", slog.Any("err", err))
+		return map[string]any{}
+	}
+
+	// Sort API by Depends
+	names, err := topologicalSort(opts.Items)
+	if err != nil {
+		log.Error("unable to sorted api by deps", slog.Any("error", err))
+		return map[string]any{}
+	}
+	log.Debug("sorted api by deps", slog.Any("names", names))
+
+	apiMap := make(map[string]*templates.API, len(opts.Items))
+	for _, id := range names {
+		for _, el := range opts.Items {
+			if el.Name == id {
+				apiMap[id] = el
+				break
+			}
+		}
+	}
+	log.Debug("created api map", slog.Int("total", len(apiMap)))
+
+	// Build the per-call resolve-invariant state (P2 mapper / P3 dict / P4
+	// gate+sinks). The per-stage loop below reads these via r.*; the
+	// per-stage mutable primitives stay loop-local (see the resolveRun
+	// concurrency note).
+	r := newResolveRun(ctx, opts, log, user)
+	dict := r.dict
+	mapper := r.mapper
+	apistageEnabled := r.apistageEnabled
+	apistageStore := r.apistageStore
+	stageErrSink := r.stageErrSink
+	pipTimingSink := r.pipTimingSink
 
 	for _, id := range names {
 		// Get the api with this identifier
