@@ -119,7 +119,7 @@ func newClusterListWatcher(t *testing.T) *cache.ResourceWatcher {
 	if rw == nil {
 		t.Fatalf("expected non-nil watcher under CACHE_ENABLED=true")
 	}
-	t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
+	t.Cleanup(rw.Stop) // #85: Stop() blocks until goroutine drain — no settle-sleep needed
 
 	added, syncCh := rw.EnsureResourceType(f1WidgetsGVR)
 	if !added {
