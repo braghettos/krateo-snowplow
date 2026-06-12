@@ -18,8 +18,8 @@ jobs:
   codegen:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
       - name: Gather dependencies
@@ -30,15 +30,22 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
       - name: Gather dependencies
         run: go mod download
+      # 0.30.230-class nil-rc guard (#131): fail the PR if any rest.Config-bearing
+      # ResolveOptions literal omits its rc field (RC / SArc). A zero rest.Config
+      # threads ~8 calls deep and breaks every Kind=* widget at cache.GVRFor —
+      # the latent path behind four HARD REVERTs. Cheap AST check, runs before
+      # the long coverage run so it fails fast.
+      - name: ResolveOptions rc/SArc construction-site gate
+        run: bash scripts/check_resolveoptions_rc.sh
       - name: Run coverage
         run: go test -race -tags=unit,integration -p 1 -coverprofile=coverage.txt -covermode=atomic ./...
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
