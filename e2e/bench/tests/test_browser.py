@@ -1286,6 +1286,188 @@ def test_read_snowplow_expvar_int_rejects_bool_value(monkeypatch):
         "snowplow_rbac_publish_seq", base_url="http://fake:8081") is None
 
 
+# ─── Task #221 (bench half) — prewarm-boundary expvar probe + fallback ──────
+#
+# prewarm_complete_via_expvar reads the snowplow_prewarm_complete map expvar
+# (internal/cache/prewarm_complete_metric.go) via the established
+# read_snowplow_expvar_map transport seam. True (done=1) / False (done=0) /
+# None (absent — pre-0.30.264 / cache-off / transport failure → caller must
+# fall back to slog-scan). Tests drive the transport via base_url + a mocked
+# urlopen, the SAME seam the expvar-int/map transport tests use.
+
+
+def _stub_debug_vars(monkeypatch, payload_bytes):
+    """Install a fake urlopen returning `payload_bytes` from /debug/vars."""
+    import bench.browser as browser_mod
+
+    class _FakeResp:
+        status = 200
+        headers = {}
+
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return payload_bytes
+
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeResp())
+
+
+def test_prewarm_complete_via_expvar_true_when_done_1(monkeypatch):
+    """Key present + done==1 → True (the prewarm boundary has been reached)."""
+    import bench.browser as browser_mod
+    _stub_debug_vars(
+        monkeypatch,
+        b'{"snowplow_prewarm_complete": {"done": 1, "elapsed_ms": 1840}}')
+    assert browser_mod.prewarm_complete_via_expvar(
+        base_url="http://fake:8081") is True
+
+
+def test_prewarm_complete_via_expvar_false_when_done_0(monkeypatch):
+    """Key present + done==0 → False (present but NOT yet reached). The key
+    exists, so the caller keeps polling the expvar (authoritative) and does
+    NOT fall back to slog-scan."""
+    import bench.browser as browser_mod
+    _stub_debug_vars(
+        monkeypatch,
+        b'{"snowplow_prewarm_complete": {"done": 0, "elapsed_ms": -1}}')
+    assert browser_mod.prewarm_complete_via_expvar(
+        base_url="http://fake:8081") is False
+
+
+def test_prewarm_complete_via_expvar_none_when_key_absent(monkeypatch):
+    """Key ABSENT (image through 0.30.264, or CACHE_ENABLED=false Disabled()
+    gate) → None → caller MUST fall back to slog-scan."""
+    import bench.browser as browser_mod
+    _stub_debug_vars(monkeypatch, b'{"snowplow_refresher_completed_total": 7}')
+    assert browser_mod.prewarm_complete_via_expvar(
+        base_url="http://fake:8081") is None
+
+
+def test_prewarm_complete_via_expvar_none_on_transport_failure(monkeypatch):
+    """Unreachable /debug/vars → None (fail to fallback, never crash)."""
+    import bench.browser as browser_mod
+
+    def _boom(req, timeout=None):
+        raise OSError("connection refused")
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen", _boom)
+    assert browser_mod.prewarm_complete_via_expvar(
+        base_url="http://fake:8081") is None
+
+
+def test_prewarm_complete_via_expvar_none_on_wrong_done_shape(monkeypatch):
+    """`done` present but wrong type (bool / string) → None → fallback. A bool
+    must NOT be coerced to 0/1 (int() would), and a missing `done` is absent."""
+    import bench.browser as browser_mod
+    # done is a bool → reject (would coerce to 1 via int()).
+    _stub_debug_vars(
+        monkeypatch,
+        b'{"snowplow_prewarm_complete": {"done": true, "elapsed_ms": 5}}')
+    assert browser_mod.prewarm_complete_via_expvar(
+        base_url="http://fake:8081") is None
+    # done missing entirely from an otherwise-present map → None.
+    _stub_debug_vars(
+        monkeypatch,
+        b'{"snowplow_prewarm_complete": {"elapsed_ms": 5}}')
+    assert browser_mod.prewarm_complete_via_expvar(
+        base_url="http://fake:8081") is None
+
+
+def test_wait_for_l1_warmup_prefers_expvar_and_skips_slog_scan(monkeypatch):
+    """When the expvar reports done=1, wait_for_l1_warmup returns True via the
+    expvar path and NEVER shells kubectl for the slog-scan (the expvar is
+    authoritative when present)."""
+    import bench.browser as browser_mod
+    import bench.cluster as cluster_mod
+
+    monkeypatch.setattr(browser_mod, "prewarm_complete_via_expvar",
+                        lambda *a, **k: True)
+
+    def _kubectl_tripwire(*a, **k):
+        raise AssertionError(
+            "wait_for_l1_warmup shelled kubectl slog-scan despite expvar done=1")
+    monkeypatch.setattr(cluster_mod, "kubectl", _kubectl_tripwire)
+    # get_runtime_metrics must also not be consulted on the expvar path.
+    monkeypatch.setattr(browser_mod, "get_runtime_metrics",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("runtime metrics consulted on "
+                                           "expvar path")))
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda s: None)
+
+    assert browser_mod.wait_for_l1_warmup(timeout=30) is True
+
+
+def test_wait_for_l1_warmup_expvar_present_not_done_keeps_polling_expvar(
+        monkeypatch):
+    """Expvar present but done=0 for a few polls, then done=1 → returns True
+    via expvar, still WITHOUT any slog-scan (key present = authoritative)."""
+    import bench.browser as browser_mod
+    import bench.cluster as cluster_mod
+
+    seq = [False, False, True]  # done=0, done=0, done=1
+    calls = {"n": 0}
+
+    def _expvar(*a, **k):
+        i = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return seq[i]
+    monkeypatch.setattr(browser_mod, "prewarm_complete_via_expvar", _expvar)
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("slog-scan ran while expvar present")))
+    monkeypatch.setattr(browser_mod, "get_runtime_metrics", lambda: None)
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda s: None)
+
+    assert browser_mod.wait_for_l1_warmup(timeout=30) is True
+    assert calls["n"] >= 3, "expvar should have been polled until done=1"
+
+
+def test_wait_for_l1_warmup_falls_back_to_slog_scan_when_key_absent(monkeypatch):
+    """Mandatory fallback: when the expvar key is ABSENT (probe returns None —
+    images through 0.30.264), wait_for_l1_warmup uses the legacy slog-scan and
+    detects the boundary from the pod-log 'warmup: completed' sentinel."""
+    import bench.browser as browser_mod
+    import bench.cluster as cluster_mod
+
+    # Expvar absent on this (old) deployed image.
+    monkeypatch.setattr(browser_mod, "prewarm_complete_via_expvar",
+                        lambda *a, **k: None)
+    # /metrics/runtime shows no cache keys yet → forces the slog-scan branch.
+    monkeypatch.setattr(browser_mod, "get_runtime_metrics",
+                        lambda: {"cache_key_count": 0})
+
+    kubectl_calls = {"n": 0}
+
+    def _fake_kubectl(*a, **k):
+        kubectl_calls["n"] += 1
+        return (0, "... warmup: completed ...", "")
+    monkeypatch.setattr(cluster_mod, "kubectl", _fake_kubectl)
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda s: None)
+
+    assert browser_mod.wait_for_l1_warmup(timeout=30) is True
+    assert kubectl_calls["n"] >= 1, (
+        "fallback slog-scan must shell kubectl when the expvar key is absent")
+
+
+def test_wait_for_l1_warmup_fallback_detects_via_runtime_cache_keys(monkeypatch):
+    """Fallback path, runtime signal: expvar absent + /metrics/runtime reports
+    cache_key_count>0 → boundary detected via runtime WITHOUT needing the
+    pod-log scan (the legacy primary fallback signal, preserved)."""
+    import bench.browser as browser_mod
+    import bench.cluster as cluster_mod
+
+    monkeypatch.setattr(browser_mod, "prewarm_complete_via_expvar",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(browser_mod, "get_runtime_metrics",
+                        lambda: {"cache_key_count": 4231})
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("kubectl scan ran though runtime "
+                                           "cache_key_count>0 already detected")))
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda s: None)
+
+    assert browser_mod.wait_for_l1_warmup(timeout=30) is True
+
+
 def test_count_user_compositions_in_ns_returns_minus1_when_no_token():
     """Missing token → -1 sentinel (re-gate v3: ns argument no longer
     in the URL, so empty ns is no longer rejected — caller may pass

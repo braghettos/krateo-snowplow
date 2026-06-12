@@ -86,6 +86,8 @@ __all__ = [
     "wait_for_compositions",
     "wait_for_l1_ready",
     "wait_for_l1_warmup",
+    # Task #221 (bench half) — prewarm-boundary expvar probe (prefer/fallback)
+    "prewarm_complete_via_expvar",
     # Task #250 Block 2 — Phase 6 S8/S9 probes
     "read_snowplow_expvar_int",
     "count_user_compositions_in_ns",
@@ -947,19 +949,90 @@ BROWSER_SCALING_PAGES = [
 # ─── L1 + compositions waiters (used by browser-side callers) ───────────────
 
 
-def wait_for_l1_warmup(timeout=300):
-    """Poll snowplow /metrics/runtime + pod logs for L1 warmup completion.
+# Task #221 (bench half): the prewarm-completion boundary expvar published by
+# the snowplow half (internal/cache/prewarm_complete_metric.go). Value shape is
+# a map {"done": 0|1, "elapsed_ms": int}; done==1 is the boundary (the same
+# atomic /readyz consults — funnels EVERY Phase1Done flip path: dispatcher
+# happy path, cache-off else branch, readiness safety-net). The key is ABSENT
+# on images through 0.30.264 (and under CACHE_ENABLED=false — Disabled() gate),
+# so callers MUST fall back to the slog-scan boundary when this returns None.
+PREWARM_COMPLETE_EXPVAR = "snowplow_prewarm_complete"
 
-    Returns True when warmup is detected, False on timeout. Behaviour
-    matches the source script's `wait_for_l1_warmup` (worktree line 1000):
-    primary signal is `cache_key_count > 0` on /metrics/runtime; fallback
-    scans pod logs for the warmup-completed sentinel.
+
+def prewarm_complete_via_expvar(base_url=None, timeout=10):
+    """Probe the snowplow_prewarm_complete expvar for the prewarm boundary.
+
+    Returns:
+        True  — the expvar is present AND done==1 (boundary reached).
+        False — the expvar is present but done==0 (boundary NOT yet reached);
+                the key exists, so the caller should keep polling the expvar
+                (it is authoritative — do NOT fall back to slog-scan).
+        None  — the key is ABSENT or unreadable (pre-0.30.264 image, cache-off
+                Disabled() gate, or transport failure). The caller MUST fall
+                back to the existing slog-scan boundary.
+
+    Reuses the established read_snowplow_expvar_map seam (single GET of
+    /debug/vars, gzip-decompress, json.loads); base_url overrides SNOWPLOW for
+    tests. None-safe throughout.
+    """
+    m = read_snowplow_expvar_map(PREWARM_COMPLETE_EXPVAR,
+                                 base_url=base_url, timeout=timeout)
+    if not isinstance(m, dict):
+        return None
+    done = m.get("done")
+    # `done` is published as an int (0/1). Anything else (missing / wrong
+    # shape) → treat the key as unusable and fall back.
+    if not isinstance(done, int) or isinstance(done, bool):
+        return None
+    return done == 1
+
+
+def wait_for_l1_warmup(timeout=300):
+    """Wait for the prewarm / L1-warmup boundary.
+
+    Task #221 (bench half): PREFER the `snowplow_prewarm_complete` expvar
+    (published by the snowplow half — the single Phase1Done flip boundary);
+    fall back to the legacy /metrics/runtime + pod-log slog-scan when the key
+    is ABSENT (images through 0.30.264 do NOT publish it, and CACHE_ENABLED=
+    false gates it off). The bench must work against BOTH, so this is a
+    prefer-expvar / fallback-to-scan probe that logs which path it used.
+
+    Returns True when the boundary is detected, False on timeout.
+
+    Legacy fallback behaviour (unchanged) matches the source script's
+    `wait_for_l1_warmup` (worktree line 1000): primary signal is
+    `cache_key_count > 0` on /metrics/runtime; secondary scans pod logs for
+    the warmup-completed sentinel.
     """
     from bench.cluster import kubectl  # deferred — cluster is lifecycle-side
 
     _log("Waiting for L1 warmup ...")
     deadline = time.time() + timeout
+    expvar_path_logged = False
+    scan_path_logged = False
     while time.time() < deadline:
+        # ── Prefer the expvar boundary (Task #221). ──
+        expvar_done = prewarm_complete_via_expvar()
+        if expvar_done is not None:
+            # Key present → it is authoritative. Use it EXCLUSIVELY (do NOT
+            # consult the slog-scan, which could fire on a stale log line).
+            if not expvar_path_logged:
+                _log(f"L1 warmup boundary: using expvar "
+                     f"{PREWARM_COMPLETE_EXPVAR} (deployed image publishes it)")
+                expvar_path_logged = True
+            if expvar_done:
+                _log(f"L1 warmup detected (expvar "
+                     f"{PREWARM_COMPLETE_EXPVAR} done=1)")
+                return True
+            time.sleep(5)
+            continue
+
+        # ── Mandatory fallback: expvar key ABSENT (pre-0.30.264 / cache-off).
+        if not scan_path_logged:
+            _log(f"L1 warmup boundary: expvar {PREWARM_COMPLETE_EXPVAR} absent "
+                 f"— falling back to /metrics/runtime + pod-log slog-scan")
+            scan_path_logged = True
+
         rt = get_runtime_metrics()
         if rt:
             keys = rt.get("cache_key_count", 0)
