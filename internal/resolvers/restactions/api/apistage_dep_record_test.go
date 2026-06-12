@@ -209,7 +209,6 @@ func TestApistageContentServe_MissRecordsDepEdges(t *testing.T) {
 // calls no-ops after the first).
 func TestApistageContentServe_HitReRecordsDepEdges(t *testing.T) {
 	rw := newF1Watcher(t)
-	_ = rw
 
 	store := cache.ResolvedCache()
 	if store == nil {
@@ -236,6 +235,29 @@ func TestApistageContentServe_HitReRecordsDepEdges(t *testing.T) {
 	}
 
 	expectedKey := cache.ComputeKey(contentKeyInputs(f1WidgetsGVR, "", ""))
+
+	// Task #331 half (b) — ORDERED TEARDOWN before the mid-test reset
+	// (#85 methodology). The seed MISS above drove a real LIST through the
+	// live newF1Watcher informer; its processor goroutine
+	// (depEventHandlers.func1 → Deps().OnAdd, deps_watch.go:208) may still
+	// be draining queued ADD events. ResetDepsForTest() nils the package
+	// `depsInstance` singleton (deps.go:933) with an UNGUARDED write —
+	// racing that drain produces a DATA RACE (reproduced 1-of-3 attempts
+	// under 32 CPU hogs + -race, /tmp/snowplow-331/race-repro.txt;
+	// goroutine 87 reset vs goroutine 124 informer-bridge read). BOTH ends
+	// are test lifecycle: the reset is a *_test.go-only helper production
+	// never calls, and the reader is a watcher goroutine this test started.
+	//
+	// rw.Stop() (watcher.go:2118 Phase 2) BLOCKS on goroutineWG.Wait()
+	// until every watcher-spawned goroutine has exited — its own doc
+	// states "a subsequent ResetDepsForTest() ... cannot race an in-flight
+	// depEventHandlers.func1 -> Deps() access." Stop() is idempotent (the
+	// stopCh close is select/default-guarded), so newF1Watcher's
+	// t.Cleanup(rw.Stop) remains safe. Stopping the watcher does NOT touch
+	// the resolved store or the dep tracker, so the populated entry below
+	// survives and the HIT path (a pure store.Get + re-record, no
+	// dispatch) is unaffected.
+	rw.Stop()
 
 	// Surgically reset the dep tracker — but keep the populated store
 	// entry. After this, the store has the content but the dep tracker

@@ -384,8 +384,36 @@ func TestValidateClusterListShape_MalformedJSON(t *testing.T) {
 // remain as deferred []json.RawMessage. The envelope decode is still
 // O(N) on the slice index (RawMessage bookkeeping) but is far cheaper
 // than the per-item map decode + field-walk that the pre-correction
-// path ran. The 50ms hard guard is preserved to surface gross
-// regressions while not false-positiving on busy CI.
+// path ran.
+//
+// Task #331 — TWO TEETH, reconciling the #328 architect ruling (a pure
+// counter would LOSE the only gross-algorithmic-blowup signal — the
+// wall-clock pass-counter's honest coverage boundary) with the #331 PM
+// ruling (give it the #328 mechanism-count treatment):
+//
+//  1. MECHANISM tooth (ALWAYS ON, instrumentation-invariant): the shape
+//     check defers items (0 materialisation passes); the single explicit
+//     decodeClusterListItems call at the call site is the ONE AND ONLY
+//     materialisation pass (exactly 1 total). Reuses the EXISTING
+//     materialiseClusterListItemsFn seam via countClusterListMaterialisations
+//     (#328). A per-item-decode regression makes the count N, not 1 —
+//     caught in BOTH build modes. RED proof: /tmp/snowplow-331/red-proof-a.txt
+//     (per-item simulation → count=2000).
+//
+//  2. WALL-CLOCK CANARY (perf-budget PROXY, RACE-SKIPPED): the >50ms guard
+//     on the call-site cost (shape check + one materialisation) is kept as
+//     the gross-algorithmic-blowup signal the #328 architect did not want
+//     to lose — it bites blowups the exactly-1 count cannot see (e.g. an
+//     O(N²) walk that still runs ONE pass). It is INTENTIONALLY skipped
+//     under the race detector (raceEnabledForTest, set by the
+//     race_enabled_test.go / race_disabled_test.go build-tag pair): -race
+//     memory-access instrumentation inflates this pure-CPU op 2-8×
+//     (70-294ms observed 2026-06-12 on the 2K envelope), which invalidates
+//     the budget as a proxy — the canary measures a perf property, not a
+//     correctness property, so instrumentation noise must not fail it. NO
+//     testing.Short() coupling: CI may run -short, which is orthogonal to
+//     whether the budget is measurable. RED proof: an injected sleep in the
+//     counting wrapper drives avg>50ms (no-race) — red-proof-a.txt.
 func TestValidateClusterListShape_Overhead(t *testing.T) {
 	items := make([]any, 0, 2000)
 	for i := 0; i < 2000; i++ {
@@ -404,24 +432,59 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 		"items":      items,
 	})
 
-	// Warm-up — first call pays the json.Unmarshal cold cost. Measure
-	// the median across 5 runs to track a stable number.
+	count := countClusterListMaterialisations(t)
+
+	// MECHANISM tooth — assert the shape check defers items (0 passes),
+	// then the SINGLE explicit decodeClusterListItems call is the one and
+	// only materialisation (exactly 1 total). Timed together so the
+	// wall-clock canary observes the real call-site cost (shape + one
+	// materialise), not just the envelope decode. Median across 5 runs.
 	var total time.Duration
 	const runs = 5
 	for i := 0; i < runs; i++ {
 		start := time.Now()
-		_, ok, reason := validateClusterListShape(testShapeGVR, raw)
-		elapsed := time.Since(start)
-		total += elapsed
+		shape, ok, reason := validateClusterListShape(testShapeGVR, raw)
 		if !ok {
 			t.Fatalf("run %d: validateClusterListShape returned ok=false: %s", i, reason)
 		}
+		// Shape check alone must NOT materialise — items stay deferred.
+		if got := count(); got != i {
+			t.Fatalf("run %d: validateClusterListShape triggered a materialisation pass "+
+				"(running total %d, want %d — the shape check must defer per-item decode "+
+				"entirely; N items must NOT mean N passes)", i, got, i)
+		}
+		_, decodeErr := decodeClusterListItems(shape)
+		if decodeErr != "" {
+			t.Fatalf("run %d: decodeClusterListItems error=%q", i, decodeErr)
+		}
+		total += time.Since(start)
 	}
+	// After 5 (shape-check 0 + one decode) iterations the total
+	// materialisation count is EXACTLY runs — one pass per call site, never
+	// per-item, never inside the shape check. This tooth is
+	// instrumentation-invariant and runs under -race too.
+	if got := count(); got != runs {
+		t.Fatalf("MECHANISM tooth: expected exactly %d materialisation passes "+
+			"(one per call site over %d runs); got %d — a per-item decode "+
+			"regression folded into the shape check would inflate this", runs, runs, got)
+	}
+
 	avg := total / runs
-	t.Logf("validateClusterListShape AC-D5.14 overhead: 2000 items, avg=%v over %d runs", avg, runs)
-	// Hard guard: a >50ms single-invocation latency on a 2K envelope
-	// would be a 5× budget breach — surface this as a test failure so
-	// the diff-review gate cannot miss it.
+	t.Logf("validateClusterListShape AC-D5.14 call-site overhead: 2000 items, avg=%v over %d runs (raceEnabled=%v)", avg, runs, raceEnabledForTest)
+
+	// WALL-CLOCK CANARY — race-skipped (see header). The race detector's
+	// instrumentation invalidates a pure-CPU perf budget; the exactly-N
+	// MECHANISM tooth above is the always-on regression signal, so skipping
+	// the proxy here loses no correctness coverage.
+	if raceEnabledForTest {
+		t.Skip("AC-D5.14 wall-clock canary skipped under -race: memory-access " +
+			"instrumentation invalidates the perf budget (2-8× inflation). The " +
+			"exactly-N materialisation-count tooth (asserted above) is the " +
+			"instrumentation-invariant regression signal.")
+	}
+	// Hard guard: a >50ms call-site latency on a 2K envelope would be a 5×
+	// budget breach — surface this as a test failure so the diff-review gate
+	// cannot miss a gross algorithmic blowup the count tooth cannot see.
 	if avg > 50*time.Millisecond {
 		t.Fatalf("AC-D5.14 overhead budget breach: avg=%v > 50ms (5× the 10ms PM-ratified budget)", avg)
 	}
