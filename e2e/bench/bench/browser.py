@@ -91,6 +91,9 @@ __all__ = [
     "count_user_compositions_in_ns",
     # Task #334a — convergence-cell discrimination tuple (report-only)
     "capture_conv_discrimination",
+    # Task #217 — per-stage L1 hit/miss delta (report-only)
+    "read_snowplow_expvar_map",
+    "compute_l1_lookup_delta",
 ]
 
 
@@ -301,6 +304,107 @@ def read_snowplow_expvar_int(key, *, base_url=None, timeout=10):
         except (ValueError, OverflowError):
             return None
     return None
+
+
+def read_snowplow_expvar_map(key, *, base_url=None, timeout=10):
+    """Fetch a single map-valued expvar from snowplow's /debug/vars.
+
+    Task #217 — REPORT-ONLY per-stage L1 hit/miss delta. Used to snapshot
+    `snowplow_dispatch_l1_lookups` (map[str] -> {hit_total, miss_total}, per
+    dispatchers/l1_lookup_metrics.go) before/after a stage so the stage proof
+    can carry the per-GVR L1 lookup delta.
+
+    Reuses the SAME read path as read_snowplow_expvar_int (single GET,
+    gzip-decompress, json.loads of /debug/vars — the established #334-A expvar
+    machinery); the ONLY difference is the value type asserted (dict, not int).
+
+    Args:
+        key:      JSON top-level key in /debug/vars (e.g.
+                  "snowplow_dispatch_l1_lookups").
+        base_url: override SNOWPLOW; useful for tests.
+        timeout:  HTTP timeout seconds.
+
+    Returns:
+        dict when /debug/vars returns 200 + key is a JSON object.
+        None on any failure path (unreachable, malformed JSON, missing key,
+        non-dict value). A cache-OFF pod publishes no such expvar, so the
+        caller records the L1 field as None — NEVER crashes a stage.
+    """
+    base = base_url if base_url is not None else SNOWPLOW
+    url = f"{base.rstrip('/')}/debug/vars"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            body = resp.read()
+            body = _decompress(body, headers=dict(resp.headers))
+            data = json.loads(body)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    val = data.get(key)
+    if isinstance(val, dict):
+        return val
+    return None
+
+
+def compute_l1_lookup_delta(before_map, after_map):
+    """Diff two snowplow_dispatch_l1_lookups snapshots into a report-only
+    per-GVR L1 hit/miss delta.
+
+    Task #217 — REPORT-ONLY. Pure function (no I/O); fully None-safe so a
+    cache-OFF / unreachable snapshot records the field as None rather than
+    crashing the stage.
+
+    The expvar value is map["<handlerKind>|<gvrString>"] ->
+    {hit_total, miss_total} (dispatchers/l1_lookup_metrics.go). We diff
+    per cell and aggregate, returning:
+
+        {
+          "per_gvr": {"<handlerKind>|<gvr>": {"hits": N, "misses": M}, ...},
+          "total":   {"hits": <sum>, "misses": <sum>},
+        }
+
+    Only cells with a non-zero hit OR miss delta appear under per_gvr, to keep
+    the proof compact. A cell present only in `after` counts its full value as
+    the delta (new (handlerKind, gvr) observed during the stage).
+
+    Returns:
+        dict as above when BOTH snapshots are dicts.
+        None if either snapshot is None (cache-off / unreachable — the caller
+        records null).
+    """
+    if not isinstance(before_map, dict) or not isinstance(after_map, dict):
+        return None
+
+    def _cell_int(cell, field):
+        if not isinstance(cell, dict):
+            return 0
+        v = cell.get(field, 0)
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    per_gvr = {}
+    total_hits = 0
+    total_misses = 0
+    for cell_key in set(before_map) | set(after_map):
+        before_cell = before_map.get(cell_key)
+        after_cell = after_map.get(cell_key)
+        d_hits = _cell_int(after_cell, "hit_total") - _cell_int(before_cell, "hit_total")
+        d_misses = _cell_int(after_cell, "miss_total") - _cell_int(before_cell, "miss_total")
+        if d_hits != 0 or d_misses != 0:
+            per_gvr[cell_key] = {"hits": d_hits, "misses": d_misses}
+        total_hits += d_hits
+        total_misses += d_misses
+
+    return {
+        "per_gvr": per_gvr,
+        "total": {"hits": total_hits, "misses": total_misses},
+    }
 
 
 # ─── Task #334a: convergence-cell discrimination tuple ──────────────────────

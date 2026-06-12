@@ -576,6 +576,14 @@ def _run_stage(stage_id: str,
     )
     streamer.start()
     deploy_fp_before = _snowplow_deploy_fingerprint()
+    # Task #217 (report-only): snapshot the per-(handlerKind, gvr) L1
+    # hit/miss counters at window-open so the success-path proof can carry
+    # the per-stage L1 lookup delta. None-safe — a cache-OFF / unreachable
+    # pod publishes no such expvar, so the snapshot (and hence the proof
+    # field) is None and NEVER crashes the stage. Reuses the established
+    # #334-A expvar read path (no new I/O mechanism).
+    l1_lookups_before = browser.read_snowplow_expvar_map(
+        "snowplow_dispatch_l1_lookups")
     try:
         try:
             try:
@@ -587,6 +595,14 @@ def _run_stage(stage_id: str,
                 # the proof's video-artifact attach below, so the deferred
                 # `.webm` is in __stage_videos__ when it is attached.
                 _drain_pending_video_finalize(ctx)
+            # Task #217 (report-only): snapshot L1 counters again at
+            # window-close (success path) and diff into the stage proof.
+            # compute_l1_lookup_delta is None-safe: if either snapshot is
+            # None the field records null. NEVER feeds compute_verdict.
+            l1_lookups_after = browser.read_snowplow_expvar_map(
+                "snowplow_dispatch_l1_lookups")
+            proof_dict["l1_lookup_delta"] = browser.compute_l1_lookup_delta(
+                l1_lookups_before, l1_lookups_after)
             _annotate_deploy_revision(stage_id, proof_dict, deploy_fp_before)
             passed = bool(proof_dict.pop("__passed__", True))
             proof = StageProof(

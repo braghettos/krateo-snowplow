@@ -74,17 +74,30 @@ def _stub_conv_discrimination_probes(monkeypatch):
       no base_url and get None. test_phases_s8bc re-binds the attribute
       explicitly and so overrides this wrapper entirely (fixtures apply
       before the test body).
+    - `read_snowplow_expvar_map` (Task #217) is the map-valued sibling, called
+      with no base_url from _run_stage's per-stage L1 snapshot. Same wrapper:
+      delegate to the REAL function only when a base_url is supplied (its
+      transport unit tests); base_url-less _run_stage callers get None, so the
+      proof's l1_lookup_delta is None — the same path a cache-off pod takes.
     """
     import bench.browser as browser_mod
     _real_expvar = browser_mod.read_snowplow_expvar_int
+    _real_expvar_map = browser_mod.read_snowplow_expvar_map
 
     def _expvar_or_none(key, *, base_url=None, timeout=10):
         if base_url is not None:
             return _real_expvar(key, base_url=base_url, timeout=timeout)
         return None
 
+    def _expvar_map_or_none(key, *, base_url=None, timeout=10):
+        if base_url is not None:
+            return _real_expvar_map(key, base_url=base_url, timeout=timeout)
+        return None
+
     monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int",
                         _expvar_or_none)
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_map",
+                        _expvar_map_or_none)
     monkeypatch.setattr(browser_mod, "_snowplow_pod_log_window",
                         lambda *a, **k: None)
 
