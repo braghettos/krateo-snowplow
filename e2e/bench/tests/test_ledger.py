@@ -495,6 +495,215 @@ def test_conv_tier_unchanged_at_30000_under_task_121():
                                   conv_s8_p99=30001, cells=None) == "WEAK_PASS"
 
 
+# ── Task #334-B: S7 delete-convergence BAND + SLOPE gate ────────────────────
+
+
+def test_s7_band_slope_constants_present_and_derived():
+    """The band + floor + semantics marker are present and exactly the
+    Diego-ratified / #335-derived values (worst-healthy 6/s × 0.5 safety)."""
+    assert ledger.S7_CONV_BAND_MS == (30000, 270000)
+    assert ledger.S7_SLOPE_FLOOR_PER_S == 3.0
+    assert ledger.VERDICT_SEMANTICS_REV == "2026-06-12/s7-band-slope"
+
+
+def test_compute_verdict_s7_kwargs_are_keyword_only_default_none():
+    """Acceptance (d): the two new inputs are keyword-only with default None,
+    so EVERY existing positional caller of compute_verdict is byte-compatible.
+    """
+    import inspect
+    ps = inspect.signature(ledger.compute_verdict).parameters
+    assert ps["conv_s7_p99"].default is None
+    assert ps["s7_slope_per_s"].default is None
+    assert ps["conv_s7_p99"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert ps["s7_slope_per_s"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_compute_verdict_s7_band_slope_gate_truthtable():
+    """The 5-row truth table (band 30000..270000 × slope floor 3.0/s × None).
+    FAIL iff above-band AND slope dropped below floor — the ONLY FAIL combo.
+    """
+    mix = _mw(900, 2000)
+    cv = ledger.compute_verdict
+    # Row 1 — below band (incl. -1 no-sample sentinel): PASS, any slope.
+    assert cv(mix, 0, 23000, conv_s7_p99=20000, s7_slope_per_s=0.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=-1, s7_slope_per_s=0.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=20000, s7_slope_per_s=None) == "PASS"
+    # Row 2 — in band: PASS, any slope (#335's 31.2s + 151.5s both land here).
+    assert cv(mix, 0, 23000, conv_s7_p99=31200, s7_slope_per_s=9.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=151500, s7_slope_per_s=6.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=270000, s7_slope_per_s=0.1) == "PASS"
+    # Row 3 — above band + slope >= floor: PASS (cluster-state, by design).
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=7.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=3.0) == "PASS"
+    # Row 4 — above band + slope < floor: FAIL (the ONLY FAIL).
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=0.8) == "FAIL"
+    assert cv(mix, 0, 23000, conv_s7_p99=270001, s7_slope_per_s=2.999) == "FAIL"
+    # Row 5 — above band + None slope: PASS (FAIL-OPEN; missing telemetry).
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=None) == "PASS"
+
+
+def test_s7_gate_is_hard_fail_peer_of_restarts_not_a_miss():
+    """Row 4 short-circuits to FAIL like restarts>0 — it is NOT a +1 to the
+    miss counter. A run with ALL latency tiers clean (warm/cold/conv_s8 in
+    tier, 0 misses) but the S7 regression signature still FAILs."""
+    mix = _mw(890, 1175)  # clean warm + cold
+    assert ledger.compute_verdict(mix, 0, 23800,
+                                  conv_s7_p99=290000,
+                                  s7_slope_per_s=0.8) == "FAIL"
+    # And it composes: a single tier miss (WEAK_PASS territory) + the S7
+    # regression is still a hard FAIL, not WEAK_PASS.
+    assert ledger.compute_verdict(_mw(1500, 1175), 0, 23800,
+                                  conv_s7_p99=290000,
+                                  s7_slope_per_s=0.8) == "FAIL"
+
+
+def test_s7_gate_does_not_perturb_existing_tiers():
+    """No-perturbation: a clean run (warm/cold/conv_s8 in tier) with S7
+    above-band-but-HEALTHY-slope still PASSes; a below-band S7 with None slope
+    still PASSes. The S7 gate is inert on every non-regression run, so the
+    existing warm/cold/conv_s8 tier arithmetic is unchanged."""
+    mix = _mw(890, 1175)
+    # above-band but slope healthy -> PASS (no miss added).
+    assert ledger.compute_verdict(mix, 0, 23800,
+                                  conv_s7_p99=290000,
+                                  s7_slope_per_s=7.0) == "PASS"
+    # below-band + None slope -> PASS.
+    assert ledger.compute_verdict(mix, 0, 23800,
+                                  conv_s7_p99=20000,
+                                  s7_slope_per_s=None) == "PASS"
+    # And the pre-#334-B positional contract is identical: a clean run with NO
+    # S7 kwargs is exactly what it was before this commit.
+    assert ledger.compute_verdict(mix, 0, 23800, cells=None) == "PASS"
+
+
+def _s7_entry(cache, slopes, *, stage="7"):
+    """Build an all_results entry whose Dashboard navs carry #334-A tuples."""
+    navs = []
+    for s in slopes:
+        navs.append({
+            "convergence_ms": 1000,
+            "conv_discrimination": {
+                "refresh_completed_slope_per_s": s,
+                "window_seconds": 10.0,
+            },
+        })
+    return {"stage": stage, "cache": cache,
+            "pages": {"Dashboard": {"navigations": navs}}}
+
+
+def test_s7_min_slope_per_s_min_not_mean():
+    """MIN (not mean) so one stalled user trips the gate."""
+    r = ledger.s7_min_slope_per_s([_s7_entry("ON", [9.0, 4.0, 7.0])])
+    assert r == 4.0
+
+
+def test_s7_min_slope_per_s_none_when_no_tuple_or_all_none():
+    """None when NO nav carries a non-None slope (cache-off / unreachable) ->
+    the gate FAIL-OPENs."""
+    assert ledger.s7_min_slope_per_s([]) is None
+    assert ledger.s7_min_slope_per_s([_s7_entry("ON", [None, None])]) is None
+    # nav without a conv_discrimination tuple at all -> None.
+    bare = {"stage": "7", "cache": "ON",
+            "pages": {"Dashboard": {"navigations": [{"convergence_ms": 1000}]}}}
+    assert ledger.s7_min_slope_per_s([bare]) is None
+
+
+def test_s7_min_slope_per_s_stage_filter_only_seven():
+    """Only stage '7' navs contribute — S6/S8 slopes are ignored."""
+    rs = [_s7_entry("ON", [0.1], stage="6"),
+          _s7_entry("ON", [0.2], stage="8"),
+          _s7_entry("ON", [8.0], stage="7")]
+    assert ledger.s7_min_slope_per_s(rs) == 8.0
+
+
+def test_s7_min_slope_per_s_cache_on_preferred_off_fallback():
+    """ON-then-OFF preference mirrors convergence_p99_for_stage: when ON navs
+    exist they alone are used; cache-off all-None tuples still resolve to
+    None (the cache-off signal is the None-ness itself)."""
+    # ON present -> OFF ignored.
+    assert ledger.s7_min_slope_per_s(
+        [_s7_entry("ON", [5.0]), _s7_entry("OFF", [0.1])]) == 5.0
+    # Only OFF, with real slopes -> used (fallback).
+    assert ledger.s7_min_slope_per_s([_s7_entry("OFF", [6.0, 3.5])]) == 3.5
+    # Only OFF, all-None (true cache-off) -> None -> FAIL-OPEN.
+    assert ledger.s7_min_slope_per_s([_s7_entry("OFF", [None])]) is None
+
+
+def test_build_row_carries_verdict_semantics_rev_and_annotations(monkeypatch):
+    """Acceptance (e): every row self-declares verdict_semantics_rev; an
+    above-band+healthy-slope S7 populates series_annotations (row 3); an
+    above-band+None S7 populates the FAIL-OPEN annotation (row 5)."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", "no cluster"))
+
+    # Row 3: above-band conv (>270000) with a HEALTHY slope -> annotation.
+    healthy = [_s7_entry("ON", [7.0])]
+    healthy[0]["pages"]["Dashboard"]["navigations"][0]["convergence_ms"] = 290000
+    healthy[0]["pages"]["Dashboard"]["navigations"][0]["user"] = "admin"
+    row = ledger.build_canonical_ledger_row(healthy, tag="t", scale=50000)
+    assert row["verdict_semantics_rev"] == "2026-06-12/s7-band-slope"
+    assert any("s7_above_band_cluster_state" in a
+               for a in row["series_annotations"]), row["series_annotations"]
+
+    # Row 5: above-band conv with None slope -> FAIL-OPEN annotation.
+    none_slope = [_s7_entry("ON", [None])]
+    none_slope[0]["pages"]["Dashboard"]["navigations"][0]["convergence_ms"] = 290000
+    none_slope[0]["pages"]["Dashboard"]["navigations"][0]["user"] = "admin"
+    row2 = ledger.build_canonical_ledger_row(none_slope, tag="t", scale=50000)
+    assert any("s7_slope_unavailable" in a
+               for a in row2["series_annotations"]), row2["series_annotations"]
+
+
+def test_build_row_no_annotation_when_in_band(monkeypatch):
+    """Rows 1/2 (below / in band) populate NO annotation — the loud note is
+    reserved for above-band excursions only."""
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", "no cluster"))
+    in_band = [_s7_entry("ON", [9.0])]
+    in_band[0]["pages"]["Dashboard"]["navigations"][0]["convergence_ms"] = 151500
+    in_band[0]["pages"]["Dashboard"]["navigations"][0]["user"] = "admin"
+    row = ledger.build_canonical_ledger_row(in_band, tag="t", scale=50000)
+    assert row["series_annotations"] == []
+    assert row["verdict_semantics_rev"] == "2026-06-12/s7-band-slope"
+
+
+def test_write_run_bundle_surfaces_s7_fail_gate_and_annotations(tmp_path,
+                                                                monkeypatch):
+    """Row 4 (above-band + dropped slope) appends an s7:above_band_slope_dropped
+    entry to summary.failed_gates; rows 3/5 surface in summary.series_annotations.
+    """
+    monkeypatch.setattr(ledger, "kubectl", lambda *a, **k: (1, "", "no cluster"))
+
+    # Row 4 FAIL: above-band conv + dropped slope. Give cyber a clean COLD +
+    # WARM sample so mix_weighted is non-null AND all latency tiers are in tier
+    # (so the verdict is the S7 gate's FAIL, not INVALID / a tier-miss). The S7
+    # slope tuple rides the warm nav.
+    cold_nav = {
+        "user": "cyberjoker", "nav_num": 1, "cold_warm": "COLD",
+        "waterfallMs": 1100,
+        "validation": {"terminal_state": "pass", "skeleton_count": 0,
+                       "errored_count": 0},
+    }
+    warm_nav = {
+        "user": "cyberjoker", "nav_num": 2, "waterfallMs": 900,
+        "convergence_ms": 290000,
+        "conv_discrimination": {"refresh_completed_slope_per_s": 0.8,
+                                "window_seconds": 10.0},
+        "validation": {"terminal_state": "pass", "skeleton_count": 0,
+                       "errored_count": 0},
+    }
+    entry = {"stage": "7", "cache": "ON",
+             "pages": {"Dashboard": {"navigations": [cold_nav, warm_nav]}}}
+    bundle = tmp_path / "run"
+    row = ledger.write_run_bundle(bundle, [entry], tag="t", scale=50000)
+    # Verdict is the hard FAIL from the S7 gate (not INVALID, not a tier miss).
+    assert row["verdict"] == "FAIL"
+    summary = json.loads((bundle / "summary.json").read_text())
+    assert any(g.startswith("s7:above_band_slope_dropped")
+               for g in summary["failed_gates"]), summary["failed_gates"]
+    assert summary["verdict_semantics_rev"] == "2026-06-12/s7-band-slope"
+    # Row 4 is the FAIL path -> NO above-band PASS annotation for this run.
+    assert summary["series_annotations"] == []
+
+
 # ── #289a: skeleton_failures respects the efaf1a4 demotion ──────────────────
 
 

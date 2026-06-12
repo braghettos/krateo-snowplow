@@ -253,15 +253,35 @@ def test_conv_discrimination_does_not_feed_convergence_p99_for_stage():
     assert with_t == without_t == 23000
 
 
-def test_compute_verdict_ignores_conv_discrimination_and_settle():
-    # compute_verdict's signature takes (mix_weighted, restarts, conv_s8_p99,
-    # cells) — there is no parameter for the tuple or the settle metric, so a
-    # PASS scenario stays PASS regardless of any tuple/settle content.
+def test_compute_verdict_s7_band_slope_gate_truthtable():
+    # Task #334-B DELIBERATELY changes the old report-only contract: the S7
+    # convergence p99 + the #334-A drain slope NOW reach compute_verdict (as
+    # kw-only inputs conv_s7_p99 / s7_slope_per_s). This replaces the former
+    # test_compute_verdict_ignores_conv_discrimination_and_settle, whose prose
+    # ("there is no parameter for the tuple") is false by design now.
+    #
+    # The 5-row truth table (band 30000..270000 × slope floor 3.0/s × None):
     mix = {"warm_p50_ms": 900, "cold_ms": 2000}
-    assert ledger.compute_verdict(mix, 0, 23000) == "PASS"
-    # A "dropped slope" / huge churn tuple cannot be passed in — proves the
-    # gating surface never reads it. (Same call, no tuple arg accepted.)
-    assert ledger.compute_verdict(mix, 0, 35000) == "WEAK_PASS"  # conv tier
+    cv = ledger.compute_verdict
+    # Row 1 — below band (incl. the -1 no-sample sentinel): PASS, any slope.
+    assert cv(mix, 0, 23000, conv_s7_p99=20000, s7_slope_per_s=0.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=-1, s7_slope_per_s=0.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=20000, s7_slope_per_s=None) == "PASS"
+    # Row 2 — in band (#335's 31.2s and 151.5s both land here): PASS, any slope.
+    assert cv(mix, 0, 23000, conv_s7_p99=31200, s7_slope_per_s=9.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=151500, s7_slope_per_s=6.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=270000, s7_slope_per_s=0.1) == "PASS"  # boundary in-band
+    # Row 3 — above band + slope >= floor: PASS (cluster-state, by design).
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=7.0) == "PASS"
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=3.0) == "PASS"  # boundary >= floor
+    # Row 4 — above band + slope < floor: the ONLY FAIL (code-regression sig).
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=0.8) == "FAIL"
+    assert cv(mix, 0, 23000, conv_s7_p99=270001, s7_slope_per_s=2.999) == "FAIL"  # boundary above+below
+    # Row 5 — above band + None slope: PASS (FAIL-OPEN; missing telemetry).
+    assert cv(mix, 0, 23000, conv_s7_p99=290000, s7_slope_per_s=None) == "PASS"
+    # Back-compat: old positional callers (no S7 kwargs) are byte-compatible.
+    assert cv(mix, 0, 23000) == "PASS"
+    assert cv(mix, 0, 35000) == "WEAK_PASS"  # conv_s8 tier miss, unchanged
 
 
 # ─── persistence: S6 proof carries BOTH telemetry fields into state.json ────

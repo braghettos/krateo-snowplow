@@ -63,6 +63,7 @@ __all__ = [
     "compute_verdict_with_falsifier",
     "aggregate_validation",
     "convergence_p99_for_stage",
+    "s7_min_slope_per_s",
     "pct",
     "get_runtime_metrics",
     "print_report",
@@ -168,6 +169,47 @@ def convergence_p99_for_stage(all_results: Iterable[dict], stage_label: str) -> 
     if not samples:
         return -1
     return pct(samples, 99)
+
+
+# ─── s7_min_slope_per_s (Task #334-B) ───────────────────────────────────────
+
+
+def s7_min_slope_per_s(all_results: Iterable[dict]) -> float | None:
+    """Min refresh_completed_slope_per_s across S7 Dashboard navs that carry a
+    Task #334-A discrimination tuple.
+
+    Returns None when NO nav carries a non-None slope (cache-OFF pods publish no
+    expvars, or expvar unreachable / window<=0) -> the #334-B gate FAIL-OPENs on
+    None (missing telemetry is not a code-regression). MIN (not mean) so a single
+    stalled user trips the gate.
+
+    Mirrors convergence_p99_for_stage's traversal (stage filter + ON-then-OFF
+    cache preference) and reads the sibling key nav["conv_discrimination"]
+    ["refresh_completed_slope_per_s"]. Purely additive: it does NOT read or feed
+    nav["convergence_ms"] (the field convergence_p99_for_stage reads)."""
+    def _slopes_for(mode):
+        out: list[float] = []
+        for entry in all_results:
+            if str(entry.get("stage")) != "7":
+                continue
+            if entry.get("cache") != mode:
+                continue
+            for _, pg in (entry.get("pages") or {}).items():
+                for nav in (pg.get("navigations") or []):
+                    tup = nav.get("conv_discrimination")
+                    if not isinstance(tup, dict):
+                        continue
+                    s = tup.get("refresh_completed_slope_per_s")
+                    if isinstance(s, (int, float)):
+                        out.append(float(s))
+        return out
+    # ON-then-OFF preference matches convergence_p99_for_stage: cache-OFF runs
+    # publish all-None tuples, so _slopes_for("OFF") stays empty -> None ->
+    # FAIL-OPEN (the cache-off signal is the None-ness itself).
+    slopes = _slopes_for("ON") or _slopes_for("OFF")
+    if not slopes:
+        return None
+    return min(slopes)
 
 
 # ─── aggregate_validation (worktree source 7065-7108) ───────────────────────
@@ -342,11 +384,57 @@ CONV_TIER_MS = 30000
 WARM_P50_TIER_MS = 1000  # Task #121: 500 -> 1000 (~1.09× worst clean run 914; 500 stays aspirational)
 COLD_TIER_MS = 2200      # #121 pattern, re-baselined 2026-06-11: 1300 -> 2200 (~1.06× worst clean run ~2070 under the lazy-context two-window methodology; 1000 stays aspirational)
 
+# ─── Task #334-B: S7 delete-convergence BAND + SLOPE gate constants ──────────
+#
+# S7's convergence_mass_s7_p99 measures refresher-queue latency for ONE resident
+# piechart cell on the delete path — NOT serve latency, NOT cluster delivery.
+# #335 (docs/task-335-s7-delete-conv-trace-2026-06-12.md) traced a 31.2s -> 151.5s
+# S7 swing across 0.30.263..0.30.264 to CLUSTER controller-churn backlog ahead of
+# the piechart cell, NOT code (the 8-commit diff never touched the
+# DELETE->evict->dirty-mark->refresher->served-flip path). The load-bearing
+# discriminator: the refresher DRAIN SLOPE stayed HEALTHY (baseline ~9-10/s, new
+# ~6-8/s) while the new run carried MORE ADD/UPDATE churn — a monotonic CODE
+# slowdown DROPS the drain slope, whereas cluster-state churn leaves the slope
+# high but pushes conv up via competing dirty work (docs/task-335…:56-73,181-184).
+#
+# So the ONLY configuration that makes a real code regression FAIL while a
+# by-design cluster-state swing PASSes is: FAIL iff conv is OUTSIDE the documented
+# serve-stale band AND the drain slope has DROPPED below a floor.
+#
+# BAND (empirical, not invented): the documented serve-stale convergence class is
+# 30-270s (docs/task-280, docs/task-282-serve-stale-depth-trace §4); #335 placed
+# BOTH today's S7 numbers (31.2s, 151.5s) inside it.
+#
+# FLOOR DERIVATION (worst-observed-healthy × safety, per
+# feedback_capacity_caps_empirical_per_entry_cost — NOT a design-time estimate):
+#   source (TRACED)         | S7-window refresh_completed slope | conv    | healthy?
+#   baseline 0.30.263       | ~9-10 /s                          | 31.2 s  | YES
+#   new 0.30.264            | ~6-8 /s                           | 151.5 s | YES (cluster-state)
+#   #335 series, healthy range = 6-10/s. Worst-observed HEALTHY slope = 6/s.
+#   Floor = worst_healthy(6) × safety(0.5) = 3.0 — a 2× headroom below the lowest
+#   healthy slope (so the entire 6-10/s healthy envelope clears it), yet well
+#   above a stalled refresher (~0-1/s). A regression that merely halves throughput
+#   (~3-5/s) brushes the floor; only a clear stall toward 0-1/s trips it — the
+#   conservatism is deliberate (#335's whole point is that false-FAIL is the
+#   expensive error). This is the conv tier's structural sibling (like CONV_TIER_MS,
+#   derived from the measured healthy envelope, not from north-star aspiration).
+#
+# VERDICT-SEMANTICS NOTE: this is the FIRST verdict input added since the Task #121
+# tier re-baseline. Ledger rows written before this commit lack verdict_semantics_rev
+# (None) => unambiguously "pre-#334-B semantics" (the gate did NOT gate S7).
+S7_CONV_BAND_MS = (30_000, 270_000)   # documented serve-stale class; task-280 / task-282 §4 / #335
+S7_SLOPE_FLOOR_PER_S = 3.0            # worst-observed healthy slope 6/s (#335) × 0.5 safety; a stalled refresher -> ~0-1/s
+
+# Series-transition marker stamped into every row built by THIS verdict logic.
+# Pre-#334-B rows lack the key (None) -> "pre-#334-B semantics".
+VERDICT_SEMANTICS_REV = "2026-06-12/s7-band-slope"
+
 
 # ─── compute_verdict (worktree source 7351-7416) ────────────────────────────
 
 
-def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
+def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None,
+                    *, conv_s7_p99=None, s7_slope_per_s=None):
     """Verdict per the architect's gates.
 
     A tier is "missed" only when the value is strictly GREATER than its
@@ -355,7 +443,7 @@ def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
     PASS:        warm_p50 <= WARM_P50_TIER_MS, cold <= COLD_TIER_MS,
                  conv <= CONV_TIER_MS, 0 restarts
     WEAK_PASS:   one tier missed
-    FAIL:        2+ tiers missed OR restarts > 0
+    FAIL:        2+ tiers missed OR restarts > 0 OR the S7 band+slope gate fires
     FLOOR:       measurements present, but the deployed chart has no cache
                  toggle (cache_supported=false). Surfaces as structural N/A.
     REJECT:      pod crashed, no usable measurements
@@ -365,6 +453,24 @@ def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
     lazy-context cold methodology); conv = CONV_TIER_MS (30000ms at 50K)
     revised Task #289 — see each constant's comment block for the
     structural-limit derivation.
+
+    Task #334-B — S7 delete-convergence BAND+SLOPE gate (kw-only inputs,
+    default None so every existing positional caller is byte-compatible). The
+    gate is a HARD-FAIL PEER of `restarts > 0` (short-circuits to FAIL; it is
+    NOT a +1 to the miss counter — a dropped refresher drain slope on the delete
+    path is a correctness/serve-stale regression, categorically worse than a
+    latency-tier miss, per feedback_no_park_broken_behind_flag). The truth table
+    (conv_s7_p99 = S7 convergence p99; s7_slope_per_s = MIN healthy-window drain
+    slope across S7 tuples):
+      - below band (conv <= 30000, incl. the -1 no-sample sentinel): PASS, any slope.
+      - in band   (30000 < conv <= 270000):                          PASS, any slope.
+      - above band (conv > 270000) AND slope >= floor (3.0):         PASS (cluster
+        state, by design — annotated by the row builder as s7_above_band_cluster_state).
+      - above band (conv > 270000) AND slope <  floor (3.0):         FAIL (the
+        code-regression signature: above-band AND dropped drain slope — #335).
+      - above band (conv > 270000) AND slope is None:                PASS (FAIL-OPEN;
+        cannot discriminate — missing telemetry is not a regression; annotated
+        s7_slope_unavailable). This is the ONLY FAIL combination.
     """
     if not mix_weighted:
         return "REJECT"
@@ -373,6 +479,20 @@ def compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
     if wp50 is None or wp50 <= 0:
         return "REJECT"
     if restarts > 0:
+        return "FAIL"
+
+    # Task #334-B: S7 delete-convergence BAND+SLOPE gate. FAIL iff conv is
+    # ABOVE the documented serve-stale band AND the refresher drain slope
+    # DROPPED below floor (the code-regression signature, #335). Above-band +
+    # healthy slope = by-design cluster-state -> PASS (annotated by the row
+    # builder). None slope -> FAIL-OPEN (cannot discriminate; do NOT fail on
+    # missing telemetry). The -1 no-sample sentinel from convergence_p99_for_stage
+    # is < band upper edge -> never enters this branch. Hard-FAIL peer of
+    # restarts>0 (NOT a miss-counter increment), so rows 1/2/3/5 keep the
+    # warm/cold/conv_s8 tier arithmetic completely unchanged.
+    if (conv_s7_p99 is not None and conv_s7_p99 > S7_CONV_BAND_MS[1]
+            and s7_slope_per_s is not None
+            and s7_slope_per_s < S7_SLOPE_FLOOR_PER_S):
         return "FAIL"
 
     def _wp50(c):
@@ -572,15 +692,41 @@ def build_canonical_ledger_row(all_results: list[dict], *,
 
     validation = aggregate_validation(all_results)
 
+    # Bind the convergence p99s + the S7 drain slope ONCE: the S7/S8 p99s feed
+    # both the row fields below AND the verdict (Task #334-B gate), so compute
+    # them here and reuse rather than recompute at each site.
+    conv_s6_p99 = convergence_p99_for_stage(all_results, "6")
+    conv_s7_p99 = convergence_p99_for_stage(all_results, "7")
+    conv_s8_p99 = convergence_p99_for_stage(all_results, "8")
+    s7_slope = s7_min_slope_per_s(all_results)
+
     mix_has_null = any(v is None for v in mix_weighted.values())
     base_verdict = compute_verdict(
-        mix_weighted, restarts,
-        convergence_p99_for_stage(all_results, "8"),
-        cells=cells)
+        mix_weighted, restarts, conv_s8_p99,
+        cells=cells,
+        conv_s7_p99=conv_s7_p99,
+        s7_slope_per_s=s7_slope)
     if validation["navs_terminal_fail"] > 0 or mix_has_null:
         verdict = "INVALID"
     else:
         verdict = base_verdict
+
+    # Task #334-B series annotations: re-derive the S7 band/slope classification
+    # so above-band excursions are LOUDLY recorded in the row (rows 3/5 of the
+    # truth table — PASS-with-annotation, never a silent verdict change). The
+    # thresholds mirror compute_verdict's gate exactly (same constants) so the
+    # two cannot drift. Row 4 (above-band + dropped slope) is the FAIL case and
+    # is surfaced via failed_gates in write_run_bundle, not here.
+    series_annotations: list[str] = []
+    if conv_s7_p99 is not None and conv_s7_p99 > S7_CONV_BAND_MS[1]:
+        if s7_slope is None:
+            series_annotations.append(
+                f"s7_slope_unavailable conv={conv_s7_p99}ms "
+                f"(telemetry missing — gate FAIL-OPEN; not scored)")
+        elif s7_slope >= S7_SLOPE_FLOOR_PER_S:
+            series_annotations.append(
+                f"s7_above_band_cluster_state conv={conv_s7_p99}ms "
+                f"slope={s7_slope}/s (healthy; cluster churn, not code — see #335)")
 
     return {
         "tag": tag,
@@ -589,9 +735,9 @@ def build_canonical_ledger_row(all_results: list[dict], *,
         "uptime_at_capture_s": uptime_s,
         "cells": cells,
         "mix_weighted": mix_weighted,
-        "convergence_mass_s6_p99": convergence_p99_for_stage(all_results, "6"),
-        "convergence_mass_s7_p99": convergence_p99_for_stage(all_results, "7"),
-        "convergence_mass_s8_p99": convergence_p99_for_stage(all_results, "8"),
+        "convergence_mass_s6_p99": conv_s6_p99,
+        "convergence_mass_s7_p99": conv_s7_p99,
+        "convergence_mass_s8_p99": conv_s8_p99,
         "convergence_per_mutation_p99_mix": _load_per_mutation_metric(
             "p99_mix", run_dir=run_dir),
         "convergence_per_class_hot_p99":    _load_per_mutation_metric(
@@ -613,6 +759,13 @@ def build_canonical_ledger_row(all_results: list[dict], *,
         "tag_specific_verifications": {},
         "pod_restart_count": restarts,
         "validation": validation,
+        # Task #334-B: every row self-declares which verdict logic produced it.
+        # Rows written before this commit lack the key (None) -> unambiguously
+        # "pre-#334-B semantics" (the gate did NOT gate S7). Durable
+        # series-transition record (survives even if the prose ledger note is
+        # lost). series_annotations carries the LOUD above-band notes (rows 3/5).
+        "verdict_semantics_rev": VERDICT_SEMANTICS_REV,
+        "series_annotations": series_annotations,
         "verdict": verdict,
     }
 
@@ -863,6 +1016,21 @@ def write_run_bundle(run_dir: Path,
                 else f"tier:cold null>{COLD_TIER_MS}")
         if conv is not None and conv not in (-1,) and conv > CONV_TIER_MS:
             failed_gates.append(f"tier:conv_s8_p99 {conv}>{CONV_TIER_MS}")
+        # Task #334-B row 4 (the S7 band+slope FAIL): conv above the documented
+        # serve-stale band AND the refresher drain slope dropped below floor —
+        # the code-regression signature (#335). Re-derives the same
+        # classification compute_verdict gated on (same constants + the same
+        # s7_min_slope_per_s helper from all_results) so the two cannot drift.
+        # Rows 3/5 (above-band PASS-with-annotation) are surfaced via
+        # series_annotations, not here.
+        conv_s7 = row.get("convergence_mass_s7_p99")
+        s7_slope = s7_min_slope_per_s(all_results)
+        if (conv_s7 is not None and conv_s7 > S7_CONV_BAND_MS[1]
+                and s7_slope is not None
+                and s7_slope < S7_SLOPE_FLOOR_PER_S):
+            failed_gates.append(
+                f"s7:above_band_slope_dropped {conv_s7}>{S7_CONV_BAND_MS[1]} "
+                f"slope {s7_slope}<{S7_SLOPE_FLOOR_PER_S}")
 
     summary = {
         "verdict": row["verdict"],
@@ -883,6 +1051,12 @@ def write_run_bundle(run_dir: Path,
                   if row["convergence_mass_s8_p99"] not in (None, -1) else None,
         },
         "failed_gates": failed_gates,
+        # Task #334-B: the LOUD above-band annotations (rows 3/5 —
+        # PASS-with-annotation, FAIL-OPEN) + the verdict-semantics marker so a
+        # reader diffing rows across this commit can tell a verdict letter
+        # changed MEANING, not that the build regressed.
+        "series_annotations": row.get("series_annotations", []),
+        "verdict_semantics_rev": row.get("verdict_semantics_rev"),
         "convergence_timeout_stage": _find_convergence_timeout_stage(
             per_stage_proofs),
         "ledger_row_path": "ledger_row.json",
@@ -1023,6 +1197,12 @@ def _ledger_row_schema_doc() -> dict:
             # Task #314 — additive optional report-only reconcile metrics.
             "conv_widget_mod_ms": {"type": ["integer", "null"]},
             "conv_ra_mod_ms":     {"type": ["integer", "null"]},
+            # Task #334-B — additive verdict-semantics marker + loud above-band
+            # annotations (rows 3/5). Pre-#334-B rows lack verdict_semantics_rev
+            # (null) -> "pre-#334-B semantics".
+            "verdict_semantics_rev": {"type": ["string", "null"]},
+            "series_annotations": {"type": "array",
+                                   "items": {"type": "string"}},
             "tag_specific_verifications": {"type": "object"},
             "pod_restart_count": {"type": "integer", "minimum": 0},
             "validation": {
