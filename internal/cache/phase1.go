@@ -91,8 +91,17 @@ var phase1Done atomic.Bool
 // the startup sequence (immediately when the cache subsystem is OFF —
 // prewarm is implicit-on-cache, #57 — or at the tail of Phase1Warmup
 // when ON).
+//
+// Task #221: also records the flip instant for the
+// snowplow_prewarm_complete expvar (markPhase1DoneObserved is
+// CompareAndSwap-once, so the boundary timestamp tracks the FIRST flip
+// even under repeated idempotent calls). This is THE canonical wiring
+// site — every flip path (dispatcher Step 8, cache-off else, readiness
+// safety-net) funnels through here, so the expvar boundary is observed
+// on all of them. See prewarm_complete_metric.go.
 func MarkPhase1Done() {
 	phase1Done.Store(true)
+	markPhase1DoneObserved()
 }
 
 // IsPhase1Done reports whether the Tag B startup warmup has completed.
