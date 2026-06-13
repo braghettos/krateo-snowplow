@@ -43,6 +43,19 @@ import (
 
 const (
 	serviceName = "snowplow"
+
+	// writeTimeout is the http.Server WriteTimeout. Go anchors the write
+	// deadline to request-read time (t0), NOT to first-byte time
+	// (net/http/server.go: deferred SetWriteDeadline(now+d) at request
+	// read). So this t0-anchored deadline must clear the cache-OFF
+	// heavy-path compute (~159s measured at 50K: full 50K paged LIST +
+	// 50K per-item RBAC; #351/C2) before the handler's single buffered
+	// Write, or the Write fails and the client gets HTTP 0. Cache-ON is
+	// sub-4s so this longer deadline is never approached on the hot path
+	// (zero warm blast radius). 300s = ~2x the measured worst-case
+	// headroom. The LB is L4 passthrough (no HTTP timeout) so nothing
+	// competes. See docs/c2-cacheoff-deliverability-trace-2026-06-13.md.
+	writeTimeout = 300 * time.Second
 )
 
 var (
@@ -881,9 +894,9 @@ func main() {
 			AllowCredentials: true,
 			MaxAge:           300, // Maximum value not ignored by any of major browsers
 		})(mux),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 50 * time.Second,
-		IdleTimeout:  30 * time.Second,
+		ReadTimeout:  10 * time.Second, // read is fast; unchanged (#351/C2)
+		WriteTimeout: writeTimeout,    // 300s — clears cache-OFF heavy path (#351/C2)
+		IdleTimeout:  30 * time.Second, // keep-alive; unchanged (#351/C2)
 	}
 
 	// Ship D (0.30.141) — architectural-consistency invariant boot
