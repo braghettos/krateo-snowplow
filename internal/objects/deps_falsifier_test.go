@@ -63,7 +63,19 @@ func TestFalsifierF3_GetNoKeyRecordsNothing(t *testing.T) {
 	// #57: pivot implicit under CACHE_ENABLED (set by newServeWatcher below).
 	cache.ResetDepsForTest()
 
-	newServeWatcher(t, newServeTestObject("default", "beta", "marker-beta"))
+	rw := newServeWatcher(t, newServeTestObject("default", "beta", "marker-beta"))
+
+	// #353: gate the asserting Get on the served-arm precondition. The
+	// invariant under test is "a bare-context Get records nothing" — it is
+	// meaningful only on the informer-served arm. newServeWatcher waits on
+	// the sync channel, but the indexer partition can still be draining
+	// after HasSynced flips (get.go:82-89); a Get fired in that window
+	// takes the apiserver fall-through arm → getFromAPIServer →
+	// UserConfig → 401 in this no-user-endpoint context, which the
+	// res.Err check below would misread as a failure. Block until "beta"
+	// is observably servable so the served arm is the one exercised. This
+	// is a deterministic sync wait on the precondition, not a sleep.
+	waitForServeObject(t, rw, serveTestGVR, "default", "beta")
 
 	// Bare context — no WithL1KeyContext.
 	res := Get(serveAdminCtx(), serveTestRef("default", "beta"))

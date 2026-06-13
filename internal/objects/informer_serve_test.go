@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	metadatafake "k8s.io/client-go/metadata/fake"
 )
@@ -224,6 +225,45 @@ func newServeWatcher(t *testing.T, seed ...runtime.Object) *cache.ResourceWatche
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
 	return rw
+}
+
+// waitForServeObject blocks until the seeded object (gvr, ns, name) is
+// observably retrievable from the informer store — i.e. the GVR is
+// servable (registered AND HasSynced) AND rw.GetObject returns a hit.
+//
+// newServeWatcher already waits on the EnsureResourceType sync channel,
+// but get.go:82-89 documents the gap that channel does NOT close: an
+// indexer partition can still be DRAINING after HasSynced has flipped, so
+// a GetObject issued in that window misses and objects.Get takes the
+// apiserver fall-through arm (getFromAPIServer → UserConfig → 401 in a
+// no-user-endpoint test context). Tests whose assertion depends on the
+// informer-served arm (not the fall-through) MUST gate the asserting Get
+// on this predicate to be deterministic. This is a real sync wait on the
+// served-arm precondition — NOT a fixed sleep: wait.PollUntilContextTimeout
+// with immediate=true returns the instant the object is present (the
+// common case is zero added latency), and uses the same canonical
+// client-go poll primitive the cache refresher uses.
+//
+// #353: flake-harden the F3 negative leg against this draining-window
+// race (pre-existing, change-independent informer-sync timing).
+func waitForServeObject(t *testing.T, rw *cache.ResourceWatcher,
+	gvr schema.GroupVersionResource, ns, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, 5*time.Second,
+		true, func(context.Context) (bool, error) {
+			if !rw.IsServable(gvr) {
+				return false, nil
+			}
+			_, hit := rw.GetObject(gvr, ns, name)
+			return hit, nil
+		})
+	if err != nil {
+		t.Fatalf("waitForServeObject: %s %s/%s not servable from informer "+
+			"within 5s (IsServable+GetObject never both true): %v",
+			gvr.String(), ns, name, err)
+	}
 }
 
 // TestGet_CacheOff_ApiserverPath — #57 re-frame of the old
