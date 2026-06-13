@@ -3000,3 +3000,247 @@ def test_stage_s3_folds_sentinel_diag_into_proof_on_happy_path(
     sentinel = proof.proof["phantom_panel_sentinel"]
     assert sentinel == {"live_bench_ns": 0, "comp_panels_cluster_wide": 0}
     assert proof.proof["ns_count"] == 20
+
+
+# ─── Task #347 — phase6 L1-warmup boundary routing + expvar trajectory ──────
+#
+# Before #347 the phase6 path only called the side-effect-free
+# `_snapshot_l1_ready_ts` (the l1_hits PROXY), so the #221 prefer-expvar /
+# fallback-to-slog-scan boundary log NEVER fired on a phase6 run. These tests
+# prove (a) the run-start boundary now routes through `wait_for_l1_warmup`
+# (expvar-present → used; absent → slog fallback), and (b) the report-only
+# expvar trajectory snapshot writer is correct + None-safe. NONE of this
+# touches compute_verdict / the ledger row.
+
+
+def test_wait_for_l1_warmup_boundary_routes_through_browser_when_cache_on(
+        monkeypatch):
+    """cache ON → `_wait_for_l1_warmup_boundary` calls
+    browser.wait_for_l1_warmup and returns its bool."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+
+    called = {"n": 0}
+
+    def _fake_wait(*a, **k):
+        called["n"] += 1
+        return True
+    monkeypatch.setattr(browser_mod, "wait_for_l1_warmup", _fake_wait)
+
+    ctx = phases_mod.StageContext(tag="t", scale=50000, cache_mode="ON")
+    assert phases_mod._wait_for_l1_warmup_boundary(ctx) is True
+    assert called["n"] == 1, "wait_for_l1_warmup must be called on the cache-ON path"
+
+
+def test_wait_for_l1_warmup_boundary_skipped_when_cache_off(monkeypatch):
+    """cache OFF → boundary is SKIPPED (returns None, never calls
+    wait_for_l1_warmup — the prewarm boundary is meaningless cache-off)."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+
+    def _tripwire(*a, **k):
+        raise AssertionError("wait_for_l1_warmup called on cache-OFF path")
+    monkeypatch.setattr(browser_mod, "wait_for_l1_warmup", _tripwire)
+
+    ctx = phases_mod.StageContext(tag="t", scale=50000, cache_mode="OFF")
+    assert phases_mod._wait_for_l1_warmup_boundary(ctx) is None
+
+
+def test_wait_for_l1_warmup_boundary_none_safe_on_exception(monkeypatch):
+    """A raise inside wait_for_l1_warmup must NOT crash the run — the
+    boundary helper swallows it and returns None."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+
+    monkeypatch.setattr(browser_mod, "wait_for_l1_warmup",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    ctx = phases_mod.StageContext(tag="t", scale=50000, cache_mode="ON")
+    assert phases_mod._wait_for_l1_warmup_boundary(ctx) is None
+
+
+def test_boundary_fires_using_expvar_log_when_expvar_present(monkeypatch):
+    """End-to-end through the REAL wait_for_l1_warmup: when the expvar is
+    present (done=1) the "using expvar" boundary log fires and the slog-scan
+    is NOT shelled. Proves the #221 boundary log now reaches a phase6 path."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+    import bench.cluster as cluster_mod
+
+    logs: list[str] = []
+    monkeypatch.setattr(browser_mod, "_log", lambda m: logs.append(str(m)))
+    # Expvar present and done → wait_for_l1_warmup uses it exclusively.
+    monkeypatch.setattr(browser_mod, "prewarm_complete_via_expvar",
+                        lambda *a, **k: True)
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("slog-scan shelled despite expvar present")))
+    monkeypatch.setattr(browser_mod, "get_runtime_metrics",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("runtime consulted on expvar path")))
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda s: None)
+
+    ctx = phases_mod.StageContext(tag="t", scale=50000, cache_mode="ON")
+    assert phases_mod._wait_for_l1_warmup_boundary(ctx) is True
+    assert any("using expvar" in m for m in logs), (
+        f"#221 'using expvar' boundary log did not fire; logs={logs}")
+
+
+def test_boundary_fires_falling_back_log_when_expvar_absent(monkeypatch):
+    """End-to-end: expvar ABSENT (None) → wait_for_l1_warmup logs the
+    "falling back" line and detects the boundary via the slog-scan."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+    import bench.cluster as cluster_mod
+
+    logs: list[str] = []
+    monkeypatch.setattr(browser_mod, "_log", lambda m: logs.append(str(m)))
+    monkeypatch.setattr(browser_mod, "prewarm_complete_via_expvar",
+                        lambda *a, **k: None)             # key absent
+    monkeypatch.setattr(browser_mod, "get_runtime_metrics",
+                        lambda: {"cache_key_count": 0})   # force slog-scan
+    monkeypatch.setattr(cluster_mod, "kubectl",
+                        lambda *a, **k: (0, "... warmup: completed ...", ""))
+    monkeypatch.setattr(browser_mod.time, "sleep", lambda s: None)
+
+    ctx = phases_mod.StageContext(tag="t", scale=50000, cache_mode="ON")
+    assert phases_mod._wait_for_l1_warmup_boundary(ctx) is True
+    assert any("falling back" in m for m in logs), (
+        f"#221 'falling back to slog-scan' log did not fire; logs={logs}")
+
+
+def test_write_expvar_trajectory_snapshot_writes_present_values(
+        monkeypatch, tmp_path):
+    """When the expvars are present, the snapshot file carries the map +
+    int values under the labelled trajectory point."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+
+    map_vals = {
+        "snowplow_dispatch_l1_lookups": {"widgets|pages": {"hit_total": 5,
+                                                           "miss_total": 1}},
+        "snowplow_prewarm_complete": {"done": 1, "elapsed_ms": 1234},
+    }
+    int_vals = {
+        "snowplow_rbac_publish_seq": 42,
+        "snowplow_refresher_completed_total": 9,
+    }
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_map",
+                        lambda k, **kw: map_vals.get(k))
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int",
+                        lambda k, **kw: int_vals.get(k))
+
+    out = phases_mod._write_expvar_trajectory_snapshot(tmp_path, "post-s6-storm")
+    assert out == tmp_path / "expvars-post-s6-storm.json"
+    assert out.exists()
+    data = json.loads(out.read_text())
+    assert data["label"] == "post-s6-storm"
+    assert data["maps"]["snowplow_prewarm_complete"] == {"done": 1,
+                                                         "elapsed_ms": 1234}
+    assert data["maps"]["snowplow_dispatch_l1_lookups"]["widgets|pages"][
+        "hit_total"] == 5
+    assert data["ints"]["snowplow_rbac_publish_seq"] == 42
+    assert data["ints"]["snowplow_refresher_completed_total"] == 9
+
+
+def test_write_expvar_trajectory_snapshot_none_safe_when_absent(
+        monkeypatch, tmp_path):
+    """Cache-off / expvar-absent → every field is null, the file still
+    writes (report-only), and the call NEVER raises."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_map",
+                        lambda k, **kw: None)
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int",
+                        lambda k, **kw: None)
+
+    out = phases_mod._write_expvar_trajectory_snapshot(tmp_path, "run-start")
+    assert out is not None and out.exists()
+    data = json.loads(out.read_text())
+    assert all(v is None for v in data["maps"].values())
+    assert all(v is None for v in data["ints"].values())
+
+
+def test_write_expvar_trajectory_snapshot_swallows_read_exceptions(
+        monkeypatch, tmp_path):
+    """A raise inside a per-key read is swallowed to null (the snapshot is a
+    diagnostic, never a stage/run failure point)."""
+    import bench.phases as phases_mod
+    import bench.browser as browser_mod
+
+    def _boom(k, **kw):
+        raise RuntimeError("transport blew up")
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_map", _boom)
+    monkeypatch.setattr(browser_mod, "read_snowplow_expvar_int", _boom)
+
+    out = phases_mod._write_expvar_trajectory_snapshot(tmp_path, "final")
+    assert out is not None and out.exists()
+    data = json.loads(out.read_text())
+    assert all(v is None for v in data["maps"].values())
+    assert all(v is None for v in data["ints"].values())
+
+
+def test_compute_verdict_untouched_by_347():
+    """Grep-proof guard: the #347 snapshot/boundary code must not CALL
+    compute_verdict. (The ledger gate stays the single source of truth for
+    the run verdict.) The docstrings deliberately mention "report-only,
+    never feeds compute_verdict", so we strip docstrings before grepping the
+    actual code body."""
+    import ast
+    import inspect
+    import bench.phases as phases_mod
+
+    for fn in (phases_mod._wait_for_l1_warmup_boundary,
+               phases_mod._write_expvar_trajectory_snapshot):
+        tree = ast.parse(inspect.getsource(fn))
+        # Drop the leading docstring expression from the function body.
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.FunctionDef)
+                    and node.body
+                    and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)):
+                node.body = node.body[1:]
+        code_only = ast.unparse(tree)
+        assert "compute_verdict" not in code_only, (
+            f"{fn.__name__} CALLS compute_verdict in code — must stay "
+            f"report-only")
+
+
+def test_run_phase6_writes_lifecycle_expvar_snapshots(tmp_path, monkeypatch):
+    """End-to-end wiring: run_phase6 through S6 must drop the run-lifecycle
+    expvar trajectory snapshots (run-start / post-s6-storm / final) into the
+    run dir. Proves the #347 snapshots fire from the run lifecycle, not just
+    in isolation. Cache OFF here, so they are all-null but still written
+    (report-only)."""
+    monkeypatch.setattr(phases, "_setup_users", lambda ctx: None)
+    monkeypatch.setattr(phases, "_teardown_users", lambda ctx: None)
+    monkeypatch.setattr(phases.browser, "FRONTEND", "http://fake")
+    monkeypatch.setattr(phases.browser, "login_all", lambda: {})
+    # The boundary wait is cache-OFF-gated; assert it is NOT reached here.
+    monkeypatch.setattr(phases.browser, "wait_for_l1_warmup",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("warmup wait ran on cache-OFF run")))
+
+    def _fake_stage(sid):
+        def _f(ctx):
+            return phases.StageProof(
+                stage_id=sid, started_at="", ended_at="",
+                passed=True, proof={}, artifacts=[],
+                what_breaks_if_skipped=f"{sid} fake")
+        return _f
+
+    monkeypatch.setattr(phases, "STAGE_REGISTRY",
+                        {sid: _fake_stage(sid) for sid in phases.STAGE_ORDER})
+
+    phases.run_phase6("t", 50000, to_stage="S6",
+                      cache_mode="OFF", run_dir=tmp_path)
+
+    assert (tmp_path / "expvars-run-start.json").exists()
+    assert (tmp_path / "expvars-post-s6-storm.json").exists()
+    assert (tmp_path / "expvars-final.json").exists()
+    # Cache-OFF → all-null payloads (the conftest expvar stub returns None for
+    # base_url-less reads), but the files must still be valid JSON.
+    final = json.loads((tmp_path / "expvars-final.json").read_text())
+    assert final["label"] == "final"
+    assert "maps" in final and "ints" in final

@@ -1497,6 +1497,98 @@ def _snapshot_l1_ready_ts(ctx: StageContext) -> int:
         return 0
 
 
+# ── Task #347: phase6 L1-readiness boundary + expvar trajectory snapshots ────
+
+
+def _wait_for_l1_warmup_boundary(ctx: StageContext) -> bool | None:
+    """Route the phase6 run-start L1-readiness wait through the #221
+    prefer-expvar / fallback-to-slog-scan boundary (`wait_for_l1_warmup`).
+
+    Before #347 the phase6 path only ever called the side-effect-free
+    `_snapshot_l1_ready_ts` (the /metrics/cache l1_hits PROXY) — so the #221
+    "using expvar snowplow_prewarm_complete" / "falling back to slog-scan"
+    boundary log NEVER fired on a phase6 run. Calling `wait_for_l1_warmup`
+    here is the smaller, lower-risk wiring (vs porting its BLOCKING
+    prefer-expvar poll loop into `_read_l1_ready_ts`, which is a non-blocking
+    snapshot read consumed by 8+ call sites with a different contract — that
+    would be the wrong shape).
+
+    Gated on cache_mode == "ON": the prewarm/L1-warmup boundary is only
+    meaningful when the cache is on (mirrors `_snapshot_l1_ready_ts`'s own
+    `cache_mode != "ON"` guard; `wait_for_l1_warmup` itself also falls back
+    cleanly under CACHE_ENABLED=false via the absent-expvar path).
+
+    Returns:
+        True/False — boundary detected / timed out (wait_for_l1_warmup's bool).
+        None       — skipped (cache off) or the call raised (None-safe:
+                     NEVER crashes the run; the run proceeds regardless).
+    """
+    if ctx.cache_mode != "ON":
+        return None
+    try:
+        return browser.wait_for_l1_warmup()
+    except Exception as e:
+        print(f"  WARN: L1 warmup boundary wait failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return None
+
+
+# Map-valued expvars snapshotted via read_snowplow_expvar_map; int-valued via
+# read_snowplow_expvar_int. Both seams return None when the key is absent /
+# the pod is cache-off / unreachable, so every field is independently
+# None-safe (a cache-off run yields an all-null snapshot, never a crash).
+_EXPVAR_TRAJECTORY_MAP_KEYS = (
+    "snowplow_dispatch_l1_lookups",   # per-(handlerKind,gvr) L1 hit/miss
+    "snowplow_prewarm_complete",      # {done, elapsed_ms} prewarm boundary
+)
+_EXPVAR_TRAJECTORY_INT_KEYS = (
+    "snowplow_rbac_publish_seq",
+    "snowplow_refresher_completed_total",
+)
+
+
+def _write_expvar_trajectory_snapshot(run_dir: Path, label: str) -> Path | None:
+    """Write a report-only expvar trajectory snapshot `expvars-{label}.json`
+    into the run dir (Task #347).
+
+    Bench-native replacement for the old tester-wrapper scripts that curled
+    /debug/vars at run-start / post-storm / final. Reuses the established
+    `read_snowplow_expvar_map` (+ `read_snowplow_expvar_int`) transport seams
+    — single GET /debug/vars, gzip-decompress, json.loads.
+
+    REPORT-ONLY: never feeds compute_verdict or the ledger row; purely a
+    diagnostic artifact. None-safe end-to-end — an absent key records null,
+    and any I/O / write failure is swallowed (returns None) so a snapshot can
+    NEVER fail a stage or the run.
+
+    Returns the written Path on success, None if nothing could be written.
+    """
+    try:
+        snapshot: dict[str, Any] = {
+            "label": label,
+            "captured_at": _now_iso(),
+            "maps": {},
+            "ints": {},
+        }
+        for key in _EXPVAR_TRAJECTORY_MAP_KEYS:
+            try:
+                snapshot["maps"][key] = browser.read_snowplow_expvar_map(key)
+            except Exception:
+                snapshot["maps"][key] = None
+        for key in _EXPVAR_TRAJECTORY_INT_KEYS:
+            try:
+                snapshot["ints"][key] = browser.read_snowplow_expvar_int(key)
+            except Exception:
+                snapshot["ints"][key] = None
+        out = Path(run_dir) / f"expvars-{label}.json"
+        out.write_text(json.dumps(snapshot, indent=2, default=str))
+        return out
+    except Exception as e:
+        print(f"  WARN: expvar trajectory snapshot '{label}' failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return None
+
+
 # ─── S0: preflight ──────────────────────────────────────────────────────────
 
 
@@ -3281,16 +3373,33 @@ def run_phase6(tag: str,
             print(f"  WARN: _setup_users failed: {type(e).__name__}: {e}",
                   flush=True)
 
+    # Task #347: route the phase6 run-start L1-readiness wait through the
+    # #221 prefer-expvar / fallback-to-slog-scan boundary so the "using
+    # expvar" / "falling back" log fires on a phase6 run (None-safe, never
+    # blocks a cache-OFF run). Capture the run-start expvar trajectory
+    # snapshot right after (report-only).
+    _wait_for_l1_warmup_boundary(ctx)
+    _write_expvar_trajectory_snapshot(run_dir, "run-start")
+
     try:
         for stage_id in window:
             fn = STAGE_REGISTRY[stage_id]
             fn(ctx)  # _run_stage handles persist + raise on ConvergenceTimeout
+            # Task #347: post-S6-storm trajectory snapshot — S6 is the 50K
+            # composition storm; capture the expvar state immediately after
+            # it completes (report-only, None-safe).
+            if stage_id == "S6":
+                _write_expvar_trajectory_snapshot(run_dir, "post-s6-storm")
     finally:
         if needs_browser:
             # Per-stage videos are attached to each stage's proof inside
             # _run_stage (via _attach_stage_video_artifacts) at the moment
             # the stage completes/fails — no run-end re-attribution needed.
             _teardown_users(ctx)
+        # Task #347: final trajectory snapshot — runs on BOTH the happy path
+        # and after a ConvergenceTimeout re-raise (finally), so the run dir
+        # always carries an end-of-run expvar snapshot. Report-only, None-safe.
+        _write_expvar_trajectory_snapshot(run_dir, "final")
 
     return load_state(run_dir) or {}
 
