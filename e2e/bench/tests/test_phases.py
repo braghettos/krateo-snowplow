@@ -3244,3 +3244,81 @@ def test_run_phase6_writes_lifecycle_expvar_snapshots(tmp_path, monkeypatch):
     final = json.loads((tmp_path / "expvars-final.json").read_text())
     assert final["label"] == "final"
     assert "maps" in final and "ints" in final
+
+
+def test_run_phase6_writes_final_snapshot_on_convergence_timeout(
+        tmp_path, monkeypatch):
+    """#349: the ConvergenceTimeout → `finally:` cleanup branch of run_phase6
+    must STILL write `expvars-final.json` before the timeout propagates.
+
+    The happy-path sibling above proves the `finally:` writes the final
+    snapshot when every stage passes. This is the UNCOVERED leg: when a
+    stage raises ConvergenceTimeout, run_phase6 re-raises it to the CLI
+    (exit 4) — but its `finally:` block runs FIRST, so the run dir must
+    still carry an end-of-run `expvars-final.json` (the #347 wiring's whole
+    point: a timed-out run is exactly when the end-of-run trajectory
+    snapshot is most diagnostically valuable).
+
+    The failing stage routes through the REAL `phases._run_stage` with a
+    `_work` that raises ConvergenceTimeout — the exact production re-raise
+    chain (`_run_stage` persists the stage proof with passed=False +
+    convergence_timeout=True, then re-raises) — so this exercises the true
+    propagation path, not a synthetic shortcut. Cache OFF → the snapshot is
+    all-null but still written (report-only, None-safe).
+    """
+    monkeypatch.setattr(phases, "_setup_users", lambda ctx: None)
+    monkeypatch.setattr(phases, "_teardown_users", lambda ctx: None)
+    monkeypatch.setattr(phases.browser, "FRONTEND", "http://fake")
+    monkeypatch.setattr(phases.browser, "login_all", lambda: {})
+    # cache-OFF run: the L1-warmup boundary wait must NOT be reached.
+    monkeypatch.setattr(phases.browser, "wait_for_l1_warmup",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("warmup wait ran on cache-OFF run")))
+
+    real_run_stage = phases._run_stage
+
+    def _fake_stage(sid):
+        def _f(ctx):
+            if sid == "S6":
+                # Route through the REAL _run_stage so the production
+                # persist-then-reraise ConvergenceTimeout chain fires.
+                def _bad_work(_c):
+                    raise ConvergenceTimeout(
+                        stage=6, user="cyberjoker",
+                        api=99, ui=100, cluster=50000, timeout_secs=300)
+                return real_run_stage(
+                    "S6", ctx, _bad_work,
+                    what_breaks_if_skipped="S6 SCALE anchor (50K storm)")
+            return phases.StageProof(
+                stage_id=sid, started_at="", ended_at="",
+                passed=True, proof={}, artifacts=[],
+                what_breaks_if_skipped=f"{sid} fake")
+        return _f
+
+    monkeypatch.setattr(phases, "STAGE_REGISTRY",
+                        {sid: _fake_stage(sid) for sid in phases.STAGE_ORDER})
+
+    # run_phase6 must re-raise the ConvergenceTimeout (so the CLI exits 4).
+    with pytest.raises(ConvergenceTimeout):
+        phases.run_phase6("t", 50000, to_stage="S6",
+                          cache_mode="OFF", run_dir=tmp_path)
+
+    # Despite the re-raise, the `finally:` block wrote the end-of-run
+    # trajectory snapshot.
+    final_path = tmp_path / "expvars-final.json"
+    assert final_path.exists(), (
+        "expvars-final.json must be written by run_phase6's finally: block "
+        "even when a stage raises ConvergenceTimeout")
+    final = json.loads(final_path.read_text())
+    assert final["label"] == "final"
+    assert "maps" in final and "ints" in final
+    # The expected map/int key sets are present (all-null under cache-OFF).
+    assert set(final["maps"]) == set(phases._EXPVAR_TRAJECTORY_MAP_KEYS)
+    assert set(final["ints"]) == set(phases._EXPVAR_TRAJECTORY_INT_KEYS)
+
+    # Cross-check: the S6 proof was persisted with the convergence-timeout
+    # flag before the re-raise (the _run_stage half of the contract), so the
+    # final snapshot and the failure record co-exist in the run dir.
+    s6_proof = json.loads((tmp_path / "proofs" / "S6.json").read_text())
+    assert s6_proof["passed"] is False
+    assert s6_proof["convergence_timeout"] is True
