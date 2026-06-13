@@ -1316,3 +1316,109 @@ def test_helm_context_args_empty_under_non_gke_escape(monkeypatch):
     import bench.cluster as cluster_mod
     monkeypatch.setenv("BENCH_ALLOW_NON_GKE", "1")
     assert cluster_mod.helm_context_args() == []
+
+
+# ─── Task #348 — paginated cluster-wide count / name probes ─────────────────
+#
+# At ~49K compositions an UNPAGED `kubectl get ... --all-namespaces` is the
+# slow path. The fix pages the SERVER-SIDE Table read via --chunk-size while
+# keeping --no-headers (the Table printer — NOT -o name/-o json, which force
+# full-object serialization and are empirically SLOWER). These tests stub
+# kubectl via the conftest `mock_kubectl` seam and assert (a) the chunked
+# flags reach the argv and (b) the Table line-count / name-set parse is
+# correct and unchanged.
+
+
+def test_count_compositions_passes_chunked_table_flags(mock_kubectl):
+    """count_compositions() must shell a PAGED Table read: --no-headers
+    (server-side Table printer, kept) + --chunk-size=<COMP_PROBE_CHUNK_SIZE>
+    (Limit/Continue paging). It must NOT use -o name / -o json (those force
+    full-object serialization — the slow path #348 fixes)."""
+    import bench.cluster as cluster_mod
+    mock_kubectl.replies = [(0, "bench-ns-01 c1 8h True\nbench-ns-01 c2 8h True", "")]
+    cluster_mod.count_compositions()
+    argv = mock_kubectl.calls[0]["argv"]
+    assert argv[0] == "kubectl"
+    assert "--no-headers" in argv, f"Table printer dropped; argv={argv}"
+    assert f"--chunk-size={cluster_mod.COMP_PROBE_CHUNK_SIZE}" in argv, (
+        f"--chunk-size paging flag missing; argv={argv}")
+    assert "--all-namespaces" in argv
+    # MUST stay an independent kubectl oracle on the Table printer — no
+    # -o name / -o json (full-object serialization = the slow path).
+    assert "name" not in argv and "json" not in argv, (
+        f"probe must not request -o name/json; argv={argv}")
+
+
+def test_count_compositions_counts_table_rows(mock_kubectl):
+    """One Table row per composition → returned count == row count."""
+    import bench.cluster as cluster_mod
+    rows = "\n".join(f"bench-ns-01 bench-app-01-{i:02d} 8h True"
+                     for i in range(7))
+    mock_kubectl.replies = [(0, rows, "")]
+    assert cluster_mod.count_compositions() == 7
+
+
+def test_count_compositions_zero_on_empty_or_error(mock_kubectl):
+    """Empty stdout or non-zero rc → 0 (unchanged contract)."""
+    import bench.cluster as cluster_mod
+    mock_kubectl.replies = [(0, "", "")]
+    assert cluster_mod.count_compositions() == 0
+    mock_kubectl.replies = [(1, "", "boom")]
+    assert cluster_mod.count_compositions() == 0
+
+
+def test_count_compositions_in_ns_passes_chunked_flags(mock_kubectl):
+    """The namespace-scoped sibling carries the same paging flags + the
+    -n <ns> scope, and counts Table rows."""
+    import bench.cluster as cluster_mod
+    mock_kubectl.replies = [(0, "c1 8h True\nc2 8h True\nc3 8h True", "")]
+    n = cluster_mod.count_compositions_in_ns("bench-ns-07")
+    argv = mock_kubectl.calls[0]["argv"]
+    assert "--no-headers" in argv
+    assert f"--chunk-size={cluster_mod.COMP_PROBE_CHUNK_SIZE}" in argv
+    assert "-n" in argv and "bench-ns-07" in argv
+    assert n == 3
+
+
+def test_list_composition_names_passes_chunked_table_flags(mock_kubectl):
+    """list_composition_names() must use the SAME paged Table read (not
+    -o jsonpath, the old full-object slow path)."""
+    import bench.cluster as cluster_mod
+    mock_kubectl.replies = [(0, "bench-ns-01 c1 8h True", "")]
+    cluster_mod.list_composition_names()
+    argv = mock_kubectl.calls[0]["argv"]
+    assert "--no-headers" in argv
+    assert f"--chunk-size={cluster_mod.COMP_PROBE_CHUNK_SIZE}" in argv
+    assert "--all-namespaces" in argv
+    assert "jsonpath" not in " ".join(argv), (
+        f"must not use the old -o jsonpath full-object path; argv={argv}")
+
+
+def test_list_composition_names_parses_ns_name_from_table(mock_kubectl):
+    """col0=ns, col1=name → {"ns/name", ...}; AGE/READY columns ignored.
+    This is the exact "ns/name" set the CONTENT name-diff compares; the
+    live cluster proved it byte-identical to the old jsonpath oracle."""
+    import bench.cluster as cluster_mod
+    out = (
+        "bench-ns-01   bench-app-01-02   8h   True\n"
+        "bench-ns-01   bench-app-01-03   8h   True\n"
+        "bench-ns-02   bench-app-02-01   3m   False\n"
+    )
+    mock_kubectl.replies = [(0, out, "")]
+    names = cluster_mod.list_composition_names()
+    assert names == {
+        "bench-ns-01/bench-app-01-02",
+        "bench-ns-01/bench-app-01-03",
+        "bench-ns-02/bench-app-02-01",
+    }
+
+
+def test_list_composition_names_none_on_error_empty_set_on_no_rows(
+        mock_kubectl):
+    """rc != 0 → None (caller distinguishes from 'legitimately empty');
+    rc == 0 with no parseable rows → empty set (NOT None)."""
+    import bench.cluster as cluster_mod
+    mock_kubectl.replies = [(1, "", "boom")]
+    assert cluster_mod.list_composition_names() is None
+    mock_kubectl.replies = [(0, "", "")]
+    assert cluster_mod.list_composition_names() == set()

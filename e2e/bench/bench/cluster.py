@@ -885,6 +885,33 @@ COMP_GVR = "composition.krateo.io"
 COMP_RES = "githubscaffoldingwithcompositionpages"
 COMP_CONTROLLER_DEPLOY = f"{COMP_RES}-v1-2-2-controller"
 
+# Task #348: page the heavy cluster-wide ground-truth count/name probes.
+#
+# At ~49K compositions a SINGLE unpaged `kubectl get ... --all-namespaces`
+# makes the apiserver build one giant response in one shot. Adding
+# `--chunk-size` makes the apiserver page it via Limit/Continue and stream
+# bounded chunks, ~2× faster wall-clock on the live 49K cluster
+# (22.3s → 11.3s for the count; 41.7s → 11.7s for the name-set — see
+# /tmp/snowplow-348-347/probe-timing.txt).
+#
+# CRITICAL — keep the SERVER-SIDE TABLE printer (`--no-headers`, the
+# default Table output). It emits ONE lean row per object (client CPU
+# stays ~4s). Empirically `-o name` / `-o json` are the variants that
+# force the apiserver to serialize FULL objects and kubectl to template
+# every one client-side — they are SLOWER (40-50s) and `-o json` moves
+# 318 MB over the wire. We need neither extra field: the `--all-namespaces`
+# Table for this CRD is `NAMESPACE  NAME  AGE  READY`, so col0=ns / col1=
+# name already gives the exact "ns/name" set the CONTENT name-diff needs
+# (proven byte-identical to the old `-o jsonpath` oracle via `diff`).
+#
+# 2000 chosen empirically: it is materially faster than 500/1000 here
+# (chunk=500→Table still 22s region via per-request overhead dominance,
+# 1000→15.2s, 2000→11.3s) while staying a bounded page the apiserver
+# streams comfortably. NOT a sampling cap — the pager walks EVERY page to
+# completion (Limit/Continue), so the returned count/name-set is the full
+# cluster truth, never truncated.
+COMP_PROBE_CHUNK_SIZE = 2000
+
 FINALIZER_PATCH = '{"metadata":{"finalizers":null}}'
 
 
@@ -938,14 +965,25 @@ def _count_bench_argo():
 
 
 def count_compositions():
-    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces", "--no-headers")
+    # Task #348: paged Table read (Limit/Continue) — see COMP_PROBE_CHUNK_SIZE.
+    # One Table row per composition → line count == composition count, full
+    # cluster truth (pager walks every page). Stays an INDEPENDENT kubectl
+    # oracle (no snowplow /call), so VERIFY remains non-circular.
+    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
+                         "--no-headers",
+                         f"--chunk-size={COMP_PROBE_CHUNK_SIZE}")
     if rc != 0 or not out.strip():
         return 0
     return len(out.strip().split("\n"))
 
 
 def count_compositions_in_ns(ns_name):
-    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name, "--no-headers")
+    # Task #348: same paged Table read, namespace-scoped. A single bench-ns
+    # tops out ~999 comps today (one page), so behaviour is identical now;
+    # the chunk bound future-proofs a namespace that grows past one page.
+    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
+                         "--no-headers",
+                         f"--chunk-size={COMP_PROBE_CHUNK_SIZE}")
     if rc != 0 or not out.strip():
         return 0
     return len(out.strip().split("\n"))
@@ -1071,16 +1109,28 @@ def list_composition_names():
     """Return a set of "ns/name" strings for all compositions in the
     cluster via kubectl. Returns None on failure (so callers can
     distinguish from 'legitimately empty').
+
+    Task #348: switched from `-o jsonpath` (which forces the apiserver to
+    serialize FULL objects + kubectl to template every one: 41.7s, ~24s
+    client CPU at 49K) to the SERVER-SIDE Table printer paged via
+    `--chunk-size` (11.7s, ~4s client CPU). The `--all-namespaces` Table
+    for this CRD is `NAMESPACE  NAME  AGE  READY`, so the first two
+    whitespace columns are ns/name — the SAME cheap request that powers
+    count_compositions(). The resulting "ns/name" set is byte-identical to
+    the old jsonpath oracle (proven via `diff` on the live 49K cluster —
+    see /tmp/snowplow-348-347/probe-timing.txt), so the CONTENT name-diff
+    semantics are preserved exactly. Stays an INDEPENDENT kubectl oracle.
     """
     rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
-                         "-o", "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{\"\\n\"}{end}")
+                         "--no-headers",
+                         f"--chunk-size={COMP_PROBE_CHUNK_SIZE}")
     if rc != 0:
         return None
     names = set()
     for line in out.strip().split("\n"):
-        line = line.strip()
-        if "/" in line:
-            names.add(line)
+        parts = line.split()
+        if len(parts) >= 2:
+            names.add(f"{parts[0]}/{parts[1]}")
     return names
 
 
