@@ -74,6 +74,22 @@ func TestMain(m *testing.M) {
 				return ctx, err
 			}
 
+			// The asserted widget (button-with-resourcesrefstemplate) has
+			// an apiRef RESTAction (cluster-namespaces) whose stage LISTs
+			// /api/v1/namespaces cluster-wide, then a resourcesRefsTemplate
+			// that iterates ${ .namespaces }. cyberjoker (group devs) must
+			// be allowed to list namespaces or that stage is forbidden,
+			// .namespaces is absent, and the iterator hard-fails ("query
+			// .namespaces must return a JSON array"). rbac.namespaces.yaml
+			// grants devs cluster-wide namespaces get/list — the sibling
+			// restactions_test.go picks it up via its rbac*.yaml glob; this
+			// package enumerates the rbac files individually and was simply
+			// missing this one.
+			err = decoder.ApplyWithManifestDir(ctx, r, testdataPath, "rbac.namespaces.yaml", []resources.CreateOption{})
+			if err != nil {
+				return ctx, err
+			}
+
 			// TODO: add a wait.For conditional helper that can
 			// check and wait for the existence of a CRD resource
 			time.Sleep(2 * time.Second)
@@ -158,7 +174,17 @@ func resolveWidget(name string) func(ctx context.Context, t *testing.T, c *envco
 
 		obj, err := Resolve(ctx, ResolveOptions{
 			RC: c.Client().RESTConfig(),
-			In: res.Unstructured,
+			// AuthnNS must point at the namespace holding the signed-up
+			// user's <user>-clientconfig Secret (demo-system, created by
+			// e2e.SignUp). Without it the apiRef RESTAction's per-user
+			// endpoint resolves a Secret ref with an EMPTY namespace —
+			// "an empty namespace may not be set when a resource name is
+			// provided" — so the apiRef stage yields nothing, the
+			// resourcesRefsTemplate iterator gets a non-array, and Resolve
+			// returns a hard error. The sibling restactions_test.go passes
+			// AuthnNS for exactly this reason.
+			AuthnNS: namespace,
+			In:      res.Unstructured,
 		})
 		if err != nil {
 			log := xcontext.Logger(ctx)

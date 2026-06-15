@@ -42,12 +42,22 @@ func TestJsonHandler(t *testing.T) {
 			err:    true,
 		},
 		{
+			// The stage filter is evaluated against the WRAPPED envelope
+			// `{<key>: <response>}`, not the bare response — see
+			// handler.go jsonHandlerCore: `pig := {opts.key: tmp}` then
+			// EvalValue(filter, pig). This was made deliberate in PR #129
+			// (KRA-672): the filter Data was changed from `tmp` to `pig`
+			// so production filters reference the stage key (e.g.
+			// `[.namespaces.items[] | .metadata.name]`). The filter here
+			// must therefore reach through the `test` key. The pre-#129
+			// `.foo` form yielded nil because top-level `pig` has no
+			// `foo`, only `test`.
 			name:  "valid JSON with filter",
 			input: `{"foo": "bar", "num": 42}`,
 			opts: jsonHandlerOptions{
 				key:    "test",
 				out:    make(map[string]any),
-				filter: ptr.To(".foo"),
+				filter: ptr.To(".test.foo"),
 			},
 			expect: map[string]any{"test": "bar"},
 			err:    false,
