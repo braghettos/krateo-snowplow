@@ -101,7 +101,7 @@ func TestResolveAPI(t *testing.T) {
 
 			err = decoder.DecodeEachFile(
 				ctx, os.DirFS(filepath.Join(testdataPath, "restactions")), "*.yaml",
-				decoder.CreateHandler(r),
+				decoder.CreateIgnoreAlreadyExists(r),
 				decoder.MutateNamespace(namespace),
 			)
 			if err != nil {
