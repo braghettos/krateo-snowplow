@@ -37,6 +37,7 @@ spec:
     name: cluster-pods
     namespace: demo-system
   resourcesRefs:
+    items:
     - id: submit
       apiVersion: v1
       resource: pods

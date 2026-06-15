@@ -18,6 +18,8 @@ import (
 
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
+	"sigs.k8s.io/e2e-framework/klient/wait"
+	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
@@ -32,9 +34,19 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// This package lives at internal/resolvers/restactions/api — four
+	// levels below the repo root — so the crds/ and testdata/ dirs are
+	// ../../../../, NOT ../../../ (which resolves to the nonexistent
+	// internal/crds + internal/testdata). With the wrong depth,
+	// SetupCRDs + decoder glob a missing directory: fs.Glob returns zero
+	// matches and a nil error, so the RESTAction CRD is never installed
+	// and no fixtures are created — every later Get/List then fails with
+	// "no matches for templates.krateo.io/v1". (The sibling restactions/
+	// and widgets/ test packages are only three levels deep, which is
+	// why ../../../ works for them but is wrong here.)
 	const (
-		crdPath      = "../../../crds"
-		testdataPath = "../../../testdata"
+		crdPath      = "../../../../crds"
+		testdataPath = "../../../../testdata"
 	)
 
 	xenv.SetTestMode(true)
@@ -74,7 +86,8 @@ func TestMain(m *testing.M) {
 
 func TestResolveAPI(t *testing.T) {
 	const (
-		testdataPath = "../../../testdata"
+		// Four levels up to the repo root (see the depth note in TestMain).
+		testdataPath = "../../../../testdata"
 		signKey      = "abbracadabbra"
 	)
 
@@ -107,20 +120,47 @@ func TestResolveAPI(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
+			// Wait for the RESTAction CRD to be discoverable before any
+			// Get below. SetupCRDs (TestMain) registers
+			// templates.krateo.io/v1, but the controller-runtime client's
+			// RESTMapper does a full ServerPreferredResources on first
+			// use; against a freshly-installed CRD that discovery
+			// transiently returns "templates.krateo.io/v1: no matches …
+			// Resource=" — the apiserver lists the group before its
+			// resource list is populated. A List that succeeds (the
+			// condition retries on List error — conditions.go
+			// ResourceListMatchN returns (false,nil) on List failure)
+			// proves the group/version is fully established and the
+			// objects just applied are visible. This replaces the
+			// fixed time.Sleep race that left CI flaky (the TODO in
+			// every TestMain) with an explicit discovery gate.
+			if err := wait.For(
+				conditions.New(r).ResourceListN(&v1.RESTActionList{}, 1),
+				wait.WithTimeout(60*time.Second),
+				wait.WithInterval(time.Second),
+			); err != nil {
+				t.Fatalf("waiting for RESTAction discovery/list to settle: %v", err)
+			}
 			return ctx
 		}).
 		Assess("Resolve API", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			r, err := resources.New(cfg.Client().RESTConfig())
 			if err != nil {
-				t.Fail()
+				t.Fatal(err)
 			}
 			r.WithNamespace(namespace)
 			apis.AddToScheme(r.GetScheme())
 
 			cr := v1.RESTAction{}
-			err = r.Get(ctx, "kube-get", namespace, &cr)
-			if err != nil {
-				t.Fail()
+			// Discovery is warm (Setup waited for the RESTAction List), so
+			// a Get failure here is a real error — make it fatal at its
+			// own site. (Previously this was a non-fatal t.Fail() and the
+			// leftover err was re-checked AFTER Resolve, which returns no
+			// error — so a transient discovery failure on this Get
+			// surfaced misleadingly as a Resolve failure at line 132.)
+			if err := r.Get(ctx, "kube-get", namespace, &cr); err != nil {
+				t.Fatalf("get RESTAction kube-get: %v", err)
 			}
 
 			res := Resolve(ctx, ResolveOptions{
@@ -128,9 +168,6 @@ func TestResolveAPI(t *testing.T) {
 				AuthnNS: cfg.Namespace(),
 				Items:   cr.Spec.API,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
 
 			enc := json.NewEncoder(os.Stderr)
 			enc.SetIndent("", "  ")

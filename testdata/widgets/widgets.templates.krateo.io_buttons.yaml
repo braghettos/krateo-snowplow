@@ -82,10 +82,6 @@ spec:
                         payload:
                           type: object
                         resource:
-                          enum:
-                          - AAA
-                          - BBB
-                          - CCC
                           type: string
                         slice:
                           properties:
