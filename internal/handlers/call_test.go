@@ -6,6 +6,7 @@ package handlers_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,9 +22,12 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/apis"
+	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
+	"sigs.k8s.io/e2e-framework/klient/wait"
+	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
@@ -68,9 +72,34 @@ func TestMain(m *testing.M) {
 				return ctx, err
 			}
 
-			// TODO: add a wait.For conditional helper that can
-			// check and wait for the existence of a CRD resource
-			time.Sleep(2 * time.Second)
+			// Wait for the freshly-installed RESTAction CRD
+			// (templates.krateo.io/v1) to be discoverable before any test
+			// proceeds. SetupCRDs registers the group/version, but the
+			// controller-runtime client's RESTMapper does a full
+			// ServerPreferredResources on first use; against a just-installed
+			// CRD that discovery transiently returns
+			// "templates.krateo.io/v1: no matches ... Resource=" — the
+			// apiserver lists the group before its resource list is
+			// populated. ResourceListN lists RESTActions; ResourceListMatchN
+			// returns (false,nil) on a List error (conditions.go), so it
+			// retries until the group/version is fully established. We assert
+			// a minimum of 0 because no RESTAction CRs exist yet at TestMain
+			// time (the per-test Setup decodes them later) — a List that
+			// succeeds at all proves discovery has settled. This replaces the
+			// fixed time.Sleep race (the TODO here) that left CI flaky and is
+			// exactly the discovery gate that fixed TestResolveAPI.
+			// AddToScheme so the typed RESTActionList is mappable by r's
+			// client (the per-test Setup adds it too, but the wait runs here).
+			if err := apis.AddToScheme(r.GetScheme()); err != nil {
+				return ctx, err
+			}
+			if err := wait.For(
+				conditions.New(r).ResourceListN(&v1.RESTActionList{}, 0),
+				wait.WithTimeout(60*time.Second),
+				wait.WithInterval(time.Second),
+			); err != nil {
+				return ctx, fmt.Errorf("waiting for RESTAction CRD discovery to settle: %w", err)
+			}
 			return ctx, nil
 		},
 	).Finish(
