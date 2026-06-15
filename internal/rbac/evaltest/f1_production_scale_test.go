@@ -7,7 +7,11 @@
 // 3 representative subject classes (broad/narrow/deny), 50K timed
 // EvaluateRBAC calls per subject after 1K warm-up. Per-call nanos
 // captured into []int64, sorted, percentiles extracted directly.
-// Pass gate: p95 ≤ 50 µs per subject per design §12.1.
+// Pass gate: allocs/op ≤ 100 per subject (instrumentation-invariant
+// mechanism gate — see TestF1 doc). Latency percentiles are MEASURED
+// and LOGGED for diagnostics but are NOT a hard fail: the original
+// p95 ≤ 50 µs wall-clock ceiling (design §12.1) flaked on shared CI
+// runners under -race (Task #328 anti-pattern fix).
 //
 // WHY 3 SUBJECTS NOT 1000
 //
@@ -36,8 +40,8 @@
 // The 1000/7500/3/25/5 split is SYNTHETIC-but-rationale-driven; I do
 // NOT have empirical cluster-CRB shape distribution data. The split
 // exercises every EvaluateRBAC code path which is the load-bearing
-// test property. If F1's p95 misses, the right response is "surface
-// as architecture signal" (3-bucket triage), NOT retune the
+// test property. If F1's allocs/op gate misses, the right response is
+// "surface as architecture signal" (3-bucket triage), NOT retune the
 // distribution to make the test pass. A follow-up F1.v2 may capture
 // actual cluster CRB shape via kubectl + Python aggregation.
 //
