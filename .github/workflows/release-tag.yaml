@@ -122,6 +122,15 @@ jobs:
           # Refresh the CRD templates: drop the previous set, copy the freshly generated ones.
           rm -f crds-subchart/templates/*.yaml
           cp "$GITHUB_WORKSPACE"/crds/*.yaml crds-subchart/templates/
+
+          # Deletion-safety: every published CRD must carry helm.sh/resource-policy: keep so
+          # Helm never garbage-collects it on upgrade/uninstall/prune (this installer
+          # heavy-reconciles and has pruned templated resources mid-cascade). controller-gen
+          # cannot emit a Helm annotation, so the publishing CI injects it — uniformly, and
+          # idempotently, so the regen can never strip it again.
+          for f in crds-subchart/templates/*.yaml; do
+            yq -i '.metadata.annotations."helm.sh/resource-policy" = "keep"' "$f"
+          done
           if [ -d crd-chart ]; then git rm -r crd-chart; fi
 
           # Patch-bump the independently-versioned crds-subchart Chart.yaml.
