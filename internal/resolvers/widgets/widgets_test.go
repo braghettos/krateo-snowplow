@@ -5,6 +5,7 @@ package widgets
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,9 +19,13 @@ import (
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	serializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
+	"sigs.k8s.io/e2e-framework/klient/wait"
+	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
@@ -90,9 +95,46 @@ func TestMain(m *testing.M) {
 				return ctx, err
 			}
 
-			// TODO: add a wait.For conditional helper that can
-			// check and wait for the existence of a CRD resource
-			time.Sleep(2 * time.Second)
+			// Wait for the freshly-installed Button CRD
+			// (widgets.templates.krateo.io/v1beta1) to be discoverable before
+			// any test proceeds. SetupCRDs registers the group/version, but
+			// the controller-runtime client's RESTMapper does a full
+			// ServerPreferredResources on first use; against a just-installed
+			// CRD that discovery transiently returns "no matches ...
+			// Resource=" — the apiserver lists the group before its resource
+			// list is populated. ResourceListMatchN returns (false,nil) on a
+			// List error (conditions.go), so it retries until the
+			// group/version is fully established.
+			//
+			// Buttons is the package-distinguishing CRD this TestMain
+			// installs (the asserted widget is a Button that the resolver
+			// fetches via objects.Get(buttons …)); the sibling restactions
+			// CRD is installed in the same SetupCRDs step and settles in
+			// lockstep, and is exercised by the per-test apiRef resolve. There
+			// is no typed Go Button/ButtonList in apis/ (the widgets group is
+			// consumed unstructured throughout the resolver), so the
+			// package-correct ObjectList is an *unstructured.UnstructuredList
+			// stamped with the ButtonList GVK — listing it proves the widgets
+			// group/version is discoverable without registering a typed
+			// kind. We assert a minimum of 0 because no Button CRs exist yet
+			// at TestMain time (the per-test Setup decodes button.*.yaml
+			// later) — a List that succeeds at all proves discovery has
+			// settled. This replaces the fixed time.Sleep race (the TODO
+			// here) that left CI flaky and is exactly the discovery gate that
+			// fixed TestResolveAPI.
+			buttons := &unstructured.UnstructuredList{}
+			buttons.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "widgets.templates.krateo.io",
+				Version: "v1beta1",
+				Kind:    "ButtonList",
+			})
+			if err := wait.For(
+				conditions.New(r).ResourceListN(buttons, 0),
+				wait.WithTimeout(60*time.Second),
+				wait.WithInterval(time.Second),
+			); err != nil {
+				return ctx, fmt.Errorf("waiting for Button CRD discovery to settle: %w", err)
+			}
 			return ctx, nil
 		},
 	).Finish(
