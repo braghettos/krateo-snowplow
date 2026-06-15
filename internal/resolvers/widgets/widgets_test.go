@@ -117,7 +117,7 @@ func TestResolveWidgets(t *testing.T) {
 
 			err = decoder.DecodeEachFile(
 				ctx, os.DirFS(filepath.Join(testdataPath, "widgets")), "button.*.yaml",
-				decoder.CreateHandler(r),
+				decoder.CreateIgnoreAlreadyExists(r),
 				decoder.MutateNamespace(namespace),
 			)
 			if err != nil {

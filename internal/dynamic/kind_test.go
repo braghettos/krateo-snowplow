@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 	"sigs.k8s.io/e2e-framework/support/kind"
 
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	xenv "github.com/krateoplatformops/plumbing/env"
 )
 
@@ -49,11 +50,11 @@ func TestKindFor(t *testing.T) {
 
 	f := features.New("Setup").
 		Assess("KindFor", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			want := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
-
-			got, err := KindFor(c.Client().RESTConfig(), schema.GroupVersionResource{Version: "v1", Resource: "configmaps"})
+			// KindFor was refactored out of internal/dynamic; cache.KindForGVR is its
+			// replacement (returns the Kind string for a GVR).
+			got, err := cache.KindForGVR(ctx, schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}, c.Client().RESTConfig())
 			assert.Nil(t, err)
-			assert.Equal(t, want, got)
+			assert.Equal(t, "ConfigMap", got)
 
 			return ctx
 		}).

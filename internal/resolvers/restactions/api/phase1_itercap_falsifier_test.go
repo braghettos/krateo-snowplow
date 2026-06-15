@@ -101,13 +101,5 @@ func TestFAL127_PostFix_IteratorExpandsFullyReachingNavmenuitemNamespace(t *test
 	}
 }
 
-// contains is a tiny substring helper (the test avoids strings.Contains
-// only to keep the import set minimal).
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}
+// contains() is shared with jsoncopy_test.go in this package (same substring helper);
+// the duplicate definition here was removed to fix a redeclaration compile error.
