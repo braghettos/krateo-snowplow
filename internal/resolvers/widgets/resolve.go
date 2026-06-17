@@ -87,6 +87,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// materialising the unbounded list at the resolver layer.
 	injectSlice(ds, opts.PerPage, opts.Page)
 
+	// extras-widgets parity (step 2): merge the per-request extras into
+	// `ds` so the widget's widgetDataTemplate AND resourcesRefsTemplate jq
+	// can reference extras keys, and so apiRef-less (static) widgets get
+	// them too. Non-overwriting (any apiRef-result key or the injectSlice
+	// triple above WINS on collision). See mergeExtras for the full
+	// rationale + precedence.
+	mergeExtras(ds, opts.Extras)
+
 	widgetDataStart := time.Now()
 	widgetData, err := resolveWidgetData(ctx, opts.In, ds)
 	phaseWidgetDataMs = time.Since(widgetDataStart).Milliseconds()
@@ -176,6 +184,20 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 		AuthnNS: opts.AuthnNS,
 		PerPage: opts.PerPage,
 		Page:    opts.Page,
+		// extras-widgets parity (step 1): thread the per-request extras
+		// into the apiRef fetch — the thread that was previously dropped
+		// here, so any extras a widget received was silently discarded.
+		// extras now flows widget → apiref → restactions.Resolve →
+		// api.Resolve, where api.Resolve seeds the resolve dict via
+		// maps.DeepCopyJSON(opts.Extras) (restactions/api/resolve.go:228-230).
+		// Effect: the apiRef RESTAction's OWN jq (its `path` / `payload`)
+		// can reference extras keys (parametrise the fetch), and those
+		// extras keys land top-level in the resolved data source `ds` the
+		// widget templates evaluate against. nil/empty extras (the
+		// prewarm/seed/refresher callers, which never set it) is a no-op:
+		// api.Resolve's `if opts.Extras != nil` gate skips the seed for
+		// nil, and an empty map deep-copies to an empty dict.
+		Extras: opts.Extras,
 	})
 }
 
@@ -293,5 +315,44 @@ func injectSlice(ds map[string]any, perPage, page int) {
 		"page":    page,
 		"perPage": perPage,
 		"offset":  (page - 1) * perPage,
+	}
+}
+
+// mergeExtras folds the per-request extras into the resolved data source
+// `ds`, NON-OVERWRITING: extras is the base; any key already present in
+// `ds` (an apiRef-RA result key, or the injectSlice pagination triple)
+// WINS on collision. This is the widget-side analogue of the RESTAction
+// precedence at internal/resolvers/restactions/api/resolve.go:228-230,
+// where the resolve dict STARTS as maps.DeepCopyJSON(opts.Extras) and the
+// API results then overwrite it — same net ordering (API/apiRef result >
+// extras), reached from the opposite direction because here `ds` already
+// holds the apiRef result.
+//
+// WHY it lives here (not only in step 1's apiref thread): widgetDataTemplate
+// (resolveWidgetData) AND resourcesRefsTemplate (resolveResourceRefs) both
+// evaluate their jq against this SAME `ds`, so one merge makes extras
+// referenceable in BOTH template paths. It is ALSO the only thing that puts
+// extras into `ds` for a widget with NO apiRef (step 1 never runs there, so
+// `ds` comes back as the empty apiref result) — covering apiRef-less / static
+// widgets.
+//
+// Each value is deep-copied via plumbing/maps.DeepCopyJSON (the same util the
+// RESTAction path uses) so `ds` — a per-call map — never aliases the
+// per-request extras map. nil/empty extras is a no-op (the len-guard skips
+// the copy + range), so a widget resolved without an extras param is
+// byte-identical to pre-change behaviour. nil `ds` is a no-op (defensive,
+// symmetric with injectSlice).
+//
+// Mechanism-uniform per feedback_no_special_cases: no widget-name table, no
+// key allowlist — every extras key is merged the same way for every widget.
+func mergeExtras(ds map[string]any, extras map[string]any) {
+	if ds == nil || len(extras) == 0 {
+		return
+	}
+	extrasCopy := maps.DeepCopyJSON(extras)
+	for k, v := range extrasCopy {
+		if _, present := ds[k]; !present {
+			ds[k] = v
+		}
 	}
 }

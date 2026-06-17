@@ -1,0 +1,38 @@
+# Extras→widgets parity (step 2) END-TO-END fixture: an apiRef-LESS (static)
+# widget. With no apiRef, the resolver's `ds` starts as the empty apiref
+# result, so the ONLY way extras keys reach the widgetDataTemplate AND the
+# resourcesRefsTemplate jq is mergeExtras (resolve.go step 2). Both templates
+# below reference extras keys; the integration test resolves this widget with
+# extras={tenant, region, names:[...]} and asserts status.widgetData +
+# status.resourcesRefs carry the extras-derived values. Fully deterministic in
+# kind — no apiserver fetch, no RBAC dependency.
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Button
+metadata:
+  namespace: demo-system
+  name: button-extras-static
+spec:
+  widgetData:
+    actions: {}
+    clickActionId: nop
+    label: base-label
+    icon: fa-clock
+    type: text
+  # widgetDataTemplate references extras keys → proves step 2 over the
+  # widgetData path end-to-end.
+  widgetDataTemplate:
+    - forPath: label
+      expression: ${ .tenant }
+    - forPath: icon
+      expression: ${ .region }
+  # resourcesRefsTemplate references an extras key (Diego's explicit case) →
+  # proves step 2 over the resourcesRefs path end-to-end. The iterator fans
+  # over the extras `names` array; each ref's namespace is the extras element.
+  resourcesRefsTemplate:
+    - iterator: ${ .names }
+      template:
+        id: ${ "ns-" + . }
+        apiVersion: v1
+        resource: namespaces
+        namespace: ${ . }
+        verb: GET

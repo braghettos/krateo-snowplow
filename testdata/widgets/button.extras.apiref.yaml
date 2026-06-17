@@ -1,0 +1,57 @@
+# Extras→widgets parity (step 1) END-TO-END fixture: the apiRef RESTAction's
+# OWN `path` jq references an extras key. This proves the previously-dropped
+# thread (resolve.go:173 → apiref → restactions → api.Resolve, which seeds the
+# resolve dict with the extras deep-copy). The RESTAction GETs a single
+# namespace BY NAME supplied via extras.nsName; createRequestOptions
+# (restactions/api/setup.go:61) evaluates `path` jq against the extras-seeded
+# dict. The integration test resolves the widget with extras={nsName:"kube-system"}
+# and asserts status.widgetData.label == "kube-system" — only reachable if
+# extras parametrised the fetch path.
+#
+# cyberjoker (group devs) is granted cluster-wide namespaces get/list by
+# testdata/rbac.namespaces.yaml, so the per-user-token fetch of
+# /api/v1/namespaces/kube-system succeeds.
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  annotations:
+    "krateo.io/verbose": "false"
+  name: extras-namespace-by-name
+  namespace: demo-system
+spec:
+  api:
+    - name: ns
+      # PATH references the extras key — the load-bearing step-1 assertion.
+      # The resolved path becomes /api/v1/namespaces/<extras.nsName>.
+      path: ${ "/api/v1/namespaces/" + .nsName }
+      # No filter: the stage stores the RAW fetched namespace object under
+      # the stage key `ns` (api/handler.go jsonHandlerCore: out[key]=tmp). The
+      # widget template below reads .ns.metadata.name — the name of the object
+      # the extras-parametrised path fetched. (Deliberately filter-free to keep
+      # the assertion independent of the per-stage filter `pig` keying.)
+      continueOnError: true
+      errorKey: nsError
+---
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Button
+metadata:
+  namespace: demo-system
+  name: button-extras-apiref
+spec:
+  widgetData:
+    actions: {}
+    clickActionId: nop
+    label: base-label
+    icon: fa-clock
+    type: text
+  apiRef:
+    name: extras-namespace-by-name
+    namespace: demo-system
+  # The fetched namespace's own name is surfaced into widgetData.label. It can
+  # only equal "kube-system" if extras.nsName parametrised the RESTAction path
+  # and the GET fetched that exact namespace object. If extras had NOT reached
+  # the path, the GET would target a name-less namespaces path and
+  # .ns.metadata.name would be absent.
+  widgetDataTemplate:
+    - forPath: label
+      expression: ${ .ns.metadata.name }
