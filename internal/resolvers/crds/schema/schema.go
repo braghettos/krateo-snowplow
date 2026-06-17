@@ -1,3 +1,8 @@
+// Package schema validates a custom resource's status against its CRD's
+// OpenAPI schema. ValidateObjectStatus fetches (and per-GVR memoises) the
+// CRD's structural schema, compiles it once, and checks the object's
+// widgetData/status payload, failing closed when the schema is absent. The
+// memo is invalidated on CRD lifecycle changes via a generation fence.
 package schema
 
 import (

@@ -1,3 +1,9 @@
+// Command snowplow is the snowplow server: it resolves Krateo RESTAction and
+// frontend Widget custom resources into the JSON the Krateo frontend
+// renders, served over /call. It wires the HTTP mux (/call, /health,
+// /readyz, /debug/vars, pprof and swagger), the per-GVR dispatchers, the
+// informer/L1 caches and prewarm engine, RBAC, and the in-cluster
+// Kubernetes clients, then runs the server until signalled to shut down.
 package main
 
 import (

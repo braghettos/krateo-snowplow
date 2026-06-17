@@ -1,3 +1,7 @@
+// Package widgetdatatemplate evaluates a widget's widgetDataTemplate entries.
+// Each entry's jq expression is run against the resolved data dictionary to
+// produce a path/value pair, which the widget resolver merges into the
+// widget's widgetData status.
 package widgetdatatemplate
 
 import (

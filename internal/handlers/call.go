@@ -1,3 +1,8 @@
+// Package handlers holds snowplow's top-level HTTP handlers. It exposes the
+// primary /call endpoint (which dispatches resource requests to the
+// per-GVR resolvers via the dispatchers proxy), the /health and /readyz
+// probes, and supporting endpoints for listing, jq evaluation, conversion,
+// and plural lookups.
 package handlers
 
 import (

@@ -1,3 +1,9 @@
+// Package dispatchers maps each handled GVR (restactions and widgets) to its
+// HTTP handler and drives the resolve-and-serve path behind /call,
+// including the L1 resolved-output cache lookup, refresh registration, and
+// in-process nested-call seam. It also hosts the prewarm engine and the
+// phase-1 walker that replays frontend navigation at boot (and on CRUD) to
+// populate the caches ahead of real traffic.
 package dispatchers
 
 import (

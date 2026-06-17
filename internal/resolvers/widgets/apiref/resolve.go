@@ -1,3 +1,6 @@
+// Package apiref resolves a widget's apiRef: it fetches the referenced
+// RESTAction object and resolves it (through the restactions resolver),
+// returning the resulting data dictionary for the widget to consume.
 package apiref
 
 import (

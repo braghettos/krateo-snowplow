@@ -1,3 +1,7 @@
+// Package jq provides the shared gojq module loader used across snowplow's
+// resolvers. ModuleLoader builds (once) a loader from the directory named by
+// the JQ_MODULES_PATH env var so jq expressions in RESTActions and widgets
+// can import common helper modules.
 package jq
 
 import (

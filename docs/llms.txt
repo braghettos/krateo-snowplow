@@ -37,20 +37,32 @@ at that same tag — don't guess, and don't trust `main` for a deployed older ve
 - [docs/architecture/observability.md](architecture/observability.md): the `/debug/vars` expvars,
   the key `slog` events, and pprof — what each tells an operator.
 
-## Blueprint-author contract (the CRDs you write)
+## Decisions (ADRs)
 
-- [howto/restactions.md](../howto/restactions.md): authoring `RESTAction` CRs.
-- [howto/widgets.md](../howto/widgets.md): authoring `Widget` CRs (apiRef, templates, `extras`).
+- [docs/adr/0001-decouple-authn.md](adr/0001-decouple-authn.md): test without deploying authn.
+- [docs/adr/0002-per-user-l1-keying.md](adr/0002-per-user-l1-keying.md): per-binding-UID L1 keying (never cohort-only) + value-dedup.
+- [docs/adr/0003-identity-free-content-key.md](adr/0003-identity-free-content-key.md): identity-free content key + serve-time UAF.
+- [docs/adr/0004-cache-is-provisional-and-removable.md](adr/0004-cache-is-provisional-and-removable.md): `CACHE_ENABLED` transparent fallback; cache is removable.
+- [docs/adr/0005-walker-driven-informer.md](adr/0005-walker-driven-informer.md): walker-driven informer; RESTMapper off the hot path.
+
+## Blueprint-author contract (the CRDs you write) + operations
+
+- [howto/restactions.md](../howto/restactions.md): authoring `RESTAction` CRs (incl. `userAccessFilter`).
+- [howto/widgets.md](../howto/widgets.md): authoring `Widget` CRs (apiRef, templates, `status`, `extras`).
+- [howto/extras.md](../howto/extras.md): `extras` end-to-end (RESTActions + widgets, precedence, cache-keying).
 - [howto/endpoints.md](../howto/endpoints.md): endpoint/secret wiring for external APIs.
 - [howto/install.md](../howto/install.md): install via the chart.
+- [howto/operating.md](../howto/operating.md): operator runbook (probes, tuning, `CACHE_ENABLED`, incident table).
 
 ## Reference
 
 - [README.md](../README.md): product overview + signposts.
+- [CONTRIBUTING.md](../CONTRIBUTING.md): build / test (the rbac TestMain trap) / release / invariants.
 - `apis/templates/` — the `RESTAction` / `Widget` Go types (source of truth for CRD fields).
 
 ## Notes (NOT authoritative)
 
-`docs/*-20YY-MM-DD.md`, `ship-*`, `path3-*`, `task-*`, retrospectives are append-only engineering
-logs, point-in-time and possibly stale. Treat them as leads to verify against code — never as
-authority. Authoritative material is ARCHITECTURE.md, `docs/architecture/`, `howto/`, and the code.
+[docs/notes/](notes/) holds append-only engineering logs (`ship-*`, `path3-*`, `task-*`, `bench-*`,
+dated `*-20YY-MM-DD.md`), point-in-time and possibly stale — see [docs/notes/README.md](notes/README.md).
+Treat them as leads to verify against code, never as authority. Authoritative material is
+ARCHITECTURE.md, `docs/architecture/`, `docs/adr/`, `howto/`, `CONTRIBUTING.md`, and the code.

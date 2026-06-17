@@ -1,3 +1,9 @@
+// Package dynamic is snowplow's thin client over the Kubernetes dynamic and
+// discovery clients for working with unstructured objects. It provides
+// accessors for common fields (apiVersion, kind, namespace, name, UID), a
+// Client wrapping dynamic + RESTMapper, and a process-singleton cached
+// discovery client (with explicit invalidation on CRD lifecycle events) so
+// GVR/Kind resolution is paid once rather than per /call.
 package dynamic
 
 import (
