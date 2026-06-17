@@ -1,3 +1,7 @@
+// Package resourcesrefstemplate expands a widget's resourcesRefsTemplate into
+// concrete resource references. It evaluates each template's jq against the
+// resolved data dictionary to produce dynamic ResourceRef values, which the
+// resourcesrefs resolver then fetches.
 package resourcesrefstemplate
 
 import (

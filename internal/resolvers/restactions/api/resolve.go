@@ -1,3 +1,9 @@
+// Package api executes the individual API stages of a RESTAction. Resolve
+// runs each stage (HTTP endpoint calls and in-process Kubernetes GET/LIST
+// loopbacks, routed through the informer cache where possible), applies the
+// stage's jq, and accumulates results into the shared dict consumed by later
+// stages and the RESTAction filter. It handles per-stage inner-call
+// fan-out, RBAC narrowing/refiltering, sorting, and endpoint resolution.
 package api
 
 import (

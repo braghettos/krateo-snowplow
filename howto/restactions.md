@@ -57,8 +57,9 @@ Defines a single HTTP request and its dependencies.
 | `errorKey` | `string` | Key to identify error fields in the response. | ❌ |
 | `exportJwt` | `boolean` | If `true`, exports a JWT token from this request for later use. | ❌ |
 | `continueOnError` | `boolean` | If `true`, continues execution even if this call fails. | ❌ |
-| `endpointRef` | `object` | Reference to a Kubernetes [`Endpoint`](endpoints.md) object defining the target service. | ✅ |
+| `endpointRef` | `object` | Reference (`name` + `namespace`) to a Kubernetes [`Endpoint`](endpoints.md) object defining the target service. | ❌ |
 | `dependsOn` | `object` | Declares a dependency on another API call defined in this spec. | ❌ |
+| `userAccessFilter` | `object` | Dispatch this read stage via snowplow's ServiceAccount and RBAC-refilter the result per item against the requesting user. Read-verb stages only. See below. | ❌ |
 
 ### `spec.api[].endpointRef`
 
@@ -78,6 +79,29 @@ Useful for chaining calls where one must complete before another.
 |--------|------|-------------|-----------|
 | `name` | `string` | Name of another API call in the list that this call depends on. | ✅ |
 | `iterator` | `string` | Optional field on which to iterate (used for loop-like behavior). | ❌ |
+
+### `spec.api[].userAccessFilter`
+
+When set, the stage is dispatched under snowplow's ServiceAccount (cluster-wide
+read) and the returned items are **refiltered per item** through the in-process
+RBAC evaluator before being returned to the caller — so a narrow user sees only
+the items they may access. Allowed only on read verbs (`GET`/`HEAD`); admission
+CEL also forbids `exportJwt: true` on such a stage. Type `UserAccessFilterSpec`
+(`apis/templates/v1/core.go:112`).
+
+| Field | Type | Description | Required |
+|--------|------|-------------|-----------|
+| `verb` | `string` | Kubernetes RBAC verb checked per item (e.g. `get`, lower-case). | ✅ |
+| `group` | `string` | API group of the checked resource (`""` = core group). | ✅ |
+| `resource` | `string` | Static plural resource name. Exactly one of `resource` / `resourcesFrom`. | conditional |
+| `resourcesFrom` | `string` | jq over the resolve dict yielding a `[]string` of plurals; an item is kept if the user may act on **any** of them (OR). | conditional |
+| `namespaceFrom` | `string` | jq evaluated per item to derive the namespace for the RBAC check. Defaults to `.metadata.namespace`. | ❌ |
+
+## Passing per-request context
+
+A `/call` may carry `?extras={…}` — a per-request JSON object that **seeds the
+resolve dict** (the API stage outputs overwrite it) and is folded into the cache
+key. See [extras.md](extras.md).
 
 ## Example
 

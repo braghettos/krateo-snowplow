@@ -1,3 +1,7 @@
+// Package util holds small, dependency-free helpers for parsing the /call
+// HTTP request: the optional extras JSON context, the target GVR and
+// namespaced name, call-path pagination, and an ETA formatter. It is a leaf
+// package shared by the handlers and resolvers.
 package util
 
 import (

@@ -1,3 +1,8 @@
+// Package restactions is the top-level RESTAction resolver. Resolve runs the
+// CR's ordered API stages (delegating to the api subpackage to execute each
+// stage's HTTP/Kubernetes calls and jq), then applies the RESTAction's
+// optional jq filter to produce the resolved status. It emits unordered
+// data only; widget-shaping logic lives in the widget resolvers, never here.
 package restactions
 
 import (

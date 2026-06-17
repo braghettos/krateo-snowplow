@@ -1,3 +1,7 @@
+// Package apis aggregates snowplow's Kubernetes API type registrations. It
+// collects the per-group SchemeBuilders (currently the templates/v1 group:
+// RESTAction, Widget, and related CRs) into AddToSchemes and exposes
+// AddToScheme to register them all on a runtime.Scheme.
 package apis
 
 import (

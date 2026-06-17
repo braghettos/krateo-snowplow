@@ -1,5 +1,11 @@
 # Installing `snowplow` on [Kind][kind]
 
+> **Production deploys** use the Helm chart `braghettos/krateo-snowplow-chart`
+> (chart name `krateo-snowplow`, image `ghcr.io/braghettos/krateo-snowplow`),
+> with `CACHE_ENABLED=true` and the runtime tuning described in
+> [operating.md](operating.md). This page is a single-node **quickstart** for
+> trying snowplow on a disposable [Kind][kind] cluster.
+
 If you have any Docker-compatible container runtime installed (including native Docker, Docker Desktop, or OrbStack), you can easily launch a disposable cluster just for this quickstart using [Kind][kind].
 
 ```sh {name=kind-up}
@@ -90,14 +96,21 @@ EOF
 
 ## 6. Deploy snowplow
 
-Finally, install `snowplow` using the Helm chart:
+Finally, install `snowplow` using the Helm chart. The chart serves on the single
+`http` port `8081` (there is no separate probe port — see
+[operating.md](operating.md)), so the NodePort maps to it:
 
 ```sh {name=install depends=create-jwt-secret}
-helm install snowplow https://github.com/krateoplatformops/helm-charts/raw/gh-pages/snowplow-0.20.2.tgz \
+helm install snowplow oci://ghcr.io/braghettos/krateo-snowplow-chart \
   --namespace ${NAMESPACE} \
-  --set service.type=NodePort --set service.nodePort=30081 \
-  --set env.DEBUG=true
+  --set service.type=NodePort --set service.port=8081 --set service.nodePort=30081 \
+  --set 'env.DEBUG=true' --set 'env.CACHE_ENABLED=true'
 ```
+
+> `env.*` values are rendered into the chart's `snowplow` ConfigMap and consumed
+> via `envFrom`; the container has no direct `env:` array. `CACHE_ENABLED=true`
+> turns on the in-process cache path; omit it (or set `false`) for the
+> transparent direct-apiserver fallback.
 
 
 ## 7. Wait until the `snowplow` deployment is ready

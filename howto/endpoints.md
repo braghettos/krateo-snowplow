@@ -52,11 +52,11 @@ stringData:
 
 ## Behavior Summary
 
-- `server-url` is mandatory
+- `server-url` is mandatory; a missing value yields the verbatim error `missed required attribute for endpoint: server-url`
 - certificates and keys are expected to be base64-encoded, not raw PEM blocks
-- when insecure is true, the TLS client skips server certificate validation
-- if both clientCertificateData and clientKeyData are present, mutual TLS is enabled
-- if certificateAuthorityData is provided, it’s added to the root CA pool
-- when a proxy URL is set, outbound requests are routed through it
-- boolean values (debug, insecure) are parsed from strings
+- when `insecure` is `true`, the TLS client skips server certificate validation
+- if both `client-certificate-data` and `client-key-data` are present, mutual TLS is enabled
+- if `certificate-authority-data` is provided, it’s added to the root CA pool
+- when `proxy-url` is set, outbound requests are routed through it
+- boolean values (`debug`, `insecure`) are parsed from strings via `strconv.ParseBool`
 

@@ -1,3 +1,10 @@
+// Package widgets is the top-level frontend Widget resolver. Resolve takes a
+// Widget CR and fills its status by orchestrating the sub-resolvers: apiRef
+// (bridge to a RESTAction), resourcesRefs and resourcesRefsTemplate
+// (resource reference expansion), and widgetDataTemplate (jq templating of
+// widgetData). It canonicalises the unordered data the RESTAction emits into
+// the shape the frontend renders, and validates the result against the
+// widget's CRD schema.
 package widgets
 
 import (

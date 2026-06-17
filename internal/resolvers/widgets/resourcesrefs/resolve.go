@@ -1,3 +1,7 @@
+// Package resourcesrefs resolves a widget's static resourcesRefs. For each
+// reference it fetches the named resource (or lists it, per the ref's verb),
+// applies RBAC filtering, and returns the per-reference results the widget
+// embeds in its status.
 package resourcesrefs
 
 import (

@@ -1,3 +1,9 @@
+// Package objects is the leaf entry point for fetching a single Kubernetes
+// object referenced by a resolver. objects.Get serves the object from the
+// in-process informer cache when possible (with RBAC narrowing and cache
+// dependency recording) and falls back to a direct apiserver GET otherwise.
+// It also hosts the shared /call query-param to ObjectReference decoder used
+// by the in-process nested-call loopback.
 package objects
 
 import (

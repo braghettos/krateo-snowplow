@@ -1,0 +1,68 @@
+# snowplow (code repo) — LLM doc index
+
+> snowplow is the Krateo content bridge: it resolves `RESTAction` and `Widget` custom resources into
+> the JSON the Krateo frontend renders, served over `/call`, with a removable three-tier cache. This
+> index is the agent entry point to the **internals & runtime** view. The **deployment, CRD and
+> wiring** view lives in the chart repo `braghettos/krateo-snowplow-chart` `docs/`.
+
+## How to use this index (agents)
+
+You are reading the docs for a SPECIFIC deployed version. Fetch every file below **at the tag that
+matches the running build**, not `main`:
+- chart version = `CompositionDefinition.spec.chart.version` for snowplow (→ the `krateo-snowplow-chart` repo tag);
+- image version = the snowplow Deployment's container image tag (→ THIS repo's tag, == the chart `appVersion`).
+Read this repo's docs at the **image-version** tag. If something isn't in the docs, read the source
+at that same tag — don't guess, and don't trust `main` for a deployed older version.
+
+## Start here
+
+- [ARCHITECTURE.md](../ARCHITECTURE.md): the one-page map — what snowplow is, the request path, the
+  three-tier cache, prewarm, RBAC/UAF, the north-star, and the provisionality invariant. Read first.
+
+## Architecture (internals & runtime)
+
+- [docs/architecture/request-lifecycle.md](architecture/request-lifecycle.md): `/call` → dispatch →
+  resolve (RESTAction/widget) → RBAC filter → serialize; GET-vs-write lanes; the layering contract.
+- [docs/architecture/caching.md](architecture/caching.md): the three tiers (L3 informer / L1
+  resolved-entry / dispatcher), the two widget L1 keys (identity-free + per-binding-UID), `ComputeKey`,
+  invalidation rules, value-dedup, and the `CACHE_ENABLED` transparent-fallback invariant.
+- [docs/architecture/prewarm.md](architecture/prewarm.md): boot seed, the phase-1 frontend-nav
+  walker (GET-only `resourcesRefs` recursion), the dynamic cohort model, the opt-in prewarm engine
+  (`PREWARM_ENGINE_ENABLED`), and CRUD-triggered re-prewarm.
+- [docs/architecture/rbac-uaf.md](architecture/rbac-uaf.md): per-binding-UID L1 keying (never
+  cohort-only, and why), the RBAC subject index, `EvaluateRBAC`, serve-time user-aware filtering, and
+  User/Group/ServiceAccount predicate symmetry.
+- [docs/architecture/north-star.md](architecture/north-star.md): the performance contract, how it is
+  measured (real Chrome page-load, mix-weighted), and the enforced gate vs the aspirational goal.
+- [docs/architecture/observability.md](architecture/observability.md): the `/debug/vars` expvars,
+  the key `slog` events, and pprof — what each tells an operator.
+
+## Decisions (ADRs)
+
+- [docs/adr/0001-decouple-authn.md](adr/0001-decouple-authn.md): test without deploying authn.
+- [docs/adr/0002-per-user-l1-keying.md](adr/0002-per-user-l1-keying.md): per-binding-UID L1 keying (never cohort-only) + value-dedup.
+- [docs/adr/0003-identity-free-content-key.md](adr/0003-identity-free-content-key.md): identity-free content key + serve-time UAF.
+- [docs/adr/0004-cache-is-provisional-and-removable.md](adr/0004-cache-is-provisional-and-removable.md): `CACHE_ENABLED` transparent fallback; cache is removable.
+- [docs/adr/0005-walker-driven-informer.md](adr/0005-walker-driven-informer.md): walker-driven informer; RESTMapper off the hot path.
+
+## Blueprint-author contract (the CRDs you write) + operations
+
+- [howto/restactions.md](../howto/restactions.md): authoring `RESTAction` CRs (incl. `userAccessFilter`).
+- [howto/widgets.md](../howto/widgets.md): authoring `Widget` CRs (apiRef, templates, `status`, `extras`).
+- [howto/extras.md](../howto/extras.md): `extras` end-to-end (RESTActions + widgets, precedence, cache-keying).
+- [howto/endpoints.md](../howto/endpoints.md): endpoint/secret wiring for external APIs.
+- [howto/install.md](../howto/install.md): install via the chart.
+- [howto/operating.md](../howto/operating.md): operator runbook (probes, tuning, `CACHE_ENABLED`, incident table).
+
+## Reference
+
+- [README.md](../README.md): product overview + signposts.
+- [CONTRIBUTING.md](../CONTRIBUTING.md): build / test (the rbac TestMain trap) / release / invariants.
+- `apis/templates/` — the `RESTAction` / `Widget` Go types (source of truth for CRD fields).
+
+## Notes (NOT authoritative)
+
+[docs/notes/](notes/) holds append-only engineering logs (`ship-*`, `path3-*`, `task-*`, `bench-*`,
+dated `*-20YY-MM-DD.md`), point-in-time and possibly stale — see [docs/notes/README.md](notes/README.md).
+Treat them as leads to verify against code, never as authority. Authoritative material is
+ARCHITECTURE.md, `docs/architecture/`, `docs/adr/`, `howto/`, `CONTRIBUTING.md`, and the code.
