@@ -50,11 +50,15 @@ spec:
     title: ""
   widgetDataTemplate:
     - forPath: title
-      expression: .getDeployment.metadata.name   # jq over ds
+      expression: ${ .getDeployment.metadata.name }   # jq over ds — MUST be wrapped in ${ }
 ```
 
-Each entry's `expression` is evaluated against `ds`; the result is set into the
-static `widgetData` at `forPath` (`resolve.go:226-258`). A *read* error on
+Each entry's `expression` is evaluated against `ds` **only when wrapped in
+`${ … }`**: `jqutil.MaybeQuery` looks for the `${` marker and, finding none,
+returns the string unchanged (`widgetdatatemplate/resolve.go:50`, plumbing
+`jqutil.MaybeQuery`) — an unwrapped value is then stored **verbatim as a literal**,
+not evaluated. The (wrapped) result is set into the static `widgetData` at
+`forPath` (`resolve.go:226-258`). A *read* error on
 `widgetDataTemplate` **fails soft** to the static-only `widgetData`
 (`resolve.go:220-224`) — a load-bearing invariant kept symmetric with the cache
 routing predicate so a read error can never land a ServiceAccount-maximal
@@ -74,6 +78,29 @@ turned into a result with:
   (`resourcesrefs/resolve.go:108-112`).
 
 The frontend renders only `allowed == true` actions.
+
+**Example — `resourcesRefsTemplate` reading `extras`.** Only the *templated*
+variant is jq-expanded against `ds`, so only it can reference `extras`; static
+`resourcesRefs.items` are read verbatim and `extras`/jq never apply to them. Here
+the `iterator` fans out over an `extras` array, and each element parametrises one
+ref (jq via `${…}`):
+
+```yaml
+spec:
+  resourcesRefsTemplate:
+    - iterator: ${ .names }          # extras.names, e.g. ["kube-system","default"]
+      template:
+        id: ${ "ns-" + . }
+        apiVersion: v1
+        resource: namespaces
+        namespace: ${ . }            # each array element becomes one ref's namespace
+        verb: GET
+```
+
+Called as `/call?resource=widgets&…&extras={"names":["kube-system","default"]}`
+(URL-encoded), this yields one `status.resourcesRefs.items` entry per name. Use
+`resourcesRefsTemplate` whenever a ref must depend on `extras`; a static
+`resourcesRefs` ref cannot.
 
 ---
 
