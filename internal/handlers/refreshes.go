@@ -1,0 +1,248 @@
+// refreshes.go — Ship 1 (live-refresh-coherence, option A).
+//
+// GET /refreshes is the per-subject live-refresh SSE stream (design §3). A
+// browser opens ONE multiplexed EventSource per tab; it arms the widgets it
+// has mounted by sending their resource coordinates (?sub=). When the
+// refresher commits a fresh L1 entry for an armed key (resolve_populate.go:291
+// -> cache.PublishRefresh), this stream emits `event: refresh\ndata: <l1Key>`.
+// The frontend then refetches /call and reads the freshly-committed L1 as a
+// HIT — no apiserver read (the cache-respecting invariant, falsifier 9.1).
+//
+// SIGNAL-ONLY, no payload: data carries just the l1Key. The body that flows
+// to the client comes from the subsequent /call, which re-applies per-user
+// RBAC gating at serve time. So a shared (widgetContent) signal never leaks
+// another subject's row-level visibility (falsifier 9.4b).
+//
+// AUTH: middleware.RefreshAuth (refreshauth.go) places UserInfo on ctx from a
+// cookie-or-header JWT. ISOLATION: every armed key is re-derived UNDER that
+// connection's identity via dispatchers.DeriveSubscriptionKey (forgery-proof;
+// design §5). ZERO apiserver reads: the only external touch is the in-process
+// RBAC snapshot inside the derivation.
+//
+// TRANSPARENT FALLBACK (project_cache_off_is_transparent_fallback): when the
+// SSE layer is disabled (REFRESH_SSE_ENABLED=false) or cache is off
+// (CACHE_ENABLED=false), the endpoint serves a clean idle stream — heartbeats
+// only, zero refresh events — so a connected client degrades to its own 5s
+// throttle and never hangs or errors.
+
+package handlers
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+
+	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/http/response"
+	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
+)
+
+const (
+	// refreshHeartbeatInterval keeps intermediaries from idling the
+	// connection and lets the client detect a dead link. 20s beats the
+	// server IdleTimeout (30s, main.go:905) with margin; the per-connection
+	// SetWriteDeadline(0) defeats the 300s WriteTimeout (main.go:904).
+	refreshHeartbeatInterval = 20 * time.Second
+
+	// refreshSubParamMaxBytes caps the decoded ?sub= payload to avoid a
+	// memory-amplification subscribe vector (extras can be large; design §6
+	// tradeoff). A connection sending a larger payload is rejected 400.
+	refreshSubParamMaxBytes = 16 * 1024
+
+	// refreshSubMaxEntries caps how many widgets one connection may arm in a
+	// single subscribe. Defence-in-depth alongside the byte cap.
+	refreshSubMaxEntries = 512
+)
+
+// subRequest is one widget's arm request inside ?sub=. It is the JSON form of
+// dispatchers.SubscriptionCoordinates. Identity is NOT carried here — it
+// comes from the connection's authenticated ctx (the forgery-proof property).
+type subRequest struct {
+	Class     string         `json:"class"`
+	Group     string         `json:"group"`
+	Version   string         `json:"version"`
+	Resource  string         `json:"resource"`
+	Namespace string         `json:"namespace"`
+	Name      string         `json:"name"`
+	PerPage   int            `json:"perPage"`
+	Page      int            `json:"page"`
+	Extras    map[string]any `json:"extras"`
+}
+
+// Refreshes returns the GET /refreshes SSE handler. signingKey is accepted
+// for symmetry with the other auth-bearing handlers and future use; identity
+// is already resolved onto ctx by middleware.RefreshAuth, so the handler does
+// not re-validate the token here.
+func Refreshes(signingKey string) http.HandlerFunc {
+	return func(wri http.ResponseWriter, req *http.Request) {
+		log := xcontext.Logger(req.Context())
+
+		// (1) Disabled / cache-off -> clean idle stream (transparent
+		// fallback). No subscription validation, no apiserver touch; the
+		// client gets heartbeats only and falls back to its own throttle.
+		if !cache.RefreshSSEEnabled() {
+			serveIdleSSE(wri, req)
+			return
+		}
+
+		// (2) Identity is already on ctx (RefreshAuth). Defence in depth.
+		ui, err := xcontext.UserInfo(req.Context())
+		if err != nil {
+			response.Unauthorized(wri, err)
+			return
+		}
+
+		// (3) Validate + re-derive the requested key-set UNDER THIS subject.
+		armed, derr := validateSubscription(req)
+		if derr != nil {
+			http.Error(wri, derr.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(armed) == 0 {
+			http.Error(wri, "no valid subscription keys", http.StatusBadRequest)
+			return
+		}
+
+		// (4) SSE headers + defeat the per-connection write deadline so the
+		// 300s WriteTimeout does not kill a long-lived stream (design §3.2,
+		// §6). SetWriteDeadline(zero) clears the deadline for THIS connection
+		// only; Go 1.20+ ResponseController, supported on go 1.25.x (go.mod).
+		rc := http.NewResponseController(wri)
+		if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+			// Some ResponseWriters (test recorders) don't support deadlines;
+			// that's non-fatal — the stream still works under the test server.
+			log.Debug("refreshes: SetWriteDeadline unsupported; continuing",
+				slog.String("subsystem", "cache"), slog.Any("err", err))
+		}
+		wri.Header().Set("Content-Type", "text/event-stream")
+		wri.Header().Set("Cache-Control", "no-cache")
+		wri.Header().Set("Connection", "keep-alive")
+		wri.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering
+		wri.WriteHeader(http.StatusOK)
+		_ = rc.Flush()
+
+		// (5) Subscribe + stream until the client disconnects.
+		ch, unsub := cache.SubscribeRefresh(armed)
+		defer unsub()
+
+		log.Info("refreshes: subscribed",
+			slog.String("subsystem", "cache"),
+			slog.String("user", ui.Username),
+			slog.Int("armed_keys", len(armed)),
+		)
+
+		heartbeat := time.NewTicker(refreshHeartbeatInterval)
+		defer heartbeat.Stop()
+		for {
+			select {
+			case <-req.Context().Done():
+				return // client gone
+			case k, ok := <-ch:
+				if !ok {
+					// Hub closed the channel (disabled mid-stream) — degrade
+					// to idle; the client falls back to its throttle.
+					return
+				}
+				if _, werr := fmt.Fprintf(wri, "event: refresh\ndata: %s\n\n", k); werr != nil {
+					return // client write failed — disconnect
+				}
+				_ = rc.Flush()
+			case <-heartbeat.C:
+				if _, werr := fmt.Fprint(wri, ": keepalive\n\n"); werr != nil {
+					return
+				}
+				_ = rc.Flush()
+			}
+		}
+	}
+}
+
+// serveIdleSSE serves a heartbeat-only SSE stream for the disabled / cache-off
+// path (transparent fallback). It opens the stream, defeats the write
+// deadline, and emits only `: keepalive` comment frames until the client
+// disconnects. Never emits a refresh event (there is no broadcaster).
+func serveIdleSSE(wri http.ResponseWriter, req *http.Request) {
+	rc := http.NewResponseController(wri)
+	_ = rc.SetWriteDeadline(time.Time{})
+	wri.Header().Set("Content-Type", "text/event-stream")
+	wri.Header().Set("Cache-Control", "no-cache")
+	wri.Header().Set("Connection", "keep-alive")
+	wri.Header().Set("X-Accel-Buffering", "no")
+	wri.WriteHeader(http.StatusOK)
+	_ = rc.Flush()
+
+	heartbeat := time.NewTicker(refreshHeartbeatInterval)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-req.Context().Done():
+			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(wri, ": keepalive\n\n"); err != nil {
+				return
+			}
+			_ = rc.Flush()
+		}
+	}
+}
+
+// validateSubscription decodes the ?sub= base64-JSON coordinate array and
+// re-derives each key UNDER the request's authenticated identity (the
+// connection ctx), returning the validated armed-key set. A coordinate that
+// fails derivation (foreign identity / unknown class / cache-off) is silently
+// skipped (fail-closed) — only keys the connection's OWN identity legitimately
+// produces are armed (design §5.2). Returns an error only on a malformed or
+// oversized ?sub= payload (a client protocol error), never on a per-entry
+// derivation failure.
+func validateSubscription(req *http.Request) (map[string]struct{}, error) {
+	raw := req.URL.Query().Get("sub")
+	if raw == "" {
+		return nil, fmt.Errorf("missing 'sub' query parameter")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		// Tolerate URL-safe base64 too (EventSource URLs are query-encoded).
+		decoded, err = base64.RawURLEncoding.DecodeString(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid 'sub' encoding: not base64")
+		}
+	}
+	if len(decoded) > refreshSubParamMaxBytes {
+		return nil, fmt.Errorf("'sub' payload too large (%d bytes; max %d)", len(decoded), refreshSubParamMaxBytes)
+	}
+
+	var reqs []subRequest
+	if err := json.Unmarshal(decoded, &reqs); err != nil {
+		return nil, fmt.Errorf("invalid 'sub' payload: not a JSON coordinate array")
+	}
+	if len(reqs) == 0 {
+		return nil, fmt.Errorf("'sub' payload is an empty array")
+	}
+	if len(reqs) > refreshSubMaxEntries {
+		return nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
+	}
+
+	armed := make(map[string]struct{}, len(reqs))
+	for _, s := range reqs {
+		key, ok := dispatchers.DeriveSubscriptionKey(req.Context(), dispatchers.SubscriptionCoordinates{
+			Class:     s.Class,
+			Group:     s.Group,
+			Version:   s.Version,
+			Resource:  s.Resource,
+			Namespace: s.Namespace,
+			Name:      s.Name,
+			PerPage:   s.PerPage,
+			Page:      s.Page,
+			Extras:    s.Extras,
+		})
+		if !ok {
+			continue // fail-closed: skip keys this identity can't produce
+		}
+		armed[key] = struct{}{}
+	}
+	return armed, nil
+}

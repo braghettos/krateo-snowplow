@@ -289,6 +289,18 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		}
 	}
 	c.Put(key, entry)
+	// Ship 1 (live-refresh-coherence, option A) — emit the live-refresh
+	// signal STRICTLY post-commit, on the refresher path only. This line is
+	// reached ONLY after the Put returned and ONLY on a genuine L1 change:
+	// the four no-Put success-returns above (cache-off :96-99, declined
+	// :214-218, evicted-during-refresh :223-229, stage-error decline
+	// :243-260) all return before here, so the signal never fires when L1
+	// did not actually change (design §1.1 — coherent by construction).
+	// resolveAndPopulateL1 is invoked ONLY from the refresher closure
+	// (dispatchers.go:86), never from cold dispatch or the prewarm walker, so
+	// this announces dep-change-driven re-resolves only. PublishRefresh is
+	// nil-safe and a no-op when the SSE layer is disabled or cache is off.
+	cache.PublishRefresh(key)
 	log.Debug("resolveAndPopulateL1: re-resolved + stored",
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
