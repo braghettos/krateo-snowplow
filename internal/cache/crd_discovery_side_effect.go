@@ -44,6 +44,9 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -120,6 +123,24 @@ type crdDiscovery struct {
 	deletesProcessed   atomic.Uint64 // Ship L — DELETE calls that completed teardown (>=1 GVR torn down)
 	deleteSkippedNG    atomic.Uint64 // Ship L — DELETE calls skipped (decode-fail / no plural / no served versions)
 	panicsRecovered    atomic.Uint64 // recover-wrapper panic catches across all lifecycle handlers
+
+	// CRD schema-widen relist (followup-crd-schema-widen-informer-relist).
+	// schemaFingerprints maps CRD object name → the last-seen fingerprint of
+	// its structural schema subtree (spec.versions[].{name,schema}). A
+	// running data informer that LIST/WATCHed under a NARROWER structural
+	// schema caches apiserver-PRUNED objects; widening the CRD at runtime
+	// (e.g. adding spec.apiRef.extras + x-kubernetes-preserve-unknown-fields)
+	// does NOT relist that informer (EnsureResourceType is registration-
+	// idempotent, watcher.go:612), so the cache keeps serving pruned objects
+	// until a manual pod bounce. We detect a real schema delta here and force
+	// a per-GVR relist. Keyed by CRD name; written ONLY by the single worker
+	// goroutine (processEvent serialises ADD/UPDATE/DELETE), so a plain map
+	// guarded by the worker's single-threadedness is sufficient — but we use
+	// sync.Map for defensiveness against a future multi-worker change and so
+	// the test reset can clear it without a lock.
+	schemaFingerprints sync.Map // map[string]string (CRD name → schema fingerprint)
+	schemaRelistsFired atomic.Uint64 // relist passes that tore down >=1 GVR on a detected schema change
+	schemaUnchanged    atomic.Uint64 // ADD/UPDATE where the schema fingerprint was unchanged (no relist — thrash guard hit)
 }
 
 var (
@@ -364,6 +385,16 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 		return
 	}
 
+	// Add to navigation-discovered set FIRST so the watcher's
+	// removable-discriminator (watcher.go:749/:1064) sees the group as
+	// nav-discovered when EnsureResourceType spawns the GVR informer — both
+	// inside DiscoverGroupResources AND inside the schema-relist (the relist's
+	// re-add MUST build a re-creatable STANDALONE informer, not a frozen
+	// shared-factory one; the standalone path is gated on this group being
+	// nav-discovered — watcher.go:1056). Idempotent + order-independent w.r.t.
+	// discovery, so it runs up front, ahead of the SA-rc gate.
+	AddNavigationDiscoveredGroup(group)
+
 	saRC := ProcessSARestConfig()
 	if saRC == nil {
 		c.discoverySkippedNG.Add(1)
@@ -373,16 +404,18 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 			slog.String("hint", "SetProcessSARestConfig was not called at startup — "+
 				"CRD-ADD discovery is degraded to walker-only. Check main.go wiring."),
 		)
+		// followup-crd-schema-widen-informer-relist — the data-informer relist
+		// is INDEPENDENT of the SA rest config (it operates on already-
+		// registered local informers + the WATCH each owns; no discovery hop).
+		// Run it even on the degraded no-SA-rc path so a runtime schema widen
+		// is never silently dropped. The F-4 schema-memo ordering (relist after
+		// the invalidators) is moot here: with no SA-rc there is no
+		// DiscoverGroupResources hop and the invalidators below do not run.
+		c.triggerCRDSchemaRelist(u)
 		return
 	}
 
 	c.discoveryInvoked.Add(1)
-
-	// Add to navigation-discovered set FIRST so the watcher's
-	// removable-discriminator (watcher.go:749/:1064) sees the
-	// group as nav-discovered when EnsureResourceType inside
-	// DiscoverGroupResources spawns the composition GVR informer.
-	AddNavigationDiscoveredGroup(group)
 
 	// Fire-and-forget discovery hop. DiscoverGroupResources is
 	// per-group singleflighted (discovery_lookup.go:228-232) and
@@ -415,6 +448,175 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	// changes the schema MUST invalidate; this is that path). Soft no-op when
 	// the schema-memo invalidator is unwired (discovery_invalidation_hook.go).
 	invalidateCRDSchemaMemo()
+
+	// followup-crd-schema-widen-informer-relist — the invalidators above
+	// refresh the DISCOVERY client + the compiled-schema VALIDATION memo, but
+	// neither relists the running DATA informer's indexer. Under
+	// CACHE_ENABLED=true objects.Get serves widget/entry-CR reads from that
+	// indexer (objects/get.go:73-142), and apiserver structural-schema pruning
+	// happens at LIST/WATCH time — so an informer that listed under a NARROWER
+	// schema keeps serving PRUNED objects after the CRD is widened, until a
+	// manual bounce. Detect a real structural-schema delta and relist the
+	// affected GVRs. Schema-delta-gated so benign CRD churn (status/printer-
+	// column patches) does NOT thrash informers. Ordered AFTER the invalidators
+	// so the relisted informer's first reads see the fresh discovery + schema
+	// state. Soft no-op when the schema is unchanged.
+	c.triggerCRDSchemaRelist(u)
+}
+
+// crdServedGVRs derives the GroupVersionResource set for every SERVED
+// version of a decoded CRD object. Shared by the DELETE teardown and the
+// schema-widen relist. Returns nil when group / plural is empty or no
+// served version exists (caller soft-skips). Mirrors the derivation in
+// triggerCRDDelete + cache_mode.go:312-321 exactly (served-only).
+func crdServedGVRs(u *unstructured.Unstructured) []schema.GroupVersionResource {
+	group, _, _ := unstructured.NestedString(u.Object, "spec", "group")
+	plural, _, _ := unstructured.NestedString(u.Object, "spec", "names", "plural")
+	if group == "" || plural == "" {
+		return nil
+	}
+	versions, found, err := unstructured.NestedSlice(u.Object, "spec", "versions")
+	if err != nil || !found || len(versions) == 0 {
+		return nil
+	}
+	var out []schema.GroupVersionResource
+	for _, v := range versions {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(vm, "name")
+		served, _, _ := unstructured.NestedBool(vm, "served")
+		if name == "" || !served {
+			continue
+		}
+		out = append(out, schema.GroupVersionResource{Group: group, Version: name, Resource: plural})
+	}
+	return out
+}
+
+// crdSchemaFingerprint computes a stable fingerprint of the structural-schema
+// subtree that governs apiserver pruning: per served version, its name plus
+// its `schema.openAPIV3Schema`. A change here is exactly the class that flips
+// which fields survive LIST/WATCH (adding a property, flipping
+// x-kubernetes-preserve-unknown-fields, etc.). Status/printer-column/
+// conversion churn lives OUTSIDE this subtree, so it does NOT change the
+// fingerprint — that is the thrash guard. Returns "" when the schema subtree
+// cannot be read (caller treats "" as "unknown" → no relist; a later event
+// with a readable schema will reconcile).
+func crdSchemaFingerprint(u *unstructured.Unstructured) string {
+	versions, found, err := unstructured.NestedSlice(u.Object, "spec", "versions")
+	if err != nil || !found {
+		return ""
+	}
+	// Build a deterministic [name, schema] projection. NestedSlice already
+	// returns deep-copied plain Go values; json.Marshal of a
+	// map[string]any sorts keys, so the encoding is canonical.
+	type vfp struct {
+		Name   string      `json:"name"`
+		Schema interface{} `json:"schema"`
+	}
+	proj := make([]vfp, 0, len(versions))
+	for _, v := range versions {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(vm, "name")
+		sch, _, _ := unstructured.NestedMap(vm, "schema", "openAPIV3Schema")
+		proj = append(proj, vfp{Name: name, Schema: sch})
+	}
+	b, mErr := json.Marshal(proj)
+	if mErr != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// triggerCRDSchemaRelist relists the running data informers for a CRD whose
+// structural schema changed since the last ADD/UPDATE we observed. No-op when
+// the fingerprint is unchanged (the common case — most CRD UPDATEs are
+// status/printer churn). Runs on the single discovery-worker goroutine
+// (serialised with every other CRD lifecycle side-effect), AFTER the
+// discovery + schema-memo invalidators.
+//
+// Mechanism per served GVR: RemoveResourceType (tears down the stale informer
+// via the R6 per-GVR stop channel, watcher.go:1406) then EnsureResourceType
+// (re-registers → fresh LIST under the now-current schema), and
+// OnResourceTypeSchemaRelisted to dirty-mark L1 entries depending on that GVR
+// so a cached widget resolve recomputes against the now-unpruned objects
+// (same dirty-mark-only set as the DELETE path's OnResourceTypeRemoved, but
+// it logs cache_event.consumed type=SCHEMA_RELIST, not CRD_DELETE). Between
+// teardown and the new informer's HasSynced, objects.Get falls through to the
+// apiserver under the 0.30.97 IsServable guard (correct, just slower).
+func (c *crdDiscovery) triggerCRDSchemaRelist(u *unstructured.Unstructured) {
+	name := u.GetName()
+	if name == "" {
+		return
+	}
+	fp := crdSchemaFingerprint(u)
+	if fp == "" {
+		// Unreadable schema subtree — cannot decide a delta. Do not relist;
+		// do not poison the stored fingerprint (leave any prior value so a
+		// later readable event still detects the real change).
+		return
+	}
+	prev, had := c.schemaFingerprints.Load(name)
+	c.schemaFingerprints.Store(name, fp)
+	if !had {
+		// FIRST observation of this CRD's schema. Any data informer already
+		// registered for its GVR listed under the apiserver's CURRENT schema —
+		// which is exactly the fingerprint we just recorded — so there is no
+		// stale-prune to correct. Record and return; the relist fires only on a
+		// subsequent CHANGE. (This also avoids a spurious relist at startup,
+		// when the CRD informer's initial replay delivers an ADD for every
+		// pre-existing CRD.)
+		return
+	}
+	if prev.(string) == fp {
+		// Schema unchanged since we last saw this CRD — benign churn. This is
+		// the thrash guard: a status/printer-column UPDATE lands here and
+		// does NOT relist.
+		c.schemaUnchanged.Add(1)
+		return
+	}
+	// A real structural-schema CHANGE since we last observed this CRD — the
+	// load-bearing case (a runtime widen of an already-watched CRD). Relist its
+	// registered+served GVRs so the data informer re-LISTs under the new schema.
+	gvrs := crdServedGVRs(u)
+	if len(gvrs) == 0 {
+		return
+	}
+	rw := Global()
+	relisted := 0
+	for _, gvr := range gvrs {
+		if rw == nil {
+			break
+		}
+		// Only relist a GVR we are actually watching. EnsureResourceType is
+		// registration-idempotent, so an unconditional Ensure would SPAWN an
+		// informer for a never-watched GVR (wrong — lazy registration is the
+		// resolver's job). Gate on current registration via IsRegistered.
+		if !rw.IsRegistered(gvr) {
+			continue
+		}
+		rw.RemoveResourceType(gvr)    // R6 per-GVR teardown; idempotent, nil-safe
+		_, _ = rw.EnsureResourceType(gvr)         // re-register → fresh LIST under current schema
+		Deps().OnResourceTypeSchemaRelisted(gvr) // dirty-mark dependent L1 (logs SCHEMA_RELIST, not CRD_DELETE)
+		relisted++
+	}
+	if relisted > 0 {
+		c.schemaRelistsFired.Add(1)
+		slog.Info("cache.crd_discovery.schema_relist",
+			slog.String("subsystem", "cache"),
+			slog.String("crd", name),
+			slog.Int("gvrs_relisted", relisted),
+			slog.String("hint", "CRD structural schema changed at runtime — relisted the data "+
+				"informer(s) so newly-permitted spec fields stop being served pruned from the "+
+				"pre-change indexer (followup-crd-schema-widen-informer-relist)."),
+		)
+	}
 }
 
 // triggerCRDDelete handles a CRD DELETE event: derive the GVRs that
@@ -600,6 +802,9 @@ type CRDDiscoveryStats struct {
 	DeletesProcessed   uint64 // Ship L — successful DELETE teardowns
 	DeleteSkippedNG    uint64 // Ship L — DELETE decode-skip / no-served-versions / no-plural
 	PanicsRecovered    uint64
+	// followup-crd-schema-widen-informer-relist
+	SchemaRelistsFired uint64 // ADD/UPDATE passes that relisted >=1 GVR on a detected structural-schema change
+	SchemaUnchanged    uint64 // ADD/UPDATE where the schema fingerprint was unchanged (thrash guard hit; no relist)
 }
 
 // CRDDiscoveryStatsSnapshot returns the current bridge counters.
@@ -614,6 +819,8 @@ func CRDDiscoveryStatsSnapshot() CRDDiscoveryStats {
 		DeletesProcessed:   c.deletesProcessed.Load(),
 		DeleteSkippedNG:    c.deleteSkippedNG.Load(),
 		PanicsRecovered:    c.panicsRecovered.Load(),
+		SchemaRelistsFired: c.schemaRelistsFired.Load(),
+		SchemaUnchanged:    c.schemaUnchanged.Load(),
 	}
 }
 

@@ -723,6 +723,31 @@ func (d *DepTracker) OnResourceTypeRemoved(gvr schema.GroupVersionResource) int 
 	return d.dirtyMarkResourceType("CRD_DELETE", gvr, matched)
 }
 
+// OnResourceTypeSchemaRelisted is invoked by the CRD schema-widen relist
+// (triggerCRDSchemaRelist, crd_discovery_side_effect.go) when a CRD's
+// structural schema CHANGED at runtime and its data informer was relisted.
+// The GVR is NOT being removed — its informer is re-LISTing under the now-
+// wider schema — but every L1 entry that LIST- or GET-depends on the GVR was
+// resolved against the PRE-widen (pruned) objects and is now stale, so it
+// must dirty-mark the same dependent-bucket set OnResourceTypeRemoved does.
+//
+// Mechanically identical to OnResourceTypeRemoved (same collectTypeMatches
+// scan, same dirty-mark-only, NEVER-evict contract) — it differs ONLY in the
+// telemetry label: it logs cache_event.consumed type=SCHEMA_RELIST, not
+// type=CRD_DELETE, so the relist's dirty-mark does not masquerade as a CRD
+// deletion in logs/metrics. dirtyMarkResourceType already parameterises the
+// event type, so this is a label-only divergence.
+//
+// Returns the number of dependent L1 keys dirty-marked. A no-op (and
+// idempotent) when no dep matches gvr.
+func (d *DepTracker) OnResourceTypeSchemaRelisted(gvr schema.GroupVersionResource) int {
+	if d == nil {
+		return 0
+	}
+	matched := d.collectTypeMatches(gvr, false /* listOnly */)
+	return d.dirtyMarkResourceType("SCHEMA_RELIST", gvr, matched)
+}
+
 // dirtyMarkResourceType dirty-marks every L1 key in matched via the
 // refreshHook — the shared body of OnResourceTypeAvailable +
 // OnResourceTypeRemoved. NEVER evicts. Returns the number marked.
