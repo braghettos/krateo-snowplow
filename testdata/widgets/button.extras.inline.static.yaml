@@ -1,0 +1,58 @@
+# inline-extras design P — apiRef-LESS fixture proving:
+#   (#1b) inline-only resourcesRefsTemplateExtras: the rrt block's keys reach
+#         the resourcesRefsTemplate jq with NO ?extras= on the request.
+#   (#5)  scope-isolation: a key present ONLY in resourcesRefsTemplateExtras is
+#         NOT visible to the widgetDataTemplate jq (which ran BEFORE the rrt
+#         fold), while the resourcesRefsTemplate jq DOES see it.
+#
+# The widget has NO apiRef, so `ds` starts empty; the ONLY source of the rrt
+# keys is the §4.2 fold (mergeExtras(ds, GetResourcesRefsExtras(...))), which
+# happens AFTER resolveWidgetData. The widgetDataTemplate below references the
+# rrt-only key `rrtNs` defensively (`// "ABSENT"`) so an absent key yields the
+# valid string "ns=ABSENT" (proving non-leak) WITHOUT writing jq-null into the
+# string-typed label field (which would trip CRD validation). The
+# resourcesRefsTemplate iterator over `names` (also rrt-only) fans out one ref
+# per element, each namespaced by `rrtNs` — proving the rrt jq sees both keys.
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Button
+metadata:
+  namespace: demo-system
+  name: button-extras-inline-static
+spec:
+  widgetData:
+    actions: {}
+    clickActionId: nop
+    label: base-label
+    icon: fa-clock
+    type: text
+  # widgetDataTemplate runs BEFORE the resourcesRefsTemplateExtras fold, so
+  # `.rrtNs` MUST be absent here → "ns=ABSENT" (scope-isolation proof #5).
+  widgetDataTemplate:
+    - forPath: label
+      expression: ${ "ns=" + (.rrtNs // "ABSENT") }
+  # resourcesRefsTemplate references the rrt-only keys (rrtNs + names) →
+  # proves #1b inline-only AND that the rrt jq DOES see them. The iterator over
+  # `names` (evaluated against ds) fans out one ref per element (proving the
+  # array key reached the jq); inside the iterator `.` is the element string, so
+  # namespace=${ . }. The second, non-iterator item references the SCALAR rrtNs
+  # against ds (proving the scalar key reached the jq).
+  resourcesRefsTemplate:
+    - iterator: ${ .names }
+      template:
+        id: ${ "ns-" + . }
+        apiVersion: v1
+        resource: namespaces
+        namespace: ${ . }
+        verb: GET
+    - template:
+        id: ${ "from-rrtNs-" + .rrtNs }
+        apiVersion: v1
+        resource: namespaces
+        namespace: ${ .rrtNs }
+        verb: GET
+  # The author-declared inline extras scoped to the resourcesRefsTemplate jq.
+  resourcesRefsTemplateExtras:
+    rrtNs: inline-team
+    names:
+      - alpha
+      - beta

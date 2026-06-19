@@ -101,6 +101,28 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	perPage, page := paginationInfo(log, req)
 
+	// inline-extras design P §1/§4.3 — the cache-key union. The widget CR is
+	// already in hand (got.Unstructured, fetched above), so read BOTH
+	// author-declared inline maps off it and fold their UNION with the
+	// per-request extras (request wins). keyExtras is the body-dependency
+	// fingerprint passed IN PLACE OF the bare request extras to every widget
+	// key site below (content + per-cohort) and the two diagnostic emits, so
+	// the widget keys vary across either inline map — without which two widgets
+	// sharing the (gvr/ns/name/pagination/request-extras) tuple but differing
+	// in apiRef.extras OR resourcesRefsTemplateExtras would collide on one
+	// identity-free cell and serve each other's body (the make-or-break crux).
+	// The apiRef sub-cell (RAFullList) is keyed separately by the apiRef-
+	// effective map threaded through apiref.Resolve (resolveApiRef §4.1) — the
+	// rrt-inline map deliberately does NOT enter that sub-cell. Absent both
+	// blocks ⇒ both accessors return {} ⇒ keyExtras == request extras ⇒
+	// byte-identical keys (backward-compat). The accessors return deep copies,
+	// so keyExtras never aliases the shared CR.
+	keyExtras := unionForKey(
+		widgets.GetApiRefExtras(got.Unstructured.Object),
+		widgets.GetResourcesRefsExtras(got.Unstructured.Object),
+		extras,
+	)
+
 	// Ship G (0.30.16x) — identity-free widget content L1 lookup runs
 	// FIRST. Same gating semantics as the per-user lookup below
 	// (strictly after EvaluateRBAC at :62-72). The content key is
@@ -135,7 +157,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		contentKey, contentHandle, _ := dispatchWidgetContentKey(req.Context(),
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
-			perPage, page, extras)
+			perPage, page, keyExtras)
 		if contentHandle != nil {
 			if entry, ok := contentHandle.Get(contentKey); ok {
 				if gated, served := gateWidgetEnvelope(req.Context(), entry.RawJSON); served {
@@ -170,7 +192,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	cacheKey, cacheHandle, cacheInputs := dispatchCacheLookupKey(req.Context(), "widgets",
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
-		perPage, page, extras)
+		perPage, page, keyExtras)
 	// Ship 0.30.188 — diagnostic slog: emit the dispatcher-side cache
 	// key + its components so it can be diff'd against the PIP seed Put
 	// log line at phase1_pip_seed.go and the per-user-fallback Put line
@@ -179,7 +201,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		cacheKey, cacheInputs, "widgets",
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
-		perPage, page, extras)
+		perPage, page, keyExtras)
 	if cacheHandle != nil {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
@@ -279,7 +301,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			cacheKey, cacheInputs, "widgets",
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
-			perPage, page, extras)
+			perPage, page, keyExtras)
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,

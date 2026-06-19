@@ -1,0 +1,37 @@
+# inline-extras design P — apiRef fixture proving:
+#   (#1a) inline-only spec.apiRef.extras: the inline `nsName` parametrises the
+#         apiRef RESTAction fetch path with NO ?extras= on the request.
+#   (#2a) request-overrides-inline: resolving WITH ?extras={nsName:...} makes
+#         the REQUEST value win over the inline default (asserted in the test).
+#   (#7)  input-only: neither inline map appears in the resolved status.
+#
+# It reuses the `extras-namespace-by-name` RESTAction defined in
+# button.extras.apiref.yaml (path: ${ "/api/v1/namespaces/" + .nsName }). The
+# widget declares spec.apiRef.extras.nsName = "kube-system"; with no request
+# extras the apiRef-effective map = {nsName: kube-system}, so the RA GETs the
+# kube-system namespace and its name surfaces into status.widgetData.label.
+#
+# cyberjoker (group devs) is granted cluster-wide namespaces get/list by
+# testdata/rbac.namespaces.yaml, so the per-user-token fetch succeeds.
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Button
+metadata:
+  namespace: demo-system
+  name: button-extras-inline-apiref
+spec:
+  widgetData:
+    actions: {}
+    clickActionId: nop
+    label: base-label
+    icon: fa-clock
+    type: text
+  apiRef:
+    name: extras-namespace-by-name
+    namespace: demo-system
+    # The author-declared inline extras scoped to the apiRef fetch. With no
+    # ?extras= request, this `nsName` parametrises the RESTAction path.
+    extras:
+      nsName: kube-system
+  widgetDataTemplate:
+    - forPath: label
+      expression: ${ .ns.metadata.name }
