@@ -85,7 +85,18 @@ const lazyRegisterSlowThreshold = 250 * time.Millisecond
 
 const (
 	//annotationKeyVerboseAPI = "krateo.io/verbose"
-	headerAcceptJSON = "Accept: application/json"
+	// headerAcceptJSON is the default per-stage Accept header. Since the
+	// feat/restaction-yaml-response ship (snowplow-side JSON-or-YAML
+	// external-GET relaxation) it advertises YAML media types in addition
+	// to JSON — strictly MORE permissive. This only affects the EXTERNAL
+	// HTTP-fetch path (httpFetchAllowingNonJSON); the internal-rest-config
+	// and informer dispatch paths bypass the HTTP client entirely and do
+	// not honour this header, so the no-regression invariant (AC4) holds.
+	// Helm repositories ignore Accept anyway and serve index.yaml as
+	// text/plain or text/yaml regardless — the relaxation is what lets
+	// that body through (the prior plumbing path 406'd it before the body
+	// was read).
+	headerAcceptJSON = "Accept: application/json, application/x-yaml, text/yaml"
 
 	// envVerboseWireDump is the Ship 0.30.121 R1-b operator kill-switch
 	// for httpcall's DumpResponse verbose wire-dump. When false (the
@@ -897,7 +908,54 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		return nil
 	}
 
-	res := httpcall.Do(gctx, call)
+	// EXTERNAL branch (feat/restaction-yaml-response): the snowplow-owned
+	// fetch replaces plumbing's httpcall.Do. It transcribes request.Do
+	// MINUS the 406 JSON content-type gate, so a 2xx YAML body (e.g. a
+	// Helm repo index.yaml served text/plain or text/yaml) is read,
+	// converted to JSON, and fed onward; a 2xx JSON body passes through
+	// value-identical (AC3). It does NOT invoke call.ResponseHandler —
+	// instead it returns the converted JSON bytes, which we feed via
+	// feedBytes (the dictMu-protected jsonHandlerBytes path) so the EXISTING
+	// handler chain (jq filter + UAF refilter + merge) is unchanged. The
+	// returned *response.Status keeps the StatusFailure shaping below
+	// byte-identical, so recordItemError honours ContinueOnError/ErrorKey
+	// exactly as it did for httpcall.Do (AC5). See external_fetch.go.
+	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(gctx, call)
+	if fetchErr != nil {
+		// A non-nil go error mirrors httpcall.Do's response.New(500, err)
+		// transport/build faults. res already carries the same 500 Failure
+		// envelope; fall through to the StatusFailure shaping below so the
+		// behaviour matches the pre-ship httpcall.Do path (which surfaced
+		// these as res.Status == Failure with the error message).
+		_ = fetchErr
+	}
+
+	// SUCCESS (feat/restaction-yaml-response): on a non-Failure fetch the
+	// owned fetch does NOT invoke call.ResponseHandler (unlike httpcall.Do);
+	// it returned the converted JSON bytes. Feed them through the SAME
+	// dictMu-protected handler chain the in-memory dispatch paths use
+	// (feedBytes → jsonHandlerBytes → jsonHandlerCore: jq filter + UAF
+	// refilter + merge), so the populated dict[id] is byte-identical to the
+	// pre-ship httpcall.Do ResponseHandler result for a JSON body (AC3).
+	//
+	// B-REGRESSION FIX: a feedBytes (handler/jq decode) error MUST NOT be
+	// returned raw to the errgroup — pre-ship that error was the return
+	// value of call.ResponseHandler, which httpcall.Do wrapped as
+	// `response.New(http.StatusInternalServerError, err)` (request.go:121-126)
+	// → a StatusFailure → the recordItemError fall-through below → under #313
+	// C-A NO truncation (downstream stages still run). Returning the raw error
+	// truncated the whole resolve where pre-ship continued (empirically
+	// proven: oracle TestOracle_PreShip dict keys [badErr good] vs new []).
+	// So we shape the feedBytes error into the SAME 500 StatusFailure
+	// envelope and route it through the identical recordItemError handling —
+	// byte-identical to the pre-ship ResponseHandler-error path. (Falsifier
+	// TestFalsifierB_SuccessBranchDecodeFailure_NoTruncate.)
+	if res.Status != response.StatusFailure {
+		if err := feedBytes(jsonBytes); err != nil {
+			res = response.New(http.StatusInternalServerError, err)
+		}
+	}
+
 	if res.Status == response.StatusFailure {
 		r.log.Error("api call response failure", slog.String("name", id),
 			slog.String("host", call.Endpoint.ServerURL),
