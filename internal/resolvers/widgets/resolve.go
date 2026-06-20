@@ -118,6 +118,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		return opts.In, err
 	}
 
+	// inline-extras design P §4.2 — resourcesRefsTemplate surface. Fold the
+	// author-declared spec.resourcesRefsTemplateExtras into `ds` HERE — AFTER
+	// resolveWidgetData has fully returned (above) and BEFORE
+	// resolveResourceRefs (below). This mutation timing IS the scope
+	// isolation (design §2.1): resolveWidgetData never re-reads `ds`, so this
+	// fold is invisible to the widgetDataTemplate jq and reaches ONLY the
+	// resourcesRefsTemplate jq (which evaluates against this same `ds`).
+	// Falsifier #5 guards this boundary.
+	//
+	// REUSE mergeExtras verbatim — its non-overwriting / ds-wins semantics are
+	// EXACTLY right: the apiRef-result (from resolveApiRef) and the per-request
+	// extras (the mergeExtras(ds, opts.Extras) fold above) are ALREADY in `ds`,
+	// so they win; the rrt-inline map only fills keys nobody else set. Net for
+	// this surface: apiRef-result > request > rrt-inline. Empty/absent block ⇒
+	// GetResourcesRefsExtras returns {} ⇒ mergeExtras len-guard no-ops ⇒
+	// byte-identical to pre-inline-extras.
+	mergeExtras(ds, GetResourcesRefsExtras(opts.In.Object))
+
 	resRefsStart := time.Now()
 	resourcesRefsResults, err := resolveResourceRefs(ctx, opts.In, ds)
 	phaseResRefsMs = time.Since(resRefsStart).Milliseconds()
@@ -185,26 +203,40 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 		return nil, err
 	}
 
+	// inline-extras design P §4.1 — apiRef surface. Fold the author-declared
+	// spec.apiRef.extras UNDER the per-request extras (request wins) into the
+	// effective map threaded to the apiRef fetch. Net precedence on this
+	// surface: apiRef-RESULT > request > apiRef-inline (the apiRef RA result
+	// overwrites the dict on collision inside api.Resolve, so the result still
+	// wins). The inline map reads the `extras` sub-key off opts.In.Object — the
+	// SAME widget CR the dispatcher reads (got.Unstructured), so key (the
+	// dispatcher's union, §1) and body stay consistent. nil/empty inline +
+	// nil/empty request ⇒ a fresh empty effective map ⇒ byte-identical to the
+	// pre-inline-extras "request-only" thread (mergeRequestWins of two empties
+	// is empty; api.Resolve no-ops on an empty dict). The seed path benefits
+	// automatically — it reads opts.In.Object too (the seeded CR), so the seed
+	// body folds apiRef-inline with no new ResolveOptions field (design §5).
+	apiRefInline := GetApiRefExtras(opts.In.Object)
+	apiRefEff := mergeRequestWins(apiRefInline, opts.Extras)
+
 	return apiref.Resolve(ctx, apiref.ResolveOptions{
 		RC:      opts.RC,
 		ApiRef:  apiRef,
 		AuthnNS: opts.AuthnNS,
 		PerPage: opts.PerPage,
 		Page:    opts.Page,
-		// extras-widgets parity (step 1): thread the per-request extras
-		// into the apiRef fetch — the thread that was previously dropped
-		// here, so any extras a widget received was silently discarded.
-		// extras now flows widget → apiref → restactions.Resolve →
-		// api.Resolve, where api.Resolve seeds the resolve dict via
+		// extras-widgets parity (step 1): thread the EFFECTIVE extras
+		// (apiRef-inline folded under request) into the apiRef fetch.
+		// extras flows widget → apiref → restactions.Resolve → api.Resolve,
+		// where api.Resolve seeds the resolve dict via
 		// maps.DeepCopyJSON(opts.Extras) (restactions/api/resolve.go:228-230).
 		// Effect: the apiRef RESTAction's OWN jq (its `path` / `payload`)
 		// can reference extras keys (parametrise the fetch), and those
 		// extras keys land top-level in the resolved data source `ds` the
-		// widget templates evaluate against. nil/empty extras (the
-		// prewarm/seed/refresher callers, which never set it) is a no-op:
-		// api.Resolve's `if opts.Extras != nil` gate skips the seed for
-		// nil, and an empty map deep-copies to an empty dict.
-		Extras: opts.Extras,
+		// widget templates evaluate against transitively. An empty effective
+		// map deep-copies to an empty dict (no-op) — the prewarm/seed/refresher
+		// callers (no request extras, no inline) stay byte-identical.
+		Extras: apiRefEff,
 	})
 }
 
@@ -362,4 +394,40 @@ func mergeExtras(ds map[string]any, extras map[string]any) {
 			ds[k] = v
 		}
 	}
+}
+
+// mergeRequestWins folds the inline (author-declared) extras UNDER the request
+// (route/query/login) extras, REQUEST WINNING on every key collision, and
+// returns a FRESH map. This is the inline-extras design P per-surface
+// precedence (§4): the route is the more-specific intent, so a request param
+// MUST override an inline default (an inline default shadowing a route param
+// would strand a detail page on the default).
+//
+// It is the INVERSE direction of mergeExtras (which is non-overwriting / ds-
+// wins) and is used at the EARLIER merge — before the effective map ever
+// reaches mergeExtras / the apiRef RA dict. Keeping the two helpers separate
+// is deliberate (design §4): request-wins-over-inline is achieved HERE;
+// apiRef-result-wins-over-everything stays in mergeExtras's ds-wins fold. Do
+// NOT collapse them — flipping mergeExtras's direction would also flip the
+// apiRef-result-vs-extras precedence and break falsifier #3.
+//
+// Both inputs are deep-copied into the result via maps.DeepCopyJSON (the same
+// util mergeExtras + the RESTAction dict seed use), so the returned map never
+// aliases the per-request extras map NOR the inline map read off the shared
+// widget CR — no shared-vs-copy concurrency hazard
+// (feedback_shared_vs_copy_is_a_concurrency_change). Both empty ⇒ a fresh
+// empty map (a no-op effective fold downstream — backward-compat).
+//
+// Mechanism-uniform (feedback_no_special_cases): every key is folded the same
+// way for every widget — no widget-name table, no key allowlist.
+func mergeRequestWins(inline, request map[string]any) map[string]any {
+	out := make(map[string]any, len(inline)+len(request))
+	for k, v := range maps.DeepCopyJSON(inline) {
+		out[k] = v
+	}
+	// Request overwrites any colliding inline key (request wins).
+	for k, v := range maps.DeepCopyJSON(request) {
+		out[k] = v
+	}
+	return out
 }

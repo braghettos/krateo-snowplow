@@ -242,6 +242,54 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 	return cache.ComputeKey(inputs), c, &inputs
 }
 
+// unionForKey builds the body-dependency fingerprint the widget L1 key must
+// fold under inline-extras design P (§1, §4.3): the UNION of both
+// author-declared inline maps (apiRef.extras + resourcesRefsTemplateExtras)
+// PLUS the per-request extras, with REQUEST WINNING on every collision
+// (mirroring the per-surface request-wins precedence in widgets.Resolve).
+//
+// WHY a flat union is the correct key material: a change to EITHER inline map
+// changes the resolved body (apiRef.extras feeds the apiRef fetch → ds; the
+// rrt block feeds the resourcesRefsTemplate jq), so the widget content +
+// per-cohort keys MUST vary on either. The union is collision-sound because
+// the widget key ALSO folds Group/Version/Resource/Namespace/Name (and, on
+// the per-cohort cell, BindingUID) — so two DIFFERENT widgets never share a
+// cell regardless of extras, and for the SAME widget the inline maps are fixed
+// by its CR (cannot vary request-to-request). The union therefore only needs
+// to discriminate the per-request variable (request extras) and the
+// per-widget-fixed inline contribution — which a flat superset does
+// faithfully (design §1 collision-soundness note).
+//
+// SCOPING: this union keys the WIDGET cell only. The apiRef sub-cell
+// (RAFullList) is keyed separately by the apiRef-EFFECTIVE map
+// (merge(apiRefInline, request)) threaded through apiref.Resolve's Extras —
+// the rrt-inline map MUST NOT enter the apiRef sub-cell (it does not affect
+// the apiRef fetch). See widgets.go's resolveApiRef + ra_full_list.go.
+//
+// All inputs are read off the widget CR via maps.NestedMap (deep copies) or
+// are the per-request extras; the result is a fresh map and never aliases any
+// of them. nil/empty all-round ⇒ a fresh empty map ⇒ ComputeKey's len>0 guard
+// skips the extras fold ⇒ the key is byte-identical to a no-extras request
+// (backward-compat, falsifier #8). Mechanism-uniform (feedback_no_special_cases):
+// every key folds the same way; no widget-name table, no key allowlist.
+func unionForKey(apiRefInline, rrtInline, request map[string]any) map[string]any {
+	out := make(map[string]any, len(apiRefInline)+len(rrtInline)+len(request))
+	// Inline maps first; request overwrites last so the request value wins on
+	// collision — matching the resolved body precedence. (Order between the two
+	// inline maps is irrelevant for a key fingerprint: both are CR-fixed, so
+	// the body is a deterministic function of the CR regardless.)
+	for k, v := range apiRefInline {
+		out[k] = v
+	}
+	for k, v := range rrtInline {
+		out[k] = v
+	}
+	for k, v := range request {
+		out[k] = v
+	}
+	return out
+}
+
 // cacheHandle is the narrow interface the dispatchers depend on. The
 // real implementation is *cache.resolvedCache; tests can substitute
 // stubs without dragging in the whole singleton. Kept package-private

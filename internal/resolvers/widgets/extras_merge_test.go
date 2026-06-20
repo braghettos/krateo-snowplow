@@ -291,6 +291,240 @@ func TestExtras_NoExtras_TemplateUnchanged(t *testing.T) {
 	}
 }
 
+// ===========================================================================
+// inline-extras design P — resolver-side helper + accessor falsifiers.
+// These unit-test the NEW merge direction (mergeRequestWins: request wins) and
+// the two accessors. The end-to-end per-surface + scope-isolation + input-only
+// proofs live in extras_integration_test.go (real cluster).
+// ===========================================================================
+
+// TestMergeRequestWins_RequestOverridesInline is the per-surface precedence
+// falsifier at the helper level (design §4, falsifier #2 core): a key declared
+// BOTH inline AND via the request resolves to the REQUEST value. This is the
+// load-bearing inversion of mergeExtras — the route is the more-specific
+// intent and MUST win over an inline default.
+func TestMergeRequestWins_RequestOverridesInline(t *testing.T) {
+	inline := parseExtras(t, `{"tenant":"inline-default","onlyInline":"keep"}`)
+	request := parseExtras(t, `{"tenant":"from-request","onlyRequest":"add"}`)
+
+	eff := mergeRequestWins(inline, request)
+
+	assert.Equal(t, "from-request", eff["tenant"],
+		"collision: the REQUEST value MUST win over the inline default (per-surface precedence)")
+	assert.Equal(t, "keep", eff["onlyInline"], "a non-colliding inline key must survive")
+	assert.Equal(t, "add", eff["onlyRequest"], "a request-only key must be present")
+}
+
+// TestMergeRequestWins_EmptyInputs — backward-compat: both empty ⇒ a fresh
+// empty map (an empty effective fold downstream is a no-op). nil inline +
+// request ⇒ exactly the request; inline + nil request ⇒ exactly the inline.
+func TestMergeRequestWins_EmptyInputs(t *testing.T) {
+	assert.Equal(t, map[string]any{}, mergeRequestWins(nil, nil), "both nil ⇒ fresh empty map")
+	assert.Equal(t, map[string]any{}, mergeRequestWins(map[string]any{}, map[string]any{}), "both empty ⇒ fresh empty map")
+
+	req := parseExtras(t, `{"a":"1"}`)
+	assert.Equal(t, map[string]any{"a": "1"}, mergeRequestWins(nil, req), "nil inline ⇒ exactly the request")
+
+	inl := parseExtras(t, `{"b":"2"}`)
+	assert.Equal(t, map[string]any{"b": "2"}, mergeRequestWins(inl, nil), "nil request ⇒ exactly the inline")
+}
+
+// TestMergeRequestWins_DeepCopiesBothInputs — the effective map must NOT alias
+// EITHER source map. Mutating a nested value through the original inline OR
+// request map after the merge must not bleed into the effective map. This is
+// the shared-vs-copy isolation that keeps the per-call effective map self-
+// contained (feedback_shared_vs_copy_is_a_concurrency_change).
+func TestMergeRequestWins_DeepCopiesBothInputs(t *testing.T) {
+	inlineNested := map[string]any{"k": "inline-orig"}
+	requestNested := map[string]any{"k": "request-orig"}
+	inline := map[string]any{"i": inlineNested}
+	request := map[string]any{"r": requestNested}
+
+	eff := mergeRequestWins(inline, request)
+
+	inlineNested["k"] = "inline-MUTATED"
+	requestNested["k"] = "request-MUTATED"
+
+	gi, _ := eff["i"].(map[string]any)
+	gr, _ := eff["r"].(map[string]any)
+	require.NotNil(t, gi)
+	require.NotNil(t, gr)
+	assert.Equal(t, "inline-orig", gi["k"], "effective map must hold a DEEP COPY of the inline source")
+	assert.Equal(t, "request-orig", gr["k"], "effective map must hold a DEEP COPY of the request source")
+}
+
+// TestMergeRequestWins_Race — falsifier #9 (merge-helper half). The dispatcher
+// + seed call the merge helpers concurrently across in-flight /calls reading
+// the SAME shared CR-derived maps. Run mergeRequestWins concurrently over
+// SHARED source maps under `-race`; the sources must never be mutated and
+// every result must be equivalent. A data race here = the shared-vs-copy
+// hazard the design's #9 guards.
+func TestMergeRequestWins_Race(t *testing.T) {
+	sharedInline := parseExtras(t, `{"tenant":"acme","nested":{"k":"v"}}`)
+	sharedRequest := parseExtras(t, `{"region":"eu"}`)
+
+	const goroutines = 32
+	done := make(chan struct{}, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			eff := mergeRequestWins(sharedInline, sharedRequest)
+			// Mutate THIS goroutine's result — must not bleed into the shared sources.
+			eff["scratch"] = "x"
+			if n, ok := eff["nested"].(map[string]any); ok {
+				n["k"] = "mutated-locally"
+			}
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+	// Sources untouched after all concurrent merges + local mutations.
+	assert.Equal(t, "acme", sharedInline["tenant"], "shared inline source must be untouched by concurrent merges")
+	nested, _ := sharedInline["nested"].(map[string]any)
+	require.NotNil(t, nested)
+	assert.Equal(t, "v", nested["k"], "shared inline nested value must be untouched (deep copy isolated it)")
+	assert.Equal(t, "eu", sharedRequest["region"], "shared request source must be untouched")
+}
+
+// TestGetApiRefExtras_ReadsSubKey_AbsentReturnsEmpty — the accessor reads the
+// `extras` SUB-KEY off spec.apiRef directly (NOT through GetApiRef's
+// ObjectReference unmarshal). Present ⇒ the map; absent apiRef OR absent
+// extras OR a typed-miss ⇒ {} (backward-compat no-op). Also proves it does NOT
+// alias the CR (deep copy).
+func TestGetApiRefExtras_ReadsSubKey_AbsentReturnsEmpty(t *testing.T) {
+	// present
+	obj := map[string]any{"spec": map[string]any{"apiRef": map[string]any{
+		"name": "ra", "namespace": "ns", "extras": map[string]any{"tenant": "acme"},
+	}}}
+	got := GetApiRefExtras(obj)
+	assert.Equal(t, "acme", got["tenant"], "must read spec.apiRef.extras")
+	got["tenant"] = "mutated" // must not bleed into the CR
+	reread := GetApiRefExtras(obj)
+	assert.Equal(t, "acme", reread["tenant"], "accessor must return a deep copy — no aliasing of the CR")
+
+	// absent extras sub-key
+	assert.Equal(t, map[string]any{}, GetApiRefExtras(map[string]any{
+		"spec": map[string]any{"apiRef": map[string]any{"name": "ra"}}}),
+		"absent extras sub-key ⇒ {}")
+	// absent apiRef
+	assert.Equal(t, map[string]any{}, GetApiRefExtras(map[string]any{"spec": map[string]any{}}),
+		"absent apiRef ⇒ {}")
+	// typed-miss (extras is not a map)
+	assert.Equal(t, map[string]any{}, GetApiRefExtras(map[string]any{
+		"spec": map[string]any{"apiRef": map[string]any{"extras": "not-a-map"}}}),
+		"typed-miss ⇒ {}")
+}
+
+// TestGetResourcesRefsExtras_ReadsSiblingBlock_AbsentReturnsEmpty — the
+// accessor reads the SIBLING block spec.resourcesRefsTemplateExtras (NOT a
+// sub-key of the resourcesRefsTemplate slice). Present ⇒ the map; absent ⇒ {}.
+func TestGetResourcesRefsExtras_ReadsSiblingBlock_AbsentReturnsEmpty(t *testing.T) {
+	obj := map[string]any{"spec": map[string]any{
+		"resourcesRefsTemplate":       []any{map[string]any{"iterator": "${ .x }"}},
+		"resourcesRefsTemplateExtras": map[string]any{"targetNs": "team-a"},
+	}}
+	got := GetResourcesRefsExtras(obj)
+	assert.Equal(t, "team-a", got["targetNs"], "must read the sibling spec.resourcesRefsTemplateExtras block")
+	got["targetNs"] = "mutated"
+	assert.Equal(t, "team-a", GetResourcesRefsExtras(obj)["targetNs"], "accessor must return a deep copy")
+
+	// absent block ⇒ {}
+	assert.Equal(t, map[string]any{}, GetResourcesRefsExtras(map[string]any{
+		"spec": map[string]any{"resourcesRefsTemplate": []any{}}}),
+		"absent resourcesRefsTemplateExtras ⇒ {}")
+}
+
+// TestInlineExtras_ApiRefInlineReferenceable_InTemplate — falsifier #1a/#2a
+// CORE at the helper level: the apiRef-effective map (inline folded under
+// request) is what reaches the apiRef RA dict + transitively `ds`. With NO
+// request, the inline value is referenceable (#1a); with a colliding request
+// key, the request value wins (#2a). Exercised through the real template eval
+// (the same path ds feeds in production).
+func TestInlineExtras_ApiRefInlineReferenceable_InTemplate(t *testing.T) {
+	// #1a — inline only (request empty): inline value reaches the template.
+	effInlineOnly := mergeRequestWins(parseExtras(t, `{"tenant":"inline-acme"}`), map[string]any{})
+	dsA := map[string]any{}
+	mergeExtras(dsA, effInlineOnly) // ds seeded from the apiRef-effective map (apiRef-less ⇒ no result to win)
+	evA := evalTenant(t, dsA)
+	assert.Equal(t, "inline-acme", evA, "#1a: apiRef-inline value (no request) must be referenceable in the template")
+
+	// #2a — request overrides inline at the apiRef surface.
+	effOverride := mergeRequestWins(parseExtras(t, `{"tenant":"inline-acme"}`), parseExtras(t, `{"tenant":"req-globex"}`))
+	dsB := map[string]any{}
+	mergeExtras(dsB, effOverride)
+	evB := evalTenant(t, dsB)
+	assert.Equal(t, "req-globex", evB, "#2a: the REQUEST value MUST win over the apiRef-inline default")
+}
+
+// TestInlineExtras_3_ApiRefResultWinsOverInline — falsifier #3. The apiRef RA
+// stage output MUST win over an apiRef.extras default on the SAME key (guards
+// against accidentally flipping mergeExtras's direction). Models the production
+// chain: api.Resolve seeds its dict from the apiRef-EFFECTIVE map
+// (mergeRequestWins(apiRefInline, request)) and the API result then OVERWRITES
+// the dict on collision (restactions/api/resolve.go:228-230) — so the result
+// becomes `ds`, where it dominates. Here we model the post-api ds (carrying the
+// result value) and confirm the inline default never displaces it.
+func TestInlineExtras_3_ApiRefResultWinsOverInline(t *testing.T) {
+	// apiRef-effective dict seeded for the fetch (inline default + request).
+	apiRefEff := mergeRequestWins(parseExtras(t, `{"tenant":"inline-default"}`), map[string]any{})
+	assert.Equal(t, "inline-default", apiRefEff["tenant"], "pre-fetch dict carries the inline default")
+
+	// The apiRef RA result overwrites `tenant` on collision (api.Resolve dict
+	// precedence) → ds holds the RESULT value. Model the resulting ds:
+	ds := map[string]any{"tenant": "from-apiRef-result"}
+	// Request extras then merge into ds non-overwriting (resolve.go:103) — does
+	// not displace the result either.
+	mergeExtras(ds, map[string]any{})
+
+	got := evalTenant(t, ds)
+	assert.Equal(t, "from-apiRef-result", got,
+		"#3: the apiRef-RESULT MUST win over the apiRef.extras inline default at template eval (mergeExtras direction must NOT be flipped)")
+}
+
+// TestInlineExtras_2b_RequestOverridesRrtInline — falsifier #2b at the resolver
+// level (resourcesRefsTemplate surface). The request extras are folded into ds
+// at resolve.go:103 (mergeExtras(ds, opts.Extras)) BEFORE the §4.2 rrt-inline
+// fold (mergeExtras(ds, rrtInline)). Since mergeExtras is non-overwriting
+// (ds-wins) and the request value is ALREADY in ds, the rrt-inline value on the
+// same key does NOT displace it → REQUEST wins over rrt-inline. Models that
+// exact two-step ds mutation order and confirms the request value survives.
+func TestInlineExtras_2b_RequestOverridesRrtInline(t *testing.T) {
+	ds := map[string]any{}
+	// Step 1 (resolve.go:103) — request extras into ds.
+	mergeExtras(ds, parseExtras(t, `{"targetNs":"req-team"}`))
+	// Step 2 (§4.2) — rrt-inline into ds, non-overwriting (ds/request wins).
+	mergeExtras(ds, parseExtras(t, `{"targetNs":"rrt-inline-team","onlyRrt":"keep"}`))
+
+	// The resourcesRefsTemplate jq sees the REQUEST value on the colliding key,
+	// and the rrt-only key still fills.
+	items := []templatesv1.ResourceRefTemplate{
+		{Template: templatesv1.ResourceRef{
+			ID: "${ .onlyRrt }", APIVersion: "v1", Resource: "namespaces",
+			Namespace: "${ .targetNs }", Verb: "get",
+		}},
+	}
+	refs, err := resourcesrefstemplate.Resolve(context.Background(), items, ds)
+	require.NoError(t, err)
+	require.Len(t, refs, 1)
+	assert.Equal(t, "req-team", refs[0].Namespace,
+		"#2b: the REQUEST value MUST win over the rrt-inline default on a colliding key")
+	assert.Equal(t, "keep", refs[0].ID, "a non-colliding rrt-inline key is still referenceable")
+}
+
+// evalTenant runs a widgetDataTemplate `${ .tenant }` against ds and returns
+// the resolved value (the real template eval path).
+func evalTenant(t *testing.T, ds map[string]any) any {
+	t.Helper()
+	evals, err := widgetdatatemplate.Resolve(context.Background(), widgetdatatemplate.ResolveOptions{
+		Items:      []templatesv1.WidgetDataTemplate{{ForPath: "data.tenant", Expression: "${ .tenant }"}},
+		DataSource: ds,
+	})
+	require.NoError(t, err)
+	require.Len(t, evals, 1)
+	return evals[0].Value
+}
+
 // toInt narrows jqutil.InferType's integer result (int/int32/int64/float64)
 // to int for width-agnostic numeric assertions.
 func toInt(t *testing.T, v any) int {

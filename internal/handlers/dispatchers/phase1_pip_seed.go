@@ -1014,7 +1014,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
-		In:      &cr,
+		In: &cr,
 		// Ship 0.30.230 fix-at-root: SArc is the SA *rest.Config carried
 		// on ctx by withCohortSeedContext upstream. Threading it here
 		// ensures the inner endpointReferenceMapper has a non-nil rc for
@@ -1078,6 +1078,26 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		return nil
 	}
 
+	// inline-extras design P §5 / MUST-FIX #1 — PIP-seed key parity at the
+	// per-cohort widget cell. The dispatcher keys this cell on the UNION of
+	// both inline maps + request (§1); the seed has NO request extras, so the
+	// union degenerates to unionForKey(apiRefInline, rrtInline, nil) read off
+	// the widget CR (e.W). Without this fold the seed would key on extras=nil
+	// while the dispatcher keys on the non-empty union → every widget
+	// declaring inline extras MISSES its prewarmed cell and resolves cold on
+	// first paint (the #317 seed/serve key-mismatch class). The seed BODY
+	// parity is AUTOMATIC: widgets.Resolve reads the inline maps off in.Object
+	// (the seeded CR) itself (resolveApiRef §4.1 + the §4.2 fold), so no
+	// ResolveOptions.Extras field is needed — only this KEY arg is computed
+	// outside Resolve and must be hand-threaded. Absent both blocks ⇒ {} + {}
+	// ⇒ a fresh empty union ⇒ byte-identical to the pre-inline-extras nil arg
+	// (HG-PIP.3 backward-compat). Falsifier #6 asserts the resulting HIT.
+	seedKeyExtras := unionForKey(
+		widgets.GetApiRefExtras(e.W.Object),
+		widgets.GetResourcesRefsExtras(e.W.Object),
+		nil,
+	)
+
 	// Ship 0.30.187 D2: the dispatcher-lookup key uses the KEY tuple
 	// (KeyPerPage, KeyPage) — derived from the /call Path the walker
 	// reached this widget through so the cell matches the dispatcher's
@@ -1087,7 +1107,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	key, handle, inputs := dispatchCacheLookupKey(ctx, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.KeyPerPage, e.KeyPage, nil)
+		e.KeyPerPage, e.KeyPage, seedKeyExtras)
 	// Ship 0.30.188 — diagnostic slog: emit the widget seed Put cache
 	// key + components so it can be diff'd against the dispatcher_get
 	// and per_user_fallback_put log lines at widgets.go.
@@ -1095,7 +1115,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		key, inputs, "widgets",
 		e.GVR.Group, e.GVR.Version, e.GVR.Resource,
 		e.W.GetNamespace(), e.W.GetName(),
-		e.KeyPerPage, e.KeyPage, nil)
+		e.KeyPerPage, e.KeyPage, seedKeyExtras)
 	if handle == nil || key == "" {
 		// L1 disabled or no identity — same defensive skip as
 		// seedOneRestaction.
@@ -1139,7 +1159,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
 
 	res, err := widgets.Resolve(resCtx, widgets.ResolveOptions{
-		In:      in,
+		In: in,
 		// Ship 0.30.230 fix-at-root: RC is the SA *rest.Config carried
 		// on ctx by withCohortSeedContext upstream. Threading it here
 		// fixes the nil-rc crash at crdschema.ValidateObjectStatus →
@@ -1206,6 +1226,18 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		// No apiRef (static widget) or unparseable — nothing to prewarm.
 		return
 	}
+	// inline-extras design P §5 / MUST-FIX #1 — PIP-seed key parity at the
+	// RAFullList sub-cell. The dispatcher's apiRef path keys this sub-cell on
+	// the apiRef-EFFECTIVE map (merge(apiRefInline, request)) via
+	// apiref.Resolve → RAFullListKeyInputs (ra_full_list.go). The seed has no
+	// request extras, so the effective map degenerates to the apiRef-inline
+	// map read off the widget CR. Threading it into apiref.Resolve's Extras
+	// below makes the seed's RAFullList key fold the SAME apiRef-inline map the
+	// dispatcher's first /call will → seed-key == serve-key on this sub-cell.
+	// The resourcesRefsTemplateExtras map is correctly NOT folded here — it
+	// does not affect the apiRef fetch (§1). Absent ⇒ {} ⇒ byte-identical to
+	// the pre-inline-extras nil Extras (extrasMinusSlice({}) → nil → no fold).
+	apiRefInline := widgets.GetApiRefExtras(w.Object)
 	// Resolve at a paginated tuple so raFullListServe engages (it requires
 	// perPage>0 && page>0). page 1 + prewarmPageLimit is sufficient: the
 	// byte-verify + pin are per-(RA × shape), NOT per-page, so this single
@@ -1229,6 +1261,10 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		AuthnNS: authnNS,
 		PerPage: pp,
 		Page:    1,
+		// inline-extras P §5 — fold the apiRef-inline map so the RAFullList
+		// key matches the dispatcher's apiRef-effective key (seed has no
+		// request extras). NOT the union — rrt-inline must not key this cell.
+		Extras: apiRefInline,
 	}); rerr != nil {
 		slog.Default().Warn("phase1.seed.rafulllist.skipped",
 			slog.String("subsystem", "cache"),
