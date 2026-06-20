@@ -611,11 +611,13 @@ func TestProcessEvent_UnknownKind_DefensiveDefault(t *testing.T) {
 //
 // Per the published shape (crd_discovery_expvar.go):
 //
-//	snowplow_crd_discovery → map[string]uint64 with 8 keys:
+//	snowplow_crd_discovery → map[string]uint64 with 10 keys:
 //	  events_enqueued / events_dropped / events_processed
 //	  discovery_invoked / discovery_skipped_ng
 //	  deletes_processed / delete_skipped_ng
 //	  panics_recovered
+//	  schema_relists_fired / schema_unchanged
+//	    (followup-crd-schema-widen-informer-relist)
 func TestCRDDiscoveryExpvarHandler(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	// CFG-1 (Ship 0.30.163): expvar gauges register only when
@@ -684,12 +686,15 @@ func TestCRDDiscoveryExpvarHandler(t *testing.T) {
 		t.Fatalf("snowplow_crd_discovery wrong shape: got %T want map[string]any", rawVal)
 	}
 
-	// All 8 keys must be present.
+	// All 10 keys must be present (incl. the schema-widen relist counters —
+	// followup-crd-schema-widen-informer-relist: guards against a future
+	// expvar-publisher regression that silently drops the relist surface).
 	wantKeys := []string{
 		"events_enqueued", "events_dropped", "events_processed",
 		"discovery_invoked", "discovery_skipped_ng",
 		"deletes_processed", "delete_skipped_ng",
 		"panics_recovered",
+		"schema_relists_fired", "schema_unchanged",
 	}
 	for _, k := range wantKeys {
 		if _, ok := m[k]; !ok {
