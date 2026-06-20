@@ -638,8 +638,28 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				// HTTP /call response body. Feed the in-memory
 				// bytes directly (Ship 0.30.128 P-CORE-1 — no
 				// io.ReadAll copy).
-				if err := feedBytes(statusRaw); err != nil {
-					return err
+				//
+				// Build backlog #6 — a feed* error (the per-item stage
+				// FILTER zero-/multi-yield, handler.go:142/154) is a
+				// per-ITEM hard error: route it through the SAME
+				// recordItemError triad the dispatch-error sibling above
+				// uses, NOT a raw `return err`. The raw return cancelled
+				// the iterator errgroup and truncated the stage + ALL
+				// downstream stages (the #313 C-A violation). The feed
+				// error IS an error, so the cause wraps with %w (parity
+				// with the sibling). Fall through to the success-log +
+				// return nil so downstream items + stages still run.
+				if ferr := feedBytes(statusRaw); ferr != nil {
+					r.log.Error("nested /call response handler failed",
+						slog.String("name", id),
+						slog.String("path", call.Path),
+						slog.String("dispatch", "in-process-nested-call"),
+						slog.String("error", ferr.Error()))
+					var itemErr error
+					if !call.ContinueOnError {
+						itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+					}
+					r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
 				}
 			}
 			// Ship #6 — depthForLog runs mapDepth (under dictMu)
@@ -705,8 +725,28 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					// Ship 0.30.128 P-CORE-2: the gated envelope
 					// is already a decoded structured value —
 					// feed it direct (no marshal, no unmarshal).
-					if err := feedValue(gatedVal); err != nil {
-						return err
+					//
+					// Build backlog #6 — a feed* error (the per-item
+					// stage FILTER zero-/multi-yield, handler.go:142/154)
+					// is a per-ITEM hard error: route it through the SAME
+					// recordItemError triad the external/in-process
+					// branches use, NOT a raw `return err` (which
+					// cancelled the iterator errgroup and truncated the
+					// stage + ALL downstream stages — the #313 C-A
+					// violation). The feed error IS an error → %w wrap.
+					// Fall through to the success-log + return nil so
+					// downstream items + stages still run.
+					if ferr := feedValue(gatedVal); ferr != nil {
+						r.log.Error("apistage-content response handler failed",
+							slog.String("name", id),
+							slog.String("path", call.Path),
+							slog.String("dispatch", "apistage-content"),
+							slog.String("error", ferr.Error()))
+						var itemErr error
+						if !call.ContinueOnError {
+							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+						}
+						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
 					}
 					// Ship #6 — see depthForLog (support.go).
 					depth := depthForLog(r.ctx, r.log, dictMu, dict)
@@ -729,8 +769,27 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		} else if raw, served := dispatchViaInformer(gctx, call); served {
 			// Informer-served bytes are in memory — feed direct
 			// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy).
-			if err := feedBytes(raw); err != nil {
-				return err
+			//
+			// Build backlog #6 — a feed* error (the per-item stage
+			// FILTER zero-/multi-yield, handler.go:142/154) is a
+			// per-ITEM hard error: route it through the SAME
+			// recordItemError triad the external/in-process branches
+			// use, NOT a raw `return err` (which cancelled the iterator
+			// errgroup and truncated the stage + ALL downstream stages —
+			// the #313 C-A violation). The feed error IS an error → %w
+			// wrap. Fall through to the success-log + return nil so
+			// downstream items + stages still run.
+			if ferr := feedBytes(raw); ferr != nil {
+				r.log.Error("informer response handler failed",
+					slog.String("name", id),
+					slog.String("path", call.Path),
+					slog.String("dispatch", "informer"),
+					slog.String("error", ferr.Error()))
+				var itemErr error
+				if !call.ContinueOnError {
+					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+				}
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
 			}
 			// Ship #6 — see depthForLog (support.go).
 			depth := depthForLog(r.ctx, r.log, dictMu, dict)
@@ -799,8 +858,27 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		} else {
 			// internal-rest-config dispatch result is in memory
 			// — feed direct (Ship 0.30.128 P-CORE-1).
-			if err := feedBytes(raw); err != nil {
-				return err
+			//
+			// Build backlog #6 — a feed* error (the per-item stage
+			// FILTER zero-/multi-yield, handler.go:142/154) is a
+			// per-ITEM hard error: route it through the SAME
+			// recordItemError triad the ierr sibling above uses, NOT a
+			// raw `return err` (which cancelled the iterator errgroup and
+			// truncated the stage + ALL downstream stages — the #313 C-A
+			// violation). The feed error IS an error → %w wrap. Fall
+			// through to the success-log + return nil so downstream items
+			// + stages still run.
+			if ferr := feedBytes(raw); ferr != nil {
+				r.log.Error("api call response failure", slog.String("name", id),
+					slog.String("host", call.Endpoint.ServerURL),
+					slog.String("path", call.Path),
+					slog.String("dispatch", "internal-rest-config"),
+					slog.String("error", ferr.Error()))
+				var itemErr error
+				if !call.ContinueOnError {
+					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+				}
+				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
 			}
 		}
 		// Ship #6 — see depthForLog (support.go).
