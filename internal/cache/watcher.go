@@ -1397,12 +1397,19 @@ func (rw *ResourceWatcher) closePerGVRStopLocked(gvr schema.GroupVersionResource
 // goroutine AND no frozen
 // store on recreate.
 //
-// Note: RemoveResourceType is wired ONLY to CRD-delete, which always
-// targets a lazily-registered composition GVR (the CRD-watch fires after
-// factory.Start). Lazy registrations run their (standalone) informer on
-// the per-GVR channel, so closing it genuinely stops the Run goroutine.
-// The four RBAC bootstrap GVRs are factory-driven on rw.stopCh and are
-// structurally never removed.
+// Note: RemoveResourceType has two callers, both targeting lazily-
+// registered (standalone, per-GVR-channel) GVRs whose group the CRD-watch
+// reached after factory.Start:
+//   - CRD DELETE teardown (triggerCRDDelete) — remove, no re-add; and
+//   - the CRD schema-widen relist (triggerCRDSchemaRelist) — remove THEN
+//     EnsureResourceType, which by the R6 contract above constructs a FRESH
+//     standalone informer that re-LISTs under the now-current CRD schema
+//     (the relist fires only AFTER AddNavigationDiscoveredGroup, so the
+//     re-add takes the standalone path, never a frozen shared-factory one).
+// Lazy registrations run their (standalone) informer on the per-GVR
+// channel, so closing it genuinely stops the Run goroutine. The four RBAC
+// bootstrap GVRs are factory-driven on rw.stopCh and are structurally never
+// removed (and never schema-relisted — typed-RBAC GVRs are not widget GVRs).
 func (rw *ResourceWatcher) RemoveResourceType(gvr schema.GroupVersionResource) {
 	if rw == nil || rw.mode == modePassthrough {
 		return

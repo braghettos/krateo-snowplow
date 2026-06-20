@@ -51,16 +51,19 @@ func registerCRDDiscoveryExpvar() {
 		expvar.Publish("snowplow_crd_discovery", expvar.Func(func() any {
 			s := CRDDiscoveryStatsSnapshot()
 			return map[string]uint64{
-				"events_enqueued":      s.EventsEnqueued,
-				"events_dropped":       s.EventsDropped,
-				"events_processed":     s.EventsProcessed,
+				"events_enqueued":  s.EventsEnqueued,
+				"events_dropped":   s.EventsDropped,
+				"events_processed": s.EventsProcessed,
 				// ADD + UPDATE path
 				"discovery_invoked":    s.DiscoveryInvoked,
 				"discovery_skipped_ng": s.DiscoverySkippedNG,
 				// DELETE path (Ship L)
-				"deletes_processed":    s.DeletesProcessed,
-				"delete_skipped_ng":    s.DeleteSkippedNG,
-				"panics_recovered":     s.PanicsRecovered,
+				"deletes_processed": s.DeletesProcessed,
+				"delete_skipped_ng": s.DeleteSkippedNG,
+				"panics_recovered":  s.PanicsRecovered,
+				// schema-widen relist (followup-crd-schema-widen-informer-relist)
+				"schema_relists_fired": s.SchemaRelistsFired,
+				"schema_unchanged":     s.SchemaUnchanged,
 			}
 		}))
 	})
