@@ -807,6 +807,21 @@ func main() {
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
 
+	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
+	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
+	// (cookie-or-header JWT -> UserInfo) instead of middleware.UserConfig,
+	// because a browser EventSource cannot set the Authorization header and
+	// /refreshes needs no <user>-clientconfig Secret lookup (it issues ZERO
+	// apiserver reads). It is DELIBERATELY NOT cache.RegisterScopedRoute'd:
+	// with no apiserver reads it is outside the read-path-scoped invariant
+	// (AssertReadPathsScoped, main.go below), and requiredScopedRoutes
+	// (fallthrough_assert.go) does not list it. Under CACHE_ENABLED=false or
+	// REFRESH_SSE_ENABLED=false the handler serves a clean idle stream
+	// (transparent fallback, project_cache_off_is_transparent_fallback).
+	mux.Handle("GET /refreshes", chain.Append(
+		middleware.RefreshAuth(*signKey)).
+		Then(handlers.Refreshes(*signKey)))
+
 	// Ship D — write-verb `/call` routes also get the middleware (PM
 	// explicit). Write verbs are out of the read-path invariant (F-11
 	// in the design), but centralizing classification prevents silent
@@ -896,12 +911,12 @@ func main() {
 				"X-Auth-Code",
 				"X-Krateo-TraceId",
 			},
-			ExposedHeaders:   []string{"Link"},
+			ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key"},
 			AllowCredentials: true,
 			MaxAge:           300, // Maximum value not ignored by any of major browsers
 		})(mux),
 		ReadTimeout:  10 * time.Second, // read is fast; unchanged (#351/C2)
-		WriteTimeout: writeTimeout,    // 300s — clears cache-OFF heavy path (#351/C2)
+		WriteTimeout: writeTimeout,     // 300s — clears cache-OFF heavy path (#351/C2)
 		IdleTimeout:  30 * time.Second, // keep-alive; unchanged (#351/C2)
 	}
 

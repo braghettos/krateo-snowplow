@@ -144,6 +144,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					emitResolvedCacheLookup(log, "widgetContent", got.GVR.String(),
 						contentKey, true, len(gated))
 					pcs.l1Hit = "content-hit"
+					setRefreshKeyHeader(wri, contentKey)
 					writeResolvedJSON(wri, gated)
 					log.Info("Widget successfully resolved",
 						slog.String("duration", util.ETA(start)),
@@ -184,6 +185,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
+			setRefreshKeyHeader(wri, cacheKey)
 			writeResolvedJSON(wri, entry.RawJSON)
 			log.Info("Widget successfully resolved",
 				slog.String("duration", util.ETA(start)),
@@ -296,5 +298,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		slog.String("l1", "miss"),
 	)
 
+	setRefreshKeyHeader(wri, cacheKey)
 	writeResolvedJSON(wri, encoded)
 }

@@ -396,6 +396,24 @@ func encodeResolvedJSON(res any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// refreshKeyHeader is the response header carrying the L1 subscription key
+// for the live-refresh signal (Ship 1). The frontend reads it to arm a
+// /refreshes subscription for this widget (design §6). Additive and invisible
+// to the JSON body contract; it MUST be in CORS ExposedHeaders (main.go) so a
+// cross-origin fetch/react-query layer can read it.
+const refreshKeyHeader = "X-Snowplow-Refresh-Key"
+
+// setRefreshKeyHeader stamps the live-refresh subscription key on the response,
+// before WriteHeader. No-op on an empty key (L1 disabled / RBAC-skipped /
+// cache-off) — the header is purely additive and must never appear empty.
+// MUST be called before writeResolvedJSON (which calls WriteHeader).
+func setRefreshKeyHeader(wri http.ResponseWriter, key string) {
+	if key == "" {
+		return
+	}
+	wri.Header().Set(refreshKeyHeader, key)
+}
+
 // writeResolvedJSON writes the canonical Content-Type + 200 + payload.
 // We deliberately do NOT log here on errors writing to the wire — a
 // client disconnect mid-write is normal and not actionable.
@@ -431,6 +449,7 @@ func writeResolvedJSON(wri http.ResponseWriter, payload []byte) {
 //     to the background re-resolve context (the 0.30.113 Part B fix
 //     surface, where the SA is transport-only and per-user identity comes
 //     from the cached Inputs).
+//
 // 0.30.166 extends the SAME attach to the per-request restactions.go +
 // widgets.go dispatcher entries — the previously-unpatched surface that
 // is the actual cache-off /call request path. See ship-307-tls-x509-cache-
