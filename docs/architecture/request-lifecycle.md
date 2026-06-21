@@ -97,6 +97,13 @@ table:
 - `POST/PUT/PATCH/DELETE /call` (main.go:809-831) — same `UserConfig` middleware
   and a write-scope `FallthroughScopeMiddleware`, but **no** `Dispatcher` in the
   chain; they go straight to `handlers.Call()`.
+- `GET /refreshes` (main.go:810) — the per-subject live-refresh **SSE** stream
+  (Ship 1, option A). Uses `middleware.RefreshAuth` and issues **zero** apiserver
+  reads (no `<user>-clientconfig` lookup). The connection re-derives each
+  subscription key under the caller's own JWT (`DeriveSubscriptionKey`), so a
+  `?sub=` coordinate cannot forge another subject's stream. The cache calls
+  `PublishRefresh(key)` after an L1 commit; the matching subscriber receives a
+  signal and refetches a guaranteed-fresh entry (instead of racing the cache).
 - `GET /debug/vars` → `expvar.Handler()` (main.go:869), with snapshot/authz-memo
   expvars registered just before the mount (main.go:862, :868).
 - `GET /debug/pprof/*` (main.go:837-841) registered on this mux directly (the
@@ -239,6 +246,12 @@ over the dict (restactions.go:58-68); otherwise the dict is marshalled as-is
 `runtime.RawExtension` (restactions.go:77-79), with `last-applied-configuration`
 and `managedFields` stripped (restactions.go:81-86).
 
+A stage that targets an external `endpointRef` is dispatched through snowplow's
+own HTTP fetch (`api/external_fetch.go` `httpFetchAllowingNonJSON`), which reuses
+plumbing's client / auth roundtrippers / retry but drops the JSON-only `406` gate
+— so the stage may receive **YAML or JSON**, and a YAML body is converted to JSON
+before the stage jq. See [ADR 0006](../adr/0006-snowplow-owned-external-fetch.md).
+
 The RESTAction emits *unordered* data. It contains **no widget-shaping logic** —
 the layering boundary is asserted in the refilter package doc (refilter.go:16-18):
 RBAC narrowing lives in the resolver/per-API-stage layer, never in widget
@@ -361,6 +374,13 @@ apiRef→RESTAction and render-eligible resourcesRefs deps
    the Put path and the write path (helpers.go:386-396).
 7. **Only clean resolves are cached.** A per-item stage error serves the partial
    body but declines the Put (restactions.go:249, widgets.go:266).
+8. **A per-item feed/decode error does not truncate the resolve.** On every served
+   dispatch branch (external fetch, in-process nested `/call`, informer-pivot,
+   internal-rest-config), a stage whose body fails to decode / jq-filter records
+   the error into `errorKey` (or surfaces it per `continueOnError`) and returns
+   `nil` for that item — remaining items and downstream stages still run (the #313
+   Option C-A contract). Branches that previously raw-`return err`'d and abandoned
+   the whole resolve were corrected in snowplow 1.2.0.
 
 ---
 

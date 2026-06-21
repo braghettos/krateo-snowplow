@@ -103,6 +103,17 @@ A `/call` may carry `?extras={…}` — a per-request JSON object that **seeds t
 resolve dict** (the API stage outputs overwrite it) and is folded into the cache
 key. See [extras.md](extras.md).
 
+## Response body: JSON or YAML
+
+An api stage that targets an external `endpointRef` may receive a **YAML *or*
+JSON** response body. snowplow owns the external fetch for these stages
+(`api/external_fetch.go`) and accepts a non-JSON `Content-Type` — a plain
+upstream client would reject it `406` before the body is read. A YAML body is
+converted to JSON **before** any stage `filter`/jq runs, so the jq sees the same
+structure either way; a JSON body is passed through unchanged (byte-identical).
+This lets a `RESTAction` consume e.g. a Helm repo `index.yaml`. See
+[ADR 0006](../docs/adr/0006-snowplow-owned-external-fetch.md).
+
 ## Example
 
 ```yaml
