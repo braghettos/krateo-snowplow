@@ -103,6 +103,28 @@ A `/call` may carry `?extras={…}` — a per-request JSON object that **seeds t
 resolve dict** (the API stage outputs overwrite it) and is folded into the cache
 key. See [extras.md](extras.md).
 
+### The per-stage `filter` sees `extras` as a reserved sibling key
+
+A stage `filter` runs against the wrapped envelope `pig`, which holds the stage
+response under the stage `name` plus two **reserved sibling keys**: `slice`
+(pagination) and `extras` (the *pure* per-request `?extras=` object). So a
+filter can read the request extras directly via `.extras.<key>`:
+
+```yaml
+filter: '{items: .things.items, tenant: .extras.tenant}'
+```
+
+`extras` is present only when the request carried a non-empty `?extras=` (so a
+no-extras resolve is unchanged). The value is the **pure request extras**, not
+the accumulated run dict.
+
+**Known asymmetry.** If a stage is literally named `extras`, the **stage
+response wins** the collision (a stage's own output is the more specific datum).
+This is the opposite of a stage named `slice`, which **loses** to the synthetic
+pagination `slice`. The difference is historical, documented, and acceptable —
+naming a stage `extras` or `slice` is degenerate. See [extras.md](extras.md) for
+the full collision/precedence rules.
+
 ## Response body: JSON or YAML
 
 An api stage that targets an external `endpointRef` may receive a **YAML *or*

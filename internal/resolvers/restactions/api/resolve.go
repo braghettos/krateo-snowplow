@@ -567,6 +567,10 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		filter:      apiCall.Filter,
 		uaf:         apiCall.UserAccessFilter,
 		apiCallName: apiCall.Name,
+		// PURE request extras (NOT dict — dict has accumulated upstream stage
+		// outputs + a synthetic slice). Exposed to the step filter as the
+		// reserved sibling key pig["extras"]. Shared reference: gojq COW fork.
+		extras: r.opts.Extras,
 	}
 	inner := jsonHandler(gctx, hOpts)
 	innerBytesFn := jsonHandlerBytes(gctx, hOpts)
