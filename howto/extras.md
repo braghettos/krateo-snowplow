@@ -48,6 +48,44 @@ for k, v := range extrasCopy {
 The pagination `slice` triple is treated like an API result — it also wins over
 `extras` (`resolve.go:88`, `:96`).
 
+#### The per-stage `filter` also sees `extras` as a reserved sibling key
+
+The per-stage RESTAction filter (`spec.api[].filter`) is evaluated against the
+wrapped envelope `pig`, which carries the stage response under the stage key
+plus two **reserved sibling keys** — `slice` (pagination) and `extras` (the
+*pure* per-request extras). So a step filter can read the request extras
+directly:
+
+```yaml
+spec:
+  api:
+    - name: things
+      path: /apis/.../things
+      filter: '[.things.items[] | select(.metadata.namespace == $__loc__) ]'
+      # …or read extras directly:
+      # filter: '.things.items | map(select(.spec.tenant == ($from_extras))) '
+      #   where the value comes from .extras.<key> in the envelope, e.g.
+      # filter: '{items: .things.items, tenant: .extras.tenant}'
+```
+
+The `extras` the filter sees is the **pure request extras** (`r.opts.Extras`),
+not the accumulated run dict — at later stages the dict has stage outputs and a
+synthetic `slice` merged in, so it is no longer the request extras. The key is
+present only when the request carried a non-empty `extras` (mirrors the `slice`
+guard), so a no-extras resolve is byte-identical to before
+(`internal/resolvers/restactions/api/handler.go` — `pig["extras"]` written under
+the `len(opts.extras) > 0` guard).
+
+**Known asymmetry — `extras`-stage *wins*, `slice`-stage *loses*.** If a stage is
+literally named `extras`, the **stage response wins** the sibling-key collision:
+`pig["extras"]` is written *before* `pig[<stageKey>]`, so the stage's own
+response clobbers the request extras for that stage's filter. This is intentional
+(a stage's own output is the more specific datum). It is the **opposite** of the
+pre-existing `slice` behaviour, where a stage named `slice` *loses* to the
+synthetic pagination `slice` (written *after* the stage key). The two reserved
+keys differ here by history, not by design; the asymmetry is documented and
+considered acceptable (declaring a stage `extras` or `slice` is degenerate).
+
 ### 2. It is input-only
 
 `extras` seeds the resolve; it is **never written back to `status`**. A widget's

@@ -42,6 +42,15 @@ type jsonHandlerOptions struct {
 	filter      *string
 	uaf         *templates.UserAccessFilterSpec
 	apiCallName string
+	// extras is the PURE per-request extras map (r.opts.Extras), exposed to
+	// the per-stage filter as the reserved sibling key pig["extras"] so the
+	// step filter can read `.extras.*` like every other jq surface. This is
+	// NOT opts.dict: dict starts as a DeepCopy of Extras (resolve.go) but then
+	// accumulates stage outputs + a synthetic `slice`, so at later stages it
+	// is no longer the pure extras. The reference is SHARED, not deep-copied:
+	// gojq is the braghettos COW fork, so the filter cannot mutate the input
+	// (mirrors the existing pig["slice"] shared-map pattern).
+	extras map[string]any
 }
 
 // jsonHandler is the HTTP-body-shaped entry point — the form
@@ -108,9 +117,17 @@ func jsonHandlerBytesApply(ctx context.Context, opts jsonHandlerOptions, dat []b
 func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) error {
 	log := xcontext.Logger(ctx)
 
-	pig := map[string]any{
-		opts.key: tmp,
+	pig := map[string]any{}
+	// pig["extras"] is written BEFORE pig[opts.key] so a stage literally named
+	// "extras" keeps its OWN response (response wins; collision Option A). The
+	// guard mirrors the `slice` guard below: write nothing when extras is
+	// absent so the no-extras envelope stays byte-identical to pre-feature.
+	// The map is SHARED, not copied — gojq's braghettos COW fork can't mutate
+	// the filter input (same contract as pig["slice"]).
+	if len(opts.extras) > 0 {
+		pig["extras"] = opts.extras
 	}
+	pig[opts.key] = tmp
 	if si, ok := opts.out["slice"]; ok {
 		pig["slice"] = si
 	}
