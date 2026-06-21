@@ -74,6 +74,31 @@ alike (`extras` is one of `widgetContent`'s key components,
 
 ---
 
+## Author-declared (inline) defaults
+
+Besides the per-request `?extras=`, a **widget CR** may declare *static* extras on
+its spec, scoped per surface and merged **under** the request `extras` (the
+request always wins on collision):
+
+- `spec.apiRef.extras` — scoped to the widget's `apiRef` RESTAction fetch (so it
+  also reaches `ds` transitively). Read by `GetApiRefExtras`
+  (`internal/resolvers/widgets/widgets.go`).
+- `spec.resourcesRefsTemplateExtras` — scoped to the `resourcesRefsTemplate` jq
+  **only**. Read by `GetResourcesRefsExtras`.
+
+The dispatcher folds the **union** of (apiRef-inline ∪ resourcesRefs-inline ∪
+request) into the L1 keys (`unionForKey`, `helpers.go`), and the prewarm seed
+applies the same union so the first paint is a hit, not a miss. Precedence is
+request-wins via `mergeRequestWins` (`widgets/resolve.go`); both inline maps are
+input-only and deep-copied (they never alias the shared CR). A widget that
+declares neither is **byte-identical** to before.
+
+> The inline fields live on the **widget CRD**, which ships from the portal
+> chart — not snowplow. Until that CRD declares them the accessors read `{}`
+> (a no-op), so the feature is latent-but-safe on a snowplow-only upgrade.
+
+---
+
 ## The full path
 
 ### RESTAction (direct `/call`)
