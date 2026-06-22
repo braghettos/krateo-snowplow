@@ -55,6 +55,32 @@ type API struct {
 
 	ExportJWT *bool `json:"exportJwt,omitempty"`
 
+	// Resolve controls post-fetch behaviour when this api-step fetches a
+	// snowplow RESTAction or Widget CR from a DIRECT apiserver path
+	// (internal proposal 2026-06-22, Diego-ratified). Default true.
+	//
+	//   - resolve: true  — after fetching the CR from the (cacheable,
+	//     dep-tracked) internal apiserver path, snowplow runs the fetched
+	//     object through the resolver IN-PROCESS (restactions.Resolve if
+	//     it is a RESTAction, widgets.Resolve if a Widget) and substitutes
+	//     the resolved envelope for the stage output — "as if /call'd",
+	//     with NO outbound /call HTTP round-trip. RBAC- and depth-gated
+	//     exactly as the HTTP /call. For any other kind (e.g. a configmap)
+	//     it is a harmless no-op (the raw fetched object is fed unchanged).
+	//   - resolve: false — return the RAW stored CR (the pre-proposal
+	//     plain objects.Get / informer-serve behaviour), unresolved.
+	//
+	// Default-true is the right ergonomic default — the common reason to
+	// reference another RA/widget by its apiserver path is to consume its
+	// RESOLVED data, which is exactly what resolve:true gives. An existing
+	// RA that fetches a raw RA/widget CR by direct path and consumes the
+	// RAW spec must set resolve:false to preserve its output (corpus audit
+	// 2026-06-22 §3: ZERO realized flips in the shipped corpus).
+	//
+	// +optional
+	// +kubebuilder:default=true
+	Resolve *bool `json:"resolve,omitempty"`
+
 	// UserAccessFilter declares that this API call dispatches via
 	// the snowplow ServiceAccount (cluster-wide read) and that the
 	// returned result set MUST be in-process-refiltered through

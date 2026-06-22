@@ -246,6 +246,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// partial-with-errors widget envelope is SERVED but MUST NOT be cached
 	// in the per-cohort `widgets` L1 — gated on sink.Count()==0 below.
 	ctx, stageErrSink := cache.WithStageErrorSink(ctx)
+	// External-no-cache (proposal 2026-06-22) — install the external-touched
+	// sink. A widget's apiRef RESTAction (and any nested resolve) runs under
+	// THIS ctx; the api resolver bumps the sink when it reaches the live
+	// external fetch. The Put-gate below declines to cache an external-touched
+	// widget envelope. The sink reaches the external-fetch site via the
+	// widget→apiref→RA ctx inheritance (context.WithValue is preserved down
+	// the resolve chain). Additive to the stage-error sink.
+	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
 
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
@@ -291,6 +299,16 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+		)
+	} else if extTouchedSink.Count() > 0 {
+		// External-no-cache (proposal 2026-06-22) — the widget's resolve
+		// touched a genuine external endpoint (e.g. an external apiRef RA).
+		// Serve the envelope but DECLINE the Put + the dep Record (no informer
+		// edge can invalidate external data). Re-fetched live on every /call.
+		cache.BumpExternalSkippedPut()
+		log.Warn("Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 		)
 	} else if cacheHandle != nil && cacheKey != "" {
 		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback Put

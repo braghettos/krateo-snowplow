@@ -279,6 +279,27 @@ func populateWidgetContentL1(
 		return
 	}
 
+	// External-no-cache (proposal 2026-06-22) — decline to seed the
+	// identity-free content cell when the widget's apiRef resolve touched a
+	// genuine external endpoint (no informer/dep edge can invalidate it). The
+	// F2 walker installs the external-touched sink on resolveCtx
+	// (phase1_walk.go); recordWidgetDeps is ALSO skipped on this declined path
+	// (the return below) — there is no entry to dep-track.
+	if extSink := cache.ExternalTouchedSinkFromContext(ctx); extSink.Count() > 0 {
+		cache.BumpExternalSkippedPut()
+		log.Debug("widget_content.populate.skip_external_touched",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", in.GetNamespace()),
+			slog.String("name", in.GetName()),
+			slog.Int("perPage", perPage),
+			slog.Int("page", page),
+			slog.Int64("external_touches", extSink.Count()),
+			slog.String("reason", "apiRef RESTAction touched an external endpoint — no dep edge to invalidate; not seeding identity-free cell, served live per /call"),
+		)
+		return
+	}
+
 	c.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,

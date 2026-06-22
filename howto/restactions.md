@@ -59,6 +59,7 @@ Defines a single HTTP request and its dependencies.
 | `continueOnError` | `boolean` | If `true`, continues execution even if this call fails. | ❌ |
 | `endpointRef` | `object` | Reference (`name` + `namespace`) to a Kubernetes [`Endpoint`](endpoints.md) object defining the target service. | ❌ |
 | `dependsOn` | `object` | Declares a dependency on another API call defined in this spec. | ❌ |
+| `resolve` | `boolean` | When this stage's `path` is a **direct apiserver path to a `RESTAction` or `Widget` CR**, controls whether snowplow runs the fetched CR through the resolver in-process. **Defaults to `true`.** See [resolving a referenced RESTAction/Widget in-process](#resolving-a-referenced-restactionwidget-in-process). | ❌ |
 | `userAccessFilter` | `object` | Dispatch this read stage via snowplow's ServiceAccount and RBAC-refilter the result per item against the requesting user. Read-verb stages only. See below. | ❌ |
 
 ### `spec.api[].endpointRef`
@@ -79,6 +80,58 @@ Useful for chaining calls where one must complete before another.
 |--------|------|-------------|-----------|
 | `name` | `string` | Name of another API call in the list that this call depends on. | ✅ |
 | `iterator` | `string` | Optional field on which to iterate (used for loop-like behavior). | ❌ |
+
+### Resolving a referenced `RESTAction`/`Widget` in-process
+
+A stage may reference **another `RESTAction` or `Widget`** by pointing its
+`path` at the CR's **direct Kubernetes apiserver path**, e.g.
+
+```yaml
+api:
+  - name: inner
+    path: /apis/templates.krateo.io/v1/namespaces/krateo-system/restactions/my-inner-ra
+    verb: GET
+    # resolve: true   # ← the default
+```
+
+With `resolve: true` (the **default**) snowplow fetches that CR from the
+in-process informer (cacheable, dependency-tracked) and then **runs it through
+the resolver in-process** — `RESTAction`s through the RESTAction resolver,
+`Widget`s through the widget resolver — substituting the **resolved** envelope
+for the stage output. The result is byte-identical to what an HTTP `/call` of
+that referenced CR would return, but with **no outbound HTTP round-trip**. The
+referenced CR becomes a cache dependency of the entry, so editing it
+re-resolves the dependent entry.
+
+| `resolve` value | Behaviour |
+|---|---|
+| `true` (default) | Fetch the CR, then resolve it in-process; the stage output is the **resolved** envelope. |
+| `false` | Return the **raw** stored CR, unresolved (the pre-1.0 behaviour). |
+| any value, on a non-`RESTAction`/`Widget` path (e.g. a `ConfigMap`) | No-op — the raw fetched object is returned (resolution is meaningful only for `RESTAction`/`Widget`). |
+
+The in-process resolve is RBAC-gated (the requesting identity must be allowed
+to `get` the referenced CR) and depth-capped (a cyclic reference chain
+terminates with a bounded error, never a hang).
+
+`resolve: true` is a **transparent fallback**: it returns the **same resolved
+data whether the snowplow cache is on or off**. With the cache off, the
+referenced CR is fetched over the requesting user's own token (the user's
+apiserver RBAC is the authoritative gate) and resolved in-process all the same —
+only slower (no informer serve, no memoisation), never a different result.
+
+> **Release note — `resolve` defaults to `true`.** If you have an existing
+> `RESTAction` that fetches another `RESTAction`/`Widget` CR by its direct
+> apiserver path and consumes the **raw** CR spec, set `resolve: false` on that
+> stage to preserve the old output. The common case — referencing another
+> `RESTAction` to consume its **resolved** data — is exactly what the default
+> gives you.
+
+> **Note — the `/call?resource=…` loopback path is retired.** Earlier versions
+> let a stage reference another `RESTAction` by a `/call?resource=…&apiVersion=…`
+> loopback URL. That loopback dispatch path has been removed; use the direct
+> apiserver path + `resolve: true` form above instead. (The `/call?resource=…`
+> URL shape is still used by the frontend SPA and the prewarm walker for
+> navigation — only the *RESTAction-stage* loopback path is retired.)
 
 ### `spec.api[].userAccessFilter`
 

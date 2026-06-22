@@ -110,6 +110,17 @@ key, the RESTAction per-binding L1 key, and the identity-free `widgetContent` ce
 alike (`extras` is one of `widgetContent`'s key components,
 `resolved.go:652-660`).
 
+> **Exception — resolves that touch an external endpoint are not cached.** If a
+> `RESTAction`'s resolve reaches a genuine **external** endpoint (an
+> `endpointRef` to a non-apiserver URL), its result is **never** written to L1 —
+> external data has no informer/dependency edge that could invalidate a stale
+> entry, so snowplow re-fetches it **live on every `/call`**. The `extras`
+> keying still applies to the *internal* (apiserver-backed) parts of a resolve;
+> it just means an external-touched outer result is not memoised under its
+> `extras`-derived key. A `${…}`-templated path that resolves at runtime to an
+> apiserver path is treated as **internal** (and cached); only genuinely
+> non-apiserver URLs are external.
+
 ---
 
 ## Author-declared (inline) defaults

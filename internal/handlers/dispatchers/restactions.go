@@ -210,6 +210,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// 0.30.257, so this is the first request-path consumer; the resolver's
 	// bump sites already existed.
 	ctx, stageErrSink := cache.WithStageErrorSink(ctx)
+	// External-no-cache (proposal 2026-06-22) — install the external-touched
+	// sink on the resolve ctx. The api resolver bumps it whenever a stage
+	// reaches the live external fetch (httpFetchAllowingNonJSON); the Put-gate
+	// below reads Count()>0 and declines to cache an external-touched result
+	// (no informer/dep edge can invalidate it). Additive to the stage-error
+	// sink — both gate the Put independently. nil-receiver-safe.
+	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -253,6 +260,21 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.String("namespace", cr.Namespace),
 			slog.Int64("stage_errors", stageErrSink.Count()),
 			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+		)
+	} else if extTouchedSink.Count() > 0 {
+		// External-no-cache (proposal 2026-06-22) — the resolve touched a
+		// genuine external endpoint (no informer/dep edge to invalidate it).
+		// Serve the body (already encoded above) but DECLINE the Put so every
+		// /call re-fetches the external API live (fresh). Declining the Put
+		// also declines the self-dep Record below — an external RA never
+		// enters the DepTracker. BumpExternalSkippedPut is the process-wide
+		// "did the gate fire?" falsifier.
+		cache.BumpExternalSkippedPut()
+		log.Warn("RESTAction touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
+			slog.String("name", cr.Name),
+			slog.String("namespace", cr.Namespace),
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 		)
 	} else if cacheHandle != nil && cacheKey != "" {
 		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback

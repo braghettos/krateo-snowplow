@@ -156,6 +156,16 @@ func raFullListServe(
 			// back this /call without poisoning the established verdict.
 			return nil, false, nil
 		}
+		// External-no-cache (proposal 2026-06-22) — if the unpaginated
+		// re-resolve touched a genuine external endpoint, SERVE the slice but
+		// DECLINE the re-Put + the dep Record (external data has no informer
+		// edge to invalidate the cell). Load-bearing surface #4 — without this
+		// the external aggregate would be cached + served stale across pages.
+		if extSink := cache.ExternalTouchedSinkFromContext(fullCtx); extSink.Count() > 0 {
+			cache.BumpExternalSkippedPut()
+			cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+			return sliced, true, nil
+		}
 		c.PutRAFullList(raKey, keyInputs, full)
 		cache.Deps().Record(raKey, gvr, namespace, name)
 		cache.RecordRAFullListServe(cache.RAFullListServeRepopulateSlice)
@@ -174,6 +184,19 @@ func raFullListServe(
 	sRA, err := resolveRA(ctx, perPage, page)
 	if err != nil {
 		return nil, false, err
+	}
+
+	// External-no-cache (proposal 2026-06-22) — load-bearing surface #4. If
+	// either first-sight resolve touched a genuine external endpoint, SERVE
+	// the (correct, fresh) page-keyed S_ra but record NO sliceability verdict,
+	// NO dep edge, and Put NO cell — external data has no informer edge to
+	// invalidate it, so caching it would serve it stale across pages/widgets
+	// (the exact defect this proposal kills). Checked AFTER both resolves so
+	// the sink reflects either one touching the external fetch.
+	if extSink := cache.ExternalTouchedSinkFromContext(fullCtx); extSink.Count() > 0 {
+		cache.BumpExternalSkippedPut()
+		cache.RecordRAFullListServe(cache.RAFullListServeFallback)
+		return sRA, true, nil
 	}
 
 	// EMPTY-FULL GUARD (0.30.208) — self-healing refusal to freeze on empty.

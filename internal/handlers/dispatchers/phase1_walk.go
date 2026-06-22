@@ -1185,6 +1185,14 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// in phase1_walk_pagination*.go and is not wired here — its Put stays at
 	// the pre-0.30.257 posture, an unchanged-behaviour gap, not a regression.)
 	resolveCtx, _ = cache.WithStageErrorSink(resolveCtx)
+	// External-no-cache (proposal 2026-06-22) — install the external-touched
+	// sink on the SAME resolveCtx (the F2 walker installs none by default —
+	// proposal §"FIVE Put surfaces" #3). populateWidgetContentL1 (below) reads
+	// it via ExternalTouchedSinkFromContext and declines to seed the
+	// identity-free content cell when the widget's resolve touched a genuine
+	// external endpoint — exactly as it declines on a stage error. Additive to
+	// the stage-error sink; both gate the Put independently.
+	resolveCtx, _ = cache.WithExternalTouchedSink(resolveCtx)
 
 	// Resolve this widget. The resolver recursively reaches this widget's
 	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any

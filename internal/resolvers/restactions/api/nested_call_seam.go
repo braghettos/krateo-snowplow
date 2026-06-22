@@ -1,45 +1,39 @@
-// nested_call_seam.go — Ship 0.30.123 (#155): the in-process nested-/call
-// resolver seam.
+// nested_call_seam.go — the in-process RA/widget resolver seam.
 //
-// THE IMPORT-CYCLE CONSTRAINT: this package (internal/resolvers/
-// restactions/api) cannot import `restactions` or `dispatchers` — both
-// import this package, so a back-import is a cycle. The actual
-// nested-/call resolution (objects.Get -> checkDispatchRBAC ->
-// restactions.Resolve) therefore lives in internal/handlers/dispatchers/
-// nested_call.go, which CAN import everything. This file declares only
-// the SEAM: a function-typed package var the dispatchers package fills
-// at startup via RegisterNestedCallResolver. Mirrors the resolveOnceFn
-// seam pattern (dispatchers/resolve_populate.go).
+// HISTORY: introduced at Ship 0.30.123 (#155) for the /call-loopback stage.
+// The /call-loopback DISPATCH BRANCH + its RESOLVER_INPROCESS_NESTED_CALL
+// kill-switch were RETIRED in the 2026-06-22 unified ship (the corpus audit
+// confirmed zero live loopback paths). The SEAM itself SURVIVES: it is now
+// the in-process resolver behind the DIRECT-APISERVER-PATH + `resolve: true`
+// mechanism (resolve_inprocess.go's maybeResolveInProcess). The flag is gone
+// — the resolve substitution is gated by the per-step `resolve` property
+// (default true), not a process-wide env switch.
 //
-// When a RESTAction stage's `path` is a /call?resource=...&apiVersion=...
-// loopback into snowplow's own /call endpoint, the resolver's inner-call
-// worker (resolve.go) — instead of issuing an HTTP request with no
-// Authorization header — invokes nestedCallResolver IN-PROCESS, carrying
-// the WithUserInfo identity already on ctx. This lets a JWT-less /
-// SA-credentialed resolve complete an exportJwt loopback stage (the
-// 0.30.120 poison) and is the hard prerequisite for F2's startup
-// SA-prewarm.
+// THE IMPORT-CYCLE CONSTRAINT: this package (internal/resolvers/restactions/
+// api) cannot import `restactions`/`widgets`/`dispatchers` — they import this
+// package, so a back-import is a cycle. The actual resolution (objects.Get ->
+// checkDispatchRBAC -> branch on GVR -> restactions.Resolve / widgets.Resolve)
+// therefore lives in internal/handlers/dispatchers/nested_call.go, which CAN
+// import everything. This file declares only the SEAM: a function-typed
+// package var the dispatchers package fills at startup via
+// RegisterNestedCallResolver. Mirrors the resolveOnceFn seam pattern
+// (dispatchers/resolve_populate.go).
+//
+// When an api-step's `path` is a direct apiserver path to a RESTAction/Widget
+// CR with resolve:true, the resolver's inner-call worker (resolve.go) — after
+// the CR is fetched from the cacheable internal path — invokes
+// nestedCallResolver IN-PROCESS, carrying the WithUserInfo identity already on
+// ctx and the OUTER L1 key (for transitive dep propagation). This lets a
+// JWT-less / SA-credentialed resolve complete a referenced-CR resolve that a
+// per-user HTTP edge could not.
 
 package api
 
 import (
 	"context"
 
-	"github.com/krateoplatformops/plumbing/env"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 )
-
-// envInprocessNestedCall gates the in-process nested-/call path. Default
-// true: a /call-loopback stage resolves in-process. Set "false" and
-// every /call stage takes the HTTP path, byte-identical to 0.30.121
-// (the loopback-detection branch is skipped entirely).
-const envInprocessNestedCall = "RESOLVER_INPROCESS_NESTED_CALL"
-
-// inprocessNestedCallEnabled reports whether the in-process nested-/call
-// path is enabled (default true).
-func inprocessNestedCallEnabled() bool {
-	return env.Bool(envInprocessNestedCall, true)
-}
 
 // NestedCallResolverFunc resolves a /call-loopback stage IN-PROCESS. ref
 // is the ObjectReference decoded from the stage's /call?resource=...&
