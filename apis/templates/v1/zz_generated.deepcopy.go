@@ -72,6 +72,11 @@ func (in *API) DeepCopyInto(out *API) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.Resolve != nil {
+		in, out := &in.Resolve, &out.Resolve
+		*out = new(bool)
+		**out = **in
+	}
 	if in.UserAccessFilter != nil {
 		in, out := &in.UserAccessFilter, &out.UserAccessFilter
 		*out = new(UserAccessFilterSpec)

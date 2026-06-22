@@ -80,10 +80,13 @@ import (
 // the first run via the RECAPTURE switch below (kept off in committed code);
 // the committed literals are the frozen oracle.
 var resolveParityGolden = map[string]string{
-	"get_single_httpcall":   `{"single":{"name":"only"}}`,
-	"iterator_multi_item":   `{"items":[{"name":"v0"},{"name":"v1"},{"name":"v2"}],"vals":[{"ns":"v0"},{"ns":"v1"},{"ns":"v2"}]}`,
-	"nested_call_inprocess": `{"nested":{"nestedField":"nested-value"}}`,
-	"error_item_403":        `{"error":[{"apiVersion":"v1","code":403,"kind":"Status","message":"item 1 (/items/v1) deliberately failed","reason":"Forbidden","status":"Failure"}],"items":[{"name":"v0"},{"name":"v2"}],"vals":[{"ns":"v0"},{"ns":"v1"},{"ns":"v2"}]}`,
+	"get_single_httpcall": `{"single":{"name":"only"}}`,
+	"iterator_multi_item": `{"items":[{"name":"v0"},{"name":"v1"},{"name":"v2"}],"vals":[{"ns":"v0"},{"ns":"v1"},{"ns":"v2"}]}`,
+	// "nested_call_inprocess" RETIRED 2026-06-22 — the /call loopback branch
+	// it exercised was removed (dead code). The in-process resolve parity is
+	// now covered by the direct-apiserver-path falsifiers (resolve_inprocess
+	// falsifiers).
+	"error_item_403": `{"error":[{"apiVersion":"v1","code":403,"kind":"Status","message":"item 1 (/items/v1) deliberately failed","reason":"Forbidden","status":"Failure"}],"items":[{"name":"v0"},{"name":"v2"}],"vals":[{"ns":"v0"},{"ns":"v1"},{"ns":"v2"}]}`,
 	"uaf_sa_endpoint_unavailable": `{"downstream":{"name":"down"},"uafStage":{"items":[]}}`,
 }
 
@@ -148,41 +151,9 @@ func caseIteratorMultiItem(t *testing.T) map[string]any {
 	return parityResolveHTTP(parityHTTPCtx(f), f, []*templates.API{stage}, extras)
 }
 
-// caseNestedCallInprocess — a /call-loopback GET stage served by the
-// in-process nested-call resolver (registered + torn down here). The stubbed
-// resolver returns canned bytes; dict["nested"] == {"nestedField":"nested-value"}.
-func caseNestedCallInprocess(t *testing.T) map[string]any {
-	t.Helper()
-	iterFailFastRetries(t)
-	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
-	// Register a deterministic nested-call resolver; restore on cleanup so
-	// no other test sees it.
-	prev := nestedCallResolver
-	nestedCallResolver = func(_ context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
-		return []byte(`{"nestedField":"nested-value"}`), nil
-	}
-	t.Cleanup(func() { nestedCallResolver = prev })
-
-	// No fixture server needed — the in-process branch never dispatches HTTP.
-	// resolveOne still needs an endpoint; attach a placeholder internal one.
-	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "parity-user"}),
-	)
-	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
-
-	stage := &templates.API{
-		Name:   "nested",
-		Path:   "http://snowplow.invalid/call?resource=widgets&apiVersion=widgets.krateo.io/v1&name=w1&namespace=default",
-		Verb:   ptr.To(http.MethodGet),
-		Filter: ptr.To(".nested"),
-	}
-	return Resolve(ctx, ResolveOptions{
-		RC:                  &rest.Config{},
-		Items:               []*templates.API{stage},
-		RESTActionNamespace: "default",
-		RESTActionName:      "resolve-extraction-parity",
-	})
-}
+// caseNestedCallInprocess RETIRED 2026-06-22 — the /call loopback GET branch
+// it exercised was removed (dead code, corpus audit). The in-process resolve
+// parity is now covered by the direct-apiserver-path + resolve:true falsifiers.
 
 // caseErrorItem403 — an iterator stage where item 1 returns 403; the other
 // items succeed (C-A: stage continues past the per-item error). dict carries
@@ -241,7 +212,6 @@ func TestResolveExtractionParity(t *testing.T) {
 	}{
 		{"get_single_httpcall", caseGetSingleHTTPCall},
 		{"iterator_multi_item", caseIteratorMultiItem},
-		{"nested_call_inprocess", caseNestedCallInprocess},
 		{"error_item_403", caseErrorItem403},
 		{"uaf_sa_endpoint_unavailable", caseUAFSAEndpointUnavailable},
 	}

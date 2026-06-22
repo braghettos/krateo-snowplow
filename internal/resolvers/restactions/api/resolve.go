@@ -30,7 +30,6 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
-	"github.com/krateoplatformops/snowplow/internal/objects"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -599,101 +598,71 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		slog.String("path", call.Path),
 	)
 
-	// Ship 0.30.123 (#155) — in-process nested /call. This is
-	// the FIRST dispatch branch (before the informer pivot,
-	// before httpcall.Do). When the stage's `path` is a
-	// /call?resource=...&apiVersion=... loopback into snowplow's
-	// OWN /call endpoint, resolve the referenced RESTAction
-	// IN-PROCESS — no HTTP request, no Authorization header,
-	// identity carried by the WithUserInfo already on ctx. This
-	// lets a JWT-less / SA-credentialed resolve complete an
-	// exportJwt loopback stage (the 0.30.120 poison) and is the
-	// hard prerequisite for F2's startup SA-prewarm.
+	// RETIRED (2026-06-22 unified ship): the /call?resource=...&apiVersion=...
+	// LOOPBACK dispatch branch (Ship 0.30.123 #155) was removed. The corpus
+	// audit (docs/corpus-audit-call-loopback-2026-06-22.md §1/§2) confirmed
+	// ZERO live RAs carry a /call api-step path, so the loopback resolve
+	// branch fired on no path today — dead code. The resolve LOGIC it called
+	// (dispatchers.ResolveNestedCall) SURVIVES, repurposed as the in-process
+	// resolver behind the new DIRECT-APISERVER-PATH + `resolve: true`
+	// mechanism (maybeResolveInProcess below). The shared `/call`-URL parser
+	// objects.ParseCallPathToObjectRef + buildPath emission STAY — they are
+	// the SPA/F2-walker navigation contract (mechanism A), independent of this
+	// resolve branch (audit §5 "the shared-parser trap").
 	//
-	// Three structural gates, ALL must hold or the branch is
-	// skipped and the call falls through to the informer pivot
-	// / httpcall.Do exactly as 0.30.121:
-	//   1. RESOLVER_INPROCESS_NESTED_CALL enabled (default true);
-	//   2. the resolver seam is wired (nestedCallResolver != nil
-	//      — the second structural fallback);
-	//   3. the call is a GET whose path parses as a /call
-	//      loopback (objects.ParseCallPathToObjectRef — SHAPE only,
-	//      no resource/name/host literal).
-	// On a nested error: honour ContinueOnError / ErrorKey
-	// exactly as the HTTP path, AND bump the 0.30.120 stage-error
-	// sink so layer (b)'s Put-gate still sees the failure.
-	if inprocessNestedCallEnabled() && nestedCallResolver != nil &&
-		ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
-		if ref, isLoopback := objects.ParseCallPathToObjectRef(call.Path); isLoopback {
-			statusRaw, nerr := nestedCallResolver(gctx, ref,
-				r.opts.PerPage, r.opts.Page, r.opts.Extras)
-			if nerr != nil {
-				r.log.Error("nested /call resolution failed",
-					slog.String("name", id),
-					slog.String("path", call.Path),
-					slog.String("dispatch", "in-process-nested-call"),
-					slog.String("error", nerr.Error()))
-				// Ship 0.30.257 (#313) W-A + layer (b) + Option C-A,
-				// deduplicated into recordItemError. The %w-wrapped
-				// cause is built ONLY when !ContinueOnError (lazy,
-				// preserving the wrap verb) and lands in itemErrs[i];
-				// BOTH ContinueOnError cases accumulate + Bump + fall
-				// through (the historical ContinueOnError=false
-				// fast-abort is intentionally retired per #313).
-				var itemErr error
-				if !call.ContinueOnError {
-					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, nerr)
-				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, nerr.Error(), nerr.Error(), itemErr)
-				// Fall through to the success-log line either way,
-				// mirroring the prior ContinueOnError contract.
-			} else {
-				// The in-process result IS the referenced
-				// RESTAction's Status.Raw — byte-identical to the
-				// HTTP /call response body. Feed the in-memory
-				// bytes directly (Ship 0.30.128 P-CORE-1 — no
-				// io.ReadAll copy).
-				//
-				// Build backlog #6 — a feed* error (the per-item stage
-				// FILTER zero-/multi-yield, handler.go:142/154) is a
-				// per-ITEM hard error: route it through the SAME
-				// recordItemError triad the dispatch-error sibling above
-				// uses, NOT a raw `return err`. The raw return cancelled
-				// the iterator errgroup and truncated the stage + ALL
-				// downstream stages (the #313 C-A violation). The feed
-				// error IS an error, so the cause wraps with %w (parity
-				// with the sibling). Fall through to the success-log +
-				// return nil so downstream items + stages still run.
-				if ferr := feedBytes(statusRaw); ferr != nil {
-					r.log.Error("nested /call response handler failed",
-						slog.String("name", id),
-						slog.String("path", call.Path),
-						slog.String("dispatch", "in-process-nested-call"),
-						slog.String("error", ferr.Error()))
-					var itemErr error
-					if !call.ContinueOnError {
-						itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
-					}
-					r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
-				}
-			}
-			// Ship #6 — depthForLog runs mapDepth (under dictMu)
-			// ONLY when Debug is enabled; on the common path it
-			// returns the sentinel and does no work / takes no lock.
-			depth := depthForLog(r.ctx, r.log, dictMu, dict)
-			dispatch := "in-process-nested-call"
-			if nerr != nil {
-				dispatch = "in-process-nested-call-error"
-			}
-			r.log.Info("api successfully resolved",
+	// In-process resolve substitution (the `resolve: true` mechanism). A step
+	// whose `path` is a direct apiserver path to a RESTAction/Widget CR is
+	// fetched (cacheably, dep-tracked) by the informer-pivot / apistage /
+	// internal-rest-config branches below, which yield the RAW CR envelope.
+	// With resolve:true (default) we then run that CR through the resolver
+	// IN-PROCESS via maybeResolveInProcess and feed the RESOLVED envelope
+	// instead of the raw CR — byte-identical to an HTTP /call of that CR, no
+	// outbound HTTP. resolve:false (or a non-RA/widget path, a LIST, or cache
+	// off) feeds the raw bytes unchanged. Computed once per call.
+	resolve := ptr.Deref(apiCall.Resolve, true)
+
+	// feedRawOrResolved feeds the dispatched RAW envelope bytes downstream,
+	// UNLESS the step is a resolve:true direct-path RA/widget GET — in which
+	// case it substitutes the in-process resolved envelope. dispatch labels
+	// the calling branch for the success/error log. A resolve error is routed
+	// through the SAME recordItemError triad an HTTP dispatch error uses (so a
+	// denied/depth-capped resolve surfaces a 403-class error, NOT empty
+	// content, and — under #313 Option C-A — does not truncate downstream
+	// stages). Returns the dispatch label to log (suffixed "-resolved" /
+	// "-resolve-error" when the in-process resolve fired).
+	feedRawOrResolved := func(raw []byte, dispatch string) string {
+		substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
+		if rerr != nil {
+			r.log.Error("in-process resolve failed",
 				slog.String("name", id),
-				slog.String("host", call.Endpoint.ServerURL),
 				slog.String("path", call.Path),
-				slog.Int("depth", depth),
-				slog.String("dispatch", dispatch),
-			)
-			return nil
+				slog.String("dispatch", dispatch+"-resolve"),
+				slog.String("error", rerr.Error()))
+			var itemErr error
+			if !call.ContinueOnError {
+				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
+			}
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			return dispatch + "-resolve-error"
 		}
+		bytesToFeed := raw
+		if did {
+			bytesToFeed = substituted
+			dispatch += "-resolved"
+		}
+		if ferr := feedBytes(bytesToFeed); ferr != nil {
+			r.log.Error("response handler failed",
+				slog.String("name", id),
+				slog.String("path", call.Path),
+				slog.String("dispatch", dispatch),
+				slog.String("error", ferr.Error()))
+			var itemErr error
+			if !call.ContinueOnError {
+				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+			}
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
+		}
+		return dispatch
 	}
 
 	// 0.30.95 resolver pivot — dispatch GET reads to the
@@ -737,31 +706,63 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		if r.apistageEnabled {
 			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call); ok {
 				if served {
-					// Ship 0.30.128 P-CORE-2: the gated envelope
-					// is already a decoded structured value —
-					// feed it direct (no marshal, no unmarshal).
+					// Ship 0.30.128 P-CORE-2: the gated envelope is
+					// already a decoded structured value — feed it
+					// direct (no marshal, no unmarshal).
 					//
-					// Build backlog #6 — a feed* error (the per-item
-					// stage FILTER zero-/multi-yield, handler.go:142/154)
-					// is a per-ITEM hard error: route it through the SAME
-					// recordItemError triad the external/in-process
-					// branches use, NOT a raw `return err` (which
-					// cancelled the iterator errgroup and truncated the
-					// stage + ALL downstream stages — the #313 C-A
-					// violation). The feed error IS an error → %w wrap.
-					// Fall through to the success-log + return nil so
+					// In-process resolve (resolve:true direct RA/widget
+					// GET): the apistage content layer ALSO serves single-
+					// CR GET-by-name (apistage.go isList==false path), so a
+					// resolve:true direct-path RA/widget GET can land here.
+					// When maybeResolveInProcess substitutes, feed the
+					// RESOLVED bytes instead of the gated raw value (it
+					// re-fetches + resolves via the seam under the outer L1
+					// key — the gated value was the raw CR). Otherwise feed
+					// the gated value unchanged (LIST, non-RA/widget,
+					// resolve:false). dispatch is labelled accordingly.
+					//
+					// Build backlog #6 — a feed* error (the per-item stage
+					// FILTER zero-/multi-yield, handler.go:142/154) is a
+					// per-ITEM hard error: route it through the SAME
+					// recordItemError triad, NOT a raw `return err` (which
+					// truncated the stage + ALL downstream stages — the
+					// #313 C-A violation). The feed error IS an error → %w
+					// wrap. Fall through to the success-log + return nil so
 					// downstream items + stages still run.
-					if ferr := feedValue(gatedVal); ferr != nil {
-						r.log.Error("apistage-content response handler failed",
+					dispatch := "apistage-content"
+					substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve)
+					if rerr != nil {
+						r.log.Error("in-process resolve failed",
 							slog.String("name", id),
 							slog.String("path", call.Path),
-							slog.String("dispatch", "apistage-content"),
-							slog.String("error", ferr.Error()))
+							slog.String("dispatch", "apistage-content-resolve"),
+							slog.String("error", rerr.Error()))
 						var itemErr error
 						if !call.ContinueOnError {
-							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+							itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
 						}
-						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
+						r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+						dispatch = "apistage-content-resolve-error"
+					} else {
+						var ferr error
+						if did {
+							ferr = feedBytes(substituted)
+							dispatch = "apistage-content-resolved"
+						} else {
+							ferr = feedValue(gatedVal)
+						}
+						if ferr != nil {
+							r.log.Error("apistage-content response handler failed",
+								slog.String("name", id),
+								slog.String("path", call.Path),
+								slog.String("dispatch", dispatch),
+								slog.String("error", ferr.Error()))
+							var itemErr error
+							if !call.ContinueOnError {
+								itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+							}
+							r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
+						}
 					}
 					// Ship #6 — see depthForLog (support.go).
 					depth := depthForLog(r.ctx, r.log, dictMu, dict)
@@ -770,7 +771,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 						slog.String("host", call.Endpoint.ServerURL),
 						slog.String("path", call.Path),
 						slog.Int("depth", depth),
-						slog.String("dispatch", "apistage-content"),
+						slog.String("dispatch", dispatch),
 					)
 					return nil
 				}
@@ -783,29 +784,13 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			// metadata-only GVR, pre-sync). Fall through.
 		} else if raw, served := dispatchViaInformer(gctx, call); served {
 			// Informer-served bytes are in memory — feed direct
-			// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy).
-			//
-			// Build backlog #6 — a feed* error (the per-item stage
-			// FILTER zero-/multi-yield, handler.go:142/154) is a
-			// per-ITEM hard error: route it through the SAME
-			// recordItemError triad the external/in-process branches
-			// use, NOT a raw `return err` (which cancelled the iterator
-			// errgroup and truncated the stage + ALL downstream stages —
-			// the #313 C-A violation). The feed error IS an error → %w
-			// wrap. Fall through to the success-log + return nil so
-			// downstream items + stages still run.
-			if ferr := feedBytes(raw); ferr != nil {
-				r.log.Error("informer response handler failed",
-					slog.String("name", id),
-					slog.String("path", call.Path),
-					slog.String("dispatch", "informer"),
-					slog.String("error", ferr.Error()))
-				var itemErr error
-				if !call.ContinueOnError {
-					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
-				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
-			}
+			// (Ship 0.30.128 P-CORE-1 — no io.ReadAll copy). For a
+			// resolve:true direct-path RA/widget GET, feedRawOrResolved
+			// substitutes the in-process resolved envelope; otherwise it
+			// feeds raw unchanged. Feed/resolve errors are routed through
+			// recordItemError (no truncation — #313 C-A); the returned
+			// dispatch label captures whether the in-process resolve fired.
+			dispatch := feedRawOrResolved(raw, "informer")
 			// Ship #6 — see depthForLog (support.go).
 			depth := depthForLog(r.ctx, r.log, dictMu, dict)
 			r.log.Info("api successfully resolved",
@@ -813,7 +798,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				slog.String("host", call.Endpoint.ServerURL),
 				slog.String("path", call.Path),
 				slog.Int("depth", depth),
-				slog.String("dispatch", "informer"),
+				slog.String("dispatch", dispatch),
 			)
 			return nil
 		}
@@ -850,6 +835,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// StatusFailure: write call.ErrorKey under dictMu, then
 	// honour ContinueOnError.
 	if raw, served, ierr := dispatchViaInternalRESTConfig(gctx, call); served || ierr != nil {
+		dispatch := "internal-rest-config"
 		if ierr != nil {
 			r.log.Error("api call response failure", slog.String("name", id),
 				slog.String("host", call.Endpoint.ServerURL),
@@ -870,38 +856,19 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ierr)
 			}
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ierr.Error(), ierr.Error(), itemErr)
+			dispatch = "internal-rest-config-error"
 		} else {
-			// internal-rest-config dispatch result is in memory
-			// — feed direct (Ship 0.30.128 P-CORE-1).
-			//
-			// Build backlog #6 — a feed* error (the per-item stage
-			// FILTER zero-/multi-yield, handler.go:142/154) is a
-			// per-ITEM hard error: route it through the SAME
-			// recordItemError triad the ierr sibling above uses, NOT a
-			// raw `return err` (which cancelled the iterator errgroup and
-			// truncated the stage + ALL downstream stages — the #313 C-A
-			// violation). The feed error IS an error → %w wrap. Fall
-			// through to the success-log + return nil so downstream items
-			// + stages still run.
-			if ferr := feedBytes(raw); ferr != nil {
-				r.log.Error("api call response failure", slog.String("name", id),
-					slog.String("host", call.Endpoint.ServerURL),
-					slog.String("path", call.Path),
-					slog.String("dispatch", "internal-rest-config"),
-					slog.String("error", ferr.Error()))
-				var itemErr error
-				if !call.ContinueOnError {
-					itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
-				}
-				r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
-			}
+			// internal-rest-config dispatch result is in memory — feed
+			// direct (Ship 0.30.128 P-CORE-1). For a resolve:true
+			// direct-path RA/widget GET, feedRawOrResolved substitutes the
+			// in-process resolved envelope; otherwise it feeds raw
+			// unchanged. Feed/resolve errors route through recordItemError
+			// (no truncation — #313 C-A); the returned dispatch label
+			// captures whether the in-process resolve fired.
+			dispatch = feedRawOrResolved(raw, "internal-rest-config")
 		}
 		// Ship #6 — see depthForLog (support.go).
 		depth := depthForLog(r.ctx, r.log, dictMu, dict)
-		dispatch := "internal-rest-config"
-		if ierr != nil {
-			dispatch = "internal-rest-config-error"
-		}
 		r.log.Info("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", call.Endpoint.ServerURL),
@@ -924,6 +891,79 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// returned *response.Status keeps the StatusFailure shaping below
 	// byte-identical, so recordItemError honours ContinueOnError/ErrorKey
 	// exactly as it did for httpcall.Do (AC5). See external_fetch.go.
+	//
+	// In-process resolve on the CACHE-OFF path (Diego ruling 2026-06-22,
+	// Option (ii) / project_cache_off_is_transparent_fallback). Under cache-off
+	// the informer-pivot / apistage / internal-rest-config branches above are
+	// all skipped (resolverUseInformer()==false; no internal rc on a per-user
+	// request), so a direct-apiserver-path RA/widget GET with resolve:true
+	// reaches THIS external fall-through. To keep resolve:true a TRANSPARENT
+	// fallback — identical resolved data cache-on AND cache-off — we run the
+	// in-process resolve substitution HERE too, BEFORE the external fetch +
+	// the external-touched bump. maybeResolveInProcess only fires for a
+	// resolve:true single-CR apiserver-path GET of a RESTAction/Widget (Gate 4
+	// rejects external/templated/LIST/non-RA-widget paths), and under cache-off
+	// the seam's objects.Get uses the USER's token (getFromAPIServer) — the
+	// authoritative cache-off RBAC gate — and ResolveNestedCall's in-process
+	// checkDispatchRBAC is itself !cache.Disabled()-gated, so the user-token
+	// model is honoured, not the SA model. On a substitution: feed the resolved
+	// envelope, do NOT external-fetch, do NOT bump the external sink (this is an
+	// internal apiserver path served in-process, NOT a genuine external
+	// endpoint), and return. A genuine external path (parseOK=false) does NOT
+	// substitute → falls through to the external fetch + bump unchanged.
+	if substituted, did, rerr := r.maybeResolveInProcess(gctx, call, resolve); did || rerr != nil {
+		dispatch := "cache-off-inprocess-resolve"
+		if rerr != nil {
+			r.log.Error("in-process resolve failed (cache-off path)",
+				slog.String("name", id),
+				slog.String("path", call.Path),
+				slog.String("dispatch", dispatch),
+				slog.String("error", rerr.Error()))
+			var itemErr error
+			if !call.ContinueOnError {
+				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, rerr)
+			}
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, rerr.Error(), rerr.Error(), itemErr)
+			dispatch = "cache-off-inprocess-resolve-error"
+		} else if ferr := feedBytes(substituted); ferr != nil {
+			r.log.Error("in-process resolve response handler failed (cache-off path)",
+				slog.String("name", id),
+				slog.String("path", call.Path),
+				slog.String("dispatch", dispatch),
+				slog.String("error", ferr.Error()))
+			var itemErr error
+			if !call.ContinueOnError {
+				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+			}
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
+		}
+		depth := depthForLog(r.ctx, r.log, dictMu, dict)
+		r.log.Info("api successfully resolved",
+			slog.String("name", id),
+			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("path", call.Path),
+			slog.Int("depth", depth),
+			slog.String("dispatch", dispatch),
+		)
+		return nil
+	}
+
+	// External-no-cache (proposal 2026-06-22) — THE external-touched bump.
+	// Reaching this line is the AUTHORITATIVE signal that this stage touched
+	// a genuine EXTERNAL endpoint: the loopback (retired) / informer-pivot /
+	// apistage / internal-rest-config branches all `return nil` BEFORE here,
+	// AND the cache-off in-process resolve above did not fire (a genuine
+	// external path, or resolve:false, or a non-RA/widget path), so control
+	// reaches httpFetchAllowingNonJSON only on the external fall-through
+	// (proposal §"Detection" — mis-classifying an internal branch as external
+	// is structurally impossible because the signal is the dispatch SITE, not
+	// the Endpoint shape). The sink is shared across this stage's iterator
+	// errgroup workers; Bump is atomic + nil-safe (no sink installed → no-op).
+	// Each of the 5 L1 Put surfaces reads Count()>0 and declines the Put (the
+	// result is still SERVED — identical to the #313 partial posture), so
+	// external data is re-fetched LIVE every /call and never persisted under a
+	// TTL it has no dep edge to invalidate.
+	cache.ExternalTouchedSinkFromContext(gctx).Bump()
 	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(gctx, call)
 	if fetchErr != nil {
 		// A non-nil go error mirrors httpcall.Do's response.New(500, err)

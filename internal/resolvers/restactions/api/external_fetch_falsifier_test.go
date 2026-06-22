@@ -365,12 +365,14 @@ func TestFalsifierH_InternalRESTConfigJSONNoRegression(t *testing.T) {
 	}
 }
 
-// (i) in-process nested-call JSON no-regression: a loopback nested /call
-// returns Status.Raw bytes that the resolver feeds via feedBytes →
+// (i) in-process resolve JSON no-regression: the in-process RA/widget
+// resolve (direct-apiserver-path + resolve:true, formerly the /call loopback)
+// returns envelope bytes that the resolver feeds via feedBytes →
 // jsonHandlerBytes (same as (h)). The decoded dict value must be
-// byte-identical to a direct unmarshal of the Status.Raw — proving the
-// nested-call path is untouched and does NOT route through the YAML
-// conversion (AC4).
+// byte-identical to a direct unmarshal of those bytes — proving the
+// in-process resolve feed path is untouched and does NOT route through the
+// YAML conversion (AC4). Tests the feed path directly (jsonHandlerBytes), not
+// the retired /call loopback trigger.
 func TestFalsifierI_NestedCallJSONNoRegression(t *testing.T) {
 	statusRaw := []byte(`{"kind":"RESTAction","apiVersion":"templates.krateo.io/v1","status":{"foo":"bar"}}`)
 

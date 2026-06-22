@@ -1,113 +1,62 @@
-// nested_call_falsifier_test.go — Ship 0.30.123 (#155) falsifiers for
-// in-process nested /call resolution.
+// nested_call_falsifier_test.go — falsifiers for the in-process RA/widget
+// resolver SEAM (dispatchers.ResolveNestedCall).
 //
-// THE MECHANISM: when a RESTAction stage's `path` is a /call?resource=...
-// loopback into snowplow's own /call endpoint, the api resolver resolves
-// the referenced RESTAction IN-PROCESS (dispatchers.ResolveNestedCall)
-// instead of issuing an HTTP request with no Authorization header. This
-// lets a JWT-less / SA-credentialed resolve complete an exportJwt
-// loopback stage — the 0.30.120 poison — and unblocks F2's startup
-// SA-prewarm.
+// THE MECHANISM (post-2026-06-22): the seam resolves a referenced
+// RESTAction/Widget CR IN-PROCESS — objects.Get → checkDispatchRBAC →
+// restactions.Resolve / widgets.Resolve → encodeResolvedJSON. It is invoked by
+// the api resolver's DIRECT-APISERVER-PATH + `resolve: true` branch
+// (maybeResolveInProcess). (It was introduced Ship 0.30.123 #155 for the /call
+// loopback; that loopback DISPATCH BRANCH + the RESOLVER_INPROCESS_NESTED_CALL
+// flag were RETIRED 2026-06-22 — the resolve LOGIC here survived. The former
+// loopback-trigger falsifiers F2/F4F6 were retired with the branch; their seam
+// properties are preserved by the direct-seam falsifiers below + the
+// resolve:true direct-path falsifiers in api/ and inprocess_resolve_falsifier_test.go.)
 //
-// SIX FALSIFIERS:
-//   F1 — HEADLINE, capturable pre-fix: a JWT-less resolve of an outer
-//        RESTAction with a /call-loopback stage produces NON-EMPTY
-//        content. Run with RESOLVER_INPROCESS_NESTED_CALL=false the
-//        loopback path is skipped (byte-identical to 0.30.121) and the
-//        stage yields EMPTY — the captured pre-fix artifact. Flag on
-//        (default): non-empty.
-//   F2 — the in-process result is byte-identical to a direct
-//        restactions.Resolve of the inner RESTAction.
-//   F3 — an exportJwt RESTAction refreshes with CORRECT non-empty
-//        content; the layer-(b) stage-error sink stays 0.
-//   F4 — recursion: a RESTAction whose /call stage references itself
-//        terminates with a `depth limit exceeded` error in
-//        dict[call.ErrorKey] (no stack overflow / hang).
-//   F5 — a denied dispatch (identity not RBAC-authorized for the inner
-//        RESTAction) surfaces a 403-class error, NOT empty.
-//   F6 — the depth-8 cap surfaces a bounded ERROR rendered AS an error
-//        by the outer response handler — NOT silent empty content.
+// SURVIVING DIRECT-SEAM FALSIFIERS (drive ResolveNestedCall directly):
+//   F1 — the in-process result is the FULL RESTAction envelope
+//        {kind,apiVersion,spec,status} — not the bare status (0.30.124 shape).
+//   F3 — an authorized resolve returns CORRECT non-empty content; the
+//        layer-(b) stage-error sink stays 0.
+//   F4 — the depth-8 recursion cap returns a bounded `depth limit exceeded`
+//        error with nil bytes (no stack overflow / hang); cap-1 proceeds.
+//   F5 — a denied dispatch (identity not RBAC-authorized for the inner CR)
+//        surfaces a 403-class error, NOT empty content (the load-bearing
+//        in-process RBAC gate).
 //
-// The api resolver is driven via api.Resolve directly with a one-stage
-// outer RESTAction whose stage is a /call loopback; the nested resolver
-// seam is swapped with a stub (api.RegisterNestedCallResolver) so the
-// loopback branch is exercised without a live cluster. F3/F5 drive the
-// real dispatchers.ResolveNestedCall against the watcher harness.
+// F3/F5 drive the real ResolveNestedCall against the watcher harness; F1/F4
+// drive it directly. No /call api-step path is used (the loopback trigger is
+// gone).
 
 package dispatchers
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
-	"k8s.io/client-go/rest"
 )
 
 // --- shared fixtures ------------------------------------------------------
 
-// nestedCallLoopbackPath is a /call?resource=...&apiVersion=... loopback
-// URL — the shape util.ParseCallPathToObjectRef recognises. Host-qualified
-// so the test also covers the host-prefixed form.
-const nestedCallLoopbackPath = "http://snowplow.krateo-system.svc:8081/call" +
-	"?resource=restactions&apiVersion=templates.krateo.io/v1" +
-	"&name=inner-restaction&namespace=krateo-system"
-
-// loopbackStage builds a one-stage outer RESTAction whose single stage is
-// a /call loopback. continueOnError mirrors the compositions-list shape
-// (the exportJwt stage runs continueOnError).
-func loopbackStage(id string, continueOnErr bool) *templates.API {
-	return &templates.API{
-		Name:            id,
-		Path:            nestedCallLoopbackPath,
-		Verb:            ptr.To(http.MethodGet),
-		ContinueOnError: ptr.To(continueOnErr),
-		ErrorKey:        ptr.To(id + "Error"),
-		// Filter projects the stage output under the id so a non-empty
-		// nested result is visible in dict[id].
-		Filter: ptr.To("." + id),
-	}
-}
-
-// nestedResolveJWTLess drives api.Resolve for a one-stage outer
-// RESTAction under a JWT-LESS identity — WithUserInfo only, NO
-// AccessToken, NO per-user Endpoint. A WithInternalEndpoint placeholder
-// lets the resolver's endpoint resolution succeed (the loopback branch
-// never dispatches over it). Returns the resolved dict.
-func nestedResolveJWTLess(t *testing.T, stage *templates.API) map[string]any {
-	t.Helper()
-	ctx := xcontext.BuildContext(context.Background(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "sa-prewarmer"}),
-	)
-	ctx = cache.WithInternalEndpoint(ctx,
-		&endpoints.Endpoint{ServerURL: "http://test.invalid"})
-	return restactionsapi.Resolve(ctx, restactionsapi.ResolveOptions{
-		// A non-nil RC keeps api.Resolve off its rest.InClusterConfig()
-		// early-return (which fails outside a cluster). The loopback
-		// branch never dereferences RC's contents — a bare config is enough.
-		RC:                  &rest.Config{},
-		Items:               []*templates.API{stage},
-		RESTActionNamespace: "krateo-system",
-		RESTActionName:      "outer-restaction",
-	})
-}
+// loopbackStage / nestedResolveJWTLess / nestedCallLoopbackPath RETIRED
+// 2026-06-22 — they drove the /call?resource= loopback DISPATCH BRANCH (now
+// removed, dead code per corpus audit). The seam they exercised
+// (ResolveNestedCall) SURVIVES as the in-process resolver behind the
+// direct-apiserver-path + resolve:true mechanism, and is tested DIRECTLY by
+// the F1/F4_Real/RBAC falsifiers below (which call ResolveNestedCall without a
+// /call api-step path) plus the new direct-path resolve:true falsifiers.
 
 // --- F1 — HEADLINE: in-process nested /call returns the FULL envelope ----
 
@@ -191,107 +140,14 @@ func TestF1_NestedCall_ReturnsFullEnvelope(t *testing.T) {
 // into the stage's ResponseHandler EXACTLY — no mutation, no re-wrap.
 // This is a unit test of the loopback branch's pass-through; the nested
 // resolver itself is stubbed, so the stub returns what the REAL
-// ResolveNestedCall returns post-0.30.124 — the full RESTAction envelope
-// {kind,apiVersion,metadata,spec,status}. The test asserts dict[id]
-// carries that envelope verbatim.
-func TestF2_NestedCall_LoopbackBranchPassesBytesVerbatim(t *testing.T) {
-	// The corrected stub returns a full RESTAction ENVELOPE — the shape
-	// the fixed ResolveNestedCall produces (encodeResolvedJSON of the
-	// resolved *RESTAction), NOT a bare status.
-	innerEnvelope := []byte(`{"kind":"RESTAction","apiVersion":"templates.krateo.io/v1",` +
-		`"metadata":{"name":"inner-restaction"},"spec":{},` +
-		`"status":{"items":[{"k":"v"}],"meta":{"n":3}}}`)
-	restore := setNestedCallResolverForTest(
-		func(_ context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
-			return innerEnvelope, nil
-		})
-	t.Cleanup(restore)
-
-	t.Setenv("RESOLVER_INPROCESS_NESTED_CALL", "true")
-	dict := nestedResolveJWTLess(t, loopbackStage("inner", true))
-
-	got, ok := dict["inner"]
-	if !ok {
-		t.Fatalf("F2: dict missing the loopback stage output")
-	}
-	// dict["inner"] is the JSON-decoded innerEnvelope (the stage handler
-	// json-decodes the nested bytes). Re-marshal and compare structurally
-	// to the nested resolver's output decoded the same way — the loopback
-	// branch must not have mutated it.
-	var want any
-	if err := json.Unmarshal(innerEnvelope, &want); err != nil {
-		t.Fatalf("F2: unmarshal inner envelope: %v", err)
-	}
-	gotBytes, _ := json.Marshal(got)
-	wantBytes, _ := json.Marshal(want)
-	if string(gotBytes) != string(wantBytes) {
-		t.Fatalf("F2: the loopback branch did NOT pass the nested bytes through "+
-			"verbatim.\n want: %s\n got:  %s", wantBytes, gotBytes)
-	}
-}
-
-// --- F4 / F6 — recursion depth bound -------------------------------------
-
-// TestF4F6_NestedCall_DepthLimitBoundedError drives a SELF-REFERENTIAL
-// nested /call: the stub resolver, instead of returning content, recurses
-// by invoking the real ResolveNestedCall-style depth check — modelled
-// here by a stub that re-enters with an incremented depth context until
-// the cap. The real recursion bound lives in ResolveNestedCall (the
-// dispatchers impl), exercised directly in TestF4_RealResolveNestedCall
-// DepthCap below. This test asserts the OUTER resolver surfaces a
-// `depth limit exceeded` error in dict[ErrorKey] — NOT a hang, NOT empty
-// (F4 + F6: a bounded error rendered AS an error, never silent empty).
-func TestF4F6_NestedCall_DepthLimitBoundedError(t *testing.T) {
-	t.Setenv("RESOLVER_INPROCESS_NESTED_CALL", "true")
-
-	// The stub emulates a /call stage whose nested resolve hit the depth
-	// cap — exactly what ResolveNestedCall returns at NestedCallMaxDepth.
-	restore := setNestedCallResolverForTest(
-		func(_ context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
-			return nil, fmt.Errorf("nested /call depth limit exceeded (%d)",
-				cache.NestedCallMaxDepth())
-		})
-	t.Cleanup(restore)
-
-	// continueOnError=true so the error lands in dict[ErrorKey] and the
-	// resolve completes (the F6 property: the cap is an ERROR, surfaced,
-	// not a silent empty).
-	dict := nestedResolveJWTLess(t, loopbackStage("selfref", true))
-
-	errVal, ok := dict["selfrefError"]
-	if !ok || errVal == nil {
-		t.Fatalf("F4/F6: depth-limit hit produced NO error key — a recursion cap "+
-			"that yields silent empty content is a masked failure; dict=%#v", dict)
-	}
-	// Ship 0.30.257 (#313) Option W-A: dict[errorKey] is now an ACCUMULATING
-	// SLICE (scalar→[]any), not last-wins. The F4/F6 INTENT is unchanged —
-	// the depth-limit cap is surfaced AS an error, never a silent empty — so
-	// the assertion is updated to read the (single) error out of the W-A
-	// slice. A bare-string value (the pre-0.30.257 shape) is still accepted
-	// for forward-compat in case this site is ever reached via a non-iterator
-	// path that did not promote.
-	if !errKeyContains(errVal, "depth limit exceeded") {
-		t.Fatalf("F4/F6: depth-limit error key = %#v; want a `depth limit exceeded` "+
-			"message rendered AS an error (W-A: as the element of an accumulating slice)", errVal)
-	}
-}
-
-// errKeyContains reports whether a resolved dict[errorKey] value carries
-// substr — handling BOTH the Ship 0.30.257 W-A accumulating-slice shape
-// (`[]any{"<msg>"}`) and a bare string (the pre-0.30.257 scalar shape).
-func errKeyContains(errVal any, substr string) bool {
-	switch v := errVal.(type) {
-	case string:
-		return strings.Contains(v, substr)
-	case []any:
-		for _, e := range v {
-			if s, ok := e.(string); ok && strings.Contains(s, substr) {
-				return true
-			}
-		}
-	}
-	return false
-}
+// TestF2 (LoopbackBranchPassesBytesVerbatim) and TestF4F6
+// (DepthLimitBoundedError via a /call api-step) RETIRED 2026-06-22 — both
+// drove the /call loopback DISPATCH BRANCH through an api-step path, which was
+// removed (dead code, corpus audit). The seam properties they checked —
+// verbatim envelope pass-through and the surfaced (non-empty) depth-cap error
+// — are preserved by TestF1_NestedCall_ReturnsFullEnvelope and
+// TestF4_RealResolveNestedCall_DepthCap (which drive ResolveNestedCall
+// directly), plus the new direct-path resolve:true falsifiers.
 
 // TestF4_RealResolveNestedCall_DepthCap drives the REAL ResolveNestedCall
 // recursion bound directly: a context already at NestedCallMaxDepth must

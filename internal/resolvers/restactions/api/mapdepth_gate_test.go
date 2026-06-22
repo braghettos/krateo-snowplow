@@ -255,6 +255,17 @@ func TestDepthForLog_AC6_AllFiveSitesGated(t *testing.T) {
 	// Exactly 5 depthForLog(r.ctx, ...) call sites — the outer-ctx form
 	// after the #330 dispatchOneCall extraction (the worker receives the
 	// resolve-invariant outer ctx as r.ctx; depthForLog must NOT get gctx).
+	//
+	// History at the 2026-06-22 unified ship: the /call loopback dispatch
+	// branch (one depthForLog site) was RETIRED (5→4), then the cache-off
+	// in-process resolve substitution added ONE site in the external branch
+	// (4→5, Diego Option (ii) — resolve:true is a transparent fallback that
+	// resolves cache-off too). The 5 gated sites are: apistage-content,
+	// informer, internal-rest-config, the cache-off in-process resolve, and
+	// the external fall-through. The cache-on in-process substitution rides
+	// the apistage/informer/internal-rest-config branches' existing success
+	// lines (no new site); only the cache-off external-branch substitution
+	// adds its own.
 	calls := regexp.MustCompile(`depthForLog\(r\.ctx,`).FindAllString(codeOnly, -1)
 	if len(calls) != 5 {
 		t.Fatalf("AC-6 FAIL: found %d depthForLog(r.ctx, ...) call sites in resolve.go, want exactly 5", len(calls))

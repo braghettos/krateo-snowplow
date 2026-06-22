@@ -159,16 +159,26 @@ func main() {
 		use.Logger(log),
 	)
 
-	// Ship 0.30.123 (#155) — wire the in-process nested-/call resolver
-	// seam. When a RESTAction stage's path is a /call?resource=... loopback
-	// into snowplow's own /call endpoint, the api resolver invokes this
-	// IN-PROCESS instead of issuing an HTTP request — so a JWT-less /
-	// SA-credentialed resolve can complete an exportJwt loopback stage.
-	// Wired unconditionally at startup (not cache-gated): the seam itself
-	// is cache-agnostic; ResolveNestedCall internally gates its RBAC check
-	// on !cache.Disabled(). Mirrors the api.resolveOnceFn seam pattern.
-	// RESOLVER_INPROCESS_NESTED_CALL (default true) is the runtime gate;
-	// a nil resolver (this wiring skipped) is the structural fallback.
+	// Wire the in-process RA/widget resolver seam (introduced Ship 0.30.123
+	// #155 for the /call loopback; the loopback DISPATCH BRANCH was retired
+	// 2026-06-22 and the seam repurposed as the in-process resolver behind the
+	// DIRECT-APISERVER-PATH + `resolve: true` mechanism). When an api-step's
+	// path is a direct apiserver path to a RESTAction/Widget CR with
+	// resolve:true, the api resolver invokes this IN-PROCESS instead of issuing
+	// an HTTP /call — so a JWT-less / SA-credentialed resolve can complete a
+	// referenced-CR resolve the HTTP edge could not.
+	//
+	// Wired UNCONDITIONALLY at startup (NOT cache-gated): the seam is
+	// cache-agnostic, so resolve:true resolves in-process under cache-ON AND
+	// cache-OFF alike (Diego Option (ii) — transparent fallback). Under
+	// cache-off the seam's objects.Get uses the user's own token and
+	// ResolveNestedCall's in-process checkDispatchRBAC self-skips via
+	// !cache.Disabled() — the user-token apiserver GET is the RBAC gate. A nil
+	// resolver (this wiring skipped — tests only) is the structural fallback:
+	// maybeResolveInProcess gate 2 then no-ops to the raw CR. The
+	// RESOLVER_INPROCESS_NESTED_CALL flag was retired with the loopback branch;
+	// the per-step `resolve` property (default true) is the only gate now.
+	// Mirrors the api.resolveOnceFn seam pattern.
 	restactionsapi.RegisterNestedCallResolver(dispatchers.ResolveNestedCall)
 
 	// #57 — retired-flag startup audit. PREWARM_ENABLED and

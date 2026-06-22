@@ -205,6 +205,14 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// overwrite the prior good entry. The sink is request-path-inert:
 	// only the refresher installs it, so a cold dispatch is unaffected.
 	rctx, stageErrSink := cache.WithStageErrorSink(rctx)
+	// External-no-cache (proposal 2026-06-22) — defense-in-depth. The
+	// refresher only ever re-Puts already-cached keys, and external RAs never
+	// get cached in the first place (the request-path Put-gates decline them),
+	// so the refresher should never re-resolve an external RA. But install +
+	// gate the external-touched sink here too, so that IF an external RA ever
+	// reached this path it would still decline the re-Put rather than persist
+	// stale external data. Additive to the stage-error sink.
+	rctx, extTouchedSink := cache.WithExternalTouchedSink(rctx)
 
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
@@ -256,6 +264,23 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("effect", "prior good entry kept; TTL is the outer net"),
 		)
 		cache.BumpRefresherSkippedStageError()
+		return nil
+	}
+
+	// External-no-cache (proposal 2026-06-22) — defense-in-depth re-Put gate.
+	// If the re-resolve touched a genuine external endpoint, the fresh bytes
+	// have no dep edge to invalidate them; decline the re-Put (keep the prior
+	// entry; TTL is the outer net) exactly as the stage-error gate does.
+	if extTouchedSink.Count() > 0 {
+		cache.BumpExternalSkippedPut()
+		log.Warn("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.String("user", refreshUser),
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
+		)
 		return nil
 	}
 

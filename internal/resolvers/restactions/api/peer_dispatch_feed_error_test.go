@@ -164,117 +164,14 @@ func containsAny(s string, subs ...string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// SITE 1 — nested /call (feedBytes(statusRaw))
+// SITE 1 — RETIRED (2026-06-22 unified ship). The /call loopback dispatch
+// branch (feedBytes(statusRaw)) was retired (dead code — corpus audit
+// confirmed zero live loopback paths). Its feed-error-no-truncate coverage
+// (#313 Option C-A) is fully subsumed by Sites 2/3/4 below, which feed via the
+// SAME feedBytes/recordItemError triad through feedRawOrResolved. The two
+// former Site-1 functions (ZeroYield/MultiYield over a /call?resource= path)
+// were deleted with the branch they exercised.
 // ---------------------------------------------------------------------------
-//
-// SEAM: RegisterNestedCallResolver returns each item's referenced RESTAction
-// Status.Raw as valid JSON {"ns":"<ns>"}. The stage Path is a /call loopback
-// (objects.ParseCallPathToObjectRef must parse it) carrying the per-item ns.
-// The filter `.site1 | select(.ns != "ns-c")` ZERO-YIELDS for ns-c → that
-// item's feedBytes(statusRaw) returns the zero-yield error.
-//
-// RED on HEAD: site 1's `if err := feedBytes(statusRaw); err != nil { return err }`
-// truncates → downstream absent.
-func TestPeerFeedError_Site1_NestedCall_ZeroYield_NoTruncate(t *testing.T) {
-	t.Setenv("RESOLVER_INPROCESS_NESTED_CALL", "true")
-	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
-
-	// Wire the nested-call resolver seam: return each ref's name as JSON.
-	prev := nestedCallResolver
-	nestedCallResolver = func(_ context.Context, ref templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
-		// ref.Name carries the per-item ns (set via the /call path template).
-		return []byte(fmt.Sprintf(`{"ns":%q}`, ref.Name)), nil
-	}
-	t.Cleanup(func() { nestedCallResolver = prev })
-
-	id := "site1"
-	itemsStage := &templates.API{
-		Name: id,
-		// /call loopback path; the ns becomes the referenced object name so
-		// the nested resolver echoes it back. objects.ParseCallPathToObjectRef
-		// parses resource+apiVersion+name from the query.
-		Path: `${ "/call?resource=widgets&apiVersion=widgets.krateo.io%2Fv1&name=" + .ns }`,
-		Verb: ptr.To(http.MethodGet),
-		DependsOn: &templates.Dependency{
-			Iterator: ptr.To(".vals"),
-		},
-		Filter:   ptr.To(fmt.Sprintf(`.%s | select(.ns != "%s")`, id, pdfeNamespaces[pdfeFailIdx])),
-		ErrorKey: ptr.To("error"),
-	}
-	downstream := &templates.API{
-		Name:      "downstream",
-		Path:      `${ "/call?resource=widgets&apiVersion=widgets.krateo.io%2Fv1&name=down" }`,
-		Verb:      ptr.To(http.MethodGet),
-		DependsOn: &templates.Dependency{Name: id},
-		Filter:    ptr.To(".downstream"),
-	}
-
-	ctx := pdfeResolveCtx("site1-user")
-	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
-	dict := Resolve(ctx, ResolveOptions{
-		RC:                  &rest.Config{},
-		Items:               []*templates.API{itemsStage, downstream},
-		Extras:              map[string]any{"vals": pdfeVals()},
-		RESTActionNamespace: "default",
-		RESTActionName:      "peer-feed-site1",
-	})
-
-	pdfeAssertNoTruncation(t, dict, id, "error", "ns-a")
-}
-
-// ---------------------------------------------------------------------------
-// SITE 1 multi-yield variant (ErrMultiYield, same return seam)
-// ---------------------------------------------------------------------------
-//
-// The filter `.site1.list[]` over a multi-element array MULTI-YIELDS (>=2
-// values) → EvalValue returns ErrMultiYield (handler.go:142). The nested
-// resolver returns a 2-element list for the failing ns so feedBytes errors
-// on that item only.
-func TestPeerFeedError_Site1_NestedCall_MultiYield_NoTruncate(t *testing.T) {
-	t.Setenv("RESOLVER_INPROCESS_NESTED_CALL", "true")
-	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
-
-	failNS := pdfeNamespaces[pdfeFailIdx]
-	prev := nestedCallResolver
-	nestedCallResolver = func(_ context.Context, ref templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
-		if ref.Name == failNS {
-			// 2-element list → `.list[]` multi-yields → ErrMultiYield.
-			return []byte(`{"list":[{"ns":"x"},{"ns":"y"}]}`), nil
-		}
-		// single-element list → `.list[]` single-yields → merges fine.
-		return []byte(fmt.Sprintf(`{"list":[{"ns":%q}]}`, ref.Name)), nil
-	}
-	t.Cleanup(func() { nestedCallResolver = prev })
-
-	id := "site1"
-	itemsStage := &templates.API{
-		Name:      id,
-		Path:      `${ "/call?resource=widgets&apiVersion=widgets.krateo.io%2Fv1&name=" + .ns }`,
-		Verb:      ptr.To(http.MethodGet),
-		DependsOn: &templates.Dependency{Iterator: ptr.To(".vals")},
-		Filter:    ptr.To(fmt.Sprintf(`.%s.list[]`, id)),
-		ErrorKey:  ptr.To("error"),
-	}
-	downstream := &templates.API{
-		Name:      "downstream",
-		Path:      `${ "/call?resource=widgets&apiVersion=widgets.krateo.io%2Fv1&name=down" }`,
-		Verb:      ptr.To(http.MethodGet),
-		DependsOn: &templates.Dependency{Name: id},
-		Filter:    ptr.To(".downstream"),
-	}
-
-	ctx := pdfeResolveCtx("site1-user")
-	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
-	dict := Resolve(ctx, ResolveOptions{
-		RC:                  &rest.Config{},
-		Items:               []*templates.API{itemsStage, downstream},
-		Extras:              map[string]any{"vals": pdfeVals()},
-		RESTActionNamespace: "default",
-		RESTActionName:      "peer-feed-site1-multi",
-	})
-
-	pdfeAssertNoTruncation(t, dict, id, "error", "ns-a")
-}
 
 // ---------------------------------------------------------------------------
 // shared informer/apistage fixture (sites 2 & 3)
@@ -460,6 +357,177 @@ func TestPeerFeedError_Site2_ApistageContent_MultiYield_NoTruncate(t *testing.T)
 	rw := pdfeNewWatcher(t, true)
 	dict := pdfeResolveCached(t, rw, pdfeGetByNameStage("site2", true))
 	pdfeAssertNoTruncation(t, dict, "site2", "error", "")
+}
+
+// ---------------------------------------------------------------------------
+// resolve:true substitution through the APISTAGE-CONTENT arm (PM gate, the
+// production-default arm). RESOLVED_CACHE_APISTAGE_ENABLED=true makes a
+// single-CR GET-by-name of a widgets-resource CR land on the apistage-content
+// block (resolve.go), which has the feedValue(gatedVal) vs feedBytes(substituted)
+// FORK. These prove the fork wires correctly: when maybeResolveInProcess
+// substitutes, the apistage arm feeds the SUBSTITUTED resolved bytes (NOT the
+// raw gated value), and the result matches the informer arm for the same CR.
+// ---------------------------------------------------------------------------
+
+// pdfeInProcSeamSentinel is the canned envelope the seam stub returns; its
+// presence in the stage output proves the apistage arm fed feedBytes(substituted)
+// and NOT feedValue(gatedVal) (the raw widget, which has no such marker).
+const pdfeInProcSeamSentinel = `{"kind":"Widget","apiVersion":"widgets.krateo.io/v1","status":{"inProcessResolved":"sentinel-value"}}`
+
+// pdfeResolveOneGetByName drives api.Resolve for a SINGLE (non-iterator)
+// resolve:true GET-by-name stage of widget-<ns> over the given watcher, under
+// the supplied outer L1 key. Returns the resolved dict.
+func pdfeResolveOneGetByName(t *testing.T, watcher *cache.ResourceWatcher, ns, outerKey string, resolve *bool) map[string]any {
+	t.Helper()
+	stage := &templates.API{
+		Name:    "ref",
+		Path:    "/apis/widgets.krateo.io/v1/namespaces/" + ns + "/widgets/widget-" + ns,
+		Verb:    ptr.To(http.MethodGet),
+		Resolve: resolve,
+		Filter:  ptr.To(".ref"),
+	}
+	ctx := pdfeResolveCtx(pdfeAdminUser)
+	ctx = cache.WithInternalEndpoint(ctx, &endpoints.Endpoint{ServerURL: "http://test.invalid"})
+	if outerKey != "" {
+		ctx = cache.WithL1KeyContext(ctx, outerKey)
+	}
+	return Resolve(ctx, ResolveOptions{
+		RC:                  &rest.Config{},
+		Items:               []*templates.API{stage},
+		Watcher:             watcher,
+		RESTActionNamespace: "default",
+		RESTActionName:      "apistage-inproc-resolve",
+	})
+}
+
+// TestInProcessResolve_ApistageArm_FeedsSubstituted is the PM-gate falsifier:
+// a resolve:true single-CR GET-by-name lands on the APISTAGE-CONTENT arm
+// (RESOLVED_CACHE_APISTAGE_ENABLED=true) and the arm feeds the SUBSTITUTED
+// resolved envelope — proving the feedValue(gatedVal) → feedBytes(substituted)
+// fork wires correctly (the riskiest of the 3 served arms). The seam is
+// stubbed to a sentinel so the substitution is unambiguous and there is ZERO
+// outbound HTTP.
+//
+// RED if the apistage arm fed feedValue(gatedVal) (the raw widget) when did==true.
+func TestInProcessResolve_ApistageArm_FeedsSubstituted(t *testing.T) {
+	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
+	rw := pdfeNewWatcher(t, true) // APISTAGE arm (production default)
+
+	// Stub the in-process resolve seam to a sentinel envelope.
+	prev := nestedCallResolver
+	var seamCalls int
+	nestedCallResolver = func(_ context.Context, ref templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
+		seamCalls++
+		if ref.Resource != "widgets" {
+			t.Errorf("apistage arm: seam ref.Resource = %q, want widgets", ref.Resource)
+		}
+		return []byte(pdfeInProcSeamSentinel), nil
+	}
+	t.Cleanup(func() { nestedCallResolver = prev })
+
+	dict := pdfeResolveOneGetByName(t, rw, "ns-a", "", ptr.To(true))
+
+	if seamCalls == 0 {
+		t.Fatalf("apistage arm: resolve:true did NOT invoke the in-process seam — "+
+			"a GET-by-name on the apistage arm fed the raw gated value instead of "+
+			"substituting; dict=%#v", dict)
+	}
+	ref, ok := dict["ref"].(map[string]any)
+	if !ok {
+		t.Fatalf("apistage arm: dict[ref] not a map: %#v", dict["ref"])
+	}
+	status, _ := ref["status"].(map[string]any)
+	if status == nil || status["inProcessResolved"] != "sentinel-value" {
+		t.Fatalf("apistage arm FORK BUG: the SUBSTITUTED resolved envelope was NOT fed "+
+			"(feedValue(gatedVal) fed the raw widget instead of feedBytes(substituted)). "+
+			"got dict[ref]=%#v", ref)
+	}
+}
+
+// TestInProcessResolve_ApistageArm_DepOnOuterKey mirrors I-7 on the apistage
+// arm: a resolve:true GET-by-name under an outer L1 key records the referenced
+// widget's apiserver-path dep edge on the OUTER key (the dep site fires
+// regardless of which serve arm dispatched, and regardless of whether the
+// substitution seam is wired). RED if the apistage arm dropped the L1 key on
+// the way to the substitution. The seam is stubbed (the substitution itself is
+// covered above + end-to-end with the real seam in the dispatchers package);
+// here we isolate that the apistage arm preserves the OUTER L1 key for the
+// dep recording (the proposal §5 / I-7 caveat on this specific arm).
+func TestInProcessResolve_ApistageArm_DepOnOuterKey(t *testing.T) {
+	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
+	rw := pdfeNewWatcher(t, true)
+
+	prev := nestedCallResolver
+	nestedCallResolver = func(_ context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
+		return []byte(pdfeInProcSeamSentinel), nil
+	}
+	t.Cleanup(func() { nestedCallResolver = prev })
+
+	const outerKey = "apistage-outer-L1-key"
+	dict := pdfeResolveOneGetByName(t, rw, "ns-c", outerKey, ptr.To(true))
+	if dict["ref"] == nil {
+		t.Fatalf("apistage arm dep test: no output — resolve:true did not run; dict=%#v", dict)
+	}
+
+	matches := cache.Deps().CollectMatchesForTest(pdfeGVR, "ns-c", "widget-ns-c")
+	if _, ok := matches[outerKey]; !ok {
+		t.Fatalf("apistage arm: NO dep edge from the OUTER L1 key %q to the referenced "+
+			"widget (gvr=%s ns=ns-c name=widget-ns-c) — editing the widget would not "+
+			"dirty-mark the outer entry. matches=%#v", outerKey, pdfeGVR, matches)
+	}
+}
+
+// TestInProcessResolve_ApistageContentCachesRaw_NoResolveContamination is the
+// CORRECTNESS counterpart the architect flagged: the apistage CONTENT cache
+// (keyed (class,gvr,ns,name) — NOT on `resolve`, contentKeyInputs apistage.go)
+// stores the RAW dispatched envelope, and the resolve:true substitution is a
+// PER-REQUEST transform applied DOWNSTREAM of the content serve. So two
+// resolves of the SAME CR — one resolve:true, one resolve:false — share the
+// same content entry (raw) yet diverge correctly: true → substituted envelope,
+// false → raw CR. A bug that cached the RESOLVED bytes at the content layer
+// (or keyed it without `resolve`) would CONTAMINATE: the 2nd (resolve:false)
+// call would hit a cached resolved entry and wrongly return the substituted
+// shape. This asserts the content cache stays resolve-agnostic and consistent
+// with the informer / internal-rest-config arms (all feed raw; substitution is
+// uniformly downstream).
+//
+// Both resolves run against the SAME watcher so the 1st populates the content
+// entry and the 2nd is a content HIT — the contamination window.
+func TestInProcessResolve_ApistageContentCachesRaw_NoResolveContamination(t *testing.T) {
+	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
+	rw := pdfeNewWatcher(t, true) // APISTAGE arm
+
+	prev := nestedCallResolver
+	nestedCallResolver = func(_ context.Context, _ templates.ObjectReference, _, _ int, _ map[string]any) ([]byte, error) {
+		return []byte(pdfeInProcSeamSentinel), nil
+	}
+	t.Cleanup(func() { nestedCallResolver = prev })
+
+	// 1st: resolve:true → populates the content entry (raw) + substitutes.
+	trueDict := pdfeResolveOneGetByName(t, rw, "ns-d", "", ptr.To(true))
+	trueRef, _ := trueDict["ref"].(map[string]any)
+	trueStatus, _ := trueRef["status"].(map[string]any)
+	if trueStatus == nil || trueStatus["inProcessResolved"] != "sentinel-value" {
+		t.Fatalf("contamination test: resolve:true did not substitute on the apistage arm; got %#v", trueRef)
+	}
+
+	// 2nd: resolve:false on the SAME CR → content HIT (raw entry already
+	// stored). Must return the RAW widget — NOT the substituted sentinel.
+	falseDict := pdfeResolveOneGetByName(t, rw, "ns-d", "", ptr.To(false))
+	falseRef, ok := falseDict["ref"].(map[string]any)
+	if !ok {
+		t.Fatalf("contamination test: dict[ref] not a map on resolve:false: %#v", falseDict["ref"])
+	}
+	// The RAW widget has metadata.name=widget-ns-d and NO status.inProcessResolved.
+	if fs, _ := falseRef["status"].(map[string]any); fs != nil && fs["inProcessResolved"] == "sentinel-value" {
+		t.Fatalf("CONTENT-CACHE CONTAMINATION: resolve:false hit a cached RESOLVED entry on the "+
+			"apistage arm — the content cache must store RAW (resolve-agnostic) bytes, with the "+
+			"substitution applied per-request downstream. got dict[ref]=%#v", falseRef)
+	}
+	meta, _ := falseRef["metadata"].(map[string]any)
+	if meta == nil || meta["name"] != "widget-ns-d" {
+		t.Fatalf("contamination test: resolve:false did not return the raw widget CR; got %#v", falseRef)
+	}
 }
 
 // ---------------------------------------------------------------------------

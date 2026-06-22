@@ -282,6 +282,15 @@ type refresher struct {
 	// net is obsolete. Layer (b) stays as the general backstop.)
 	refresherSkippedStageError atomic.Uint64
 
+	// External-no-cache (proposal 2026-06-22) — external-touched Put-gate
+	// counter. externalSkippedPut counts L1 Puts declined because the
+	// resolve reached the live external fetch (httpFetchAllowingNonJSON),
+	// which has no informer/dep edge to invalidate it. Process-wide
+	// falsifier for "did the external gate fire?"; read via
+	// ExternalSkippedPut(), bumped via BumpExternalSkippedPut() at each of
+	// the 5 Put surfaces.
+	externalSkippedPut atomic.Uint64
+
 	// Ship #98 / 0.30.215 — customer-priority yield falsifier counter.
 	// yieldedTotal ticks every time a worker spent at least one yield-poll
 	// parked in yieldToCustomer waiting for the customer-inflight signal
