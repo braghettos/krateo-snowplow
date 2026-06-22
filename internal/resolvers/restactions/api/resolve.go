@@ -1458,6 +1458,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	return r.dict
 }
 
+// discoverGroupResourcesFn is the package-private indirection over
+// cache.DiscoverGroupResources so the Fix A1 per-group-dedup falsifier
+// (lazy_register_storm_test.go) can count invocations per distinct group
+// without standing up a real discovery client. Production path is
+// unchanged. Mirrors cache.discoveryClientBuilder (discovery_lookup.go:151).
+var discoverGroupResourcesFn = cache.DiscoverGroupResources
+
 // lazyRegisterInnerCallPaths walks the per-stage RequestOptions slice
 // (one entry per iterator dispatch — the iterator + non-iterator paths
 // share this code) and calls cache.Global().EnsureResourceType for the
@@ -1482,6 +1489,19 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 		return
 	}
 	seen := map[schema.GroupVersionResource]struct{}{}
+	// 2026-06-22 Fix A1 (discovery storm) — per-group dedup. A
+	// composition-detail stage emits ONE RequestOptions entry per
+	// iterator dispatch (28 composition kinds for composition.krateo.io),
+	// every one carrying the SAME static group. Without this gate the
+	// AddNavigationDiscoveredGroup+DiscoverGroupResources block below
+	// fires once PER entry → 28× the same synchronous discovery hop on
+	// the hot resolve path (each hop = ServerGroups + a
+	// ServerResourcesForGroupVersion loop over the group's full version
+	// union, all returning already-known state). seenGroups collapses
+	// that to once per DISTINCT group per resolve. It is a SIBLING of the
+	// GVR `seen` map (which only guards EnsureResourceType below) — NOT a
+	// bare sync.Once: a 2nd DISTINCT group still registers + discovers.
+	seenGroups := map[string]struct{}{}
 	for i := range opts {
 		path := opts[i].Path
 
@@ -1518,21 +1538,28 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 		// too (it IS navigation-reached).
 		if cache.PrewarmEnabled() {
 			if grp, grpOK := cache.ExtractAPIServerGroupFromTemplatedPath(path); grpOK {
-				cache.AddNavigationDiscoveredGroup(grp)
-				// The walker's *rest.Config is wired through
-				// cache.WithInternalRESTConfig during Phase 1 (SA-
-				// credentialed walk). When absent (e.g. a non-Phase-1
-				// /call), the discovery hop is skipped — the only
-				// caller pattern that requires it is the SA-credentialed
-				// walker, which DOES set it.
-				if rcAny, ok := cache.InternalRESTConfigFromContext(ctx); ok {
-					if cfg, ok := rcAny.(*rest.Config); ok && cfg != nil {
-						if _, err := cache.DiscoverGroupResources(ctx, cfg, grp); err != nil {
-							log.Warn("cache.discovery.group_resources_fetch_failed",
-								slog.String("subsystem", "cache"),
-								slog.String("group", grp),
-								slog.Any("err", err),
-							)
+				// Fix A1 — gate on first-sight of this DISTINCT group in
+				// the current opts slice. A 2nd distinct group still
+				// passes this gate (registers + discovers); a repeat of an
+				// already-seen group is skipped, killing the storm.
+				if _, dupGrp := seenGroups[grp]; !dupGrp {
+					seenGroups[grp] = struct{}{}
+					cache.AddNavigationDiscoveredGroup(grp)
+					// The walker's *rest.Config is wired through
+					// cache.WithInternalRESTConfig during Phase 1 (SA-
+					// credentialed walk). When absent (e.g. a non-Phase-1
+					// /call), the discovery hop is skipped — the only
+					// caller pattern that requires it is the SA-credentialed
+					// walker, which DOES set it.
+					if rcAny, ok := cache.InternalRESTConfigFromContext(ctx); ok {
+						if cfg, ok := rcAny.(*rest.Config); ok && cfg != nil {
+							if _, err := discoverGroupResourcesFn(ctx, cfg, grp); err != nil {
+								log.Warn("cache.discovery.group_resources_fetch_failed",
+									slog.String("subsystem", "cache"),
+									slog.String("group", grp),
+									slog.Any("err", err),
+								)
+							}
 						}
 					}
 				}

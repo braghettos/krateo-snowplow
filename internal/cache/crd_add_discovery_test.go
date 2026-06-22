@@ -56,6 +56,7 @@ func withCleanCRDDiscovery(t *testing.T) {
 	ResetNavigationDiscoveredGroupsForTest()
 	ResetDiscoveryCountersForTest()
 	ResetDiscoverySingleflightForTest()
+	resetCachedDiscoveryForTest()
 	prevDC := discoveryClientBuilder
 	prevRC := ProcessSARestConfig()
 	t.Cleanup(func() {
@@ -66,6 +67,7 @@ func withCleanCRDDiscovery(t *testing.T) {
 		ResetNavigationDiscoveredGroupsForTest()
 		ResetDiscoveryCountersForTest()
 		ResetDiscoverySingleflightForTest()
+		resetCachedDiscoveryForTest()
 	})
 }
 

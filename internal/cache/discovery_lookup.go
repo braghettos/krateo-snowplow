@@ -46,6 +46,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
+	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 )
@@ -163,15 +164,146 @@ var discoveryClientBuilder = func(rc *rest.Config) (discovery.DiscoveryInterface
 // each goroutine would issue its own discovery LIST.
 var discoverGroupSingleflight sync.Map // group(string) -> *sync.Mutex
 
-// discoverGroupOnce guards the per-group "discovery has completed at
-// least once" flag. v6 NOTE: we do NOT permanently cache the
-// discovered set — a re-walk on widget CRUD must be able to detect
-// newly-added composition GVRs. The mutex serializes concurrent calls
-// only; the discovery hop itself is repeated on every walker re-entry
-// (idempotent via EnsureResourceType).
+// discoverGroupLock returns the per-group serialize-only mutex. The
+// mutex serializes concurrent calls for the SAME group only; calls for
+// distinct groups proceed in parallel.
+//
+// 2026-06-22 Fix A2 (discovery storm) — the discovery hop is NO LONGER
+// unconditionally repeated on every walker re-entry. The apiserver
+// round-trips are now served from a process-singleton cache-local
+// CachedDiscoveryInterface (cachedDiscoveryClient below), and the hot
+// (forceFresh:false) path short-circuits to (0,nil) when the cache is
+// Fresh() AND every registerable GVR of every currently-served version
+// is already registered (versionCompleteForGroup). This kills the
+// ~21-round-trip residual the v6 "repeat every walk" design paid on
+// already-known state, WITHOUT a once-flag: the short-circuit predicate
+// is RECOMPUTED every call, so a newly-served version (spec.versions[]
+// widen) leaves a GVR un-registered → predicate false → full discovery
+// walk. The CRD-event path (DiscoverGroupResourcesFresh, forceFresh:
+// true) Invalidate()s the cached discovery surface (memcache.Invalidate
+// is a GLOBAL wipe — all groups; client-go has no per-group shard) and
+// re-reads the apiserver BEFORE the registration walk, so a CREATE/UPDATE
+// never reads stale. The global wipe is a bounded, accepted cost: after a
+// (rare) CRD event the next hot-path call for ANY nav-group sees
+// Fresh()==false and pays ONE shared aggregated-discovery refresh
+// (refreshLocked downloads the whole surface in a single hop,
+// memcache.go:242-260), NOT N storms. Registration itself stays
+// idempotent via EnsureResourceType.
 func discoverGroupLock(group string) *sync.Mutex {
 	v, _ := discoverGroupSingleflight.LoadOrStore(group, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+// --- Fix A2 — cache-local cached discovery client -------------------------
+
+// cachedDiscoveryClient is the process-singleton CachedDiscoveryInterface
+// that serves ServerGroups + ServerResourcesForGroupVersion from an
+// in-memory cache (k8s.io/client-go/discovery/cached/memory —
+// NewMemCacheClient, the SAME prior art internal/dynamic/client.go:30
+// uses). The first read per process downloads the API surface; every
+// subsequent read on the hot (forceFresh:false) path is an O(1) in-memory
+// lookup — eliminating the ~21 apiserver round-trips/call the raw v6
+// client paid (discovery storm RC-1 residual).
+//
+// LAYERING — built cache-LOCAL in internal/cache; does NOT import the
+// internal/dynamic SA-discovery singleton (internal/cache is BELOW
+// internal/dynamic — importing up would invert the layering wall). It
+// wraps whatever discoveryClientBuilder returns (the same test seam the
+// fakes already swap), so unit tests need no new wiring.
+//
+// CACHE-OFF — built LAZILY and ONLY from inside discoverGroupResources,
+// AFTER the modePassthrough guard. A CACHE_ENABLED=false process never
+// reaches the build site, so the raw-apiserver path stays byte-identical
+// (project_cache_off_is_transparent_fallback).
+//
+// CONCURRENCY — the singleton POINTER is guarded by cachedDiscoveryMu
+// (built once under the write lock; read on the hot path). The memcache
+// client's own mutation surface (Fresh()/Invalidate()/refreshLocked) is
+// lock-guarded inside client-go (memcache.go:209/220/235), so a concurrent
+// Invalidate() (forceFresh path) against a Fresh()/ServerGroups() read
+// (hot path) is race-safe by construction. The shared-vs-private
+// conversion (the 0.30.128 hazard class,
+// feedback_shared_vs_copy_is_a_concurrency_change) is gated by the
+// concurrent -race falsifier (discovery_storm_a2_race_test.go).
+var (
+	cachedDiscoveryMu     sync.RWMutex
+	cachedDiscoveryClient discovery.CachedDiscoveryInterface
+)
+
+// getCachedDiscovery returns the process-singleton cached discovery
+// client, building it lazily from rc on first use. MUST be called only
+// AFTER the modePassthrough guard (so cache-off never builds it). The
+// built client wraps discoveryClientBuilder(rc) in a memCacheClient.
+//
+// Goroutine-safe: build-once under the write lock, warm reads under the
+// read lock. Mirrors the SharedSADiscoveryClient build-once shape
+// (internal/dynamic/cached_client.go:181) but cache-local.
+func getCachedDiscovery(rc *rest.Config) (discovery.CachedDiscoveryInterface, error) {
+	cachedDiscoveryMu.RLock()
+	if cachedDiscoveryClient != nil {
+		c := cachedDiscoveryClient
+		cachedDiscoveryMu.RUnlock()
+		return c, nil
+	}
+	cachedDiscoveryMu.RUnlock()
+
+	cachedDiscoveryMu.Lock()
+	defer cachedDiscoveryMu.Unlock()
+	if cachedDiscoveryClient != nil {
+		return cachedDiscoveryClient, nil
+	}
+	raw, err := discoveryClientBuilder(rc)
+	if err != nil {
+		return nil, err
+	}
+	cachedDiscoveryClient = cacheddiscovery.NewMemCacheClient(raw)
+	return cachedDiscoveryClient, nil
+}
+
+// resetCachedDiscoveryForTest clears the cached-discovery singleton so
+// each test rebuilds it from the freshly-installed discoveryClientBuilder
+// fake. TEST-ONLY.
+func resetCachedDiscoveryForTest() {
+	cachedDiscoveryMu.Lock()
+	cachedDiscoveryClient = nil
+	cachedDiscoveryMu.Unlock()
+}
+
+// versionCompleteForGroup reports whether every registerable GVR of every
+// currently-served version of group is already registered in rw. The hot
+// (forceFresh:false) short-circuit predicate — RECOMPUTED every call (NOT
+// a once-flag): a newly-served version (spec.versions[] widen) lists a GVR
+// that rw.IsRegistered reports false for → returns false → caller runs the
+// full discovery walk. Reads served versions from the (possibly cached)
+// disco client; a per-version discovery error is treated as "not complete"
+// (conservative — forces the full walk, which re-attempts + soft-fails per
+// version exactly as the non-short-circuit path does).
+func versionCompleteForGroup(disco discovery.DiscoveryInterface, rw *ResourceWatcher, group string) bool {
+	versions, err := serverVersionsForGroup(disco, group)
+	if err != nil || len(versions) == 0 {
+		return false
+	}
+	for _, version := range versions {
+		gv := schema.GroupVersion{Group: group, Version: version}
+		list, lerr := disco.ServerResourcesForGroupVersion(gv.String())
+		if lerr != nil || list == nil {
+			return false
+		}
+		for _, el := range list.APIResources {
+			if !discoveryIsRegisterableResource(el) {
+				continue
+			}
+			gvk := gv.WithKind(el.Kind)
+			if isBuiltInKind(gvk) {
+				continue
+			}
+			gvr := schema.GroupVersionResource{Group: group, Version: version, Resource: el.Name}
+			if !rw.IsRegistered(gvr) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Counters — observability for the discovery hop. Mirror the
@@ -215,14 +347,47 @@ var (
 // mode are all soft no-ops returning (0, nil) so callers can wire
 // this unconditionally.
 func DiscoverGroupResources(ctx context.Context, rc *rest.Config, group string) (int, error) {
+	return discoverGroupResources(ctx, rc, group, false)
+}
+
+// DiscoverGroupResourcesFresh is the CRD-event-path entry point
+// (crd_discovery_side_effect.go). forceFresh:true → it Invalidate()s the
+// cached discovery surface (memcache.Invalidate is a GLOBAL wipe — all
+// groups) and re-reads the apiserver BEFORE the registration walk, so a
+// CRD CREATE/UPDATE can NEVER register against a
+// stale cached read (the S4/F-4 stuck-zero regression class,
+// docs/ship-0.30.233-s4-cache-invalidation-trace). No version-complete
+// short-circuit on this path: a CREATE/UPDATE is exactly the case where a
+// newly-served version's GVR is not yet registered, so a fresh full walk
+// is mandatory.
+func DiscoverGroupResourcesFresh(ctx context.Context, rc *rest.Config, group string) (int, error) {
+	return discoverGroupResources(ctx, rc, group, true)
+}
+
+// discoverGroupResources is the shared implementation behind
+// DiscoverGroupResources (forceFresh:false, hot /call walker) and
+// DiscoverGroupResourcesFresh (forceFresh:true, CRD-event path).
+//
+//   - forceFresh:false — the hot path. Short-circuits to (0,nil) when the
+//     cached discovery client is Fresh() AND every served version's
+//     registerable GVR is already registered (versionCompleteForGroup).
+//     Otherwise runs the full walk against the (cached) client — already-
+//     known state is served from memory, so a non-short-circuited walk
+//     still pays ZERO apiserver round-trips while the cache stays warm.
+//   - forceFresh:true — the CRD-event path. Invalidate()s the cached
+//     discovery surface (memcache.Invalidate is a GLOBAL wipe — all
+//     groups; a superset invalidation is always safe), forcing the next
+//     read to re-download, then ALWAYS runs the full walk against the
+//     freshly re-read apiserver state.
+func discoverGroupResources(ctx context.Context, rc *rest.Config, group string, forceFresh bool) (int, error) {
 	if group == "" {
 		return 0, nil
 	}
 	rw := Global()
 	if rw == nil || rw.mode == modePassthrough {
-		// Cache off / passthrough — no informer to spawn, but record
-		// the group anyway so a future cache-on transition has the
-		// nav-discovered set ready.
+		// Cache off / passthrough — no informer to spawn, and the
+		// cached-discovery client is NEVER built (byte-identical raw
+		// path). Record nothing; a future cache-on transition rebuilds.
 		return 0, nil
 	}
 
@@ -236,7 +401,10 @@ func DiscoverGroupResources(ctx context.Context, rc *rest.Config, group string) 
 		return 0, ctx.Err()
 	}
 
-	disco, err := discoveryClientBuilder(rc)
+	// Build (lazily, post-passthrough-guard) the process-singleton cached
+	// discovery client. Replaces the per-call raw client — the apiserver
+	// round-trips are now served from the memcache after the first read.
+	disco, err := getCachedDiscovery(rc)
 	if err != nil {
 		slog.Warn("cache.discovery.client_build_failed",
 			slog.String("subsystem", "cache"),
@@ -244,6 +412,19 @@ func DiscoverGroupResources(ctx context.Context, rc *rest.Config, group string) 
 			slog.Any("err", err),
 		)
 		return 0, err
+	}
+
+	if forceFresh {
+		// CRD CREATE/UPDATE — drop the cached discovery surface (a GLOBAL
+		// memcache wipe, all groups) so the walk below re-reads the
+		// apiserver and sees the newly-served version's GVRs.
+		disco.Invalidate()
+	} else if disco.Fresh() && versionCompleteForGroup(disco, rw, group) {
+		// Hot path, cache warm + every served version fully registered —
+		// nothing to do. Recomputed every call (NOT a once-flag): a newly-
+		// served version leaves a GVR un-registered → predicate false →
+		// fall through to the full walk below.
+		return 0, nil
 	}
 
 	// Enumerate every version of `group` via ServerGroups().
