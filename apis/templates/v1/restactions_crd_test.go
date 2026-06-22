@@ -8,17 +8,19 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// TestGeneratedCRDKeepsResourcePolicyAnnotation is the falsifier guarding the
-// `helm.sh/resource-policy: keep` annotation on the generated RESTActions CRD.
+// TestGeneratedCRDOmitsResourcePolicyAnnotation is the falsifier locking in the
+// teardown-completeness decision (chart #31): the generated RESTActions CRD must
+// NOT carry the `helm.sh/resource-policy: keep` annotation.
 //
-// Without `keep`, a `helm uninstall` deletes the RESTActions CRD and, with it,
-// every RESTAction CR in the cluster — a data-loss risk at 50K scale. The
-// annotation is emitted by the `+kubebuilder:metadata:annotations=...` marker on
-// the RESTAction type (apis/templates/v1/restactions.go). controller-gen does not
-// emit it on its own, so a controller-gen bump or an accidental marker removal
-// could silently drop it during the next `make generate` / crds-sync. This test
-// fails loudly if that ever happens.
-func TestGeneratedCRDKeepsResourcePolicyAnnotation(t *testing.T) {
+// Rationale (#31): the RESTActions CRD has a single Helm owner — the dedicated
+// crds-subchart — and no parent chart templates it. Upgrades are unaffected
+// because Helm only prunes resources that LEAVE the chart, and the CRD never
+// leaves it. Re-adding `keep` would silently orphan the component CRD on a
+// `helm uninstall` of the crds-subchart release (teardown never reaches a clean
+// slate). A controller-gen marker (#9/#39) previously re-emitted `keep`,
+// defeating #31; that marker was reverted. This test fails loudly if `keep`
+// ever reappears on the generated CRD.
+func TestGeneratedCRDOmitsResourcePolicyAnnotation(t *testing.T) {
 	// crds/ lives at the repo root; this test file is apis/templates/v1.
 	crdPath := filepath.Join("..", "..", "..", "crds", "templates.krateo.io_restactions.yaml")
 
@@ -36,14 +38,13 @@ func TestGeneratedCRDKeepsResourcePolicyAnnotation(t *testing.T) {
 		t.Fatalf("unmarshal generated CRD: %v", err)
 	}
 
-	const (
-		key  = "helm.sh/resource-policy"
-		want = "keep"
-	)
-	if got := crd.Metadata.Annotations[key]; got != want {
-		t.Fatalf("generated CRD %s: metadata.annotations[%q] = %q, want %q "+
-			"(the +kubebuilder:metadata:annotations marker on RESTAction must emit it; "+
-			"without it helm uninstall deletes the CRD and all RESTAction CRs)",
-			crdPath, key, got, want)
+	const key = "helm.sh/resource-policy"
+	if got, present := crd.Metadata.Annotations[key]; present {
+		t.Fatalf("generated CRD %s: metadata.annotations[%q] = %q, want it ABSENT "+
+			"(per chart #31 teardown-completeness: the crds-subchart is the CRD's single Helm "+
+			"owner, upgrades are unaffected because the CRD never leaves the chart, and `keep` "+
+			"would orphan the CRD on helm uninstall; the +kubebuilder:metadata:annotations "+
+			"marker on RESTAction must NOT re-emit it)",
+			crdPath, key, got)
 	}
 }
