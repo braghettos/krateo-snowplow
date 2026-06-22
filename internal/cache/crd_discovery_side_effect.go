@@ -424,7 +424,13 @@ func triggerCRDDiscovery(obj interface{}, kind crdLifecycleKind) {
 	// DiscoverGroupResources at discovery_lookup.go:255-258 +
 	// :270-275).
 	ctx := context.Background()
-	if _, derr := DiscoverGroupResources(ctx, saRC, group); derr != nil {
+	// Fix A2 — the CRD-event path MUST force-fresh: Invalidate the cached
+	// discovery surface (a GLOBAL memcache wipe — all groups) and re-read
+	// the apiserver BEFORE the registration walk, so a CREATE/UPDATE never
+	// registers against a stale cached read (the S4/F-4 stuck-zero
+	// regression class). The hot /call walker keeps the cached/short-
+	// circuit DiscoverGroupResources.
+	if _, derr := DiscoverGroupResourcesFresh(ctx, saRC, group); derr != nil {
 		slog.Warn("cache.crd_discovery.discover_group_failed",
 			slog.String("subsystem", "cache"),
 			slog.String("group", group),
