@@ -17,7 +17,6 @@ type RESTActionSpec struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:resource:scope=Namespaced,shortName=ra,categories={krateo,rest,actions}
-// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 
 // RESTAction allows users to declaratively define calls to APIs that may in turn depend on other calls.
 type RESTAction struct {
