@@ -1,6 +1,6 @@
 // retired_flags.go — #57 retired-flag startup audit.
 //
-// Task #57 folded two formerly-standalone env flags into the single
+// Task #57 folded formerly-standalone env flags into the single
 // CACHE_ENABLED master gate (project_single_cache_flag_direction):
 //
 //   - PREWARM_ENABLED      — startup prewarm is now implicit-on-cache
@@ -8,6 +8,10 @@
 //   - RESOLVER_USE_INFORMER — the resolver/objects informer-serve pivot is
 //                            now implicit-on-cache (resolverUseInformer() /
 //                            useInformer() == !cache.Disabled()).
+//   - RESOLVED_CACHE_APISTAGE_ENABLED — the api-stage L1 key-swap is now
+//                            on iff ResolvedCacheEnabled()
+//                            (ApistageL1Enabled() == ResolvedCacheEnabled()),
+//                            same class as the two above.
 //
 // The helpers no longer READ these env vars, so a stale value in the
 // environment is functionally ignored. We do NOT hard-error on a retired
@@ -65,6 +69,10 @@ var retiredFlags = []retiredFlag{
 	{
 		name:     "RESOLVER_USE_INFORMER",
 		behavior: "the informer-serve pivot is now implicit-on-cache; set CACHE_ENABLED=false to disable",
+	},
+	{
+		name:     "RESOLVED_CACHE_APISTAGE_ENABLED",
+		behavior: "the api-stage L1 is now on iff the resolved cache is on; set RESOLVED_CACHE_ENABLED=false (or CACHE_ENABLED=false) to disable",
 	},
 }
 
