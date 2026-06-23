@@ -263,6 +263,40 @@ func TestAssertReadPathsScoped_AllPresentReturnsZero(t *testing.T) {
 	}
 }
 
+// TestAssertReadPathsScoped_RBACEndpointUnregisteredStillPasses is the /rbac
+// endpoint falsifier #6 (design §7). GET /rbac is mounted on UserConfig but
+// DELIBERATELY NOT RegisterScopedRoute'd — like /refreshes, it issues ZERO
+// per-user apiserver reads (enumeration runs under the SA), so it sits outside
+// the read-path-scoped invariant. Because requiredScopedRoutes is a positive
+// whitelist (it only checks REQUIRED routes are present, never flags extras),
+// an un-registered /rbac cannot trip AssertReadPathsScoped: with every
+// required route registered and /rbac left unregistered, the assert still
+// returns 0. (And /rbac is not in requiredScopedRoutes, so a future ship
+// cannot accidentally require it.)
+func TestAssertReadPathsScoped_RBACEndpointUnregisteredStillPasses(t *testing.T) {
+	ResetRouteScopeRegistryForTest()
+	RegisterScopedRoute("GET /api-info/names", ScopePlurals)
+	RegisterScopedRoute("GET /list", ScopeList)
+	RegisterScopedRoute("GET /call", ScopeCallGeneric)
+	RegisterScopedRoute("POST /call", ScopeCallWritePost)
+	RegisterScopedRoute("PUT /call", ScopeCallWritePut)
+	RegisterScopedRoute("PATCH /call", ScopeCallWritePatch)
+	RegisterScopedRoute("DELETE /call", ScopeCallWriteDelete)
+	// GET /rbac deliberately NOT registered (mirrors /refreshes).
+
+	if missing := AssertReadPathsScoped(); missing != 0 {
+		t.Errorf("FALSIFIER #6 FAIL: missing count = %d; want 0 — an unregistered /rbac "+
+			"must NOT trip the read-path-scoped invariant", missing)
+	}
+
+	for _, r := range requiredScopedRoutes {
+		if r == "GET /rbac" {
+			t.Fatalf("FALSIFIER #6 FAIL: GET /rbac must NOT be in requiredScopedRoutes "+
+				"(it issues zero per-user apiserver reads); found it in %v", requiredScopedRoutes)
+		}
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // AC-D.5 — closed-enum discipline
 // ─────────────────────────────────────────────────────────────────────
@@ -462,8 +496,8 @@ func TestFallthroughScope_E2E_HTTPChain(t *testing.T) {
 	// A nil scope is the canonical scope-marker-drop regression the
 	// architect's audit refuted but Ship D had no test for.
 	if observedScope == nil {
-		t.Fatalf("scope marker DROPPED across the middleware chain — observedScope==nil. "+
-			"This is the regression the test exists to catch (Ship D.1). "+
+		t.Fatalf("scope marker DROPPED across the middleware chain — observedScope==nil. " +
+			"This is the regression the test exists to catch (Ship D.1). " +
 			"BuildContext probe ran AFTER FallthroughScopeMiddleware; the scope must survive.")
 	}
 	if !observedScope.Active {
@@ -575,4 +609,3 @@ func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 		t.Errorf("snowplow_assertion_violations_total[read_paths_scoped] missing — expvar map shape regression")
 	}
 }
-

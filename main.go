@@ -832,6 +832,20 @@ func main() {
 		middleware.RefreshAuth(*signKey)).
 		Then(handlers.Refreshes(*signKey)))
 
+	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
+	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
+	// resolves a referenced RESTAction's api[] stages to the (group, version,
+	// resource, verb) tuples a /call WOULD read, WITHOUT dispatching.
+	// Authenticated with the SAME JWT+clientconfig as /call (middleware.UserConfig):
+	// the JWT authenticates the caller, but the enumeration uses NONE of the
+	// caller's RBAC perms (it runs under the SA), so the read-set is computable
+	// before any binding exists. DELIBERATELY NOT cache.RegisterScopedRoute'd:
+	// like /refreshes above, it issues ZERO per-user apiserver reads, so it sits
+	// outside the read-path-scoped invariant (fallthrough_assert.go).
+	mux.Handle("GET /rbac", chain.Append(
+		middleware.UserConfig(*signKey, *authnNS)).
+		Then(handlers.RBAC()))
+
 	// Ship D — write-verb `/call` routes also get the middleware (PM
 	// explicit). Write verbs are out of the read-path invariant (F-11
 	// in the design), but centralizing classification prevents silent
