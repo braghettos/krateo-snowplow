@@ -223,10 +223,11 @@ func TestDepthForLog_AC3_CommonPathTakesNoLock(t *testing.T) {
 
 // TestDepthForLog_AC6_AllFiveSitesGated — AC-6.
 //
-// Exactly 5 mapDepth call sites existed in resolve.go; all 5 are now
-// routed through depthForLog. This test greps resolve.go's source and
-// asserts: zero ungated `mapDepth(` CALL sites remain, and there are
-// exactly 5 depthForLog(r.ctx, ...) call sites.
+// All mapDepth call sites in resolve.go are routed through depthForLog.
+// This test greps resolve.go's source and asserts: zero ungated
+// `mapDepth(` CALL sites remain, and there are exactly 6 depthForLog(r.ctx,
+// ...) call sites (5 pre-Fix-A1 dispatch branches + the Fix A1 discovery
+// branch).
 //
 // Task #330 Commit 4: the 5 sites moved into (*resolveRun).dispatchOneCall,
 // where the OUTER context is r.ctx (the resolve-invariant field), so the
@@ -252,7 +253,7 @@ func TestDepthForLog_AC6_AllFiveSitesGated(t *testing.T) {
 			"every site must route through depthForLog", len(mapDepthCall))
 	}
 
-	// Exactly 5 depthForLog(r.ctx, ...) call sites — the outer-ctx form
+	// Exactly 6 depthForLog(r.ctx, ...) call sites — the outer-ctx form
 	// after the #330 dispatchOneCall extraction (the worker receives the
 	// resolve-invariant outer ctx as r.ctx; depthForLog must NOT get gctx).
 	//
@@ -260,14 +261,18 @@ func TestDepthForLog_AC6_AllFiveSitesGated(t *testing.T) {
 	// branch (one depthForLog site) was RETIRED (5→4), then the cache-off
 	// in-process resolve substitution added ONE site in the external branch
 	// (4→5, Diego Option (ii) — resolve:true is a transparent fallback that
-	// resolves cache-off too). The 5 gated sites are: apistage-content,
-	// informer, internal-rest-config, the cache-off in-process resolve, and
-	// the external fall-through. The cache-on in-process substitution rides
-	// the apistage/informer/internal-rest-config branches' existing success
-	// lines (no new site); only the cache-off external-branch substitution
-	// adds its own.
+	// resolves cache-off too).
+	//
+	// Fix A1 (2026-06-23, the bare-group-discovery x509 fix) added the
+	// discovery dispatch branch ahead of the external fall-through (5→6).
+	// The 6 gated sites are: apistage-content, informer, internal-rest-config,
+	// the discovery branch, the cache-off in-process resolve, and the external
+	// fall-through. The cache-on in-process substitution rides the
+	// apistage/informer/internal-rest-config branches' existing success lines
+	// (no new site); the discovery and cache-off external-branch substitutions
+	// each add their own.
 	calls := regexp.MustCompile(`depthForLog\(r\.ctx,`).FindAllString(codeOnly, -1)
-	if len(calls) != 5 {
-		t.Fatalf("AC-6 FAIL: found %d depthForLog(r.ctx, ...) call sites in resolve.go, want exactly 5", len(calls))
+	if len(calls) != 6 {
+		t.Fatalf("AC-6 FAIL: found %d depthForLog(r.ctx, ...) call sites in resolve.go, want exactly 6", len(calls))
 	}
 }

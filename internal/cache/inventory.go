@@ -332,6 +332,90 @@ func ParseAPIServerPathToDep(path string) (gvr schema.GroupVersionResource, name
 	return schema.GroupVersionResource{}, "", "", false
 }
 
+// ParseAPIServerDiscoveryPath recognises a BARE group-discovery
+// apiserver path and returns its GroupVersion in the canonical
+// "<group>/<version>" (or bare "<version>" for the core group) form
+// that discovery.ServerResourcesForGroupVersion consumes.
+//
+// It is the discovery-shape sibling of ParseAPIServerPathToDep (shares
+// its ${...}-rejection + trailing-slash strip) and is the load-bearing
+// shape predicate for the discovery dispatch branch (dispatchViaDiscovery,
+// resolvers/restactions/api). It returns true ONLY for the two bare
+// group-discovery shapes:
+//
+//   - /apis/<group>/<version>   — exactly 2 segments after "/apis/"
+//   - /api/<version>            — exactly 1 segment after "/api/" (core group)
+//
+// It returns FALSE for EVERY resource path — anything with a resource
+// segment (≥3 segments after "/apis/", ≥2 after "/api/"), namespaced or
+// cluster-scoped, GET-by-name or LIST. This is the code-enforced RBAC
+// boundary: the discovery branch SA-serves the discovery SHAPE only;
+// SA-serving a resource path would be a cross-user leak, so a resource
+// path MUST never be classified here as discovery (it keeps its existing
+// per-user-token dispatch branch unchanged). It also returns FALSE for
+// non-apiserver paths (external URLs, unresolved ${...}), the bare
+// "/apis" / "/api" roots (a multi-group discovery index, not a single
+// GroupVersion), and any malformed shape.
+//
+// No special-cases (feedback_no_special_cases.md): the predicate is keyed
+// purely on path SHAPE — segment count under the apiserver prefix — never
+// on a literal group/version/resource value.
+func ParseAPIServerDiscoveryPath(path string) (groupVersion string, ok bool) {
+	// Strip query string.
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	// Strip trailing slash.
+	path = strings.TrimRight(path, "/")
+
+	// Reject paths with unresolved JQ template fragments.
+	if strings.Contains(path, "${") {
+		return "", false
+	}
+
+	switch {
+	case strings.HasPrefix(path, "/apis/"):
+		// Bare group discovery: /apis/<group>/<version> — EXACTLY two
+		// segments. parts==1 is the bare /apis/<group> (a group's
+		// version list, not a single GroupVersion) → reject. parts>=3
+		// carries a resource segment → reject (RBAC boundary).
+		rest := strings.TrimPrefix(path, "/apis/")
+		if rest == "" {
+			return "", false
+		}
+		parts := strings.Split(rest, "/")
+		if len(parts) != 2 {
+			return "", false
+		}
+		group := parts[0]
+		version := parts[1]
+		if group == "" || version == "" {
+			return "", false
+		}
+		return group + "/" + version, true
+
+	case strings.HasPrefix(path, "/api/"):
+		// Core-group discovery: /api/<version> — EXACTLY one segment.
+		// parts>=2 carries a resource segment → reject (RBAC boundary).
+		// The core-group GroupVersion is the bare version ("v1").
+		rest := strings.TrimPrefix(path, "/api/")
+		if rest == "" {
+			return "", false
+		}
+		parts := strings.Split(rest, "/")
+		if len(parts) != 1 {
+			return "", false
+		}
+		version := parts[0]
+		if version == "" {
+			return "", false
+		}
+		return version, true
+	}
+
+	return "", false
+}
+
 // unstructuredSliceField pulls obj[fields...] as []any. Returns
 // (nil, false, nil) when the path is missing or the leaf is not a
 // slice. An error is returned only when an intermediate node has the
