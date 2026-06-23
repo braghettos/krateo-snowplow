@@ -125,15 +125,14 @@ func f1RoleBinding(ns, user string) *rbacv1.RoleBinding {
 // newF1Watcher builds a synced cache=on watcher seeded with one widget
 // per namespace in f1AllNamespaces, a widget-lister ClusterRole, and
 // RoleBindings granting f1BroadUser EVERY namespace + f1NarrowUser only
-// f1NarrowNamespaces. RESOLVED_CACHE_APISTAGE_ENABLED is set so the
-// content-keyed api-stage path is live; the informer pivot is implicit
-// under CACHE_ENABLED (#57 — the standalone RESOLVER_USE_INFORMER flag was
-// retired).
+// f1NarrowNamespaces. The content-keyed api-stage path is live because it
+// is folded under CACHE_ENABLED+RESOLVED_CACHE_ENABLED (#57 — the standalone
+// RESOLVED_CACHE_APISTAGE_ENABLED flag was retired); the informer pivot is
+// likewise implicit under CACHE_ENABLED (RESOLVER_USE_INFORMER retired).
 func newF1Watcher(t *testing.T) *cache.ResourceWatcher {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
 	cache.ResetDepsForTest()
 	t.Cleanup(func() {

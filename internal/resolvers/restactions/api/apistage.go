@@ -24,8 +24,10 @@
 //     before the stage filter produces dict[id]. Narrowed content is
 //     never stored — no cross-user leak.
 //
-// EVERYTHING here is gated by cache.ApistageL1Enabled() — default OFF.
-// Flag-off the resolver is byte-identical to 0.30.118 (AC-F1.1).
+// EVERYTHING here is gated by cache.ApistageL1Enabled() — on with the
+// cache subsystem (folded under the master gate per #57). With the
+// resolved-output store off the resolver is byte-identical to 0.30.118
+// (AC-F1.1).
 
 package api
 

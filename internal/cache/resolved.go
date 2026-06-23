@@ -74,13 +74,6 @@ const (
 	// not from a runtime toggle.
 	envResolvedCacheMaxResidentBytes = "RESOLVED_CACHE_MAX_RESIDENT_BYTES"
 
-	// envResolvedCacheApistageEnabled is the Ship E (0.30.116) opt-in
-	// gate for the per-api-stage L1 key-swap. Default OFF — flag-off the
-	// RESTAction resolver runs byte-identical to 0.30.115 (AC-E1). It is
-	// gated UNDER ResolvedCacheEnabled() (the api-stage L1 needs the
-	// resolved-output store + the refresher).
-	envResolvedCacheApistageEnabled = "RESOLVED_CACHE_APISTAGE_ENABLED"
-
 	// envWidgetContentL1Enabled is the Ship G (0.30.16x) opt-in gate for
 	// the identity-free widget content L1 layer. Default ON — the layer
 	// is the actual zero-cold ship per Diego's 2026-05-21 framing; flag-
@@ -494,24 +487,22 @@ func ResolvedCacheEnabled() bool {
 }
 
 // ApistageL1Enabled reports whether the Ship E (0.30.116) per-api-stage
-// L1 key-swap is opted in. THREE gates, all must hold:
+// L1 key-swap is active. On iff ResolvedCacheEnabled(), i.e. both master
+// gates hold:
 //  1. CACHE_ENABLED=true        — the whole cache subsystem (Disabled()).
 //  2. RESOLVED_CACHE_ENABLED!=false — the resolved-output L1 store +
 //     refresher, which the api-stage entry reuses verbatim.
-//  3. RESOLVED_CACHE_APISTAGE_ENABLED=="true" — the per-feature opt-in.
 //
-// Internal default OFF (gate 3 must be the explicit string "true"). This
-// is a back-out knob for the api-stage L1 key-swap — a working,
-// load-bearing, RBAC-sensitive identity-free cache that runs =true in
-// production (#57: kept as a back-out knob, NOT folded — same class as
-// RESOLVED_CACHE_ENABLED). Flag-off the RESTAction resolver runs
-// byte-identical to 0.30.115 — no per-stage Get/Put, no api-stage L1 key
-// (AC-E1).
+// Folded into the master gate per #57 (project_single_cache_flag_direction)
+// — the api-stage L1 is a working, load-bearing, RBAC-sensitive identity-
+// free cache that ran =true everywhere in production, so it is now in the
+// same class as PrewarmEnabled: implicit-on under the cache subsystem with
+// no per-feature env flag. With RESOLVED_CACHE_ENABLED=false (or the whole
+// subsystem off via CACHE_ENABLED) the RESTAction resolver runs byte-
+// identical to 0.30.115 — no per-stage Get/Put, no api-stage L1 key
+// (AC-E1, now re-anchored to RESOLVED_CACHE_ENABLED=false).
 func ApistageL1Enabled() bool {
-	if !ResolvedCacheEnabled() {
-		return false
-	}
-	return os.Getenv(envResolvedCacheApistageEnabled) == "true"
+	return ResolvedCacheEnabled()
 }
 
 // WidgetContentL1Enabled reports whether the Ship G (0.30.16x) identity-

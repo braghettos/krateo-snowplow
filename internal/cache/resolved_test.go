@@ -346,31 +346,42 @@ func TestApistageCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 	}
 }
 
-// TestApistageL1Enabled_DefaultOffAndGates asserts AC-E6: the feature is
-// default-off and gated under CACHE_ENABLED + RESOLVED_CACHE_ENABLED.
-func TestApistageL1Enabled_DefaultOffAndGates(t *testing.T) {
-	// CACHE off → apistage off regardless of its own flag.
+// TestApistageL1Enabled_FoldedUnderResolvedCache asserts the #57 fold
+// (F-FOLD-1 truth table): the api-stage L1 is now on iff
+// ResolvedCacheEnabled() — no per-feature env flag. It is off when either
+// master gate is off and on when both are open, regardless of the
+// (now-ignored) RESOLVED_CACHE_APISTAGE_ENABLED env.
+func TestApistageL1Enabled_FoldedUnderResolvedCache(t *testing.T) {
+	// CACHE off → apistage off.
 	t.Setenv("CACHE_ENABLED", "false")
-	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
 	if ApistageL1Enabled() {
-		t.Fatalf("AC-E6: apistage L1 active with CACHE_ENABLED=false")
+		t.Fatalf("F-FOLD-1: apistage L1 active with CACHE_ENABLED=false")
 	}
 	// CACHE on, RESOLVED_CACHE off → apistage off.
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "false")
 	if ApistageL1Enabled() {
-		t.Fatalf("AC-E6: apistage L1 active with RESOLVED_CACHE_ENABLED=false")
+		t.Fatalf("F-FOLD-1: apistage L1 active with RESOLVED_CACHE_ENABLED=false")
 	}
-	// All gates open but the apistage flag unset → default OFF.
+	// Both master gates open → on (default), no per-feature opt-in needed.
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "")
-	if ApistageL1Enabled() {
-		t.Fatalf("AC-E6: apistage L1 must default OFF when its flag is unset")
-	}
-	// Explicit opt-in → on.
-	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
 	if !ApistageL1Enabled() {
-		t.Fatalf("AC-E6: apistage L1 must be on when all three gates are open")
+		t.Fatalf("F-FOLD-1: apistage L1 must be on when both master gates are open")
+	}
+}
+
+// TestApistageL1Enabled_ApistageEnvNoLongerConsulted is F-FOLD-2: with
+// both master gates on, the retired RESOLVED_CACHE_APISTAGE_ENABLED env
+// has no effect — toggling it through every shape leaves the result
+// invariantly true.
+func TestApistageL1Enabled_ApistageEnvNoLongerConsulted(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	for _, v := range []string{"", "false", "true", "garbage"} {
+		t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", v)
+		if !ApistageL1Enabled() {
+			t.Fatalf("F-FOLD-2: apistage L1 must stay on regardless of retired env=%q", v)
+		}
 	}
 }
 

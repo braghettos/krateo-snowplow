@@ -280,8 +280,9 @@ on cap it drops new records silently and relies on TTL for correctness (`deps.go
    (`resolved.go:547-550`, `484-494`); the dispatcher's in-process EvaluateRBAC gate is skipped
    because per-user apiserver fetches enforce RBAC inline (`restactions.go:92-108`). The whole
    subsystem stays cleanly removable per `cache.go:10-13`. `CACHE_ENABLED` is the single master
-   gate — prewarm and the informer-serve pivot are implicit under it; only fine-grained back-out
-   knobs (`RESOLVED_CACHE_ENABLED`, `WIDGET_CONTENT_L1_ENABLED`, `RESOLVED_CACHE_APISTAGE_ENABLED`)
+   gate — prewarm, the informer-serve pivot, and the api-stage L1 (Ship E) are implicit under it
+   (the latter folded per #57; `RESOLVED_CACHE_APISTAGE_ENABLED` retired); only fine-grained
+   back-out knobs (`RESOLVED_CACHE_ENABLED`, `WIDGET_CONTENT_L1_ENABLED`)
    remain (`cache.go:15-24`).
 2. **RBAC is never short-circuited by a hit.** The EvaluateRBAC gate runs *before* the L1 lookup
    (`restactions.go:96-116`); the identity-free widget cell is re-personalised per request by

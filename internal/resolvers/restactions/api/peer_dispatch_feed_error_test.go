@@ -230,16 +230,18 @@ func pdfeListKinds() map[schema.GroupVersionResource]string {
 }
 
 // pdfeNewWatcher stands up a synced cache=on watcher seeded with one widget
-// per namespace plus the admin RBAC. apistageOn flips
-// RESOLVED_CACHE_APISTAGE_ENABLED (site 2 vs site 3).
+// per namespace plus the admin RBAC. apistageOn selects the apistage-enabled
+// vs apistage-disabled dispatch branch (site 2 vs site 3). Post #57-fold the
+// api-stage L1 is on iff ResolvedCacheEnabled(), so the off-arm disables it
+// via RESOLVED_CACHE_ENABLED=false (the master gate it now folds under) —
+// still exercising the apistage-disabled path.
 func pdfeNewWatcher(t *testing.T, apistageOn bool) *cache.ResourceWatcher {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
-	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	if apistageOn {
-		t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
+		t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	} else {
-		t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "false")
+		t.Setenv("RESOLVED_CACHE_ENABLED", "false")
 	}
 	cache.ResetResolvedCacheForTest()
 	cache.ResetDepsForTest()
@@ -342,8 +344,9 @@ func pdfeResolveCached(t *testing.T, watcher *cache.ResourceWatcher, stage *temp
 // SITE 2 — apistage gated envelope (feedValue(gatedVal))
 // ---------------------------------------------------------------------------
 //
-// RESOLVED_CACHE_APISTAGE_ENABLED=true → the apistageContentServe path feeds a
-// decoded gated value via feedValue. The failing item's filter zero-yields →
+// apistage ON (folded under RESOLVED_CACHE_ENABLED, #57) → the
+// apistageContentServe path feeds a decoded gated value via feedValue. The
+// failing item's filter zero-yields →
 // feedValue returns the error → site 2's raw `return err` truncates.
 func TestPeerFeedError_Site2_ApistageContent_ZeroYield_NoTruncate(t *testing.T) {
 	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
@@ -361,8 +364,8 @@ func TestPeerFeedError_Site2_ApistageContent_MultiYield_NoTruncate(t *testing.T)
 
 // ---------------------------------------------------------------------------
 // resolve:true substitution through the APISTAGE-CONTENT arm (PM gate, the
-// production-default arm). RESOLVED_CACHE_APISTAGE_ENABLED=true makes a
-// single-CR GET-by-name of a widgets-resource CR land on the apistage-content
+// production-default arm). apistage ON (folded under RESOLVED_CACHE_ENABLED)
+// makes a single-CR GET-by-name of a widgets-resource CR land on the apistage-content
 // block (resolve.go), which has the feedValue(gatedVal) vs feedBytes(substituted)
 // FORK. These prove the fork wires correctly: when maybeResolveInProcess
 // substitutes, the apistage arm feeds the SUBSTITUTED resolved bytes (NOT the
@@ -402,7 +405,7 @@ func pdfeResolveOneGetByName(t *testing.T, watcher *cache.ResourceWatcher, ns, o
 
 // TestInProcessResolve_ApistageArm_FeedsSubstituted is the PM-gate falsifier:
 // a resolve:true single-CR GET-by-name lands on the APISTAGE-CONTENT arm
-// (RESOLVED_CACHE_APISTAGE_ENABLED=true) and the arm feeds the SUBSTITUTED
+// (apistage ON via RESOLVED_CACHE_ENABLED) and the arm feeds the SUBSTITUTED
 // resolved envelope — proving the feedValue(gatedVal) → feedBytes(substituted)
 // fork wires correctly (the riskiest of the 3 served arms). The seam is
 // stubbed to a sentinel so the substitution is unambiguous and there is ZERO
