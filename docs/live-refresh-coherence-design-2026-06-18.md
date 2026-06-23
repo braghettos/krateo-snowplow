@@ -308,7 +308,7 @@ wri.Header().Set("X-Snowplow-Refresh-Key", cacheKey)   // additive; before Write
 ## 7. Flags / gating (`project_single_cache_flag_direction`, `project_caching_is_provisional`)
 
 - **No new master flag.** `/refreshes` and the broadcaster are **implicit under `CACHE_ENABLED`** (lean implicit, per `project_single_cache_flag_direction`). Cache-off ⇒ no refresher ⇒ no emit ⇒ idle stream. The endpoint is registered unconditionally on the mux (a route that no-ops under cache-off is harmless and matches `/list`/`/call` which also serve transparently cache-off).
-- **One sub-layer back-out knob** (consistent with `RESOLVED_CACHE_APISTAGE_ENABLED` et al.): `REFRESH_SSE_ENABLED` (default true-when-cache-on) so the SSE layer is independently disable-able without losing L1 — provisional/removable. The broadcaster `Publish`/`Subscribe` become no-ops when off.
+- **One sub-layer back-out knob** (consistent with `WIDGET_CONTENT_L1_ENABLED` et al.): `REFRESH_SSE_ENABLED` (default true-when-cache-on) so the SSE layer is independently disable-able without losing L1 — provisional/removable. The broadcaster `Publish`/`Subscribe` become no-ops when off.
 - **Coalesce window:** `REFRESH_COALESCE_WINDOW_MS` (default 250). **Connection budget / heartbeat interval:** must be sized **empirically** at 1000 users × N widgets (`feedback_capacity_caps_empirical_per_entry_cost`) — do NOT ship a guessed FD/connection cap. The Phase-0 tester baseline + a connection-scale measurement feed this.
 
 ---

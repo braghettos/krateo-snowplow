@@ -255,10 +255,11 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 
 	log.Info("base dict for api resolver", slog.Any("dict", dict))
 
-	// Ship F1 (0.30.119): the content-keyed api-stage L1 is active only
-	// when RESOLVED_CACHE_APISTAGE_ENABLED=true (default off). Read the
-	// gate + the store handle ONCE before the loop; flag-off both stay
-	// inert and every call runs the byte-identical 0.30.118 path.
+	// Ship F1 (0.30.119): the content-keyed api-stage L1 is active
+	// whenever the resolved-output store is on (ApistageL1Enabled folded
+	// under the cache master gate per #57). Read the gate + the store
+	// handle ONCE before the loop; with the store off both stay inert and
+	// every call runs the byte-identical 0.30.118 path.
 	//
 	// Unlike Ship E's per-stage, per-user key, the F1 content layer keys
 	// each K8s CALL by its (gvr, namespace, name-or-empty) — identity-

@@ -100,7 +100,7 @@
 | Ship | Scope | Open items | Status |
 |------|-------|------------|--------|
 | **Ship D** | CRD-lifecycle cache handling | **R4, R6** | DONE — 0.30.114 (D1+D2) + 0.30.115 (R6). |
-| **Ship E** | api-stage L1 — **within-RESTAction** stage reuse: cache resolved stage output at RESTAction api-stage granularity behind `RESOLVED_CACHE_APISTAGE_ENABLED` (default off); the same RESTAction re-resolved reuses its own stage entries; dep-scoped refresh keeps them fresh. Depends on Ship C (refresher). | **O4, O5, O6, O8** | Implemented — 0.30.116 (default-off; budget set from 50K bench). |
+| **Ship E** | api-stage L1 — **within-RESTAction** stage reuse: cache resolved stage output at RESTAction api-stage granularity; the same RESTAction re-resolved reuses its own stage entries; dep-scoped refresh keeps them fresh. Depends on Ship C (refresher). | **O4, O5, O6, O8** | Implemented — 0.30.116. **Folded under the master gate (#57)** — `RESOLVED_CACHE_APISTAGE_ENABLED` retired; api-stage L1 is now on iff `RESOLVED_CACHE_ENABLED`, same class as `PrewarmEnabled`. |
 | **Ship F** | resolve-per-identity prewarm — flat prewarm walk replaying frontend navigation per observed identity. | **O1, O2, O3, O7** (prewarm O-items); **O9** as a perf follow-up. | Not started. |
 
 > Ship C (runtime refresher) shipped at 0.30.112–0.30.113; it is the

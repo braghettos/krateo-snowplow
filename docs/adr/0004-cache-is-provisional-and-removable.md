@@ -41,8 +41,10 @@ toggle and the invariant that turning it off is a *transparent fallback*, not a 
   - **Prewarm** makes its harvesters nil and the seed a no-op under the master gate
     (`phase1_walk.go:351-395`).
 - `CACHE_ENABLED` is the single master gate; prewarm and the informer-serve pivot are implicit
-  under it. Only fine-grained back-out knobs remain (`RESOLVED_CACHE_ENABLED`,
-  `WIDGET_CONTENT_L1_ENABLED`, `RESOLVED_CACHE_APISTAGE_ENABLED`, `cache.go:15-24`) for narrowing
+  under it. The api-stage L1 (Ship E) is likewise folded — implicit-on under
+  `RESOLVED_CACHE_ENABLED`, no per-feature flag (#57; `RESOLVED_CACHE_APISTAGE_ENABLED` retired).
+  Only fine-grained back-out knobs remain (`RESOLVED_CACHE_ENABLED`,
+  `WIDGET_CONTENT_L1_ENABLED`, `cache.go:15-24`) for narrowing
   a regression to one tier without losing the others.
 - The subsystem is kept structurally removable (`cache.go:10-13`).
 

@@ -21,7 +21,9 @@
 // or informer-pivot env flag; stale values of the retired names are
 // ignored (main.go's retired-flag audit warns once). Several sub-layer
 // back-out knobs remain explicit (RESOLVED_CACHE_ENABLED,
-// RESOLVED_CACHE_APISTAGE_ENABLED, WIDGET_CONTENT_L1_ENABLED, etc.).
+// WIDGET_CONTENT_L1_ENABLED, etc.). The api-stage L1 (ApistageL1Enabled)
+// is likewise folded — implicit-on under RESOLVED_CACHE_ENABLED, no
+// per-feature flag.
 package cache
 
 import "os"

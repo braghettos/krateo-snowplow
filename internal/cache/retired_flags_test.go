@@ -10,6 +10,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -99,6 +100,45 @@ func TestAuditRetiredFlags_FalseLogsWarn(t *testing.T) {
 	}
 	if r.attrs["remediation"] == "" {
 		t.Fatalf("WARN audit line must carry a remediation hint; attrs=%v", r.attrs)
+	}
+}
+
+// TestAuditRetiredFlags_ApistageFalseLogsWarn — #57 apistage fold: an
+// operator who set RESOLVED_CACHE_APISTAGE_ENABLED=false to keep the
+// api-stage L1 OFF now silently gets it ON under the resolved cache. That
+// is the exact silent-behavior-change the WARN path exists for, so the
+// retired apistage flag MUST be audited at Warn on "false" with the
+// RESOLVED_CACHE_ENABLED remediation (not CACHE_ENABLED only — disabling
+// apistage alone is no longer possible).
+func TestAuditRetiredFlags_ApistageFalseLogsWarn(t *testing.T) {
+	cache.ResetRetiredFlagAuditForTest()
+	t.Cleanup(cache.ResetRetiredFlagAuditForTest)
+	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "false")
+
+	log, recs := newCaptureLogger()
+	cache.AuditRetiredFlags(log)
+
+	got := findAuditRecords(*recs, "RESOLVED_CACHE_APISTAGE_ENABLED")
+	if len(got) != 1 {
+		t.Fatalf("RESOLVED_CACHE_APISTAGE_ENABLED=false: want exactly 1 audit line; got %d (%+v)", len(got), *recs)
+	}
+	r := got[0]
+	if r.level != slog.LevelWarn {
+		t.Fatalf("RESOLVED_CACHE_APISTAGE_ENABLED=false: want slog.Warn; got %v", r.level)
+	}
+	if r.attrs["status"] != "ignored" {
+		t.Fatalf("audit line must report status=ignored; attrs=%v", r.attrs)
+	}
+	if r.attrs["effective_behavior"] == "" {
+		t.Fatalf("audit line must state the new effective behavior; attrs=%v", r.attrs)
+	}
+	// The remediation must point at RESOLVED_CACHE_ENABLED — disabling
+	// apistage alone is no longer possible post-fold.
+	if r.attrs["remediation"] == "" {
+		t.Fatalf("WARN audit line must carry a remediation hint; attrs=%v", r.attrs)
+	}
+	if !strings.Contains(r.attrs["effective_behavior"], "RESOLVED_CACHE_ENABLED") {
+		t.Fatalf("apistage remediation must name RESOLVED_CACHE_ENABLED; got %q", r.attrs["effective_behavior"])
 	}
 }
 
