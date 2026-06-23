@@ -879,6 +879,76 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		return nil
 	}
 
+	// Fix A1 — BARE group-discovery dispatch branch (CA-bearing SA
+	// transport). A composition-resources RA issues an api-step GET against
+	// a bare group-discovery URL /apis/<g>/<v> (no resource segment, no
+	// endpointRef) to enumerate a managed apiVersion's served resources.
+	// That 2-segment path parse-fails ParseAPIServerPathToDep, so it fell
+	// through every CA-bearing branch above to the external fetch, which
+	// builds a plumbing client from the per-user <user>-clientconfig TOKEN-
+	// auth Endpoint — plumbing's tlsConfigFor drops the cluster caData for a
+	// token-auth endpoint (HasCertAuth()-only CA install) → x509: certificate
+	// signed by unknown authority. TRACED:
+	// docs/troubleshoot-discovery-url-apistep-x509-2026-06-23.md. Same
+	// plumbing TLS defect internal_dispatch.go documents for the Phase-1 SA
+	// path (0.30.104).
+	//
+	// dispatchViaDiscovery serves the discovery SHAPE only (a resource path
+	// is NEVER routed here — ParseAPIServerDiscoveryPath returns false for
+	// ≥3-segment paths — so it keeps its per-user-token branch byte-
+	// unchanged; the SA-serve exemption is sound because group discovery is
+	// anonymous-readable and carries NO tenant data). The branch fires
+	// regardless of CACHE_ENABLED (the SA rc is the process-wide
+	// dynamic.ServiceAccountRESTConfig() singleton, present cache-on AND
+	// cache-off — AC5 transparent fallback) and BEFORE the external fetch,
+	// so the bare-discovery GET never reaches the broken plumbing TLS path.
+	//
+	// The served body is the marshalled *metav1.APIResourceList. It is fed
+	// through the SAME dictMu-protected handler chain (feedBytes) the other
+	// dispatch branches use — it is NOT a resolve:true RA/widget single-CR
+	// GET, so we do NOT run maybeResolveInProcess on it. A non-nil err is
+	// the REAL discovery error; like the internal-rest-config branch we do
+	// NOT fall through to the external fetch (that would re-hit the broken
+	// plumbing TLS path and mask the error behind a second x509 failure) —
+	// we surface it via recordItemError exactly as an httpcall.Do
+	// StatusFailure (ContinueOnError / ErrorKey honoured).
+	if raw, served, derr := dispatchViaDiscovery(gctx, call); served || derr != nil {
+		dispatch := "discovery"
+		if derr != nil {
+			r.log.Error("api call response failure", slog.String("name", id),
+				slog.String("host", call.Endpoint.ServerURL),
+				slog.String("path", call.Path),
+				slog.String("dispatch", "discovery"),
+				slog.String("error", derr.Error()))
+			var itemErr error
+			if !call.ContinueOnError {
+				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, derr)
+			}
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, derr.Error(), derr.Error(), itemErr)
+			dispatch = "discovery-error"
+		} else if ferr := feedBytes(raw); ferr != nil {
+			r.log.Error("discovery response handler failed",
+				slog.String("name", id),
+				slog.String("path", call.Path),
+				slog.String("dispatch", dispatch),
+				slog.String("error", ferr.Error()))
+			var itemErr error
+			if !call.ContinueOnError {
+				itemErr = fmt.Errorf("api %s item %d failed: %w", id, i, ferr)
+			}
+			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
+		}
+		depth := depthForLog(r.ctx, r.log, dictMu, dict)
+		r.log.Info("api successfully resolved",
+			slog.String("name", id),
+			slog.String("host", call.Endpoint.ServerURL),
+			slog.String("path", call.Path),
+			slog.Int("depth", depth),
+			slog.String("dispatch", dispatch),
+		)
+		return nil
+	}
+
 	// EXTERNAL branch (feat/restaction-yaml-response): the snowplow-owned
 	// fetch replaces plumbing's httpcall.Do. It transcribes request.Do
 	// MINUS the 406 JSON content-type gate, so a 2xx YAML body (e.g. a
