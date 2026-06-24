@@ -913,6 +913,14 @@ func main() {
 	rbac.RegisterAuthzMemoExpvar()
 	mux.Handle("GET /debug/vars", expvar.Handler())
 
+	// Fix #1 / stale-delete diagnostic — read-only per-GVR servability
+	// snapshot {HasSynced, watchBroken, confirmed, servable}
+	// (docs/rca-stale-delete-compositiondefinitions-informer-2026-06-25.md).
+	// Mutates no state; available in both cache-on and cache-off so the
+	// stale-delete latch (registered-but-unconfirmed / watch-broken GVR) is
+	// diagnosable without a kubectl exec. Mounted next to /debug/vars.
+	mux.HandleFunc("GET /debug/servable", handlers.DebugServable())
+
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
 		os.Interrupt,
 		syscall.SIGINT,

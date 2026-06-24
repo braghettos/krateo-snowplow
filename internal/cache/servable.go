@@ -250,48 +250,199 @@ func (rw *ResourceWatcher) RefreshDiscovery(ctx context.Context) {
 	// Write confirmed + clear watchBroken on advanced RV, under the lock.
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
+	rw.ensureConfirmMapsLocked()
+	for i, gvr := range gvrs {
+		rw.applyConfirmLocked(gvr, gis[i], disco != nil, served[groupVersionString(gvr)])
+	}
+}
+
+// ensureConfirmMapsLocked lazily allocates the conjunct-3/4 state maps.
+// Callers MUST hold rw.mu.Lock(). Shared by RefreshDiscovery and the
+// scoped ConfirmResourceType so both write through the SAME maps.
+func (rw *ResourceWatcher) ensureConfirmMapsLocked() {
 	if rw.confirmed == nil {
 		rw.confirmed = map[schema.GroupVersionResource]struct{}{}
 	}
 	if rw.lastSyncRV == nil {
 		rw.lastSyncRV = map[schema.GroupVersionResource]string{}
 	}
-	for i, gvr := range gvrs {
-		// Conjunct 4: confirm the resource type. With no discovery
-		// client, disco==nil ⇒ resourceTypeConfirmedLocked already
-		// returns true, so we leave rw.confirmed untouched here.
-		if disco != nil {
-			if served[groupVersionString(gvr)] {
-				rw.confirmed[gvr] = struct{}{}
-			} else {
-				// Resource type not served — un-confirm it. This is
-				// what gates a post-startup CRD until the apiserver
-				// publishes its API, and also correctly retracts a
-				// confirmation if a CRD is deleted.
-				delete(rw.confirmed, gvr)
-			}
-		}
+}
 
-		// Conjunct-3 recovery: a successful relist advances the
-		// informer's LastSyncResourceVersion. If it advanced since the
-		// last refresh AND the informer is currently synced, the WATCH
-		// is healthy again — clear watchBroken.
-		rv := gis[i].Informer().LastSyncResourceVersion()
-		prev := rw.lastSyncRV[gvr]
-		if rv != "" && rv != prev && gis[i].Informer().HasSynced() {
-			if _, broken := rw.watchBroken[gvr]; broken {
-				delete(rw.watchBroken, gvr)
-				slog.Info("cache.watch.recovered",
-					slog.String("subsystem", "cache"),
-					slog.String("gvr", gvr.String()),
-					slog.String("reason", "LastSyncResourceVersion advanced — reflector relisted"),
-				)
-			}
-		}
-		if rv != "" {
-			rw.lastSyncRV[gvr] = rv
+// applyConfirmLocked is the per-GVR conjunct-3/4 update body extracted from
+// RefreshDiscovery so the scoped ConfirmResourceType reuses the EXACT same
+// confirm/recover logic — it does NOT fork a parallel predicate
+// (feedback_no_special_cases / the architect's "reuse RefreshDiscovery's
+// confirm logic" constraint). Callers MUST hold rw.mu.Lock() and MUST have
+// called ensureConfirmMapsLocked.
+//
+//   - haveDisco: a discovery client is wired (disco != nil). With no
+//     discovery client, conjunct 4 is degraded-true (resourceTypeConfirmedLocked
+//     returns true) so rw.confirmed is left untouched — identical to the
+//     pre-extraction RefreshDiscovery branch.
+//   - typeServed: whether the apiserver currently serves gvr's resource
+//     type (the result of resourceTypeServed for gvr's group/version).
+func (rw *ResourceWatcher) applyConfirmLocked(
+	gvr schema.GroupVersionResource,
+	gi informers.GenericInformer,
+	haveDisco bool,
+	typeServed bool,
+) {
+	// Conjunct 4: confirm the resource type. With no discovery client,
+	// haveDisco==false ⇒ resourceTypeConfirmedLocked already returns true,
+	// so we leave rw.confirmed untouched here.
+	if haveDisco {
+		if typeServed {
+			rw.confirmed[gvr] = struct{}{}
+		} else {
+			// Resource type not served — un-confirm it. This is what
+			// gates a post-startup CRD until the apiserver publishes its
+			// API, and also correctly retracts a confirmation if a CRD is
+			// deleted.
+			delete(rw.confirmed, gvr)
 		}
 	}
+
+	// Conjunct-3 recovery: a successful relist advances the informer's
+	// LastSyncResourceVersion. If it advanced since the last refresh AND
+	// the informer is currently synced, the WATCH is healthy again — clear
+	// watchBroken.
+	rv := gi.Informer().LastSyncResourceVersion()
+	prev := rw.lastSyncRV[gvr]
+	if rv != "" && rv != prev && gi.Informer().HasSynced() {
+		if _, broken := rw.watchBroken[gvr]; broken {
+			delete(rw.watchBroken, gvr)
+			slog.Info("cache.watch.recovered",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.String("reason", "LastSyncResourceVersion advanced — reflector relisted"),
+			)
+		}
+	}
+	if rv != "" {
+		rw.lastSyncRV[gvr] = rv
+	}
+}
+
+// ConfirmResourceType runs ONE conjunct-3/4 confirmation pass SCOPED to a
+// single gvr, reusing RefreshDiscovery's exact confirm/recover body
+// (applyConfirmLocked) — it does NOT fork a parallel confirm predicate.
+//
+// Fix #1 (1b): primed on the api-step LIST register path (informer_dispatch.go
+// Gate 6, after EnsureResourceType) and on the apistage content-HIT
+// re-touch (1a) so the FIRST post-boot LIST of a registered GVR does not
+// wait a full discoveryRefreshInterval (30s) tick to become servable, and a
+// transient boot-time discovery flap self-corrects. Without this, a
+// registered-but-unconfirmed GVR served from the apistage content cache
+// stays latched not-servable to TTL — the stale-delete root cause
+// (docs/rca-stale-delete-compositiondefinitions-informer-2026-06-25.md §4.3).
+//
+// Lazy + idempotent (feedback_bounding_mechanism_discipline): a no-op for
+// an UNregistered gvr (nothing to confirm — the LIST register path calls
+// EnsureResourceType first, so by the time this runs the informer exists or
+// the call is a cheap miss) and re-runnable any number of times (confirming
+// an already-confirmed GVR is a map write of an existing key). One discovery
+// round-trip (ServerResourcesForGroupVersion) for gvr's group/version, off
+// the lock; bounded by ctx.
+//
+// Concurrency: writes rw.confirmed / rw.watchBroken / rw.lastSyncRV under
+// rw.mu.Lock() — the SAME maps + lock the discovery-refresh ticker uses, so
+// the two are serialised (feedback_shared_vs_copy_is_a_concurrency_change;
+// covered by TestFalsifierHealA_ScopedConfirmRace under -race).
+//
+// Nil-receiver / passthrough safe.
+func (rw *ResourceWatcher) ConfirmResourceType(ctx context.Context, gvr schema.GroupVersionResource) {
+	if rw == nil || rw.mode == modePassthrough {
+		return
+	}
+
+	// Snapshot registration + discovery client under RLock; run the
+	// (blocking) discovery call WITHOUT the lock; re-read the informer + write
+	// back under Lock (N2 — the informer handle is re-read under the write
+	// lock, not captured here, to survive a delete+recreate interleave).
+	rw.mu.RLock()
+	_, registered := rw.informers[gvr]
+	disco := rw.disco
+	rw.mu.RUnlock()
+	if !registered {
+		// Nothing to confirm — the GVR has no informer. Lazy: the LIST
+		// register path (EnsureResourceType) runs first; a miss here is a
+		// cheap no-op, not a registration.
+		return
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
+
+	typeServed := false
+	if disco != nil {
+		typeServed = resourceTypeServed(disco, gvr)
+	}
+
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	// Re-check registration under the write lock: a concurrent
+	// RemoveResourceType (CRD-DELETE teardown) could have unregistered gvr
+	// between the RUnlock and here. Confirming a torn-down GVR would
+	// resurrect a stale rw.confirmed entry the teardown meant to drop.
+	//
+	// N2 (architect): re-READ gi from rw.informers under the write lock
+	// rather than trusting the gi captured under the earlier RLock. On a
+	// delete+recreate interleave (RemoveResourceType then EnsureResourceType
+	// of a fresh informer) the captured gi is stale; reading its
+	// LastSyncResourceVersion in applyConfirmLocked would write rw.lastSyncRV
+	// off the OLD reflector. The re-read binds the conjunct-3 recovery to the
+	// CURRENT informer.
+	curGI, stillRegistered := rw.informers[gvr]
+	if !stillRegistered {
+		return
+	}
+	rw.ensureConfirmMapsLocked()
+	rw.applyConfirmLocked(gvr, curGI, disco != nil, typeServed)
+}
+
+// ServableGVRStatus is a read-only per-GVR servability snapshot row,
+// surfaced by the /debug/servable diagnostic. It exposes the four
+// servability conjuncts so an operator can see WHY a GVR is (not) servable
+// without a kubectl exec into the pod.
+type ServableGVRStatus struct {
+	GVR         string `json:"gvr"`
+	HasSynced   bool   `json:"hasSynced"`   // conjunct 2
+	WatchBroken bool   `json:"watchBroken"` // conjunct 3 (true ⇒ not servable)
+	Confirmed   bool   `json:"confirmed"`   // conjunct 4
+	Servable    bool   `json:"servable"`    // all four conjuncts
+}
+
+// ServableSnapshot returns a read-only per-GVR servability snapshot over
+// every registered informer. READ-ONLY: it takes rw.mu in READ mode and
+// mutates NO state (no confirm, no register, no watch-flag change) — it is
+// safe to call from a diagnostic HTTP handler on every request.
+//
+// Returns nil for a nil receiver or passthrough mode (no informers to
+// report). Deterministically ordered is NOT guaranteed (map iteration); the
+// handler sorts for stable output.
+func (rw *ResourceWatcher) ServableSnapshot() []ServableGVRStatus {
+	if rw == nil || rw.mode == modePassthrough {
+		return nil
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	out := make([]ServableGVRStatus, 0, len(rw.informers))
+	for gvr, gi := range rw.informers {
+		_, broken := rw.watchBroken[gvr]
+		_, confirmed := rw.confirmed[gvr]
+		// servableLocked is the single source of truth for the composite —
+		// reuse it rather than re-deriving the conjunction here, so a future
+		// conjunct change cannot make the diagnostic disagree with the gate.
+		_, servable := rw.servableLocked(gvr)
+		out = append(out, ServableGVRStatus{
+			GVR:         gvr.String(),
+			HasSynced:   gi.Informer().HasSynced(),
+			WatchBroken: broken,
+			Confirmed:   confirmed,
+			Servable:    servable,
+		})
+	}
+	return out
 }
 
 // resourceTypeServed reports whether the apiserver currently serves
