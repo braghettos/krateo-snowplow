@@ -6,6 +6,7 @@ import (
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // perCallState carries the per-/call timing + observability state that
@@ -50,7 +51,7 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 		if ui, err := xcontext.UserInfo(ctx); err == nil {
 			user = ui.Username
 		}
-		slog.InfoContext(ctx, "dispatcher.call.complete",
+		attrs := []any{
 			slog.String("handler", handler),
 			slog.String("path", st.path),
 			slog.String("method", st.method),
@@ -58,6 +59,22 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 			slog.String("l1_hit", st.l1Hit),
 			slog.String("gvr", st.gvr),
 			slog.Int64("total_ms", time.Since(st.start).Milliseconds()),
-		)
+		}
+		// OTel log-correlation (ADDITIVE + default-OFF). When tracing is
+		// enabled, an OTel server span is active on ctx (otelhttp wrap in
+		// main.go), so attach its W3C trace_id/span_id to this
+		// otel_logs-bound record for trace<->log correlation in ClickHouse.
+		// When tracing is disabled SpanContextFromContext returns an invalid
+		// span context, so these fields are simply omitted and the record is
+		// byte-identical to the pre-OTel emission. This does NOT touch the
+		// shortid X-Krateo-TraceId correlation id, which lives on a separate
+		// header/status field and is unaffected here.
+		if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+			attrs = append(attrs,
+				slog.String("trace_id", sc.TraceID().String()),
+				slog.String("span_id", sc.SpanID().String()),
+			)
+		}
+		slog.InfoContext(ctx, "dispatcher.call.complete", attrs...)
 	}
 }
