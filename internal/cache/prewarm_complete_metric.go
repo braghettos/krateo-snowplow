@@ -126,3 +126,20 @@ func registerPrewarmCompleteMetric() {
 func RegisterPrewarmCompleteMetricForTest() {
 	registerPrewarmCompleteMetric()
 }
+
+// PrewarmCompleteSnapshot returns (done, elapsedMs) mirroring the
+// snowplow_prewarm_complete expvar value: done is 1 after the Phase1Done
+// flip (0 before), elapsedMs is the process-start->done wall-clock in ms
+// (-1 until the flip). Exported so the OTel metrics mirror
+// (internal/metrics) can observe the same boundary as /debug/vars without
+// reaching into private cache state.
+func PrewarmCompleteSnapshot() (done int64, elapsedMs int64) {
+	done, elapsedMs = 0, -1
+	if IsPhase1Done() {
+		done = 1
+		if n := phase1DoneNanos.Load(); n > 0 {
+			elapsedMs = (n - prewarmProcessStartNanos) / int64(time.Millisecond)
+		}
+	}
+	return done, elapsedMs
+}

@@ -1,0 +1,288 @@
+// Package metrics mirrors snowplow's existing expvar counters/gauges onto
+// an OpenTelemetry OTLP/HTTP MeterProvider so they can be scraped by the
+// OTel collector alongside traces.
+//
+// ADDITIVE + GATED (load-bearing): the expvar surface at /debug/vars is
+// UNTOUCHED — these OTLP instruments are a parallel export of the SAME
+// underlying counters, read through the same exported accessors the expvar
+// closures use. The whole pipeline is gated by OTEL_METRICS_ENABLED
+// (default false). When the gate is off, Setup registers NOTHING (no
+// MeterProvider, no exporter, no instruments) and returns a no-op
+// shutdown, so the off-path is byte-identical to the pre-OTel binary.
+//
+// All instruments are OBSERVABLE (async): a single registered callback
+// reads the live counter snapshots at collection time. This matches the
+// expvar.Func "computed-on-read" semantics exactly and adds zero cost to
+// the hot path — the callback only runs when the collector reads, and only
+// when metrics are enabled.
+package metrics
+
+import (
+	"context"
+
+	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/rbac"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+)
+
+const (
+	// EnvMetricsEnabled gates the entire OTLP metrics pipeline. Default
+	// false.
+	EnvMetricsEnabled = "OTEL_METRICS_ENABLED"
+
+	// EnvOTLPEndpoint is the OTLP/HTTP collector endpoint, shared with the
+	// trace pipeline via the standard OTEL_EXPORTER_OTLP_ENDPOINT contract.
+	EnvOTLPEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
+
+	serviceName = "snowplow"
+	meterName   = "github.com/krateoplatformops/snowplow"
+)
+
+// ShutdownFunc flushes and stops the metrics pipeline. Always non-nil; a
+// no-op when metrics were not enabled.
+type ShutdownFunc func(context.Context) error
+
+// Setup wires the OTLP/HTTP metric exporter + a periodic-reader
+// MeterProvider when OTEL_METRICS_ENABLED is true, registers it as the
+// global MeterProvider, and registers the observable instruments that
+// mirror snowplow's expvar counters.
+//
+// No-op (registers nothing) when the gate is off.
+func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
+	noop := func(context.Context) error { return nil }
+
+	if !env.Bool(EnvMetricsEnabled, false) {
+		return noop, nil
+	}
+
+	opts := []otlpmetrichttp.Option{}
+	if ep := env.String(EnvOTLPEndpoint, ""); ep != "" {
+		opts = append(opts, otlpmetrichttp.WithEndpointURL(ep))
+	}
+
+	exp, err := otlpmetrichttp.New(ctx, opts...)
+	if err != nil {
+		return noop, err
+	}
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceName(serviceName),
+			semconv.ServiceVersion(build),
+		),
+	)
+	if err != nil && res == nil {
+		res = resource.Default()
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp)),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+
+	if err := registerInstruments(mp.Meter(meterName)); err != nil {
+		// Best-effort: shut the provider down so we don't leak the reader
+		// goroutine, then surface the error.
+		_ = mp.Shutdown(ctx)
+		return noop, err
+	}
+
+	return mp.Shutdown, nil
+}
+
+// registerInstruments declares every observable instrument and a single
+// callback that reads the live counter snapshots. Instrument names mirror
+// the expvar keys (with the conventional `_total` suffix on monotonic
+// counters) so dashboards can correlate the two surfaces.
+func registerInstruments(m metric.Meter) error {
+	// --- cache: apiserver fallthrough + assertion violations ---
+	fallthroughTotal, err := m.Int64ObservableCounter(
+		"snowplow_apiserver_fallthrough_total",
+		metric.WithDescription("Cumulative apiserver fall-throughs (cache miss path)."),
+	)
+	if err != nil {
+		return err
+	}
+	assertionViolations, err := m.Int64ObservableCounter(
+		"snowplow_assertion_violations_total",
+		metric.WithDescription("Cumulative read-path-scoped assertion violations."),
+	)
+	if err != nil {
+		return err
+	}
+
+	// --- cache: RBAC snapshot publish sequence ---
+	rbacPublishSeq, err := m.Int64ObservableCounter(
+		"snowplow_rbac_publish_seq",
+		metric.WithDescription("RBAC snapshot publish sequence number."),
+	)
+	if err != nil {
+		return err
+	}
+
+	// --- cache: CRD discovery bridge counters (one gauge, keyed by stat) ---
+	crdDiscovery, err := m.Int64ObservableCounter(
+		"snowplow_crd_discovery",
+		metric.WithDescription("CRD-discovery bridge counters, labelled by stat."),
+	)
+	if err != nil {
+		return err
+	}
+
+	// --- cache: registered GVR count ---
+	registeredGVRs, err := m.Int64ObservableGauge(
+		"snowplow_plurals_registered_gvrs",
+		metric.WithDescription("Number of GVRs with a registered informer."),
+	)
+	if err != nil {
+		return err
+	}
+
+	// --- cache: prewarm completion boundary ---
+	prewarmDone, err := m.Int64ObservableGauge(
+		"snowplow_prewarm_complete",
+		metric.WithDescription("1 once Phase1Done has flipped, else 0."),
+	)
+	if err != nil {
+		return err
+	}
+	prewarmElapsed, err := m.Int64ObservableGauge(
+		"snowplow_prewarm_complete_elapsed_ms",
+		metric.WithDescription("Process-start to Phase1Done wall-clock (ms); -1 until flip."),
+	)
+	if err != nil {
+		return err
+	}
+
+	// --- cache: live-refresh broadcaster ---
+	refreshPublished, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_published_total",
+		metric.WithDescription("Live-refresh signals published."))
+	if err != nil {
+		return err
+	}
+	refreshDelivered, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_delivered_total",
+		metric.WithDescription("Live-refresh signals delivered to subscribers."))
+	if err != nil {
+		return err
+	}
+	refreshDropped, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_dropped_total",
+		metric.WithDescription("Live-refresh signals dropped (slow consumer)."))
+	if err != nil {
+		return err
+	}
+	refreshCoalesced, err := m.Int64ObservableCounter("snowplow_refresh_broadcaster_coalesced_total",
+		metric.WithDescription("Live-refresh signals coalesced."))
+	if err != nil {
+		return err
+	}
+	refreshSubscribers, err := m.Int64ObservableGauge("snowplow_refresh_broadcaster_subscribers",
+		metric.WithDescription("Current live-refresh subscriber count."))
+	if err != nil {
+		return err
+	}
+
+	// --- rbac: snapshot authz memo ---
+	memoHits, err := m.Int64ObservableCounter("snowplow_authz_memo_hits",
+		metric.WithDescription("Snapshot authz memo hits."))
+	if err != nil {
+		return err
+	}
+	memoMisses, err := m.Int64ObservableCounter("snowplow_authz_memo_misses",
+		metric.WithDescription("Snapshot authz memo misses."))
+	if err != nil {
+		return err
+	}
+	memoSwaps, err := m.Int64ObservableCounter("snowplow_authz_memo_swaps",
+		metric.WithDescription("Snapshot authz memo generation swaps."))
+	if err != nil {
+		return err
+	}
+	memoRefused, err := m.Int64ObservableCounter("snowplow_authz_memo_refused",
+		metric.WithDescription("Snapshot authz memo cap-breach refused inserts."))
+	if err != nil {
+		return err
+	}
+	memoDenyUncached, err := m.Int64ObservableCounter("snowplow_authz_memo_deny_uncached_total",
+		metric.WithDescription("Deny verdicts not cached by the memo."))
+	if err != nil {
+		return err
+	}
+	memoEntries, err := m.Int64ObservableGauge("snowplow_authz_memo_entries",
+		metric.WithDescription("Live entry count of the current memo shard."))
+	if err != nil {
+		return err
+	}
+
+	// Single callback reading every snapshot at collection time.
+	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(fallthroughTotal, int64(cache.FallthroughTotal()))
+		o.ObserveInt64(assertionViolations, int64(cache.AssertionViolationsTotal()),
+			metric.WithAttributes(attribute.String("check", "read_paths_scoped")))
+		o.ObserveInt64(rbacPublishSeq, int64(cache.RBACGen()))
+
+		s := cache.CRDDiscoveryStatsSnapshot()
+		for stat, v := range map[string]uint64{
+			"events_enqueued":      s.EventsEnqueued,
+			"events_dropped":       s.EventsDropped,
+			"events_processed":     s.EventsProcessed,
+			"discovery_invoked":    s.DiscoveryInvoked,
+			"discovery_skipped_ng": s.DiscoverySkippedNG,
+			"deletes_processed":    s.DeletesProcessed,
+			"delete_skipped_ng":    s.DeleteSkippedNG,
+			"panics_recovered":     s.PanicsRecovered,
+			"schema_relists_fired": s.SchemaRelistsFired,
+			"schema_unchanged":     s.SchemaUnchanged,
+		} {
+			o.ObserveInt64(crdDiscovery, int64(v),
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+
+		o.ObserveInt64(registeredGVRs, registeredGVRCount())
+
+		done, elapsed := cache.PrewarmCompleteSnapshot()
+		o.ObserveInt64(prewarmDone, done)
+		o.ObserveInt64(prewarmElapsed, elapsed)
+
+		published, delivered, dropped, coalesced := cache.RefreshBroadcasterCounters()
+		o.ObserveInt64(refreshPublished, int64(published))
+		o.ObserveInt64(refreshDelivered, int64(delivered))
+		o.ObserveInt64(refreshDropped, int64(dropped))
+		o.ObserveInt64(refreshCoalesced, int64(coalesced))
+		o.ObserveInt64(refreshSubscribers, int64(cache.RefreshSubscriberCount()))
+
+		hits, misses, swaps, refused, denyUncached, entries := rbac.AuthzMemoSnapshot()
+		o.ObserveInt64(memoHits, int64(hits))
+		o.ObserveInt64(memoMisses, int64(misses))
+		o.ObserveInt64(memoSwaps, int64(swaps))
+		o.ObserveInt64(memoRefused, int64(refused))
+		o.ObserveInt64(memoDenyUncached, int64(denyUncached))
+		o.ObserveInt64(memoEntries, int64(entries))
+		return nil
+	},
+		fallthroughTotal, assertionViolations, rbacPublishSeq, crdDiscovery,
+		registeredGVRs, prewarmDone, prewarmElapsed,
+		refreshPublished, refreshDelivered, refreshDropped, refreshCoalesced, refreshSubscribers,
+		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
+	)
+	return err
+}
+
+// registeredGVRCount returns the number of GVRs with a registered informer,
+// mirroring the `count` field of snowplow_plurals_registered_gvrs. Returns
+// 0 when the global watcher is nil (cache off / not wired).
+func registeredGVRCount() int64 {
+	rw := cache.Global()
+	if rw == nil {
+		return 0
+	}
+	return int64(len(rw.RegisteredGVRs()))
+}

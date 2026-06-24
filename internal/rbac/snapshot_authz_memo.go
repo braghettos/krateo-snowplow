@@ -229,6 +229,17 @@ func AuthzMemoDenyUncachedForTest() uint64 {
 	return authzMemoDenyUncached.Load()
 }
 
+// AuthzMemoSnapshot returns the live snapshot-authz memo counters
+// (hits, misses, swaps, refused, denyUncached, entries) mirroring the
+// snowplow_authz_memo_* expvar keys. Exported (unlike AuthzMemoStatsForTest,
+// which is test-only and resettable) so the OTel metrics mirror
+// (internal/metrics) can observe the same values as /debug/vars in
+// production.
+func AuthzMemoSnapshot() (hits, misses, swaps, refused, denyUncached uint64, entries int) {
+	return authzMemoHits.Load(), authzMemoMisses.Load(), authzMemoSwaps.Load(),
+		authzMemoRefused.Load(), authzMemoDenyUncached.Load(), authzMemoEntriesForExpvar()
+}
+
 // authzMemoExpvarFuncs is consumed by RegisterAuthzMemoExpvar; kept here
 // so the counters' wiring stays adjacent to their definitions.
 func authzMemoExpvarFuncs() map[string]expvar.Func {

@@ -15,6 +15,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/http/util"
 	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateoplatformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
 )
 
@@ -128,6 +129,17 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		werr := fmt.Errorf("unable to create HTTP Client for endpoint: %w", err)
 		return response.New(http.StatusInternalServerError, werr), nil, "", werr
 	}
+
+	// OTel outbound instrumentation (ADDITIVE + default-OFF). When
+	// OTEL_TRACES_ENABLED is true, wrap the client transport so this
+	// external GET to authn / api-steps emits a client span and injects a
+	// W3C `traceparent` (the request already carries ctx via
+	// NewRequestWithContext above, so the active server span is the
+	// parent). When tracing is disabled WrapTransport returns the transport
+	// unchanged, so this branch is a no-op and the outbound path stays
+	// byte-identical. The existing shortid X-Krateo-TraceId header set
+	// above is UNTOUCHED — both correlation ids ride the same request.
+	cli.Transport = tracing.WrapTransport(cli.Transport)
 
 	// REUSED verbatim: retry wrapper.
 	retryCli := util.NewRetryClient(cli)

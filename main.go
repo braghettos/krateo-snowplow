@@ -34,11 +34,15 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateoplatformops/snowplow/internal/metrics"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	crdschema "github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	"github.com/krateoplatformops/snowplow/internal/tracing"
 	httpSwagger "github.com/swaggo/http-swagger"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
@@ -153,6 +157,28 @@ func main() {
 	if *debugOn {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
+
+	// OTel observability (ADDITIVE + default-OFF). Both Setup calls are
+	// no-ops unless OTEL_TRACES_ENABLED / OTEL_METRICS_ENABLED are true; in
+	// the off-path they register nothing (no TracerProvider/MeterProvider,
+	// no propagator, no exporter), so the global providers stay no-op and
+	// every instrumentation site degrades to zero cost. This does NOT touch
+	// the shortid X-Krateo-TraceId correlation id, the stdout->otel_logs log
+	// pipeline, or the use.TraceId()/use.Logger() chain below — OTel
+	// coexists with all three. The deferred shutdowns flush the batch
+	// span/metric pipelines on graceful exit; they are no-ops when disabled.
+	otelCtx := context.Background()
+	traceShutdown, err := tracing.Setup(otelCtx, build)
+	if err != nil {
+		log.Error("otel tracing setup failed", slog.Any("err", err))
+	}
+	defer func() { _ = traceShutdown(context.Background()) }()
+
+	metricShutdown, err := metrics.Setup(otelCtx, build)
+	if err != nil {
+		log.Error("otel metrics setup failed", slog.Any("err", err))
+	}
+	defer func() { _ = metricShutdown(context.Background()) }()
 
 	chain := use.NewChain(
 		use.TraceId(),
@@ -923,6 +949,30 @@ func main() {
 	}...)
 	defer stop()
 
+	// OTel HTTP server instrumentation (default-OFF gated). otelhttp wraps
+	// the mux to create a server span per request and EXTRACT inbound W3C
+	// traceparent/baggage (the global propagator installed by
+	// tracing.Setup). When tracing is disabled the global TracerProvider is
+	// the no-op default, so otelhttp.NewHandler produces no spans and adds
+	// negligible overhead — the off-path stays effectively byte-identical.
+	//
+	// The wrap sits INSIDE use.CORS so CORS remains OUTERMOST and answers
+	// the OPTIONS preflight before otelhttp ever runs (otelhttp would
+	// otherwise span the preflight; CORS must own it). WithFilter skips
+	// span creation for the high-frequency health/readiness/debug probes.
+	var rootHandler http.Handler = otelhttp.NewHandler(mux, serviceName,
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method + " " + r.URL.Path
+		}),
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			switch r.URL.Path {
+			case "/health", "/readyz":
+				return false
+			}
+			return !strings.HasPrefix(r.URL.Path, "/debug/")
+		}),
+	)
+
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", *port),
 		Handler: use.CORS(cors.Options{
@@ -934,11 +984,17 @@ func main() {
 				"Content-Type",
 				"X-Auth-Code",
 				"X-Krateo-TraceId",
+				// W3C trace-context + baggage headers — REQUIRED so the
+				// browser frontend can propagate traceparent/tracestate/
+				// baggage into snowplow (cross-repo CORS dependency).
+				"traceparent",
+				"tracestate",
+				"baggage",
 			},
 			ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key"},
 			AllowCredentials: true,
 			MaxAge:           300, // Maximum value not ignored by any of major browsers
-		})(mux),
+		})(rootHandler),
 		ReadTimeout:  10 * time.Second, // read is fast; unchanged (#351/C2)
 		WriteTimeout: writeTimeout,     // 300s — clears cache-OFF heavy path (#351/C2)
 		IdleTimeout:  30 * time.Second, // keep-alive; unchanged (#351/C2)
