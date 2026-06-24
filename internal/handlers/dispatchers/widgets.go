@@ -61,20 +61,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// re-seed work for the dispatch's duration.
 	defer markCustomerInFlight()()
 
-	// OOM regression fix (a) — shared process-wide weighted memory budget
-	// (resolve_budget.go). Identical acquire site to restactions.go: ONE
-	// budget across both dispatchers (they reach the same heavy resolve +
-	// encode path). See restactions.go ServeHTTP for the full rationale.
-	releaseBudget, err := acquireCustomerResolveBudget(req.Context())
-	if err != nil {
-		xcontext.Logger(req.Context()).Warn("customer resolve budget acquire failed",
-			slog.Any("err", err))
-		response.Encode(wri, response.New(http.StatusServiceUnavailable,
-			fmt.Errorf("resolve budget unavailable: %w", err)))
-		return
-	}
-	defer releaseBudget()
-
 	extras, err := util.ParseExtras(req)
 	if err != nil {
 		response.BadRequest(wri, err)

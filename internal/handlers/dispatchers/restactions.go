@@ -76,24 +76,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// Cheap atomic; deferred decrement covers every return path.
 	defer markCustomerInFlight()()
 
-	// OOM regression fix (a) — process-wide weighted memory budget on the
-	// customer resolve entry (resolve_budget.go; project_regression_journal
-	// 2026-06-23). Acquired HERE at the ServeHTTP entry, not inside Resolve:
-	// the /call loopback is retired so nested RA→RA / RA→widget resolves run
-	// in-process and never re-enter ServeHTTP, making this acquire site
-	// re-entrancy-safe. Blocks until the per-resolve weight fits under the
-	// budget so the concurrent fan-out (and thus transient heap) is bounded
-	// INDEPENDENT of the inbound burst size; ctx-cancel while queued → 503.
-	releaseBudget, err := acquireCustomerResolveBudget(req.Context())
-	if err != nil {
-		log.Warn("customer resolve budget acquire failed",
-			slog.Any("err", err))
-		response.Encode(wri, response.New(http.StatusServiceUnavailable,
-			fmt.Errorf("resolve budget unavailable: %w", err)))
-		return
-	}
-	defer releaseBudget()
-
 	extras, err := util.ParseExtras(req)
 	if err != nil {
 		response.BadRequest(wri, err)
