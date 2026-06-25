@@ -218,16 +218,29 @@ func inspectInClusterStage(rc *rest.Config, stage *templates.API, dict map[strin
 		path := opt.Path
 
 		// Resource path → GVR (the dominant case).
-		if gvr, ns, _, ok := cache.ParseAPIServerPathToDep(path); ok {
+		if gvr, ns, name, ok := cache.ParseAPIServerPathToDep(path); ok {
 			if err := validateGVR(rc, gvr); err != nil {
 				return nil, fmt.Errorf("discovery validation failed for %s: %w", gvr.String(), err)
+			}
+			// The RBAC verb is determined by the path SHAPE, not a constant:
+			// a COLLECTION read (`.../resource`, no object name) is authorized
+			// as `list`; a BY-NAME read (`.../resource/<name>`) as `get`. The
+			// HTTP-stage method is CEL-bound to GET/HEAD (core.go:30), but the
+			// apiserver authorizes a collection GET under the `list` verb — so
+			// the prior constant `get` UNDER-GRANTED every collection stage and
+			// 403'd the real LIST at /call (#44 verb bug, design §4). Resource
+			// granularity is unchanged (Name stays "" — a resource-level grant,
+			// per design §3.2); only the verb reflects the read shape.
+			verb := "list"
+			if name != "" {
+				verb = "get"
 			}
 			rows = append(rows, Resource{
 				Group:     gvr.Group,
 				Version:   gvr.Version,
 				Resource:  gvr.Resource,
 				Namespace: ns,
-				Verb:      "get",
+				Verb:      verb,
 			})
 			continue
 		}
