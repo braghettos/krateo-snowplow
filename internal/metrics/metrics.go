@@ -5,10 +5,21 @@
 // ADDITIVE + GATED (load-bearing): the expvar surface at /debug/vars is
 // UNTOUCHED — these OTLP instruments are a parallel export of the SAME
 // underlying counters, read through the same exported accessors the expvar
-// closures use. The whole pipeline is gated by OTEL_METRICS_ENABLED
-// (default false). When the gate is off, Setup registers NOTHING (no
-// MeterProvider, no exporter, no instruments) and returns a no-op
-// shutdown, so the off-path is byte-identical to the pre-OTel binary.
+// closures use. The whole pipeline is gated by OTEL_METRICS_ENABLED, which
+// DEFAULTS to the value of the OTEL_ENABLED master switch when unset (so
+// OTEL_ENABLED=true turns metrics on; a per-signal OTEL_METRICS_ENABLED
+// still overrides). With both unset it is false. When the gate is off,
+// Setup registers NOTHING (no MeterProvider, no exporter, no instruments)
+// and returns a no-op shutdown, so the off-path is byte-identical to the
+// pre-OTel binary.
+//
+// This matches the canonical platform OTel enablement contract (the
+// chart-inspector internal/telemetry ConfigFromEnv and the runtimes):
+//
+//	OTEL_ENABLED            master switch                (default false)
+//	OTEL_TRACING_ENABLED    gate tracing  (default: value of OTEL_ENABLED)
+//	OTEL_METRICS_ENABLED    gate metrics  (default: value of OTEL_ENABLED)
+//	OTEL_EXPORTER_OTLP_ENDPOINT   collector OTLP/HTTP endpoint
 //
 // All instruments are OBSERVABLE (async): a single registered callback
 // reads the live counter snapshots at collection time. This matches the
@@ -34,8 +45,14 @@ import (
 )
 
 const (
-	// EnvMetricsEnabled gates the entire OTLP metrics pipeline. Default
-	// false.
+	// EnvEnabled is the master OTel switch. Default false. It supplies the
+	// default for EnvMetricsEnabled so a single flag turns the whole pipeline
+	// on.
+	EnvEnabled = "OTEL_ENABLED"
+
+	// EnvMetricsEnabled gates the entire OTLP metrics pipeline. It DEFAULTS to
+	// the value of EnvEnabled (OTEL_ENABLED) when unset; a per-signal value
+	// overrides the master. Default (with the master unset) is false.
 	EnvMetricsEnabled = "OTEL_METRICS_ENABLED"
 
 	// EnvOTLPEndpoint is the OTLP/HTTP collector endpoint, shared with the
@@ -50,16 +67,25 @@ const (
 // no-op when metrics were not enabled.
 type ShutdownFunc func(context.Context) error
 
+// metricsEnabled resolves the metrics gate from the canonical contract:
+// OTEL_METRICS_ENABLED, defaulting to the value of the OTEL_ENABLED master
+// when the per-signal var is unset. With both unset it is false, preserving
+// the default-off byte-identical guarantee.
+func metricsEnabled() bool {
+	return env.Bool(EnvMetricsEnabled, env.Bool(EnvEnabled, false))
+}
+
 // Setup wires the OTLP/HTTP metric exporter + a periodic-reader
-// MeterProvider when OTEL_METRICS_ENABLED is true, registers it as the
-// global MeterProvider, and registers the observable instruments that
-// mirror snowplow's expvar counters.
+// MeterProvider when metrics resolve to enabled (OTEL_METRICS_ENABLED,
+// defaulting to OTEL_ENABLED), registers it as the global MeterProvider,
+// and registers the observable instruments that mirror snowplow's expvar
+// counters.
 //
 // No-op (registers nothing) when the gate is off.
 func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 	noop := func(context.Context) error { return nil }
 
-	if !env.Bool(EnvMetricsEnabled, false) {
+	if !metricsEnabled() {
 		return noop, nil
 	}
 

@@ -159,8 +159,11 @@ func main() {
 	}
 
 	// OTel observability (ADDITIVE + default-OFF). Both Setup calls are
-	// no-ops unless OTEL_TRACES_ENABLED / OTEL_METRICS_ENABLED are true; in
-	// the off-path they register nothing (no TracerProvider/MeterProvider,
+	// no-ops unless tracing/metrics resolve to enabled: the OTEL_ENABLED
+	// master switch turns both on, and OTEL_TRACING_ENABLED /
+	// OTEL_METRICS_ENABLED (each defaulting to OTEL_ENABLED) gate the
+	// per-signal pipelines. With all unset they are false; in the off-path
+	// they register nothing (no TracerProvider/MeterProvider,
 	// no propagator, no exporter), so the global providers stay no-op and
 	// every instrumentation site degrades to zero cost. This does NOT touch
 	// the shortid X-Krateo-TraceId correlation id, the stdout->otel_logs log
