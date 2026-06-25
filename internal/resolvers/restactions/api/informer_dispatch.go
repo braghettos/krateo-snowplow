@@ -356,7 +356,26 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		// (singleflight under rw.mu); duplicate calls are sub-microsecond
 		// no-ops. It returns the per-GVR sync channel — closed once that
 		// informer's initial WaitForCacheSync completes.
-		_, syncCh := rw.EnsureResourceType(gvr)
+		added, syncCh := rw.EnsureResourceType(gvr)
+
+		// Fix #1 (1b) — stale-delete confirm-on-register
+		// (docs/rca-stale-delete-compositiondefinitions-informer-2026-06-25.md §6).
+		// When THIS dispatch is the one that lazily registers the GVR
+		// (added==true) on a LIST (name==""), prime ONE scoped conjunct-3/4
+		// confirmation pass so the GVR does not have to wait a full 30s
+		// discovery-refresh tick to become servable, and a transient
+		// boot-time discovery flap self-corrects. ConfirmResourceType reuses
+		// RefreshDiscovery's confirm body (no forked predicate) and writes
+		// rw.confirmed / rw.watchBroken under rw.mu.
+		//
+		// LIST-ONLY (feedback_bounding_mechanism_discipline + the 1.5.1
+		// boot-OOM): gated on name=="" so the GET-by-name child-resource
+		// fan-out never primes a confirm — no child informer is forced.
+		// `added`-gated so it is a one-shot per registration, not per
+		// dispatch — a duplicate dispatch returns added==false and skips it.
+		if added && name == "" {
+			rw.ConfirmResourceType(ctx, gvr)
+		}
 
 		// R2-b bounded single-attempt sync-wait. servedAfterWait is set
 		// only when the budget is positive AND the informer became

@@ -501,6 +501,46 @@ func apistageContentServe(
 		// hot-path cost per Deps.Record/RecordList doc.
 		if isList {
 			cache.Deps().RecordList(contentKey, gvr, ns)
+			// Fix #1 (1a) — stale-delete heal/re-touch
+			// (docs/rca-stale-delete-compositiondefinitions-informer-2026-06-25.md).
+			// A LIST served from this content HIT short-circuits BEFORE
+			// dispatchViaInformer, so once the entry was Put while the GVR
+			// was not-servable nothing ever re-touches the informer to
+			// confirm it — the GVR latches not-servable, its data informer
+			// never delivers DELETEs, and the dependent resolved-output LIST
+			// entry (e.g. /blueprints) stays stale to TTL. Re-touch the
+			// informer here so a registered-but-unconfirmed GVR keeps being
+			// nudged onto the discovery-confirm path:
+			//
+			//   - EnsureResourceType is singleflight-idempotent (sub-µs map
+			//     check when already registered — watcher.go:625); it does
+			//     NOT change what is served (still this content HIT). This
+			//     keeps the GVR registered + on the 30s discovery-refresh
+			//     confirm path (servable.go:208), which confirms every
+			//     registered GVR — so even a content-only-served LIST is
+			//     confirmed within one tick (≤30s) instead of latching
+			//     forever. That is the heal.
+			//
+			// NO per-HIT ConfirmResourceType here (architect N1, gate):
+			// ConfirmResourceType runs an UNCACHED ServerResourcesForGroupVersion
+			// discovery call, and for a GVR latched not-servable (the bug
+			// scenario) `!IsServable` stays true so EVERY content-HIT LIST
+			// would issue one — a discovery-storm amplifier on the same GVR
+			// class as regression #42 (feedback_bounding_mechanism_discipline:
+			// cost MUST be cost-proportional, not per-request-worst-case). The
+			// sub-tick prime lives SOLELY in 1b (confirm-on-register, one-shot
+			// per registration); here we only keep the GVR registered + on the
+			// ticker, which heals within ≤1 tick. The HIT path therefore stays
+			// the O(1) EnsureResourceType map check.
+			//
+			// LIST-ONLY (feedback_bounding_mechanism_discipline + the 1.5.1
+			// boot-OOM): this is inside `if isList` (name==""), so the
+			// GET-by-name child-resource fan-out (the OOM path) is NEVER
+			// re-touched — no child informer is ever forced. AFTER the cache
+			// read.
+			if rw := cache.Global(); rw != nil {
+				rw.EnsureResourceType(gvr)
+			}
 		} else {
 			cache.Deps().Record(contentKey, gvr, ns, name)
 		}
