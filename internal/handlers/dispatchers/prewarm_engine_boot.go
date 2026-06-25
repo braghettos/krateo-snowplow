@@ -187,6 +187,40 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 		return nil
 	}
 
+	// LATENT HAZARD (gate build-obligation #1). This engine boot seed runs
+	// the SERIAL single-worker loop (seedScopeYielding — a plain for-loop
+	// with one restactions.Resolve in flight at a time, yielding to
+	// customers via engineYieldCheckpoint). That serial shape is what
+	// memory-bounds the seed: warm-peak is bounded by a SINGLE resolve's
+	// weight, NOT a concurrent fan-out, so it CANNOT reproduce the
+	// concurrent-fan-out OOM that (a)/#46 fixed.
+	//
+	// BUT: the DEAD errgroup seed path (runPIPSeed, phase1_pip_seed.go —
+	// GOMAXPROCS-bounded g.SetLimit(runtime.GOMAXPROCS(0)) concurrent
+	// cohort fan-out) RE-ACTIVATES if PREWARM_ENGINE_ENABLED=false
+	// (phase1_walk.go:409 picks runPIPSeed when the engine is off). That
+	// concurrent seed BYPASSES the (a) process-wide weighted memory budget
+	// (which is on the CUSTOMER resolve entry, not the legacy seed loop) →
+	// it can re-OOM on the seed. The proactive RA union here WIDENS the
+	// seed source, so a fallback to the concurrent path would fan out over
+	// MORE refs.
+	//
+	// GUARD: production MUST keep PREWARM_ENGINE_ENABLED=true (the helm
+	// overlay sets it true — main-chart-reconciliation). F-3 asserts the
+	// production-on posture. Deleting the dead errgroup path is a separate
+	// BACKLOG item (NOT this ship).
+	if !PrewarmEngineEnabled() {
+		// Defensive: rePrewarmBoot is only reached when the engine path is
+		// selected (phase1_walk.go:482), so this branch should be
+		// unreachable in production. Emit loudly if it ever fires.
+		log.Warn("prewarm.engine.boot.hazard_engine_disabled_but_boot_reached",
+			slog.String("subsystem", "cache"),
+			slog.String("effect", "rePrewarmBoot reached with PREWARM_ENGINE_ENABLED=false — the concurrent "+
+				"runPIPSeed errgroup path (which BYPASSES the (a) memory budget) may also be active; "+
+				"this is the documented latent re-OOM hazard — keep the engine enabled"),
+		)
+	}
+
 	// ── (1) RE-WALK the nav roots AFTER the sync barrier. A FRESH walker
 	// per root (new visited map — reusing the boot pass's visited would
 	// short-circuit every child and descend nothing). The SAME walk() so
@@ -257,6 +291,19 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 	// ── (4) SEED per cohort with PER-TARGET-GVR scoping.
 	restactionRefs := deps.harvester.snapshot()
 	widgetEntries := deps.navHarv.snapshot()
+
+	// Proactive composition-page RESTAction seed (Option A) — UNION the
+	// RBAC-reachable RESTAction refs into the harvester snapshot so the
+	// per-composition click-through detail RESTActions (never reached by
+	// the nav walk — the harvester gap) are warmed at boot. Default-OFF
+	// (PROACTIVE_RA_SEED_ENABLED); flag-off the union is a no-op and the
+	// snapshot is harvester-only (F-6 transparent). The added refs flow
+	// through the SAME seedScopeYielding loop — each ref is scoped to its
+	// own per-binding targets via restActionTargetGVR + per-RA target GVR,
+	// so the per-binding cell-key sharing invariant is unchanged.
+	if ProactiveRASeedEnabled() {
+		restactionRefs = unionProactiveRARefs(restactionRefs, deps.rw, log)
+	}
 
 	log.Info("prewarm.engine.boot.rewalk_complete",
 		slog.String("subsystem", "cache"),
@@ -481,6 +528,82 @@ func seedScopeYielding(ctx context.Context,
 		}
 	}
 	return nil
+}
+
+// unionProactiveRARefs unions the RBAC-reachable RESTAction refs
+// (cache.RBACReachableRestActionRefs — Option A: the RESTAction CRs some
+// published binding grants `get` on, intersected with the boot-anchored
+// RESTActions informer) into the nav-walk harvester snapshot, deduped by
+// {ns,name} EXACTLY as the harvester dedups (phase1_content_prewarm.go).
+//
+// The proactive refs carry the SAME fixed RESTAction GVR coordinates the
+// harvester writes (restActionGVR group/version/resource), so the
+// downstream seedScopeYielding loop + objects.Get treat them identically.
+//
+// SEED-TARGETING ONLY (no special-case): the source is purely
+// RBAC-derived (zero resource/name/path literal). Over-inclusion = wasted
+// seed (benign); the per-request authz boundary is unchanged.
+func unionProactiveRARefs(harvested []templatesv1.ObjectReference,
+	rw *cache.ResourceWatcher, log *slog.Logger) []templatesv1.ObjectReference {
+
+	proactive := cache.RBACReachableRestActionRefs(rw)
+	if len(proactive) == 0 {
+		log.Info("prewarm.engine.boot.proactive_ra_seed",
+			slog.String("subsystem", "cache"),
+			slog.Int("harvested", len(harvested)),
+			slog.Int("proactive_reachable", 0),
+			slog.Int("added", 0),
+			slog.String("note", "no RBAC-reachable RESTAction refs (no binding grants get on restactions, or informer empty) — seed source unchanged"),
+		)
+		return harvested
+	}
+
+	out := unionRefsForTest(harvested, proactive)
+
+	log.Info("prewarm.engine.boot.proactive_ra_seed",
+		slog.String("subsystem", "cache"),
+		slog.Int("harvested", len(harvested)),
+		slog.Int("proactive_reachable", len(proactive)),
+		slog.Int("added", len(out)-len(harvested)),
+		slog.String("note", "RBAC-reachable RESTAction refs unioned into the boot seed source (Option A); the per-composition detail RESTActions the nav walk never reaches are now seeded"),
+	)
+	return out
+}
+
+// unionRefsForTest is the pure dedup core of unionProactiveRARefs — it
+// appends the proactive refs (built as RESTAction ObjectReferences with the
+// fixed GVR coordinates the harvester uses) onto the harvested slice, deduped
+// by {ns,name} EXACTLY as the harvester dedups
+// (phase1_content_prewarm.go). RBAC-source-independent so a falsifier can
+// exercise the dedup without a live cluster. Named *ForTest because the
+// falsifier is its only direct external caller; production reaches it through
+// unionProactiveRARefs.
+func unionRefsForTest(harvested []templatesv1.ObjectReference,
+	proactive []cache.RestActionRef) []templatesv1.ObjectReference {
+
+	seen := make(map[string]struct{}, len(harvested)+len(proactive))
+	out := make([]templatesv1.ObjectReference, 0, len(harvested)+len(proactive))
+	for _, r := range harvested {
+		key := r.Namespace + "/" + r.Name
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, r)
+	}
+	for _, p := range proactive {
+		key := p.Namespace + "/" + p.Name
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, templatesv1.ObjectReference{
+			Reference:  templatesv1.Reference{Name: p.Name, Namespace: p.Namespace},
+			APIVersion: restActionGVR.Group + "/" + restActionGVR.Version,
+			Resource:   restActionGVR.Resource,
+		})
+	}
+	return out
 }
 
 // restActionTargetGVR derives the GVR a RESTAction LISTs from its

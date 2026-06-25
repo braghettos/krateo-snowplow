@@ -82,6 +82,27 @@ func PrewarmEngineEnabled() bool {
 	return env.String(envPrewarmEngineEnabled, "false") == "true"
 }
 
+// envProactiveRASeedEnabled is the opt-in for the proactive
+// composition-page RESTAction seed source (Option A). When ON, the engine
+// boot seed UNIONS the RBAC-reachable RESTAction refs
+// (cache.RBACReachableRestActionRefs) into the nav-walk harvester snapshot
+// so the per-composition click-through detail RESTActions (never reached
+// by the nav walk) get warmed at boot. Default false: flag-off the seed
+// source is byte-identical to the harvester-only snapshot (F-6 — the
+// served content is unchanged; this flag only widens WHICH refs the seed
+// loop iterates, never the per-request authz boundary).
+//
+// It rides the engine gate: it is a no-op unless PrewarmEnabled()
+// (implicit-on-cache, #57) AND the engine boot seed runs
+// (PrewarmEngineEnabled()). The legacy runPIPSeed path does NOT consult it.
+const envProactiveRASeedEnabled = "PROACTIVE_RA_SEED_ENABLED"
+
+// ProactiveRASeedEnabled reports whether the proactive RESTAction seed
+// source is opted in. Defaults false (opt-in).
+func ProactiveRASeedEnabled() bool {
+	return env.String(envProactiveRASeedEnabled, "false") == "true"
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Customer-priority signal. Every customer /call dispatch brackets its
 // work with these. The engine yields while the counter is > 0.
