@@ -130,8 +130,9 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		return response.New(http.StatusInternalServerError, werr), nil, "", werr
 	}
 
-	// OTel outbound instrumentation (ADDITIVE + default-OFF). When
-	// OTEL_TRACES_ENABLED is true, wrap the client transport so this
+	// OTel outbound instrumentation (ADDITIVE + default-OFF). When tracing
+	// is enabled (OTEL_TRACING_ENABLED, defaulting to OTEL_ENABLED), wrap
+	// the client transport so this
 	// external GET to authn / api-steps emits a client span and injects a
 	// W3C `traceparent` (the request already carries ctx via
 	// NewRequestWithContext above, so the active server span is the
