@@ -167,9 +167,12 @@ func TestInspect_UAFVerbVerbatim_FreeFormVerb(t *testing.T) {
 	}
 }
 
-// Falsifier #2 — a non-UAF in-cluster GET stage emits verb "get" (core.go:30
-// bounds the HTTP-stage verb to GET/HEAD; HEAD requires the same get RBAC verb).
-func TestInspect_NonUAFStage_VerbGet(t *testing.T) {
+// Falsifier #2 — a non-UAF in-cluster COLLECTION stage emits verb "list".
+// The HTTP-stage method is CEL-bound to GET/HEAD (core.go:30), but a
+// collection read (`.../pods`, no object name) is authorized by the apiserver
+// under the `list` verb, not `get` (#44 verb fix, design §4). The prior
+// constant `get` here UNDER-GRANTED the collection read.
+func TestInspect_NonUAFStage_CollectionVerbList(t *testing.T) {
 	withInspectSARESTConfig(t, fakeDiscoveryServer(t))
 
 	ra := &templates.RESTAction{
@@ -186,9 +189,9 @@ func TestInspect_NonUAFStage_VerbGet(t *testing.T) {
 	if len(unresolved) != 0 {
 		t.Fatalf("expected zero unresolved, got %+v", unresolved)
 	}
-	row, ok := findRow(rows, "", "pods", "get")
+	row, ok := findRow(rows, "", "pods", "list")
 	if !ok {
-		t.Fatalf("FALSIFIER #2 FAIL: non-UAF GET stage must emit verb=get for pods; got %+v", rows)
+		t.Fatalf("FALSIFIER #2 FAIL: non-UAF COLLECTION stage must emit verb=list for pods; got %+v", rows)
 	}
 	if row.Namespace != "krateo-system" {
 		t.Fatalf("expected namespace krateo-system on the namespaced pods row, got %q", row.Namespace)
@@ -198,8 +201,9 @@ func TestInspect_NonUAFStage_VerbGet(t *testing.T) {
 // DEFECT 2 falsifier — an extras-driven dependsOn.iterator stage expands to one
 // RequestOptions per iterator element (createRequestOptions/jqutil.ForEach). The
 // inspect pass MUST classify EVERY opt, not just opts[0]: a per-namespace pods
-// GET iterating [ns-a, ns-b] must emit a pods row for EACH namespace. Before the
-// fix (only opts[0] inspected) the ns-b row was silently dropped = under-grant.
+// COLLECTION iterating [ns-a, ns-b] must emit a pods row for EACH namespace.
+// Before the fix (only opts[0] inspected) the ns-b row was silently dropped =
+// under-grant. Each collection row carries verb=list (#44 verb fix).
 func TestInspect_ExtrasIteratorStage_EmitsRowPerNamespace(t *testing.T) {
 	withInspectSARESTConfig(t, fakeDiscoveryServer(t))
 
@@ -233,13 +237,13 @@ func TestInspect_ExtrasIteratorStage_EmitsRowPerNamespace(t *testing.T) {
 	for _, ns := range []string{"ns-a", "ns-b"} {
 		found := false
 		for _, r := range rows {
-			if r.Resource == "pods" && r.Verb == "get" && r.Namespace == ns {
+			if r.Resource == "pods" && r.Verb == "list" && r.Namespace == ns {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Fatalf("DEFECT 2 FAIL: extras-iterator stage must emit a pods/get row for "+
+			t.Fatalf("DEFECT 2 FAIL: extras-iterator stage must emit a pods/list row for "+
 				"namespace %q — inspecting only opts[0] would drop it (under-grant). got rows=%+v", ns, rows)
 		}
 	}
@@ -359,8 +363,9 @@ func TestInspect_EndpointRefStage_Omitted(t *testing.T) {
 	if _, ok := findRow(rows, "", "external", "get"); ok {
 		t.Fatalf("endpointRef stage leaked an in-cluster row: %+v", rows)
 	}
-	if _, ok := findRow(rows, "", "pods", "get"); !ok {
-		t.Fatalf("the in-cluster pods stage should still emit; got %+v", rows)
+	// /api/v1/pods is a cluster-scoped COLLECTION → verb=list (#44 verb fix).
+	if _, ok := findRow(rows, "", "pods", "list"); !ok {
+		t.Fatalf("the in-cluster pods collection stage should still emit (verb=list); got %+v", rows)
 	}
 	if len(rows) != 1 {
 		t.Fatalf("expected exactly 1 row (pods); got %d: %+v", len(rows), rows)
@@ -492,15 +497,17 @@ func TestInspect_DedupeAndSort(t *testing.T) {
 	if len(unresolved) != 0 {
 		t.Fatalf("expected zero unresolved, got %+v", unresolved)
 	}
-	// namespaces/get appears once (deduped), namespaces/watch once, deployments/get once.
-	if _, ok := findRow(rows, "", "namespaces", "get"); !ok {
-		t.Fatalf("missing namespaces/get; got %+v", rows)
+	// namespaces/list appears once (the two collection GET stages dedupe),
+	// namespaces/watch once (UAF, distinct verb), deployments/list once.
+	// (#44 verb fix: collection reads carry verb=list, not get.)
+	if _, ok := findRow(rows, "", "namespaces", "list"); !ok {
+		t.Fatalf("missing namespaces/list; got %+v", rows)
 	}
 	if _, ok := findRow(rows, "", "namespaces", "watch"); !ok {
 		t.Fatalf("missing namespaces/watch (different verb, must stay distinct); got %+v", rows)
 	}
-	if _, ok := findRow(rows, "apps", "deployments", "get"); !ok {
-		t.Fatalf("missing apps/deployments/get; got %+v", rows)
+	if _, ok := findRow(rows, "apps", "deployments", "list"); !ok {
+		t.Fatalf("missing apps/deployments/list; got %+v", rows)
 	}
 	if len(rows) != 3 {
 		t.Fatalf("expected exactly 3 rows after dedupe, got %d: %+v", len(rows), rows)
