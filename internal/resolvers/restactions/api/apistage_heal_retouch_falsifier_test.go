@@ -153,7 +153,7 @@ func TestFalsifierRetouchLIST_RegistersInformerOnContentHit(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, _, ok := apistageContentServe(ctx, store, call)
+	_, _, ok := apistageContentServe(ctx, store, call, false)
 	if !ok {
 		t.Fatalf("apistageContentServe ok=false on the seeded LIST content HIT")
 	}
@@ -196,7 +196,7 @@ func TestFalsifierRetouchGET_DoesNotRegisterInformer(t *testing.T) {
 			Verb: ptr.To(http.MethodGet),
 		},
 	}
-	_, _, ok := apistageContentServe(ctx, store, call)
+	_, _, ok := apistageContentServe(ctx, store, call, false)
 	if !ok {
 		t.Fatalf("apistageContentServe ok=false on the seeded GET-by-name content HIT")
 	}
