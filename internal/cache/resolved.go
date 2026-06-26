@@ -36,6 +36,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,20 @@ const (
 	envResolvedCacheMaxBytes     = "RESOLVED_CACHE_MAX_BYTES"
 	envResolvedCacheTTLSeconds   = "RESOLVED_CACHE_TTL_SECONDS"
 	envResolvedCacheSummaryEvery = "RESOLVED_CACHE_SUMMARY_EVERY_SECONDS"
+
+	// envCatalogUnservableTTLSeconds is the R1 Layer 2 (#36) bounded
+	// staleness backstop. When > 0, an apistage entry stored while its
+	// underlying GVR informer is NOT servable (registered-but-not-synced /
+	// watch-broken / unconfirmed) gets this SHORT per-entry TTL instead of
+	// the standard RESOLVED_CACHE_TTL_SECONDS, so a degraded / not-fully-
+	// resolved catalog entry self-corrects within the bound EVEN IF a
+	// dirty-mark / refresh-ordering gap is ever missed. This is a
+	// bounded-staleness floor, NOT a flag-park: the dirty-mark + refresher
+	// remain the primary invalidation; this is the safety net that caps the
+	// worst case. Default 0 = DISABLED (the per-entry override is purely
+	// additive; with it unset, entries use the standard TTL exactly as
+	// before). Operators set it via the chart value.
+	envCatalogUnservableTTLSeconds = "CATALOG_UNSERVABLE_TTL_SECONDS"
 
 	// envResolvedCacheMaxResidentBytes is the Ship 4a (0.30.198) byte
 	// budget for the PINNED resident region — the eviction-protected cells
@@ -238,6 +253,17 @@ type ResolvedEntry struct {
 	// before Put; Put reads it under mu to decide resident vs transient
 	// accounting.
 	Pinned bool
+
+	// TTLOverride — R1 Layer 2 (#36) bounded-staleness backstop. When > 0,
+	// THIS entry expires after TTLOverride instead of the store's standard
+	// ttl. Set to the short CATALOG_UNSERVABLE_TTL_SECONDS when an apistage
+	// entry is stored while its GVR informer is not servable, so a degraded
+	// catalog entry self-evicts within the bound even if a dirty-mark is
+	// missed. Zero means "use the store's standard ttl" (the default for
+	// every healthy entry) — purely additive. Read in Get's TTL check;
+	// also folded into the metadata ttl-remaining projection. Set before
+	// Put; not mutated after.
+	TTLOverride time.Duration
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set
@@ -723,6 +749,20 @@ func canonicaliseExtras(m map[string]any) ([]byte, error) {
 	return out, nil
 }
 
+// effectiveTTLLocked returns the TTL governing this entry's expiry: the
+// per-entry TTLOverride when positive (R1 Layer 2 #36 bounded-staleness
+// backstop), else the store's standard ttl. Callers MUST hold c.mu.
+func (c *ResolvedCacheStore) effectiveTTLLocked(entry *ResolvedEntry) time.Duration {
+	if entry != nil && entry.TTLOverride > 0 {
+		// Honour the shorter of the two so the backstop can only TIGHTEN the
+		// bound, never extend an entry past the store's standard ttl.
+		if c.ttl <= 0 || entry.TTLOverride < c.ttl {
+			return entry.TTLOverride
+		}
+	}
+	return c.ttl
+}
+
 // Get returns the cached entry for key, or (nil, false). A TTL-expired
 // entry is treated as a miss and is dropped during the same call so
 // memory pressure is bounded. Increments hit/miss counters atomically.
@@ -739,7 +779,12 @@ func (c *ResolvedCacheStore) Get(key string) (*ResolvedEntry, bool) {
 		return nil, false
 	}
 	item := el.Value.(*lruItem)
-	if c.ttl > 0 && time.Since(item.entry.CreatedAt) > c.ttl {
+	// R1 Layer 2 (#36): a per-entry TTLOverride (the short
+	// CATALOG_UNSERVABLE_TTL_SECONDS set on entries stored while their GVR
+	// was not servable) takes precedence over the store's standard ttl, so a
+	// degraded catalog entry self-evicts within the bound. Zero override =
+	// the standard ttl (every healthy entry).
+	if eff := c.effectiveTTLLocked(item.entry); eff > 0 && time.Since(item.entry.CreatedAt) > eff {
 		c.removeElementLocked(el)
 		c.evictTTLTotal.Add(1)
 		c.missTotal.Add(1)
@@ -999,6 +1044,125 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 		ResidentPinTotal:        c.residentPinTotal.Load(),
 		ResidentDemoteTotal:     c.residentDemoteTotal.Load(),
 	}
+}
+
+// ResolvedEntryMeta is the METADATA-ONLY projection of one cached
+// resolved-output entry, returned by RangeMetadata for the /debug/apistage
+// diagnostic (R1 design §6 Mode 1).
+//
+// STRUCTURAL LEAK GUARD (PM F-2): this struct contains ONLY scalar metadata
+// — class, key hash, GVR coordinates, age/TTL, and the LENGTH of the body.
+// It deliberately has NO []byte, NO []*unstructured.Unstructured, and NO
+// map field, so it is STRUCTURALLY INCAPABLE of carrying RawJSON, the parsed
+// Items, or the Extras key-inputs. Resolved output is per-identity
+// RBAC-sensitive; a content dump would be a cross-user leak. The leak guard
+// is the type itself (and RangeMetadata's field-by-field copy), not a
+// comment — see TestRangeMetadata_StructurallyCannotLeakContent.
+type ResolvedEntryMeta struct {
+	CacheEntryClass string `json:"cacheEntryClass"`
+	// KeyHash is the opaque ComputeKey string (a hash) — not reversible to
+	// inputs, safe to expose.
+	KeyHash string `json:"keyHash"`
+	// Path is a derived apiserver-style path from the GVR coordinates
+	// (group/version/resource[/namespaces/ns][/name]) — built from the key
+	// inputs, NOT from any resolved body.
+	Path      string `json:"path"`
+	Group     string `json:"group"`
+	Version   string `json:"version"`
+	Resource  string `json:"resource"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	// Stage is the apistage per-stage discriminator (itself a hash of the
+	// stage id + filter + dependsOn-output) — opaque, not content.
+	Stage       string `json:"stage,omitempty"`
+	AgeSeconds  int64  `json:"ageSeconds"`
+	TTLRemainingSeconds int64 `json:"ttlRemainingSeconds"`
+	Pinned      bool   `json:"pinned"`
+	// ItemsCount is the LENGTH of the pre-parsed LIST envelope (0 when not a
+	// parsed-list apistage entry). A count only — never the items themselves.
+	ItemsCount int `json:"itemsCount"`
+	// RawJSONBytes is the LENGTH of the encoded body (for size diagnostics) —
+	// never the body.
+	RawJSONBytes int `json:"rawJSONBytes"`
+}
+
+// RangeMetadata walks every live cached entry under c.mu (read-consistent
+// snapshot semantics: the lock is held for the whole walk) and invokes fn
+// with the METADATA-ONLY projection of each. Iteration stops early if fn
+// returns false. Returns immediately on a nil receiver.
+//
+// STRUCTURAL LEAK GUARD (PM F-2): fn receives a ResolvedEntryMeta, which by
+// construction cannot carry RawJSON / Items / Extras (see the type doc). This
+// method reads those fields ONLY to compute scalar projections (len(), an age
+// duration, a path string from the GVR) — it never copies a body, a parsed
+// item, or the extras map into the emitted value. A future field added to
+// ResolvedEntryMeta that could carry content would break
+// TestRangeMetadata_StructurallyCannotLeakContent.
+func (c *ResolvedCacheStore) RangeMetadata(fn func(ResolvedEntryMeta) bool) {
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		item := el.Value.(*lruItem)
+		entry := item.entry
+		meta := ResolvedEntryMeta{
+			KeyHash:      item.key,
+			AgeSeconds:   int64(now.Sub(entry.CreatedAt).Seconds()),
+			Pinned:       entry.Pinned,
+			ItemsCount:   len(entry.Items),
+			RawJSONBytes: len(entry.RawJSON),
+		}
+		if eff := c.effectiveTTLLocked(entry); eff > 0 {
+			rem := eff - now.Sub(entry.CreatedAt)
+			if rem < 0 {
+				rem = 0
+			}
+			meta.TTLRemainingSeconds = int64(rem.Seconds())
+		}
+		if in := entry.Inputs; in != nil {
+			meta.CacheEntryClass = in.CacheEntryClass
+			meta.Group = in.Group
+			meta.Version = in.Version
+			meta.Resource = in.Resource
+			meta.Namespace = in.Namespace
+			meta.Name = in.Name
+			meta.Stage = in.Stage
+			meta.Path = metaPathFromCoords(in.Group, in.Version, in.Resource, in.Namespace, in.Name)
+		}
+		if !fn(meta) {
+			return
+		}
+	}
+}
+
+// metaPathFromCoords builds an apiserver-style path string from GVR
+// coordinates for the /debug metadata projection. Pure string composition
+// from the key inputs — touches no resolved body.
+func metaPathFromCoords(group, version, resource, namespace, name string) string {
+	var b strings.Builder
+	if group == "" {
+		b.WriteString("/api/")
+		b.WriteString(version)
+	} else {
+		b.WriteString("/apis/")
+		b.WriteString(group)
+		b.WriteString("/")
+		b.WriteString(version)
+	}
+	if namespace != "" {
+		b.WriteString("/namespaces/")
+		b.WriteString(namespace)
+	}
+	b.WriteString("/")
+	b.WriteString(resource)
+	if name != "" {
+		b.WriteString("/")
+		b.WriteString(name)
+	}
+	return b.String()
 }
 
 // ApistageEvictPressure is the Ship E (0.30.116) O6 budget signal: the
@@ -1322,6 +1486,20 @@ func intFromEnv(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// CatalogUnservableTTL returns the configured R1 Layer 2 (#36) bounded-
+// staleness backstop duration, or 0 when DISABLED (the default — the env
+// var unset/0/invalid). When > 0, an apistage entry stored while its GVR is
+// not servable should carry this as ResolvedEntry.TTLOverride. Read at Put
+// time (cheap os.Getenv + Atoi); kept here next to the resolved-cache TTL
+// knobs since it governs per-entry expiry in this store.
+func CatalogUnservableTTL() time.Duration {
+	s := intFromEnv(envCatalogUnservableTTLSeconds, 0)
+	if s <= 0 {
+		return 0
+	}
+	return time.Duration(s) * time.Second
 }
 
 func int64FromEnv(key string, def int64) int64 {
