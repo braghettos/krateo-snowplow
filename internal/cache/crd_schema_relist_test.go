@@ -42,8 +42,8 @@ type dirtyRecorder struct {
 }
 
 func newDirtyRecorder() *dirtyRecorder { return &dirtyRecorder{keys: map[string]int{}} }
-func (r *dirtyRecorder) hook() func(string) {
-	return func(k string) { r.mu.Lock(); r.keys[k]++; r.mu.Unlock() }
+func (r *dirtyRecorder) hook() func(string, schema.GroupVersionResource) {
+	return func(k string, _ schema.GroupVersionResource) { r.mu.Lock(); r.keys[k]++; r.mu.Unlock() }
 }
 func (r *dirtyRecorder) marked(k string) bool {
 	r.mu.Lock()

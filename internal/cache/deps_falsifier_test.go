@@ -45,8 +45,8 @@ type captureHook struct {
 	keys []string
 }
 
-func (h *captureHook) fn() func(string) {
-	return func(k string) {
+func (h *captureHook) fn() func(string, schema.GroupVersionResource) {
+	return func(k string, _ schema.GroupVersionResource) {
 		h.mu.Lock()
 		h.keys = append(h.keys, k)
 		h.mu.Unlock()

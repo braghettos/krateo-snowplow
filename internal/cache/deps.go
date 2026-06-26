@@ -268,6 +268,49 @@ func ApistagePrewarmFromContext(ctx context.Context) bool {
 	return v
 }
 
+// ctxKeyRefreshTriggerGVRType is the typed context key for the R1 Layer 1
+// refresh-trigger-GVR marker.
+type ctxKeyRefreshTriggerGVRType struct{}
+
+var ctxKeyRefreshTriggerGVR = ctxKeyRefreshTriggerGVRType{}
+
+// WithRefreshTriggerGVR returns a child context carrying the GVR whose
+// dirty-mark TRIGGERED this refresher re-resolve (R1 Layer 1). It is set
+// ONLY by the refresher's re-resolve entry point (resolve_populate.go),
+// NEVER on a request-path /call — so a marked ctx is structurally proof
+// that this resolve is a refresher re-resolve driven by a specific GVR
+// event.
+//
+// THE INVARIANT it establishes: during a refresher re-resolve triggered by
+// GVR X, apistageContentServe must NOT serve a stale content HIT for a
+// content entry whose OWN dep GVR == X — it must re-dispatch that unit
+// fresh, so the whole-RA re-resolve consumes the FRESH input rather than a
+// sibling stage's stale content snapshot (the content-shield defect, R1
+// §3). The comparison is dep-edge equality (entry's GVR == trigger GVR),
+// UNIFORM across every GVR — no per-resource/path special-case
+// (feedback_no_special_cases). The request path never carries the marker,
+// so apistageContentServe's HIT branch is byte-identical for real /call.
+//
+// A nil ctx is returned unchanged.
+func WithRefreshTriggerGVR(ctx context.Context, gvr schema.GroupVersionResource) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyRefreshTriggerGVR, gvr)
+}
+
+// RefreshTriggerGVRFromContext returns the trigger GVR set by
+// WithRefreshTriggerGVR and true, or a zero GVR and false when the ctx is
+// not a refresher re-resolve (every request-path /call). apistageContentServe
+// consults it to decide a forced-miss on dep-edge equality.
+func RefreshTriggerGVRFromContext(ctx context.Context) (schema.GroupVersionResource, bool) {
+	if ctx == nil {
+		return schema.GroupVersionResource{}, false
+	}
+	v, ok := ctx.Value(ctxKeyRefreshTriggerGVR).(schema.GroupVersionResource)
+	return v, ok
+}
+
 // Dependency env knobs.
 const (
 	envDepsMaxRecords = "DEPS_MAX_RECORDS"
@@ -349,9 +392,12 @@ type DepTracker struct {
 	store   *ResolvedCacheStore
 
 	// enqueueFn is the refresher hook OnUpdate calls. Wired by
-	// SetRefreshHook; nil-safe (OnUpdate becomes a no-op).
+	// SetRefreshHook; nil-safe (OnUpdate becomes a no-op). R1 Layer 1: the
+	// hook now also receives the GVR whose event triggered the dirty-mark,
+	// so the refresher can carry it to the re-resolve (WithRefreshTriggerGVR)
+	// for the dep-edge-equality forced-miss.
 	enqueueMu sync.RWMutex
-	enqueueFn func(l1Key string)
+	enqueueFn func(l1Key string, triggerGVR schema.GroupVersionResource)
 }
 
 // depsInstance is the singleton — lazily initialised on first call to
@@ -401,10 +447,13 @@ func (d *DepTracker) SetStore(s *ResolvedCacheStore) {
 // SetRefreshHook wires the refresher enqueue function. Safe to call
 // multiple times; later calls replace the earlier wiring.
 //
-// The hook is called with an L1 key string for each dependent entry
-// matched by OnUpdate. The refresher is responsible for dedup, ordering,
-// and the actual re-resolve.
-func (d *DepTracker) SetRefreshHook(fn func(l1Key string)) {
+// The hook is called with an L1 key string + the GVR whose event matched
+// this dependent entry (R1 Layer 1 — the trigger GVR), for each dependent
+// entry matched by OnUpdate/OnAdd/OnDelete. The refresher is responsible
+// for dedup, ordering, and the actual re-resolve, and carries the trigger
+// GVR to the re-resolve so apistageContentServe can force-miss a content
+// entry keyed on that same GVR.
+func (d *DepTracker) SetRefreshHook(fn func(l1Key string, triggerGVR schema.GroupVersionResource)) {
 	d.enqueueMu.Lock()
 	d.enqueueFn = fn
 	d.enqueueMu.Unlock()
@@ -536,7 +585,7 @@ func (d *DepTracker) onChange(eventType string, gvr schema.GroupVersionResource,
 	marked := 0
 	for l1Key := range matched {
 		if enqueue != nil {
-			enqueue(l1Key)
+			enqueue(l1Key, gvr)
 		}
 		marked++
 	}
@@ -618,7 +667,7 @@ func (d *DepTracker) OnDelete(gvr schema.GroupVersionResource, namespace, name s
 		}
 		// Bucket 2 (LIST-dep) or bucket 3 (dependent-GET-dep) → dirty-mark.
 		if enqueue != nil {
-			enqueue(l1Key)
+			enqueue(l1Key, gvr)
 		}
 		dirtyMarked++
 	}
@@ -762,7 +811,7 @@ func (d *DepTracker) dirtyMarkResourceType(eventType string, gvr schema.GroupVer
 	marked := 0
 	for l1Key := range matched {
 		if enqueue != nil {
-			enqueue(l1Key)
+			enqueue(l1Key, gvr)
 		}
 		marked++
 	}

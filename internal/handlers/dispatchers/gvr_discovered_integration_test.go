@@ -349,7 +349,7 @@ func TestGVRDiscoveredIntegration_DepRecordedThenAddFiresConsumed(t *testing.T) 
 	// against a separate engine instance, but the global deps tracker
 	// is process-wide).
 	var enqueueCount atomic.Int64
-	stub := func(key string) {
+	stub := func(key string, _ schema.GroupVersionResource) {
 		if key == l1Key {
 			enqueueCount.Add(1)
 		}
@@ -441,7 +441,7 @@ func TestGVRDiscoveredIntegration_AdminPerBindingCellsExceedPreExistingClusterLi
 
 	// Install a counter to track WHICH cells are dirty-marked.
 	dirtyMarked := map[string]int{}
-	deps.SetRefreshHook(func(key string) {
+	deps.SetRefreshHook(func(key string, _ schema.GroupVersionResource) {
 		dirtyMarked[key]++
 	})
 	defer deps.SetRefreshHook(nil)

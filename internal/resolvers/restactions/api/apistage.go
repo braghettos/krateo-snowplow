@@ -478,7 +478,26 @@ func apistageContentServe(
 	var parsed parsedListEnvelope
 	var haveParsed bool
 	var entryRef *cache.ResolvedEntry
-	if entry, hit := store.Get(contentKey); hit && entry != nil {
+	// R1 Layer 1 — refresh-context content-bypass (force a MISS on a content
+	// HIT whose OWN dep GVR is the GVR that TRIGGERED this refresher
+	// re-resolve). Without it, a whole-RA refresh re-resolve serves this
+	// stage from its STORED content bytes (the HIT branch below short-
+	// circuits the fresh fetch — the content-shield, R1 §3), so the
+	// re-resolve consumes a stale sibling snapshot and re-stores a degraded
+	// result. forceContentMiss is true ONLY when:
+	//   - ctx carries a refresh trigger GVR (WithRefreshTriggerGVR, set ONLY
+	//     by the refresher's re-resolve entry point — NEVER a request-path
+	//     /call, so the HIT branch is byte-identical for real traffic), AND
+	//   - that trigger GVR == this content unit's own GVR (dep-edge
+	//     equality — UNIFORM, no per-resource/path special-case,
+	//     feedback_no_special_cases).
+	// On a forced miss we fall through to the MISS branch, which re-dispatches
+	// fresh + re-Puts, so the whole-RA re-resolve reads the FRESH input.
+	forceContentMiss := false
+	if tg, ok := cache.RefreshTriggerGVRFromContext(ctx); ok && tg == gvr {
+		forceContentMiss = true
+	}
+	if entry, hit := store.Get(contentKey); hit && entry != nil && !forceContentMiss {
 		hitObserved = true // Ship 0.30.193 C3 — observed cache hit.
 		envelope = entry.RawJSON
 		entryRef = entry

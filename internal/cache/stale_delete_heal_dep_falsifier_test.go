@@ -80,7 +80,7 @@ type healBCaptureHook struct {
 	keys []string
 }
 
-func (h *healBCaptureHook) fn(k string) {
+func (h *healBCaptureHook) fn(k string, _ schema.GroupVersionResource) {
 	h.mu.Lock()
 	h.keys = append(h.keys, k)
 	h.mu.Unlock()

@@ -43,6 +43,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -244,6 +245,21 @@ type refresher struct {
 	handlersMu sync.RWMutex
 	handlers   map[string]RefreshFunc
 
+	// triggerGVRByKey carries the GVR whose dirty-mark enqueued each key
+	// (R1 Layer 1). The SetRefreshHook callback stores key→trigger-GVR
+	// before the queue.Add; processNext loads+deletes it at dequeue and
+	// stamps WithRefreshTriggerGVR on the re-resolve ctx so
+	// apistageContentServe force-misses a content entry keyed on that GVR.
+	// A key present in the queue but ABSENT here (e.g. a self-enqueue, or
+	// a value overwritten by a later dirty-mark before dequeue) simply
+	// carries no trigger GVR — the re-resolve then behaves exactly as
+	// pre-R1 (no forced miss). Last-write-wins on concurrent re-marks of
+	// the same key is acceptable: any of the dirtying GVRs is a valid
+	// force-miss target, and the rate-floor/dedup already collapses the
+	// re-marks to one re-resolve. sync.Map: write-on-enqueue,
+	// delete-on-dequeue, bounded by the in-flight key set.
+	triggerGVRByKey sync.Map
+
 	// Falsifier counters (atomic).
 	enqueueTotal        atomic.Uint64
 	completedTotal      atomic.Uint64
@@ -406,7 +422,14 @@ func StartRefresher(ctx context.Context) {
 		// branch); the memo holds the entry, so we MUST consult the memo
 		// directly, not the L1 store. The invalidator is non-blocking
 		// (drop-on-full) so this never delays the refresher enqueue path.
-		Deps().SetRefreshHook(func(l1Key string) {
+		Deps().SetRefreshHook(func(l1Key string, triggerGVR schema.GroupVersionResource) {
+			// R1 Layer 1 — record the GVR whose dirty-mark enqueued this key
+			// BEFORE the queue.Add, so processNext can stamp it on the
+			// re-resolve ctx (dep-edge-equality force-miss). Last-write-wins
+			// on concurrent re-marks (any dirtying GVR is a valid target);
+			// an empty (zero) GVR is still stored — RefreshTriggerGVRFromContext
+			// only matches a non-empty equality so a zero never force-misses.
+			r.triggerGVRByKey.Store(l1Key, triggerGVR)
 			// Path 3.2 / 0.30.218 — two-tier dispatch. If the key is a
 			// registered cluster_list cell, route it to the
 			// HIGH-PRIORITY tier; otherwise the normal tier. The
@@ -761,7 +784,21 @@ func (r *refresher) processNext(ctx context.Context) bool {
 		}
 	}
 
-	if err := r.processOne(ctx, key, entry, ok); err != nil {
+	// R1 Layer 1 — stamp the trigger GVR (recorded at enqueue by the
+	// SetRefreshHook callback) onto the re-resolve ctx, so
+	// apistageContentServe force-misses a content entry keyed on that GVR
+	// during this whole-RA re-resolve. Load-and-delete: the entry is
+	// consumed exactly once per dispatch; a key with no recorded GVR (self-
+	// enqueue) carries none and the re-resolve is pre-R1-identical. Done
+	// here (not in the floored-defer branch above) so the GVR survives a
+	// floor deferral and is consumed at the eventual real dispatch.
+	rctx := ctx
+	if v, present := r.triggerGVRByKey.LoadAndDelete(key); present {
+		if tg, isGVR := v.(schema.GroupVersionResource); isGVR && !tg.Empty() {
+			rctx = WithRefreshTriggerGVR(ctx, tg)
+		}
+	}
+	if err := r.processOne(rctx, key, entry, ok); err != nil {
 		r.failedTotal.Add(1)
 		// Poison-pill bound (Part A). NumRequeues is how many times this
 		// exact key has already been AddRateLimited. Once it exceeds the
