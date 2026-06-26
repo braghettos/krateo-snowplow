@@ -56,7 +56,13 @@ const (
 // taken from the connection's ctx, never the wire (the forgery-proof
 // property, see file header).
 type SubscriptionCoordinates struct {
-	Class     string // CacheEntryClass: "widgets" | "widgetContent" | "restactions" | "apistage" | "raFullList"
+	// Class is the CacheEntryClass: "widgets" | "widgetContent" |
+	// "restactions" | "apistage" | "raFullList". The frontend learns the
+	// right value from the X-Snowplow-Refresh-Class response header the /call
+	// dispatcher stamps (helpers.go setRefreshKeyHeader) — it echoes that
+	// verbatim rather than guessing widgets-vs-widgetContent (frontend guide
+	// §2.5). An unknown class fails closed in DeriveSubscriptionKey's default.
+	Class     string
 	Group     string
 	Version   string
 	Resource  string

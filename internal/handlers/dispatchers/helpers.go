@@ -451,15 +451,30 @@ func encodeResolvedJSON(res any) ([]byte, error) {
 // cross-origin fetch/react-query layer can read it.
 const refreshKeyHeader = "X-Snowplow-Refresh-Key"
 
-// setRefreshKeyHeader stamps the live-refresh subscription key on the response,
-// before WriteHeader. No-op on an empty key (L1 disabled / RBAC-skipped /
-// cache-off) — the header is purely additive and must never appear empty.
-// MUST be called before writeResolvedJSON (which calls WriteHeader).
-func setRefreshKeyHeader(wri http.ResponseWriter, key string) {
+// refreshClassHeader carries the CacheEntryClass the response was keyed
+// under. Paired with refreshKeyHeader so the frontend arms the EXACT
+// /refreshes subscription class instead of guessing widgets-vs-widgetContent
+// (frontend guide §2.5/§8). The value matches SubscriptionCoordinates.Class
+// exactly: "widgets" | "widgetContent" | "restactions" | "apistage" |
+// "raFullList". Additive; MUST be in CORS ExposedHeaders (main.go).
+const refreshClassHeader = "X-Snowplow-Refresh-Class"
+
+// setRefreshKeyHeader stamps the live-refresh subscription key + the class it
+// was keyed under, before WriteHeader. No-op on an empty key (L1 disabled /
+// RBAC-skipped / cache-off) — the headers are purely additive and must never
+// appear empty. class is the CacheEntryClass the dispatcher keyed this
+// response by (the SAME class the caller passes to emitResolvedCacheLookup);
+// it is stamped only alongside a non-empty key so the two headers are always
+// consistent. MUST be called before writeResolvedJSON (which calls
+// WriteHeader).
+func setRefreshKeyHeader(wri http.ResponseWriter, key, class string) {
 	if key == "" {
 		return
 	}
 	wri.Header().Set(refreshKeyHeader, key)
+	if class != "" {
+		wri.Header().Set(refreshClassHeader, class)
+	}
 }
 
 // writeResolvedJSON writes the canonical Content-Type + 200 + payload.
