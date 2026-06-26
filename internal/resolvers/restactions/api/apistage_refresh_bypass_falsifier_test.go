@@ -214,7 +214,7 @@ func TestFalsifierR1_RefreshTriggerForcesMissOfStaleContent(t *testing.T) {
 	// the STALE content HIT. Asserted POSITIVELY: the served value is the
 	// 1-managed collapsed snapshot (the content-shield, F-3 condition).
 	putR1StaleContentEntry(store)
-	v, served, ok := apistageContentServe(r1Ctx(), store, r1GetCall())
+	v, served, ok := apistageContentServe(r1Ctx(), store, r1GetCall(), false)
 	if !ok || !served {
 		t.Fatalf("request-path content HIT must serve (ok=%v served=%v)", ok, served)
 	}
@@ -227,7 +227,7 @@ func TestFalsifierR1_RefreshTriggerForcesMissOfStaleContent(t *testing.T) {
 	// force-miss (dep-edge inequality) — still serves stale.
 	otherGVR := schema.GroupVersionResource{Group: "x.io", Version: "v1", Resource: "others"}
 	vNeg, servedNeg, okNeg := apistageContentServe(
-		cache.WithRefreshTriggerGVR(r1Ctx(), otherGVR), store, r1GetCall())
+		cache.WithRefreshTriggerGVR(r1Ctx(), otherGVR), store, r1GetCall(), false)
 	if !okNeg || !servedNeg {
 		t.Fatalf("different-GVR refresh HIT must still serve (ok=%v served=%v)", okNeg, servedNeg)
 	}
@@ -239,7 +239,7 @@ func TestFalsifierR1_RefreshTriggerForcesMissOfStaleContent(t *testing.T) {
 
 	// --- GREEN arm: refresh marker for THE SAME GVR force-misses → fresh.
 	vFresh, servedFresh, okFresh := apistageContentServe(
-		cache.WithRefreshTriggerGVR(r1Ctx(), r1FsaGVR), store, r1GetCall())
+		cache.WithRefreshTriggerGVR(r1Ctx(), r1FsaGVR), store, r1GetCall(), false)
 	if !okFresh || !servedFresh {
 		t.Fatalf("same-GVR refresh re-dispatch must serve fresh (ok=%v served=%v)", okFresh, servedFresh)
 	}
@@ -252,7 +252,7 @@ func TestFalsifierR1_RefreshTriggerForcesMissOfStaleContent(t *testing.T) {
 
 	// And the forced miss RE-STORED the fresh content: a subsequent
 	// request-path HIT now serves fresh (the re-resolve corrected the cell).
-	vAfter, _, okAfter := apistageContentServe(r1Ctx(), store, r1GetCall())
+	vAfter, _, okAfter := apistageContentServe(r1Ctx(), store, r1GetCall(), false)
 	if !okAfter {
 		t.Fatalf("post-bypass request-path HIT must serve")
 	}

@@ -705,7 +705,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// to the 0.30.118 pivot path.
 	if resolverUseInformer() {
 		if r.apistageEnabled {
-			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call); ok {
+			if gatedVal, served, ok := apistageContentServe(gctx, r.apistageStore, call, apiCall.UserAccessFilter != nil); ok {
 				if served {
 					// Ship 0.30.128 P-CORE-2: the gated envelope is
 					// already a decoded structured value — feed it

@@ -100,6 +100,7 @@ func gateContentEnvelope(
 		GetVerb() string
 	},
 	raw []byte,
+	uafActive bool,
 ) (any, bool) {
 	gvr, _, name, parseOK := cache.ParseAPIServerPathToDep(call.GetPath())
 	if !parseOK {
@@ -108,6 +109,20 @@ func gateContentEnvelope(
 		// only invokes the gate for content-served calls). Decode to a
 		// value so the return type matches the gated paths (Ship 0.30.128
 		// P-CORE-2).
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, false
+		}
+		return v, true
+	}
+	// SECURITY (#58, UAF-AWARE — symmetric with the pre-parsed-LIST branch):
+	// a UAF step is served UN-narrowed here; the per-user narrowing is the
+	// UAF refilter DOWNSTREAM (which diverges from raw filterGet/ListByRBAC).
+	// Applying raw RBAC to a UAF step would strip the UAF-intended scope.
+	// So for a UAF step (LIST or GET-by-name) decode + pass through; only a
+	// NON-UAF step takes the raw-RBAC gate (which is the over-serve fix for
+	// LIST + the unchanged GET narrowing for no-UAF GET).
+	if uafActive {
 		var v any
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, false
@@ -422,10 +437,19 @@ func (c callPathVerb) GetVerb() string {
 // step 3 is skipped — the prewarm resolve has no requester; it only
 // populates the content entry. F1 leaves the skip-point; F2 sets the
 // marker.
+// uafActive (#58): does the OWNING stage carry a userAccessFilter? It selects
+// how a pre-parsed LIST content cell is gated at serve time (see the
+// gate-selection comment at the serve branch below). A NON-UAF LIST is
+// narrowed by the requester's RAW RBAC (filterListByRBAC via gateListItems);
+// a UAF LIST is served UN-narrowed here and narrowed by the UAF refilter
+// downstream — the two narrowings DIVERGE for real UAF steps (verb/resource/
+// namespace-source differ), so applying raw RBAC to a UAF step would wrongly
+// strip the UAF-intended scope (the Diego/arch UAF verdict).
 func apistageContentServe(
 	ctx context.Context,
 	store *cache.ResolvedCacheStore,
 	call httpcall.RequestOptions,
+	uafActive bool,
 ) (value any, served bool, ok bool) {
 	log := xcontext.Logger(ctx)
 
@@ -644,30 +668,47 @@ func apistageContentServe(
 	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
 	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
 	// takes gateContentEnvelope's RawJSON path. Ship 0.30.128 P-CORE-2:
-	// the gate now returns the DECODED envelope value, so the caller
-	// feeds it via jsonHandlerValue with no marshal + no unmarshal.
+	// the gate returns the DECODED envelope value, so the caller feeds it
+	// via jsonHandlerValue with no marshal + no unmarshal.
 	//
-	// Ship 0.30.242 H.c-layered Phase 2b — design §3.4 / §22.1.A item
-	// #4. The pre-ship gateListItemsWithMemo branch (per-cohort gate
-	// memo at serve time) is REMOVED. Under H.c-layered the apistage
-	// cell is RBAC-narrowed AT POPULATE TIME by the BindingUID that
-	// authorised it (the cell's ResolvedKeyInputs.BindingUID is folded
-	// into ComputeKey — every cell holds items that THIS binding
-	// permits; every cohort sharing this binding sees the same items).
-	// The serve path no longer needs a per-cohort filter; the items in
-	// the cell are correct by construction.
+	// SECURITY (#58 — cross-tenant LIST over-serve, UAF-AWARE fix). The
+	// apistage content cell is populated SA-MAXIMAL / UN-GATED (the MISS
+	// dispatch runs under WithApistageContentResolve, which SKIPS
+	// dispatchViaInformer's inline filterListByRBAC — informer_dispatch.go
+	// :482/575), so the stored items are the full SA-visible set. The
+	// 0.30.242 "narrowed-at-populate, no serve-refilter" claim was WRONG
+	// (the cell's apistage BindingUID is "" — contentKeyInputs never sets it
+	// — so the key is identity-invariant; nothing narrows at populate). The
+	// per-user narrowing MUST run at SERVE — but HOW depends on the stage:
 	//
-	// The new serveParsedListEnvelope returns the parsed items as a
-	// []any with served=true. The entryRef parameter remains in scope
-	// for the gateContentEnvelope branch below (unstructured GET path)
-	// but is no longer consumed by the parsed-list branch.
+	//   - NON-UAF LIST → gateListItems (filterListByRBAC: the requester's
+	//     RAW RBAC, verb=list, the LISTed GVR, item namespace). Restores the
+	//     pre-0.30.242 gated serve; `serveParsedListEnvelope` (no filter) was
+	//     the over-serve regression → a narrow tenant got the FULL list.
+	//
+	//   - UAF LIST → serveParsedListEnvelope UNCHANGED (un-narrowed here).
+	//     A UAF step is called with ELEVATED privilege precisely because the
+	//     requester LACKS the raw RBAC; the per-user narrowing is the UAF
+	//     refilter DOWNSTREAM (refilter.go evalSingle: uaf.Verb, uaf.Resource,
+	//     NamespaceFrom(item)), which DIVERGES from raw filterListByRBAC for
+	//     real UAF steps (verb=create, resource swap, ns from .metadata.name).
+	//     Routing a UAF LIST through gateListItems would apply raw RBAC the
+	//     requester does not have → strip the UAF-intended scope to
+	//     near-empty → the refilter cannot recover it → BREAK UAF. So UAF
+	//     LISTs pass through un-narrowed for the refilter to handle (exactly
+	//     the pre-0.30.242 UAF behaviour). The TestFalsifier58 UAF-arm (a
+	//     DIVERGENT UAF) is the proof this branch is required.
 	_ = entryRef
 	var gated any
 	var gateOK bool
 	if haveParsed {
-		gated, gateOK = serveParsedListEnvelope(parsed)
+		if uafActive {
+			gated, gateOK = serveParsedListEnvelope(parsed)
+		} else {
+			gated, gateOK = gateListItems(ctx, gvr, parsed)
+		}
 	} else {
-		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope)
+		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope, uafActive)
 	}
 	if !gateOK {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
