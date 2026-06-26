@@ -331,6 +331,16 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		// refs filtered out per Revision 14). Edge type 3 (inner K8s
 		// calls inside the RestAction) is OUT OF SCOPE at this tag.
 		recordWidgetDeps(log, cacheKey, got.GVR, res)
+
+		// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
+		// Put + dep-Record — never the stage-error / external-skip declines
+		// above). If a /refreshes connection is already armed for this key
+		// (it re-armed after a TTL-eviction, and this cold-fill replaces the
+		// evicted entry), announce the fill so the viewer's frame goes fresh
+		// now instead of waiting for the next churn. No-op when unarmed.
+		// SCOPE: widgets only — NOT widgetContent (shared key w/o BindingUID
+		// fold → cross-deliver risk) per refresh_publish.go.
+		publishIfSubscribed(cacheKey)
 	}
 
 	log.Info("Widget successfully resolved",

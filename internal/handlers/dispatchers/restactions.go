@@ -302,6 +302,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		// edge whose DELETE/UPDATE events the watcher never wires.
 		ensureWatcherInformerForGVR(got.GVR)
 		cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+
+		// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
+		// Put + dep-Record — never the stage-error / external-skip declines
+		// above). If a /refreshes connection is already armed for this key
+		// (it re-armed after a TTL-eviction, and this cold-fill replaces the
+		// evicted entry), announce the fill so the viewer's frame goes fresh
+		// now instead of waiting for the next churn. No-op when unarmed.
+		publishIfSubscribed(cacheKey)
 	}
 
 	log.Info("RESTAction successfully resolved",
