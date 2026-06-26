@@ -433,10 +433,17 @@ func TestResolveExtractionParity_UserInfoErrEarlyExit(t *testing.T) {
 //
 // The assertion is a SUBSEQUENCE match on the load-bearing ordered events
 // (pagination → base dict → per-stage "api successfully resolved" ×2) rather
-// than an exhaustive full-log equality, because Debug-level events
+// than an exhaustive full-log equality, because the other events
 // (dep.recorded, "calling api", endpoint-resolved) are interleaved by the
 // concurrent worker and are not order-stable at parallelism>1. We pin
-// PARALLELISM=1 and assert the Info-level spine, which IS order-stable.
+// PARALLELISM=1 and assert the spine, which IS order-stable.
+//
+// Capture is at Debug level: Fix 2b (task #43) moved the steady-state
+// success lines "base dict for api resolver" and "api successfully resolved"
+// from Info→Debug (they fire per-resolve and dominated the prod log volume).
+// The spine itself — pagination → base dict → per-stage success ×2 — and its
+// ORDER are unchanged; only the emit LEVEL moved, so the order-preservation
+// invariant this test guards is asserted by capturing at Debug.
 func TestResolveExtractionParity_SlogEventOrder(t *testing.T) {
 	iterFailFastRetries(t)
 	t.Setenv("RESOLVER_ITER_PARALLELISM", "1")
@@ -458,7 +465,7 @@ func TestResolveExtractionParity_SlogEventOrder(t *testing.T) {
 		Filter:    ptr.To(".stage2"),
 	}
 
-	events := captureSlogEventsAt(t, slog.LevelInfo, func(ctx context.Context) {
+	events := captureSlogEventsAt(t, slog.LevelDebug, func(ctx context.Context) {
 		// ctx carries the capture logger; add UserInfo (so Resolve does NOT
 		// early-exit on the UserInfo guard) + the fixture endpoint.
 		ctx = xcontext.BuildContext(ctx, xcontext.WithUserInfo(jwtutil.UserInfo{Username: "parity-user"}))
@@ -471,7 +478,7 @@ func TestResolveExtractionParity_SlogEventOrder(t *testing.T) {
 		})
 	})
 
-	// The Info-level spine, in order:
+	// The resolve spine, in order:
 	//   "pagination options"           (P0)
 	//   "base dict for api resolver"   (P3)
 	//   "api successfully resolved"    (stage1)
