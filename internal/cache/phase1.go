@@ -59,6 +59,7 @@ import (
 
 	"log/slog"
 
+	"github.com/krateoplatformops/plumbing/env"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
 )
@@ -318,9 +319,30 @@ func (rw *ResourceWatcher) RegisterMetaQuerySeeds() int {
 // at the start of the pass is synced AND nothing new appeared, hence
 // every informer is synced.
 //
-// It does NOT layer its own timeout — the caller (Phase1Warmup) owns the
-// deadline via ctx so the PHASE1_TIMEOUT_SECONDS budget is the single
-// source of truth and also bounds a pathological never-stabilizing loop.
+// BOUNDED EXIT POLICY (Fix 1b, task #43) — the outer ctx
+// (PHASE1_TIMEOUT_SECONDS) remains the absolute backstop, but the loop no
+// longer relies on it as the ONLY bound. Two UNIFORM env knobs (no
+// per-GVR/per-name branch — feedback_no_special_cases) bound the loop:
+//
+//   - PHASE1_SYNC_PASS_GRACE_SECONDS (default 45): each WaitForCacheSync
+//     pass runs under a per-pass CHILD ctx, not the outer 900s ctx. A
+//     single never-HasSynced informer can therefore only stall ONE pass
+//     for `passGrace`, not the whole budget.
+//   - PHASE1_SYNC_QUIESCENCE_SECONDS (default 10): once the registered set
+//     has been STABLE (count unchanged) for this window AND every informer
+//     that CAN sync has, the barrier returns "good enough" (nil error,
+//     readiness flips) even if a stuck informer never reached HasSynced.
+//     The stuck GVR set is named in the cache.phase1.sync_wait_good_enough
+//     structured log.
+//
+// "Good enough" is SAFE because a late- or never-syncing informer is
+// covered downstream: lazy register-on-navigation serves its first /call
+// via the apiserver fallthrough (informer-fallthrough-not-synced), and the
+// refresher converges its data into L1 as events land — readiness gates on
+// "substrate mostly warm + set stopped growing", not "every version-pinned
+// composition CRD finished its initial LIST". This extends the same
+// readiness-independent-of-cluster-shape invariant Ship 2 / 0.30.196 used
+// for the background cohort seed.
 //
 // INVARIANT the count-equality test depends on: the registered-informer
 // set is append-only during Phase 1 in practice — RemoveResourceType is
@@ -340,6 +362,18 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 	}
 
 	start := time.Now()
+
+	// Fix 1b (task #43): uniform bounds, read once. Per-pass grace caps how
+	// long a single WaitForCacheSync pass can block on a slow/stuck informer
+	// (a child ctx, NOT the outer 900s budget). Quiescence is the
+	// set-stability window after which we accept "good enough".
+	passGrace := time.Duration(env.Int("PHASE1_SYNC_PASS_GRACE_SECONDS", 45)) * time.Second
+	quiescence := time.Duration(env.Int("PHASE1_SYNC_QUIESCENCE_SECONDS", 10)) * time.Second
+
+	// Set-stability tracking across passes (touched only in this goroutine).
+	lastCount := -1
+	lastChange := start
+
 	for pass := 1; ; pass++ {
 		if ctx.Err() != nil {
 			slog.Warn("cache.phase1.sync_wait_incomplete",
@@ -351,12 +385,15 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		// Snapshot the informer set + count under the lock.
+		// Snapshot the informer set + count + GVRs under the lock so a
+		// post-pass !HasSynced check can name the stuck GVRs.
 		rw.mu.RLock()
 		countBefore := len(rw.informers)
 		syncs := make([]clientcache.InformerSynced, 0, countBefore)
-		for _, gi := range rw.informers {
+		gvrs := make([]schema.GroupVersionResource, 0, countBefore)
+		for gvr, gi := range rw.informers {
 			syncs = append(syncs, gi.Informer().HasSynced)
+			gvrs = append(gvrs, gvr)
 		}
 		rw.mu.RUnlock()
 
@@ -365,9 +402,23 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 			return nil
 		}
 
-		// Wait for this snapshot's informers to sync (outside the lock,
-		// so concurrent registrations are not blocked).
-		if !clientcache.WaitForCacheSync(ctx.Done(), syncs...) {
+		// Track set-stability: a change resets the quiescence clock.
+		if countBefore != lastCount {
+			lastCount = countBefore
+			lastChange = time.Now()
+		}
+
+		// Wait for this snapshot's informers to sync under a PER-PASS child
+		// ctx (outside rw.mu, so concurrent registrations are not blocked).
+		// A single never-HasSynced informer can stall at most this one pass
+		// for `passGrace` — never the whole outer budget.
+		passCtx, cancel := context.WithTimeout(ctx, passGrace)
+		synced := clientcache.WaitForCacheSync(passCtx.Done(), syncs...)
+		cancel()
+
+		// The outer budget being exhausted is the hard backstop — surface it
+		// as the existing incomplete warning regardless of pass outcome.
+		if ctx.Err() != nil {
 			slog.Warn("cache.phase1.sync_wait_incomplete",
 				slog.String("subsystem", "cache"),
 				slog.Int("pass", pass),
@@ -375,19 +426,14 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
 				slog.Any("err", ctx.Err()),
 			)
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return context.DeadlineExceeded
+			return ctx.Err()
 		}
 
-		// Re-snapshot: if the count is unchanged, NO informer was
-		// registered during the WaitForCacheSync pass — the barrier is
-		// genuinely complete. If it grew, a CRD-add (or a late resolver
-		// touch) landed mid-wait; loop and re-wait so the new informer
-		// is included.
 		countAfter := rw.RegisteredCount()
-		if countAfter == countBefore {
+		setStable := countAfter == countBefore
+
+		if synced && setStable {
+			// Happy path: every informer in a stable set synced.
 			slog.Info("cache.phase1.sync_wait_complete",
 				slog.String("subsystem", "cache"),
 				slog.Int("passes", pass),
@@ -396,12 +442,43 @@ func (rw *ResourceWatcher) WaitAllInformersSynced(ctx context.Context) error {
 			)
 			return nil
 		}
+
+		// Pass did NOT fully sync (or set still growing). If the registered
+		// set has been STABLE for the quiescence window, accept "good
+		// enough": the informers that can sync have, and the stuck ones are
+		// covered by lazy-register fallthrough + the refresher. Name the
+		// stuck GVRs so the operator can see exactly what was deferred.
+		if setStable && time.Since(lastChange) >= quiescence {
+			unsynced := make([]string, 0)
+			rw.mu.RLock()
+			for _, gvr := range gvrs {
+				if gi, ok := rw.informers[gvr]; ok && !gi.Informer().HasSynced() {
+					unsynced = append(unsynced, gvr.String())
+				}
+			}
+			rw.mu.RUnlock()
+			slog.Info("cache.phase1.sync_wait_good_enough",
+				slog.String("subsystem", "cache"),
+				slog.Int("passes", pass),
+				slog.Int("informer_count", countAfter),
+				slog.Int64("waited_ms", time.Since(start).Milliseconds()),
+				slog.Int64("set_stable_ms", time.Since(lastChange).Milliseconds()),
+				slog.Int("unsynced_count", len(unsynced)),
+				slog.Any("unsynced_gvrs", unsynced),
+				slog.String("reason", "registered set stable for the quiescence window; deferring still-unsynced informers to lazy-register fallthrough + refresher"),
+			)
+			return nil
+		}
+
+		// Set still changing OR not yet quiescent — re-snapshot and re-wait.
 		slog.Info("cache.phase1.sync_wait_repass",
 			slog.String("subsystem", "cache"),
 			slog.Int("pass", pass),
 			slog.Int("count_before", countBefore),
 			slog.Int("count_after", countAfter),
-			slog.String("reason", "informer registered mid-wait — re-snapshotting so the new informer is in the barrier"),
+			slog.Bool("pass_synced", synced),
+			slog.Int64("set_stable_ms", time.Since(lastChange).Milliseconds()),
+			slog.String("reason", "set still growing or not yet quiescent — re-snapshotting"),
 		)
 	}
 }

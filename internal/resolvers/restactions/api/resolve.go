@@ -253,7 +253,7 @@ func newResolveRun(ctx context.Context, opts ResolveOptions, log *slog.Logger, u
 		}
 	}
 
-	log.Info("base dict for api resolver", slog.Any("dict", dict))
+	log.Debug("base dict for api resolver", slog.Any("dict", dict))
 
 	// Ship F1 (0.30.119): the content-keyed api-stage L1 is active
 	// whenever the resolved-output store is on (ApistageL1Enabled folded
@@ -767,7 +767,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 					}
 					// Ship #6 — see depthForLog (support.go).
 					depth := depthForLog(r.ctx, r.log, dictMu, dict)
-					r.log.Info("api successfully resolved",
+					r.log.Debug("api successfully resolved",
 						slog.String("name", id),
 						slog.String("host", call.Endpoint.ServerURL),
 						slog.String("path", call.Path),
@@ -794,7 +794,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			dispatch := feedRawOrResolved(raw, "informer")
 			// Ship #6 — see depthForLog (support.go).
 			depth := depthForLog(r.ctx, r.log, dictMu, dict)
-			r.log.Info("api successfully resolved",
+			r.log.Debug("api successfully resolved",
 				slog.String("name", id),
 				slog.String("host", call.Endpoint.ServerURL),
 				slog.String("path", call.Path),
@@ -870,7 +870,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 		}
 		// Ship #6 — see depthForLog (support.go).
 		depth := depthForLog(r.ctx, r.log, dictMu, dict)
-		r.log.Info("api successfully resolved",
+		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", call.Endpoint.ServerURL),
 			slog.String("path", call.Path),
@@ -940,7 +940,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
 		}
 		depth := depthForLog(r.ctx, r.log, dictMu, dict)
-		r.log.Info("api successfully resolved",
+		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", call.Endpoint.ServerURL),
 			slog.String("path", call.Path),
@@ -1009,7 +1009,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 			r.recordItemError(dictMu, itemErrs, id, i, call.ErrorKey, ferr.Error(), ferr.Error(), itemErr)
 		}
 		depth := depthForLog(r.ctx, r.log, dictMu, dict)
-		r.log.Info("api successfully resolved",
+		r.log.Debug("api successfully resolved",
 			slog.String("name", id),
 			slog.String("host", call.Endpoint.ServerURL),
 			slog.String("path", call.Path),
@@ -1111,7 +1111,7 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// read against concurrent jsonHandler writes. On the common
 	// (Info) path it does no work and takes no lock.
 	depth := depthForLog(r.ctx, r.log, dictMu, dict)
-	r.log.Info("api successfully resolved",
+	r.log.Debug("api successfully resolved",
 		slog.String("name", id),
 		slog.String("host", call.Endpoint.ServerURL),
 		slog.String("path", call.Path),

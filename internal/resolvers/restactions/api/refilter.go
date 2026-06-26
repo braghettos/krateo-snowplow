@@ -518,7 +518,7 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 	if u, err := xcontext.UserInfo(ctx); err == nil {
 		username = u.Username
 	}
-	log.Info("userAccessFilter",
+	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
 		slog.String("user", username),
@@ -543,7 +543,7 @@ func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, username st
 	if log == nil || apiCall == nil || apiCall.UserAccessFilter == nil {
 		return
 	}
-	log.Info("userAccessFilter",
+	log.Debug("userAccessFilter",
 		slog.String("subsystem", "uaf"),
 		slog.String("dispatch", "service_account"),
 		slog.String("user", username),
