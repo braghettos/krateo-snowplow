@@ -29,6 +29,7 @@ import (
 	"github.com/krateoplatformops/plumbing/server/use/cors"
 	"github.com/krateoplatformops/plumbing/slogs/pretty"
 	_ "github.com/krateoplatformops/snowplow/docs"
+	"github.com/krateoplatformops/snowplow/internal/authn"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
@@ -100,6 +101,21 @@ func main() {
 		env.String("CONTROLLER_HEALTH_NAMESPACES", "krateo-system"),
 		"comma-separated list of namespaces whose controllers are watched for Resilience-1 expvar gauges")
 
+	// #57 (seed→authn→loopback token). The prewarm seed authenticates its
+	// projected (audience-bound) SA token to authn for a real authn-issued
+	// JWT, then propagates it through the nested loopback /call so the
+	// composition-resources RAs warm (rca-prewarm-nested-loopback-jwt §5).
+	urlAuthn := flag.String("url-authn", env.String("URL_AUTHN", "http://authn.krateo-system.svc.cluster.local:8082"),
+		"krateo authn base URL for the seed SA→JWT token exchange (#57)")
+	saTokenPath := flag.String("serviceaccount-token-path", env.String("SERVICEACCOUNT_TOKEN_PATH", ""),
+		"path to the projected (audience=authn) ServiceAccount token (#57; empty → authn.DefaultTokenPath)")
+	// #57 (C-b) self-loopback host: the bearer-append self-loopback arm
+	// compares a resolved endpoint against this (exact scheme+host+port). A
+	// /call api-step that resolves HERE is snowplow's own JWT-gated endpoint
+	// and needs the seed bearer. PORT-anchored to the listen port.
+	urlSelf := flag.String("url-self", env.String("URL_SELF", "http://snowplow.krateo-system.svc.cluster.local:8081"),
+		"snowplow's own service URL — the self-loopback host for the #57 bearer-append arm (exact scheme+host+port match)")
+
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
 		flag.PrintDefaults()
@@ -156,6 +172,27 @@ func main() {
 	slog.SetDefault(log)
 	if *debugOn {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
+	}
+
+	// #57 — wire the prewarm seed's authn token source + the self-loopback
+	// host once at startup. The authn.Client exchanges snowplow's projected
+	// (audience=authn) SA token for an authn-issued JWT; the seed installs it
+	// on the prewarm ctx so a nested loopback /call carries a bearer
+	// snowplow's own middleware accepts (rca-prewarm-nested-loopback-jwt §5).
+	// Both are additive + degrade-safe: if URL_SELF is empty the self-loopback
+	// bearer arm never fires (pre-#57 gate); if the token exchange fails the
+	// seed runs token-less (WARN+expvar, not fatal — phase1_walk C-a).
+	authnClient := authn.New(*urlAuthn, *saTokenPath)
+	dispatchers.SetSeedLoopbackTokenProvider(authnClient.Token)
+	if restactionsapi.SetSelfHost(*urlSelf) {
+		log.Info("prewarm seed loopback auth wired (#57)",
+			slog.String("url_authn", *urlAuthn),
+			slog.String("url_self", *urlSelf),
+			slog.String("hint", "seed exchanges its audience=authn SA token for a JWT + appends it on self-loopback /call steps (exact host match)"))
+	} else {
+		log.Info("prewarm seed self-loopback bearer arm DISABLED (#57)",
+			slog.String("url_self", *urlSelf),
+			slog.String("hint", "URL_SELF empty/unparseable — the self-loopback bearer-append arm is off; named-endpoint steps follow the pre-#57 gate"))
 	}
 
 	// OTel observability (ADDITIVE + default-OFF). Both Setup calls are
