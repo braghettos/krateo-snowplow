@@ -1002,7 +1002,7 @@ func main() {
 				"tracestate",
 				"baggage",
 			},
-			ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key"},
+			ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
 			AllowCredentials: true,
 			MaxAge:           300, // Maximum value not ignored by any of major browsers
 		})(rootHandler),
