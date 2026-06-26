@@ -959,6 +959,15 @@ func main() {
 	// /debug/servable (docs/design-r1-allcompositionresources-invalidation-2026-06-26.md §6).
 	mux.HandleFunc("GET /debug/apistage", handlers.DebugApistage())
 
+	// #61 diagnostic — read-only AGGREGATE-ONLY refresh-broadcaster counters
+	// (published/delivered/dropped/coalesced + subscriber count), the
+	// on-cluster instrument for verifying live-refresh delivery
+	// (refreshDeliveredTotal>0 for an armed key under churn) without a kubectl
+	// exec. NO per-subscription-key/identity enumeration — totals only (a
+	// per-key dump would be a cross-user signal). Mounted next to
+	// /debug/servable + /debug/apistage (docs/rca-refreshes-zero-delivery-2026-06-26.md §5).
+	mux.HandleFunc("GET /debug/refreshes", handlers.DebugRefreshes())
+
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
 		os.Interrupt,
 		syscall.SIGINT,

@@ -41,6 +41,7 @@ import (
 
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -200,39 +201,95 @@ type resourceRefLite struct {
 	Name       string
 }
 
-// extractResourcesRefs reads spec.resourcesRefs.items[] off the widget
-// object and returns the lite triples.
+// extractResourcesRefs reads the UNION of the widget's
+// status.resourcesRefs.items[] (the resolved, request-extras-driven
+// displayed refs the resolver writes — see resolve.go status
+// SetNestedField + the extractResourcesRefsItems precedent at
+// phase1_walk.go:1567) AND spec.resourcesRefs.items[] (any
+// author-declared static refs) and returns the lite triples.
+//
+// (#61, 1.5.8) Decoding the status `path` is LOAD-BEARING: a composition-
+// DETAIL widget resolves its displayed target into status with an EMPTY
+// spec. A spec-only read — OR a naive status FIELD read (the items have no
+// such fields) — recorded NO dep edge on the displayed resource → the
+// armed top-level L1 key was never dirty-marked on its reconcile →
+// /refreshes delivered zero events (broken 1.5.5–1.5.7). The union (not a
+// flip to status-only) preserves genuinely-static spec refs (resolve.go
+// guards the status write with len(results)>0, so an unresolved widget is
+// spec-only).
 func extractResourcesRefs(w *unstructured.Unstructured) []resourceRefLite {
 	if w == nil {
 		return nil
 	}
-	arr, ok, err := maps.NestedSlice(w.Object, "spec", "resourcesRefs", "items")
-	if !ok || err != nil {
-		return nil
-	}
-	out := make([]resourceRefLite, 0, len(arr))
-	for _, raw := range arr {
-		m, ok := raw.(map[string]any)
-		if !ok {
-			continue
+	out := make([]resourceRefLite, 0, 8)
+	seen := map[resourceRefLite]struct{}{}
+	appendUnique := func(r resourceRefLite) {
+		if _, dup := seen[r]; dup {
+			return
 		}
-		r := resourceRefLite{}
-		if v, ok := m["id"].(string); ok {
-			r.ID = v
-		}
-		if v, ok := m["apiVersion"].(string); ok {
-			r.APIVersion = v
-		}
-		if v, ok := m["resource"].(string); ok {
-			r.Resource = v
-		}
-		if v, ok := m["namespace"].(string); ok {
-			r.Namespace = v
-		}
-		if v, ok := m["name"].(string); ok {
-			r.Name = v
-		}
+		seen[r] = struct{}{}
 		out = append(out, r)
+	}
+
+	// (a) status items: PATH-DECODED (ResourceRefResult has no inline gvr
+	// fields; the displayed target is encoded in path as /call?resource=…).
+	if arr, ok, err := maps.NestedSlice(w.Object, "status", "resourcesRefs", "items"); ok && err == nil {
+		for _, raw := range arr {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			pathStr, _ := m["path"].(string)
+			if pathStr == "" {
+				continue
+			}
+			ref, ok := objects.ParseCallPathToObjectRef(pathStr)
+			if !ok {
+				// External link / non-/call path / missing resource|apiVersion.
+				continue
+			}
+			r := resourceRefLite{
+				APIVersion: ref.APIVersion,
+				Resource:   ref.Resource,
+				Namespace:  ref.Namespace,
+				Name:       ref.Name,
+			}
+			if id, ok := m["id"].(string); ok {
+				r.ID = id
+			}
+			appendUnique(r)
+		}
+	}
+
+	// (b) spec items: FIELD-READ (static author refs carry inline fields).
+	if arr, ok, err := maps.NestedSlice(w.Object, "spec", "resourcesRefs", "items"); ok && err == nil {
+		for _, raw := range arr {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			r := resourceRefLite{}
+			if v, ok := m["id"].(string); ok {
+				r.ID = v
+			}
+			if v, ok := m["apiVersion"].(string); ok {
+				r.APIVersion = v
+			}
+			if v, ok := m["resource"].(string); ok {
+				r.Resource = v
+			}
+			if v, ok := m["namespace"].(string); ok {
+				r.Namespace = v
+			}
+			if v, ok := m["name"].(string); ok {
+				r.Name = v
+			}
+			appendUnique(r)
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
