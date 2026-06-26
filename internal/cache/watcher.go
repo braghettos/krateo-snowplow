@@ -1630,10 +1630,17 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 		return uns, true
 	}
 
+	// Hardening #1 (serve_requires_servable): hold rw.mu across the
+	// servability gate AND the indexer read off the SAME gi handle —
+	// closing the GET check-then-act gap (the caller's IsServable precheck
+	// and this read were otherwise two separate lock acquisitions). A
+	// not-servable GVR returns a silent miss (the CORRECT fallback — the
+	// caller falls through to apiserver). The serve_requires_servable
+	// assert guards the HIT path as defense-in-depth.
 	rw.mu.RLock()
-	gi, ok := rw.informers[gvr]
-	rw.mu.RUnlock()
+	defer rw.mu.RUnlock()
 
+	gi, ok := rw.servableLocked(gvr)
 	if !ok {
 		return nil, false
 	}
@@ -1645,6 +1652,13 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, namespace,
 
 	obj, exists, err := gi.Informer().GetIndexer().GetByKey(key)
 	if err != nil || !exists {
+		return nil, false
+	}
+
+	// Defense-in-depth: assert the invariant at the serve (we are about to
+	// return obj,true). Holds by construction (gi came from servableLocked)
+	// — the assert trips if a future refactor reads the indexer without it.
+	if !rw.assertServeRequiresServableLocked(gvr, "GetObject") {
 		return nil, false
 	}
 
@@ -1763,6 +1777,14 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 	defer rw.mu.RUnlock()
 	gi, ok := rw.servableLocked(gvr)
 	if !ok {
+		return nil, false
+	}
+	// Defense-in-depth: assert the invariant AT THE SERVE (the moment we
+	// return data,true). gi was just resolved by servableLocked so this
+	// holds by construction today; the assert is the guard that trips
+	// (test-panic / prod-count="serve_requires_servable") if a future
+	// refactor returns a HIT here without the predicate.
+	if !rw.assertServeRequiresServableLocked(gvr, "ListObjectsServable") {
 		return nil, false
 	}
 	return listFromIndexer(gi, namespace), true
@@ -1938,10 +1960,14 @@ func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, names
 		}
 		return uns, true
 	}
+	// Hardening #1 (serve_requires_servable): same servable-under-lock
+	// discipline as GetObject — gate the serve on servableLocked (silent
+	// miss-and-fallthrough when not servable), read off the SAME gi handle,
+	// assert at the HIT path as defense-in-depth.
 	rw.mu.RLock()
-	gi, ok := rw.informers[gvr]
-	rw.mu.RUnlock()
+	defer rw.mu.RUnlock()
 
+	gi, ok := rw.servableLocked(gvr)
 	if !ok {
 		return nil, false
 	}
@@ -1953,6 +1979,10 @@ func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, names
 
 	obj, exists, err := gi.Informer().GetIndexer().GetByKey(key)
 	if err != nil || !exists {
+		return nil, false
+	}
+
+	if !rw.assertServeRequiresServableLocked(gvr, "GetTypedObject") {
 		return nil, false
 	}
 

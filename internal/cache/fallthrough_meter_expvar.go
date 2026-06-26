@@ -58,11 +58,12 @@ func registerFallthroughExpvar() {
 			return fallthroughTotal.Load()
 		}))
 		expvar.Publish("snowplow_assertion_violations_total", expvar.Func(func() any {
-			// Ship D — only one check is wired today (read_paths_scoped),
-			// so the expvar value is the per-check map shape ready for
-			// future expansion.
+			// Per-check map. Each invariant assertion registers its own
+			// check= label here (Ship D: read_paths_scoped; hardening #1:
+			// serve_requires_servable).
 			return map[string]uint64{
-				"read_paths_scoped": assertionViolationsTotal.Load(),
+				"read_paths_scoped":       assertionViolationsTotal.Load(),
+				"serve_requires_servable": serveRequiresServableViolations.Load(),
 			}
 		}))
 		expvar.Publish("snowplow_apiserver_fallthrough_cells", expvar.Func(func() any {
