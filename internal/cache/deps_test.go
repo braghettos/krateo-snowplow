@@ -158,7 +158,7 @@ func TestDeps_OnDelete_DirtyMarksDependentGet(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	got := d.OnDelete(gvr, "ns", "dependency")
 	if got != 0 {
@@ -215,7 +215,7 @@ func TestDeps_OnUpdate_EnqueuesAndDoesNotEvict(t *testing.T) {
 
 	var enqueued []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(l1Key string) {
+	d.SetRefreshHook(func(l1Key string, _ schema.GroupVersionResource) {
 		mu.Lock()
 		enqueued = append(enqueued, l1Key)
 		mu.Unlock()
@@ -430,7 +430,7 @@ func TestDeps_ConcurrentRecordAndDelete_RaceFree(t *testing.T) {
 
 	// Updaters: OnUpdate sweeps the other half. No real hook needed —
 	// we just exercise the lookup path.
-	d.SetRefreshHook(func(_ string) {})
+	d.SetRefreshHook(func(_ string, _ schema.GroupVersionResource) {})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -511,7 +511,7 @@ func TestRecordingInnerCallDep_ListScope(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	// OnDelete for ANY object of that GVR in ns dirty-marks via list-scope.
 	got := d.OnDelete(gvr, "bench-ns-02", "bench-app-02-XX")
@@ -566,7 +566,7 @@ func TestRecordingInnerCallDep_ExactObject(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	// DELETE the named object — neither widget is its self-representation,
 	// so both are dirty-marked (exact-GET-dep + list-dep).
@@ -646,7 +646,7 @@ func TestIteratorEmitsPerNamespaceEdges(t *testing.T) {
 	// away, so the entry is stale-while-revalidate, not evicted).
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	got := d.OnDelete(iterGVR, "bench-ns-25", "bench-app-XX")
 	if got != 0 {
@@ -681,7 +681,7 @@ func TestOnDelete_DirtyMarksViaListScope(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	evicted := d.OnDelete(gvr, "bench-ns-02", "bench-app-02-06")
 	if evicted != 0 {
@@ -720,7 +720,7 @@ func TestDeps_OnResourceTypeAvailable_DirtyMarksListDeps(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	got := d.OnResourceTypeAvailable(gvr)
 	if got != 2 {
@@ -755,7 +755,7 @@ func TestDeps_OnResourceTypeAvailable_NoMatchIsNoOp(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	if got := d.OnResourceTypeAvailable(gvr); got != 0 {
 		t.Fatalf("OnResourceTypeAvailable marked %d, want 0 (no matching LIST-dep)", got)
@@ -799,7 +799,7 @@ func TestDeps_OnResourceTypeRemoved_DirtyMarksListAndGetDeps(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	got := d.OnResourceTypeRemoved(gvr)
 	if got != 3 {
@@ -833,7 +833,7 @@ func TestDeps_OnResourceTypeRemoved_NoMatchIsNoOp(t *testing.T) {
 
 	var marked []string
 	var mu sync.Mutex
-	d.SetRefreshHook(func(k string) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { mu.Lock(); marked = append(marked, k); mu.Unlock() })
 
 	if got := d.OnResourceTypeRemoved(gvr); got != 0 {
 		t.Fatalf("OnResourceTypeRemoved marked %d, want 0 (no matching dep)", got)

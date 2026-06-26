@@ -62,7 +62,7 @@ func TestACR1b_AddPreSyncDropped(t *testing.T) {
 	d := Deps()
 	d.RecordList(adminL1, gvr, "bench-ns-01")
 	marked := 0
-	d.SetRefreshHook(func(string) { marked++ })
+	d.SetRefreshHook(func(string, schema.GroupVersionResource) { marked++ })
 
 	// Fire an ADD-equivalent through the real handler closure.
 	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "new-obj"))
@@ -98,7 +98,7 @@ func TestACR1a_AddPostSyncDirtyMarksListDep(t *testing.T) {
 	d := Deps()
 	d.RecordList(adminL1, gvr, "bench-ns-07")
 	var marked []string
-	d.SetRefreshHook(func(k string) { marked = append(marked, k) })
+	d.SetRefreshHook(func(k string, _ schema.GroupVersionResource) { marked = append(marked, k) })
 
 	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-07", "fresh-obj"))
 
@@ -129,7 +129,7 @@ func TestACO14_NilSyncChDrops(t *testing.T) {
 	d := Deps()
 	d.RecordList(adminL1, gvr, "bench-ns-01")
 	marked := 0
-	d.SetRefreshHook(func(string) { marked++ })
+	d.SetRefreshHook(func(string, schema.GroupVersionResource) { marked++ })
 
 	// Two ADDs — the WARN must fire at most once, both must drop.
 	handlers.AddFunc(unstructuredObj(gvr, "bench-ns-01", "a"))

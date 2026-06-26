@@ -40,17 +40,18 @@ import (
 	"github.com/krateoplatformops/plumbing/ptr"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // depRecordCapturedHook returns a SetRefreshHook closure that captures
 // every enqueued L1 key, plus a snapshot function. Concurrency-safe so
 // the test can run under -race.
-func depRecordCapturedHook() (hook func(string), snapshot func() []string) {
+func depRecordCapturedHook() (hook func(string, schema.GroupVersionResource), snapshot func() []string) {
 	var (
 		mu      sync.Mutex
 		entries []string
 	)
-	hook = func(k string) {
+	hook = func(k string, _ schema.GroupVersionResource) {
 		mu.Lock()
 		entries = append(entries, k)
 		mu.Unlock()
