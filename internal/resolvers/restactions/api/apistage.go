@@ -565,6 +565,18 @@ func apistageContentServe(
 			RawJSON: dispatched,
 			Inputs:  ptrTo(contentKeyInputs(gvr, ns, name)),
 		}
+		// R1 Layer 2 (#36): bounded-staleness backstop. If this content
+		// entry is being stored while its GVR informer is NOT servable
+		// (registered-but-not-synced / watch-broken / unconfirmed — e.g. the
+		// core.krateo.io discovery flap that re-latches not-servable), it may
+		// be a degraded / not-fully-resolved snapshot. Stamp the short
+		// CATALOG_UNSERVABLE_TTL_SECONDS so it self-evicts within the bound
+		// even if a dirty-mark / refresh-ordering gap is missed. Uniform
+		// over every GVR (no path/resource special-case — feedback_no_special_cases);
+		// disabled (TTLOverride stays 0 → standard TTL) when the env is unset.
+		if ttl := cache.CatalogUnservableTTL(); ttl > 0 && !cache.Global().IsServable(gvr) {
+			newEntry.TTLOverride = ttl
+		}
 		// R3: parse the LIST envelope ONCE and attach the items to the
 		// entry, so every future content-Get-hit gates without a
 		// re-unmarshal. A malformed envelope (parseOK=false) stores

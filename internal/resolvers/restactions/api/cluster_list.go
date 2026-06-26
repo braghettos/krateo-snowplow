@@ -421,6 +421,15 @@ func populateClusterListCellSync(
 		ItemsAPIVersion: parsed.apiVersion,
 		ItemsKind:       parsed.kind,
 	}
+	// R1 Layer 2 (#36) bounded-staleness backstop — same uniform predicate
+	// as the apistage content Put (apistage.go): a catalog entry materialised
+	// while its GVR informer is NOT servable gets the short
+	// CATALOG_UNSERVABLE_TTL_SECONDS so a degraded cluster_list snapshot
+	// self-evicts within the bound. UNIFORM, no path/resource special-case
+	// (feedback_no_special_cases); disabled (override stays 0) when unset.
+	if ttl := cache.CatalogUnservableTTL(); ttl > 0 && !cache.Global().IsServable(gvr) {
+		newEntry.TTLOverride = ttl
+	}
 	defensiveParseMs := materialiseElapsed.Milliseconds()
 
 	putStart := time.Now()

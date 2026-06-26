@@ -950,6 +950,15 @@ func main() {
 	// diagnosable without a kubectl exec. Mounted next to /debug/vars.
 	mux.HandleFunc("GET /debug/servable", handlers.DebugServable())
 
+	// R1 diagnostic — read-only METADATA-ONLY snapshot of resolved-output
+	// cache entries (class/path/gvr/age/ttl/items_count), for diagnosing a
+	// degraded apistage entry (stale getComposition / cluster-scoped
+	// allCompositionResources) without a kubectl exec. NEVER returns
+	// resolved bodies (per-identity RBAC-sensitive) — the structural leak
+	// guard is cache.ResolvedEntryMeta's type shape. Mounted next to
+	// /debug/servable (docs/design-r1-allcompositionresources-invalidation-2026-06-26.md §6).
+	mux.HandleFunc("GET /debug/apistage", handlers.DebugApistage())
+
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
 		os.Interrupt,
 		syscall.SIGINT,
