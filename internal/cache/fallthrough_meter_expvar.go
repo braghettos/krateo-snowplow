@@ -62,8 +62,9 @@ func registerFallthroughExpvar() {
 			// check= label here (Ship D: read_paths_scoped; hardening #1:
 			// serve_requires_servable).
 			return map[string]uint64{
-				"read_paths_scoped":       assertionViolationsTotal.Load(),
-				"serve_requires_servable": serveRequiresServableViolations.Load(),
+				"read_paths_scoped":        assertionViolationsTotal.Load(),
+				"serve_requires_servable":  serveRequiresServableViolations.Load(),
+				"seed_aggregate_footprint": seedUnitFootprintViolations.Load(),
 			}
 		}))
 		expvar.Publish("snowplow_apiserver_fallthrough_cells", expvar.Func(func() any {

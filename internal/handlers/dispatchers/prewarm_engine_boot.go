@@ -466,6 +466,13 @@ func seedScopeYielding(ctx context.Context,
 		cctx, cancel := context.WithTimeout(ctx, pipCohortTimeout)
 		defer cancel()
 		cohortCtx := withCohortSeedContext(cctx, c, saEP, saRC)
+		// #46: the footprint bound (semaphore admission + per-unit HeapInuse
+		// assert) lives in the SHARED primitives seedOneWidget/seedOneRestaction
+		// (after their identity short-circuit), NOT here — both the engine
+		// (this) and the legacy errgroup path funnel through those primitives,
+		// so bounding the shared mechanism covers both with ONE insertion
+		// (feedback_no_special_cases). seedOneTarget stays a thin timeout+yield
+		// wrapper.
 		return do(cohortCtx)
 	}
 

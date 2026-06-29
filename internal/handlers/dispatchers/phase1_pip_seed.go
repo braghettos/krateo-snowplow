@@ -520,6 +520,12 @@ func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHa
 			// FOREGROUND (still gates phase1Done) but per-cohort
 			// failures no longer FAIL-CLOSE the whole pod.
 			pipBindingSetSeedResolvesTotal.Add(1)
+			// #46: NO bound wrap here — the footprint bound lives in the SHARED
+			// primitives seedOneWidget/seedOneRestaction (which this errgroup's
+			// seedCohortFn funnels through), so the aggregate is bounded at the
+			// shared mechanism, NOT per-caller. The errgroup's SetLimit
+			// (GOMAXPROCS) is the OUTER semaphore; Piece-B's is INNER (in the
+			// primitive) — strict outer→inner ordering, deadlock-free.
 			if err := seedCohortFn(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
 				// #158 — classify the failure instead of blanket-labelling
 				// it "expected RBAC." pipBindingSetSeedFailuresTotal is kept
@@ -968,6 +974,18 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		return nil
 	}
 
+	// #46: bound this seed unit's footprint (semaphore admission + per-unit
+	// HeapInuse assert), AFTER the identity short-circuit so the customer
+	// /call path is untouched. seedOneRestaction is a SHARED primitive — both
+	// the engine (serial) and legacy errgroup (concurrent) seed paths funnel
+	// here, so this one bracket bounds BOTH aggregates. Transparent when
+	// SEED_FOOTPRINT_BUDGET_BYTES==0.
+	seedRelease, seedErr := enterSeedUnit(ctx, "restaction/"+ref.Namespace+"/"+ref.Name)
+	if seedErr != nil {
+		return seedErr // ctx cancelled while blocked on the bound
+	}
+	defer seedRelease()
+
 	scheme := k8sruntime.NewScheme()
 	if err := apis.AddToScheme(scheme); err != nil {
 		return fmt.Errorf("add apis to scheme: %w", err)
@@ -1121,6 +1139,18 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		// seedOneRestaction.
 		return nil
 	}
+
+	// #46: bound this seed unit's footprint (semaphore admission + per-unit
+	// HeapInuse assert), AFTER the identity short-circuit so the customer
+	// /call path is untouched. seedOneWidget is a SHARED primitive — both the
+	// engine (serial) and legacy errgroup (concurrent) seed paths funnel here,
+	// so this one bracket bounds BOTH aggregates. Transparent when
+	// SEED_FOOTPRINT_BUDGET_BYTES==0.
+	seedRelease, seedErr := enterSeedUnit(ctx, "widget/"+e.W.GetNamespace()+"/"+e.W.GetName())
+	if seedErr != nil {
+		return seedErr // ctx cancelled while blocked on the bound
+	}
+	defer seedRelease()
 
 	// DeepCopy the widget CR — widgets.Resolve mutates its In object
 	// (sets status.widgetData etc.). The harvester already DeepCopied
