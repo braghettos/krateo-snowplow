@@ -35,7 +35,11 @@ package dispatchers
 import (
 	"context"
 
+	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // classRestActions / classWidgets are the two entry-class values that have
@@ -83,6 +87,57 @@ type SubscriptionCoordinates struct {
 // is rbac.EvaluateRBAC, which reads the in-process RBAC snapshot (the same
 // snapshot /call consults) — never the apiserver. So /refreshes stays off
 // the apiserver path end to end.
+// subscriptionKeyExtras returns the SAME extras union the EMIT path folds into
+// a widget's cache key — the inline author-declared blocks UNIONed with the
+// request extras — so the subscription key the server arms is byte-identical to
+// the key the resolver Puts + PublishRefreshes (#64).
+//
+// THE BUG IT FIXES: the emit key folds unionForKey(spec.apiRef.extras,
+// spec.resourcesRefsTemplateExtras, requestExtras) (helpers.go:275 +
+// widgets.GetApiRefExtras/GetResourcesRefsExtras), but DeriveSubscriptionKey
+// historically folded ONLY coords.Extras (the request half). A
+// composition-DETAIL widget with inline extras therefore derived a DIFFERENT
+// key on the subscription side than the cell publishes → zero delivery. The
+// frontend CANNOT supply the inline blocks (they are server-side CR fields it
+// never sees), so the union MUST be reconstructed server-side from the widget
+// CR — exactly as the emit path does.
+//
+// MECHANISM REUSE (C64-2, no re-impl): the inline getters
+// widgets.GetApiRefExtras / GetResourcesRefsExtras + the in-package unionForKey
+// are the EXACT functions the emit path uses, so the fold is identical by
+// construction.
+//
+// FAIL-CLOSED (C64-1): objects.Get failing (NotFound / RBAC-denied / nil) →
+// (nil, false). The caller SKIPS the coordinate — it does NOT arm a
+// request-only key (which would never match the emit key for an inline-extras
+// widget, re-introducing the bug) and does NOT fall back. A connection can
+// only arm a key whose widget CR its own identity can GET — the same
+// forgery-proof posture as the BindingUID derivation (the objects.Get carries
+// the connection ctx's identity + RBAC).
+//
+// COST (C64-6): objects.Get is informer-served under cache-on (get.go
+// useInformer→IsServable) — an in-memory read at SUBSCRIBE time (≤ the armed
+// coord count, bounded ≤512), never per-event, never the apiserver.
+func subscriptionKeyExtras(ctx context.Context, c SubscriptionCoordinates) (map[string]any, bool) {
+	got := objects.Get(ctx, templatesv1.ObjectReference{
+		Reference: templatesv1.Reference{
+			Name:      c.Name,
+			Namespace: c.Namespace,
+		},
+		APIVersion: schema.GroupVersion{Group: c.Group, Version: c.Version}.String(),
+		Resource:   c.Resource,
+	})
+	if got.Err != nil || got.Unstructured == nil {
+		// Fail-closed: skip the coord (no request-only fallback).
+		return nil, false
+	}
+	return unionForKey(
+		widgets.GetApiRefExtras(got.Unstructured.Object),
+		widgets.GetResourcesRefsExtras(got.Unstructured.Object),
+		c.Extras,
+	), true
+}
+
 func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) (string, bool) {
 	switch coords.Class {
 	case cache.CacheEntryClassWidgetContent:
@@ -90,21 +145,51 @@ func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) 
 		// (nobody owns it); the per-user gating is re-applied at serve time
 		// (gateWidgetEnvelope). Arming it reveals only "the shared envelope
 		// changed" — not subject-specific information (design §5.2 caveat).
+		//
+		// #64: a widgetContent cell is a widget — its emit key folds the inline
+		// extras union, so the subscription key MUST too. Reconstruct the union
+		// from the widget CR (fail-closed-skip if it can't be GET) and pass it
+		// in place of the request-only coords.Extras.
+		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
+		if !ok {
+			return "", false
+		}
 		key, handle, _ := dispatchWidgetContentKey(ctx,
 			coords.Group, coords.Version, coords.Resource,
-			coords.Namespace, coords.Name, coords.PerPage, coords.Page, coords.Extras)
+			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
+		if handle == nil || key == "" {
+			return "", false
+		}
+		return key, true
+
+	case classWidgets:
+		// Identity-bound widget. #64: same inline-extras union as widgetContent
+		// — the emit key (widgets.go genuine-Put) folds unionForKey(inline,
+		// request); the subscription key must fold the identical union or the
+		// armed key never matches the published one for an inline-extras widget.
+		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
+		if !ok {
+			return "", false
+		}
+		key, handle, _ := dispatchCacheLookupKey(ctx, coords.Class,
+			coords.Group, coords.Version, coords.Resource,
+			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
 		if handle == nil || key == "" {
 			return "", false
 		}
 		return key, true
 
 	case classRestActions,
-		classWidgets,
 		cache.CacheEntryClassApistage,
 		cache.CacheEntryClassRAFullList:
 		// Identity-bound: dispatchCacheLookupKey folds the BindingUID derived
 		// from ctx's identity. A foreign coordinate set yields the caller's
 		// own BindingUID -> a key the foreign cell never publishes to.
+		//
+		// #64: these classes carry NO inline-extras blocks (they are not
+		// widgets — a RESTAction/apistage/raFullList cell's emit key folds only
+		// the request extras), so raw coords.Extras is request-only parity on
+		// BOTH sides. UNCHANGED.
 		key, handle, _ := dispatchCacheLookupKey(ctx, coords.Class,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, coords.Extras)

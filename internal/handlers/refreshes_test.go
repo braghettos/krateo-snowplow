@@ -24,7 +24,15 @@ import (
 	"time"
 
 	"github.com/krateoplatformops/plumbing/jwtutil"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
 
 const refreshTestSignKey = "test-sign-key-ship1-live-refresh"
@@ -60,6 +68,78 @@ func subParam(t *testing.T) string {
 	}}
 	raw, _ := json.Marshal(body)
 	return base64.StdEncoding.EncodeToString(raw)
+}
+
+// seedAuthTestWidget wires cache.Global() with the dashboard-piechart panel CR
+// that subParam() arms + an RBAC binding granting userA's group (devs) get/list
+// on panels, so the #64 subscriptionKeyExtras objects.Get (informer-served,
+// RBAC-gated under the connection identity) succeeds and DeriveSubscriptionKey
+// derives a valid key.
+//
+// WHY (#64): the auth tests exercise the REAL arming path, which now (correctly,
+// C64-1 fail-closed) requires a fetchable widget CR — a widget the user can't
+// GET is not live-refreshable, so it is not armed. Pre-#64 these coords
+// phantom-armed (200, but the request-only key was WRONG → never delivered, the
+// very bug). Seeding the CR tests the honest arming path.
+func seedAuthTestWidget(t *testing.T) {
+	t.Helper()
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+
+	panelGVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels"}
+	crbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}
+	crGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
+	scheme := runtime.NewScheme()
+	_ = rbacv1.AddToScheme(scheme)
+	listKinds := map[schema.GroupVersionResource]string{
+		crbGVR: "ClusterRoleBindingList",
+		crGVR:  "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}: "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:        "RoleList",
+		panelGVR: "PanelList",
+	}
+	rule := []rbacv1.PolicyRule{{Verbs: []string{"get", "list"}, APIGroups: []string{"widgets.templates.krateo.io"}, Resources: []string{"panels"}}}
+	seed := []runtime.Object{
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "panel-reader"}, Rules: rule},
+		// Grant the "devs" GROUP (userA's mintToken group) get/list panels.
+		&rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "devs-bind", UID: types.UID("uid-devs")},
+			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "devs"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "panel-reader"},
+		},
+		&unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "widgets.templates.krateo.io/v1beta1",
+			"kind":       "Panel",
+			"metadata":   map[string]any{"name": "dashboard-piechart", "namespace": "krateo-system"},
+			"spec":       map[string]any{}, // no inline extras — request-only key, byte-identical to emit
+		}},
+	}
+
+	wctx, wcancel := context.WithCancel(context.Background())
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, seed...)
+	rw, err := cache.NewResourceWatcher(wctx, dyn)
+	if err != nil {
+		wcancel()
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer syncCancel()
+	if err := rw.WaitForCacheSync(syncCtx, 5*time.Second); err != nil {
+		rw.Stop()
+		wcancel()
+		t.Fatalf("WaitForCacheSync: %v", err)
+	}
+	_, _ = rw.EnsureResourceType(panelGVR)
+	_ = rw.WaitForCacheSync(syncCtx, 5*time.Second)
+	cache.RebuildRBACSnapshotForTest(rw)
+	prev := cache.Global()
+	cache.SetGlobal(rw)
+	t.Cleanup(func() {
+		rw.Stop()
+		wcancel()
+		cache.SetGlobal(prev)
+		cache.PublishRBACSnapshotForTest(nil)
+	})
 }
 
 // refreshServer wires the production chain (RefreshAuth -> Refreshes) on a
@@ -103,6 +183,7 @@ func TestRefreshes_Auth_HeaderTokenReachesHandler(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("REFRESH_SSE_ENABLED", "")
+	seedAuthTestWidget(t) // #64: the armed widget CR must be fetchable (C64-1 fail-closed)
 	base := refreshServer(t)
 
 	resp, cancel := openStream(t, base, "?sub="+subParam(t), func(req *http.Request) {
@@ -127,6 +208,7 @@ func TestRefreshes_Auth_CookieTokenReachesHandler(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	t.Setenv("REFRESH_SSE_ENABLED", "")
 	t.Setenv("REFRESH_SESSION_COOKIE", "krateo-session")
+	seedAuthTestWidget(t) // #64: the armed widget CR must be fetchable (C64-1 fail-closed)
 	base := refreshServer(t)
 
 	resp, cancel := openStream(t, base, "?sub="+subParam(t), func(req *http.Request) {
