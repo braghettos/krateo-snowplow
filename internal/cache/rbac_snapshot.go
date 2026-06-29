@@ -988,6 +988,14 @@ func PublishRBACSnapshotForTest(s *RBACSnapshot) {
 	rbacSnap.Store(s)
 }
 
+// BumpRBACGenForTest increments rbacSnapshotPublishSeq so RBACGen() reports a
+// published snapshot (>0), letting a handler test simulate the WARM readiness
+// state (#68: refreshWarmupIncomplete keys on RBACGen()==0 as one warmup
+// disjunct). Production bumps this only via rebuildRBACSnapshot's publish.
+// ResetRBACGenForTest restores it to 0 (the pre-readiness state).
+func BumpRBACGenForTest()  { rbacSnapshotPublishSeq.Add(1) }
+func ResetRBACGenForTest() { rbacSnapshotPublishSeq.Store(0) }
+
 // RebuildSubjectIndexesForTest exposes the unexported
 // rebuildSubjectIndexes for tests that hand-build snapshots and need
 // to populate the CRBsBy*/RBsBy* subject-index maps (which the rbac

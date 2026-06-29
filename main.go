@@ -966,7 +966,18 @@ func main() {
 	// exec. NO per-subscription-key/identity enumeration — totals only (a
 	// per-key dump would be a cross-user signal). Mounted next to
 	// /debug/servable + /debug/apistage (docs/rca-refreshes-zero-delivery-2026-06-26.md §5).
-	mux.HandleFunc("GET /debug/refreshes", handlers.DebugRefreshes())
+	//
+	// #69 — AUTH-GATED for prod. Wrapped in middleware.RefreshAuth (the SAME
+	// cookie-or-header JWT gate /refreshes uses), so a bare unauthenticated GET
+	// now 401s instead of returning the counters. The body stays aggregate-only
+	// (uint64 totals + int subscriber count + bool — structurally cannot carry
+	// per-key/per-user data), so even past the gate it is leak-safe; the gate
+	// is defence-in-depth so the diagnostic is not world-readable in prod. Uses
+	// the same RefreshAuth chain form as /refreshes (no apiserver read, no
+	// UserConfig Secret lookup).
+	mux.Handle("GET /debug/refreshes", chain.Append(
+		middleware.RefreshAuth(*signKey)).
+		Then(handlers.DebugRefreshes()))
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
 		os.Interrupt,

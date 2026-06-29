@@ -103,6 +103,22 @@ func Refreshes(signingKey string) http.HandlerFunc {
 			return
 		}
 		if len(armed) == 0 {
+			// #68: distinguish a TRANSIENT empty (the post-redeploy warmup
+			// window — informer/RBAC snapshot not yet synced, so
+			// DeriveSubscriptionKey skips every coord) from a GENUINELY empty
+			// one (warm, but all coords NotFound / RBAC-denied — the blessed
+			// C64-1 honest-400). During warmup, serve the documented idle
+			// stream (keepalives only; the browser stays connected and starts
+			// delivering once warm) instead of a 400 the frontend must back off
+			// from. The gate keys STRICTLY on warmup readiness
+			// (refreshWarmupIncomplete = !IsPhase1Done || RBACGen==0), NOT on
+			// the armed count or WHY coords were skipped — so a warm
+			// all-NotFound/all-denied subscription still gets the correct 400
+			// (the divert cannot mask "armed nothing valid" once warm).
+			if refreshWarmupIncomplete() {
+				serveIdleSSE(wri, req)
+				return
+			}
 			http.Error(wri, "no valid subscription keys", http.StatusBadRequest)
 			return
 		}
@@ -159,6 +175,27 @@ func Refreshes(signingKey string) http.HandlerFunc {
 			}
 		}
 	}
+}
+
+// refreshWarmupIncomplete reports whether the pod is still in its post-(re)deploy
+// warmup window — the ~4-min span where the informer/RBAC substrate is not yet
+// synced, so DeriveSubscriptionKey legitimately skips every coord (#68). It is
+// the disjunction of the two readiness gates already used elsewhere:
+//   - !cache.IsPhase1Done() — the Tag-B startup warmup gate (the /readyz signal,
+//     phase1.go); false until the prewarm walk completes.
+//   - cache.RBACGen() == 0 — no RBAC snapshot published yet (rbac_snapshot.go);
+//     EvaluateRBAC fails closed until the first publish, so every identity-bound
+//     coord derives the empty/denied key pre-publish.
+// BOTH disjuncts are required: phase1 can complete while the RBAC snapshot is
+// momentarily unpublished (and vice-versa) — either alone leaves
+// DeriveSubscriptionKey unable to produce a real armed key.
+//
+// It deliberately does NOT consult the armed count or the skip reason — so a
+// WARM pod (both gates satisfied) with a genuinely-empty/all-denied
+// subscription still falls through to the honest 400 (C64-1), not the idle
+// stream. The divert is STRICTLY warmup-gated by construction.
+func refreshWarmupIncomplete() bool {
+	return !cache.IsPhase1Done() || cache.RBACGen() == 0
 }
 
 // serveIdleSSE serves a heartbeat-only SSE stream for the disabled / cache-off

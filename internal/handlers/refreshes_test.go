@@ -306,6 +306,15 @@ func TestRefreshes_Validation_Rejections(t *testing.T) {
 func TestRefreshes_Validation_AllForeignKeysRejected(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	// #68: this asserts the WARM-pod honest-400 for unarmable (unknown-class)
+	// keys. Mark the pod warm (both gates: phase1 done + RBAC published) so the
+	// new warmup-divert does NOT serve an idle stream — the divert is for the
+	// transient warmup window only, not for a warm pod with genuinely-empty
+	// subscriptions (C64-1 honest-400 must survive).
+	cache.MarkPhase1Done()
+	cache.BumpRBACGenForTest()
+	t.Cleanup(cache.ResetPhase1DoneForTest)
+	t.Cleanup(cache.ResetRBACGenForTest)
 	base := refreshServer(t)
 	tok := mintToken(t, "userA")
 
