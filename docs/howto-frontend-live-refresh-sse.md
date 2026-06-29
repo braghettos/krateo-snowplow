@@ -226,6 +226,17 @@ class RefreshManager {
 - **Reconnect** is automatic (native `EventSource`); on reconnect it re-sends the
   same `?sub=`, so no extra handling — just rebuild `sub` when the widget set
   changes.
+- **Fires on CONTENT CHANGE, not on every reconcile.** A `refresh` event is
+  emitted only when the widget's *resolved rendered output* actually changes —
+  not on every Kubernetes reconcile of the underlying resource. A resource that
+  reconciles repeatedly but produces **stable output** (e.g. a stuck or erroring
+  composition whose status keeps re-writing to the same values) will **never**
+  publish a refresh. This is by design (it avoids spurious refetches), but it
+  confounds a naive test: *"I watched a failing composition and got nothing"* is
+  expected, not a bug. **When testing, pick a target whose rendered content
+  actually changes** (e.g. scale a deployment, edit a value the widget displays)
+  — and use `/debug/refreshes` (`published` climbing) to confirm the server is
+  emitting at all.
 
 ---
 

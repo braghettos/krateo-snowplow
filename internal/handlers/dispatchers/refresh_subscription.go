@@ -139,16 +139,30 @@ func subscriptionKeyExtras(ctx context.Context, c SubscriptionCoordinates) (map[
 }
 
 func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) (string, bool) {
-	// (#64 real root cause — page/perPage divergence) The EMIT /call path runs
-	// coords through paginationInfo → normalizePagination, so a non-paginated
-	// widget folds "-1","-1" into ComputeKey. The subscription receives
-	// coords.PerPage/Page from ?sub= as 0,0 (the frontend sends 0, or omits the
-	// fields → json zero). Without normalizing here, the sub key folds "0","0"
-	// ≠ the emit "-1","-1" → the armed key never matches the published one →
-	// delivered:0, for EVERY class (the fold is class-independent). Apply the
-	// SHARED normalization core (the same one paginationInfo calls — extracted,
-	// not re-implemented, so the two sides cannot drift) to ALL classes BEFORE
-	// the per-class derivation below.
+	key, _, ok := deriveSubscription(ctx, coords)
+	return key, ok
+}
+
+// deriveSubscription is the SINGLE key-derivation body for /refreshes. It
+// returns BOTH the cache key string AND the pre-hash *cache.ResolvedKeyInputs
+// so the prod path (DeriveSubscriptionKey → key) and the test pre-hash
+// assertion (deriveSubscriptionKeyInputsForTest → inputs) share ONE
+// implementation and cannot drift (#66 — eliminates the parallel-copy shadow
+// that was the same drift class as the #64 root cause itself; see the
+// /refreshes saga regression journal). There is no dead prod code: the
+// dispatch*Key helpers ALREADY compute and return the inputs; we now keep them
+// instead of discarding the third value.
+//
+// (#64 real root cause — page/perPage divergence) The EMIT /call path runs
+// coords through paginationInfo → normalizePagination, so a non-paginated
+// widget folds "-1","-1" into ComputeKey. The subscription receives
+// coords.PerPage/Page from ?sub= as 0,0 (the frontend sends 0, or omits the
+// fields → json zero). Without normalizing here, the sub key folds "0","0" ≠
+// the emit "-1","-1" → the armed key never matches the published one →
+// delivered:0, for EVERY class. Apply the SHARED normalization core (the same
+// one paginationInfo calls — extracted, not re-implemented, so the two sides
+// cannot drift) to ALL classes BEFORE the per-class derivation below.
+func deriveSubscription(ctx context.Context, coords SubscriptionCoordinates) (string, *cache.ResolvedKeyInputs, bool) {
 	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
 
 	switch coords.Class {
@@ -164,15 +178,15 @@ func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) 
 		// in place of the request-only coords.Extras.
 		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
 		if !ok {
-			return "", false
+			return "", nil, false
 		}
-		key, handle, _ := dispatchWidgetContentKey(ctx,
+		key, handle, inputs := dispatchWidgetContentKey(ctx,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
 		if handle == nil || key == "" {
-			return "", false
+			return "", nil, false
 		}
-		return key, true
+		return key, inputs, true
 
 	case classWidgets:
 		// Identity-bound widget. #64: same inline-extras union as widgetContent
@@ -181,15 +195,15 @@ func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) 
 		// armed key never matches the published one for an inline-extras widget.
 		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
 		if !ok {
-			return "", false
+			return "", nil, false
 		}
-		key, handle, _ := dispatchCacheLookupKey(ctx, coords.Class,
+		key, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
 		if handle == nil || key == "" {
-			return "", false
+			return "", nil, false
 		}
-		return key, true
+		return key, inputs, true
 
 	case classRestActions,
 		cache.CacheEntryClassApistage,
@@ -202,69 +216,26 @@ func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) 
 		// widgets — a RESTAction/apistage/raFullList cell's emit key folds only
 		// the request extras), so raw coords.Extras is request-only parity on
 		// BOTH sides. UNCHANGED.
-		key, handle, _ := dispatchCacheLookupKey(ctx, coords.Class,
+		key, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, coords.Extras)
 		if handle == nil || key == "" {
-			return "", false
+			return "", nil, false
 		}
-		return key, true
+		return key, inputs, true
 
 	default:
 		// Unknown class — fail closed.
-		return "", false
+		return "", nil, false
 	}
 }
 
-// deriveSubscriptionKeyInputsForTest mirrors DeriveSubscriptionKey but returns
-// the PRE-HASH ResolvedKeyInputs (the 3rd value DeriveSubscriptionKey discards)
-// so the #64 golden can assert pre-hash-STRING equality against the emit-side
-// inputs field-by-field — STRONGER than digest equality and independent of the
-// (on-cluster-only) admin BindingUID. Test-only; production uses
-// DeriveSubscriptionKey. Mirrors the exact same normalization + per-class
-// branching so the inputs it returns are what DeriveSubscriptionKey hashes.
+// deriveSubscriptionKeyInputsForTest returns the PRE-HASH ResolvedKeyInputs the
+// REAL DeriveSubscriptionKey path computes (#66: now a thin accessor over the
+// SHARED deriveSubscription body — NOT a mirror, so the pre-hash golden
+// exercises the production derivation and cannot test a stale shadow).
+// Test-only.
 func deriveSubscriptionKeyInputsForTest(ctx context.Context, coords SubscriptionCoordinates) (*cache.ResolvedKeyInputs, bool) {
-	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
-
-	switch coords.Class {
-	case cache.CacheEntryClassWidgetContent:
-		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
-		if !ok {
-			return nil, false
-		}
-		_, handle, inputs := dispatchWidgetContentKey(ctx,
-			coords.Group, coords.Version, coords.Resource,
-			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
-		if handle == nil || inputs == nil {
-			return nil, false
-		}
-		return inputs, true
-
-	case classWidgets:
-		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
-		if !ok {
-			return nil, false
-		}
-		_, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
-			coords.Group, coords.Version, coords.Resource,
-			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
-		if handle == nil || inputs == nil {
-			return nil, false
-		}
-		return inputs, true
-
-	case classRestActions,
-		cache.CacheEntryClassApistage,
-		cache.CacheEntryClassRAFullList:
-		_, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
-			coords.Group, coords.Version, coords.Resource,
-			coords.Namespace, coords.Name, coords.PerPage, coords.Page, coords.Extras)
-		if handle == nil || inputs == nil {
-			return nil, false
-		}
-		return inputs, true
-
-	default:
-		return nil, false
-	}
+	_, inputs, ok := deriveSubscription(ctx, coords)
+	return inputs, ok
 }
