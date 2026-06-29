@@ -139,6 +139,18 @@ func subscriptionKeyExtras(ctx context.Context, c SubscriptionCoordinates) (map[
 }
 
 func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) (string, bool) {
+	// (#64 real root cause — page/perPage divergence) The EMIT /call path runs
+	// coords through paginationInfo → normalizePagination, so a non-paginated
+	// widget folds "-1","-1" into ComputeKey. The subscription receives
+	// coords.PerPage/Page from ?sub= as 0,0 (the frontend sends 0, or omits the
+	// fields → json zero). Without normalizing here, the sub key folds "0","0"
+	// ≠ the emit "-1","-1" → the armed key never matches the published one →
+	// delivered:0, for EVERY class (the fold is class-independent). Apply the
+	// SHARED normalization core (the same one paginationInfo calls — extracted,
+	// not re-implemented, so the two sides cannot drift) to ALL classes BEFORE
+	// the per-class derivation below.
+	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
+
 	switch coords.Class {
 	case cache.CacheEntryClassWidgetContent:
 		// Identity-free shared shell. The key is the same for every subject
@@ -201,5 +213,58 @@ func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) 
 	default:
 		// Unknown class — fail closed.
 		return "", false
+	}
+}
+
+// deriveSubscriptionKeyInputsForTest mirrors DeriveSubscriptionKey but returns
+// the PRE-HASH ResolvedKeyInputs (the 3rd value DeriveSubscriptionKey discards)
+// so the #64 golden can assert pre-hash-STRING equality against the emit-side
+// inputs field-by-field — STRONGER than digest equality and independent of the
+// (on-cluster-only) admin BindingUID. Test-only; production uses
+// DeriveSubscriptionKey. Mirrors the exact same normalization + per-class
+// branching so the inputs it returns are what DeriveSubscriptionKey hashes.
+func deriveSubscriptionKeyInputsForTest(ctx context.Context, coords SubscriptionCoordinates) (*cache.ResolvedKeyInputs, bool) {
+	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
+
+	switch coords.Class {
+	case cache.CacheEntryClassWidgetContent:
+		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
+		if !ok {
+			return nil, false
+		}
+		_, handle, inputs := dispatchWidgetContentKey(ctx,
+			coords.Group, coords.Version, coords.Resource,
+			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
+		if handle == nil || inputs == nil {
+			return nil, false
+		}
+		return inputs, true
+
+	case classWidgets:
+		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
+		if !ok {
+			return nil, false
+		}
+		_, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
+			coords.Group, coords.Version, coords.Resource,
+			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
+		if handle == nil || inputs == nil {
+			return nil, false
+		}
+		return inputs, true
+
+	case classRestActions,
+		cache.CacheEntryClassApistage,
+		cache.CacheEntryClassRAFullList:
+		_, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
+			coords.Group, coords.Version, coords.Resource,
+			coords.Namespace, coords.Name, coords.PerPage, coords.Page, coords.Extras)
+		if handle == nil || inputs == nil {
+			return nil, false
+		}
+		return inputs, true
+
+	default:
+		return nil, false
 	}
 }

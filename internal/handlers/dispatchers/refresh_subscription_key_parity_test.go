@@ -152,6 +152,11 @@ func TestFalsifier64_ARM1_WidgetsInlineExtrasUnion(t *testing.T) {
 	buildWidgetParityWatcher(t, true, inline)
 	ctx := ctxUserA()
 	coords := panelCoords(classWidgets, map[string]any{"name": "demo-vpc"})
+	// #64 pagination: the emit path normalizes page/perPage (paginationInfo →
+	// normalizePagination), and DeriveSubscriptionKey now does too. Mirror it on
+	// the hand-built emit keys below so this extras golden compares like-for-like
+	// (0,0 → -1,-1) instead of tripping on the pagination fold.
+	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
 
 	subKey, ok := DeriveSubscriptionKey(ctx, coords)
 	if !ok || subKey == "" {
@@ -201,6 +206,7 @@ func TestFalsifier64_ARM2_WidgetsNoInlineBackwardCompat(t *testing.T) {
 	buildWidgetParityWatcher(t, true, nil) // no inline block
 	ctx := ctxUserA()
 	coords := panelCoords(classWidgets, map[string]any{"name": "demo-vpc"})
+	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page) // #64 pagination parity
 
 	subKey, ok := DeriveSubscriptionKey(ctx, coords)
 	if !ok {
@@ -221,6 +227,7 @@ func TestFalsifier64_ARM3_WidgetContentInlineExtrasUnion(t *testing.T) {
 	buildWidgetParityWatcher(t, true, inline)
 	ctx := ctxUserA()
 	coords := panelCoords(cache.CacheEntryClassWidgetContent, map[string]any{"name": "demo-vpc"})
+	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page) // #64 pagination parity
 
 	subKey, ok := DeriveSubscriptionKey(ctx, coords)
 	if !ok || subKey == "" {
@@ -250,6 +257,7 @@ func TestFalsifier64_ARM4_RestActionsRequestOnlyUnchanged(t *testing.T) {
 	buildWidgetParityWatcher(t, true, inline)
 	ctx := ctxUserA()
 	coords := panelCoords(classRestActions, map[string]any{"name": "demo-vpc"})
+	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page) // #64 pagination parity
 
 	subKey, ok := DeriveSubscriptionKey(ctx, coords)
 	if !ok {
