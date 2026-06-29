@@ -71,11 +71,38 @@ func paginationInfo(log *slog.Logger, req *http.Request) (perPage, page int) {
 		}
 	}
 
+	return normalizePagination(perPage, page)
+}
+
+// normalizePagination is the SINGLE normalization core for the cache-key
+// pagination fold, shared by the EMIT path (paginationInfo, from the /call
+// query) and the SUBSCRIPTION path (DeriveSubscriptionKey, from ?sub= coords)
+// so both stamp byte-identical (perPage, page) into ComputeKey.
+//
+// (#64 real root cause) A non-paginated /call sends no perPage/page query →
+// paginationInfo's -1,-1 default → the emit key folds "-1","-1". The frontend
+// subscription sends perPage:0/page:0 (or omits them → json zero) → 0,0. "-1"
+// != "0" → key mismatch → published + subscribers>=1 + delivered:0, for EVERY
+// class (the fold is class-independent). EXTRACTING the normalization (rather
+// than re-implementing it on the subscription side) is the fix: the drift
+// between two hand-written copies is exactly what caused the bug.
+//
+// Rules (mirrors the historical paginationInfo, the page=1 rule INCLUDED):
+//   - perPage <= 0  → -1 (non-paginated sentinel)
+//   - page    <= 0  → -1 (non-paginated sentinel)
+//   - perPage > 0 && page <= 0 → page = 1 (a paginated request with no/zero
+//     page means the first page; this rule MUST survive the extraction)
+func normalizePagination(perPage, page int) (int, int) {
+	if perPage <= 0 {
+		perPage = -1
+	}
+	if page <= 0 {
+		page = -1
+	}
 	if perPage > 0 && page <= 0 {
 		page = 1
 	}
-
-	return
+	return perPage, page
 }
 
 // checkDispatchRBAC is the cache=on permission gate (Revision 2
