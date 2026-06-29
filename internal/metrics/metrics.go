@@ -33,14 +33,17 @@ import (
 
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
+	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/sdk/resource"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
@@ -248,6 +251,141 @@ func registerInstruments(m metric.Meter) error {
 		return err
 	}
 
+	// --- prewarm engine: the unified walk/seed worker (production path) ---
+	prewarmEngEnqueued, err := m.Int64ObservableCounter("snowplow_prewarm_engine_enqueued_total",
+		metric.WithDescription("Cumulative enqueueScope calls (every enqueue, even dedup-coalesced)."))
+	if err != nil {
+		return err
+	}
+	prewarmEngProcessed, err := m.Int64ObservableCounter("snowplow_prewarm_engine_processed_total",
+		metric.WithDescription("Prewarm-engine scopes fully processed by the worker."))
+	if err != nil {
+		return err
+	}
+	prewarmEngYield, err := m.Int64ObservableCounter("snowplow_prewarm_engine_yield_total",
+		metric.WithDescription("Prewarm-engine worker parked for a customer /call (customer-priority yield)."))
+	if err != nil {
+		return err
+	}
+	prewarmEngPending, err := m.Int64ObservableGauge("snowplow_prewarm_engine_pending_depth",
+		metric.WithDescription("Live prewarm-engine pending-scope depth; 0 once the worker drains."))
+	if err != nil {
+		return err
+	}
+
+	// --- prewarm phase-1: apiRef pagination coverage ---
+	phase1UnitsPlanned, err := m.Int64ObservableGauge("snowplow_phase1_units_planned",
+		metric.WithDescription("widgetContent cells the apiRef pagination walk planned to seed."))
+	if err != nil {
+		return err
+	}
+	phase1UnitsSeeded, err := m.Int64ObservableGauge("snowplow_phase1_units_seeded",
+		metric.WithDescription("Page cells handed to populateWidgetContentL1 with a non-nil envelope."))
+	if err != nil {
+		return err
+	}
+	phase1ApiRefPages, err := m.Int64ObservableCounter("snowplow_phase1_apiref_pages_total",
+		metric.WithDescription("Extra apiRef pages (page 2..N) resolved across all paginated widgets."))
+	if err != nil {
+		return err
+	}
+	phase1EligibleNoContinue, err := m.Int64ObservableCounter("snowplow_phase1_eligible_no_continue_total",
+		metric.WithDescription("Distinct eligible widgets whose page-1 resolve produced no continuation."))
+	if err != nil {
+		return err
+	}
+
+	// --- prewarm phase-1: boot-walk fan-out ---
+	phase1WalkZeroChildren, err := m.Int64ObservableCounter("snowplow_phase1_walk_zero_children_total",
+		metric.WithDescription("Boot-walk observations that found zero children."))
+	if err != nil {
+		return err
+	}
+	phase1WalkObservations, err := m.Int64ObservableCounter("snowplow_phase1_walk_observations_total",
+		metric.WithDescription("Total boot-walk children-count observations (zero-children denominator)."))
+	if err != nil {
+		return err
+	}
+
+	// --- prewarm phase-1: per-target seed outcomes ---
+	phase1SeedResolves, err := m.Int64ObservableCounter("snowplow_phase1_bindingset_seed_resolves_total",
+		metric.WithDescription("Per-binding-target phase-1 seed resolves."))
+	if err != nil {
+		return err
+	}
+	phase1SeedFailures, err := m.Int64ObservableCounter("snowplow_phase1_bindingset_seed_failures_total",
+		metric.WithDescription("Grand-total phase-1 seed failures (= rbac_deny + operational)."))
+	if err != nil {
+		return err
+	}
+	phase1SeedRBACDeny, err := m.Int64ObservableCounter("snowplow_phase1_seed_rbac_deny_total",
+		metric.WithDescription("EXPECTED narrow-RBAC seed denies (403/401); cohort genuinely can't read the target."))
+	if err != nil {
+		return err
+	}
+	phase1SeedOpFail, err := m.Int64ObservableCounter("snowplow_phase1_seed_operational_fail_total",
+		metric.WithDescription("UNEXPECTED seed failures (ctx timeout/cancel, 5xx, transport, panic); should be 0."))
+	if err != nil {
+		return err
+	}
+
+	// --- refresher: background re-resolve worker pool (one counter keyed by stat) ---
+	refresher, err := m.Int64ObservableCounter("snowplow_refresher",
+		metric.WithDescription("Refresher worker-pool counters, labelled by stat."))
+	if err != nil {
+		return err
+	}
+	refresherQueueDepth, err := m.Int64ObservableGauge("snowplow_refresher_queue_depth",
+		metric.WithDescription("Live refresher workqueue depth; climbing with stagnant completed = workers stuck."))
+	if err != nil {
+		return err
+	}
+
+	// --- discovery: SA-discovery client (one counter keyed by stat) ---
+	saDiscovery, err := m.Int64ObservableCounter("snowplow_sa_discovery",
+		metric.WithDescription("SA-discovery client counters, labelled by stat."))
+	if err != nil {
+		return err
+	}
+
+	// --- discovery: compiled-CRD-schema memo (one counter keyed by stat) ---
+	crdSchemaMemo, err := m.Int64ObservableCounter("snowplow_crd_schema_memo",
+		metric.WithDescription("Compiled-CRD-schema memo counters, labelled by stat."))
+	if err != nil {
+		return err
+	}
+
+	// --- upstream health: aggregate controller + webhook gauges ---
+	upstreamControllers, err := m.Int64ObservableGauge("snowplow_upstream_controllers",
+		metric.WithDescription("Auto-discovered upstream controllers, labelled by health (healthy/unhealthy)."))
+	if err != nil {
+		return err
+	}
+	upstreamWebhooks, err := m.Int64ObservableGauge("snowplow_upstream_webhooks",
+		metric.WithDescription("Discovered admission webhooks, labelled by policy (total/fail)."))
+	if err != nil {
+		return err
+	}
+
+	// --- dispatch: L1 resolved-output lookup aggregate hit/miss ---
+	dispatchL1, err := m.Int64ObservableCounter("snowplow_dispatch_l1_lookups_total",
+		metric.WithDescription("Cluster-wide dispatch-L1 resolved-output lookups, labelled by outcome (hit/miss)."))
+	if err != nil {
+		return err
+	}
+
+	// --- RAFullList: cheap Go-slice serve outcomes + index drift canary ---
+	raFullListServe, err := m.Int64ObservableCounter("snowplow_ra_full_list_serve",
+		metric.WithDescription("RAFullList serve-outcome counters, labelled by outcome."))
+	if err != nil {
+		return err
+	}
+	bindingsDeltaSkipped, err := m.Int64ObservableCounter("snowplow_bindings_by_gvr_delta_skipped_non_typed",
+		metric.WithDescription("Delta-event objects neither typed nor convertible, DROPPED (index drift canary); should be 0."))
+	if err != nil {
+		return err
+	}
+
 	// Single callback reading every snapshot at collection time.
 	_, err = m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		o.ObserveInt64(fallthroughTotal, int64(cache.FallthroughTotal()))
@@ -292,12 +430,122 @@ func registerInstruments(m metric.Meter) error {
 		o.ObserveInt64(memoRefused, int64(refused))
 		o.ObserveInt64(memoDenyUncached, int64(denyUncached))
 		o.ObserveInt64(memoEntries, int64(entries))
+
+		// --- prewarm engine ---
+		engEnq, engProc, engYield, engPending := dispatchers.PrewarmEngineSnapshot()
+		o.ObserveInt64(prewarmEngEnqueued, int64(engEnq))
+		o.ObserveInt64(prewarmEngProcessed, int64(engProc))
+		o.ObserveInt64(prewarmEngYield, int64(engYield))
+		o.ObserveInt64(prewarmEngPending, engPending)
+
+		// --- phase-1 pagination ---
+		planned, seeded, apiRefPages, eligibleNoCont := dispatchers.Phase1PaginationSnapshot()
+		o.ObserveInt64(phase1UnitsPlanned, int64(planned))
+		o.ObserveInt64(phase1UnitsSeeded, int64(seeded))
+		o.ObserveInt64(phase1ApiRefPages, int64(apiRefPages))
+		o.ObserveInt64(phase1EligibleNoContinue, int64(eligibleNoCont))
+
+		// --- phase-1 boot walk ---
+		zeroChildren, walkObservations := dispatchers.Phase1WalkSnapshot()
+		o.ObserveInt64(phase1WalkZeroChildren, int64(zeroChildren))
+		o.ObserveInt64(phase1WalkObservations, int64(walkObservations))
+
+		// --- phase-1 seed outcomes ---
+		seedResolves, seedFailures, seedRBACDeny, seedOpFail := dispatchers.Phase1SeedSnapshot()
+		o.ObserveInt64(phase1SeedResolves, int64(seedResolves))
+		o.ObserveInt64(phase1SeedFailures, int64(seedFailures))
+		o.ObserveInt64(phase1SeedRBACDeny, int64(seedRBACDeny))
+		o.ObserveInt64(phase1SeedOpFail, int64(seedOpFail))
+
+		// --- refresher pool ---
+		rEnq, rComp, rFail, rRetried, rDropped,
+			rSkipNoEntry, rSkipNoHandler, rSkipStageErr,
+			rYielded, rCapped, rFloored, rQueueDepth := cache.RefresherSnapshot()
+		for stat, v := range map[string]uint64{
+			"enqueue":             rEnq,
+			"completed":           rComp,
+			"failed":              rFail,
+			"retried":             rRetried,
+			"dropped":             rDropped,
+			"skipped_no_entry":    rSkipNoEntry,
+			"skipped_no_handler":  rSkipNoHandler,
+			"skipped_stage_error": rSkipStageErr,
+			"yielded":             rYielded,
+			"capped":              rCapped,
+			"floored":             rFloored,
+		} {
+			o.ObserveInt64(refresher, int64(v),
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+		o.ObserveInt64(refresherQueueDepth, rQueueDepth)
+
+		// --- SA-discovery ---
+		sa := dynamic.SADiscoveryStatsSnapshot()
+		for stat, v := range map[string]uint64{
+			"builds":        sa.Builds,
+			"invalidations": sa.Invalidations,
+			"fallbacks":     sa.Fallbacks,
+		} {
+			o.ObserveInt64(saDiscovery, int64(v),
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+
+		// --- CRD-schema memo ---
+		csHits, csMisses, csStale, csInval := schema.CRDSchemaMemoSnapshot()
+		for stat, v := range map[string]uint64{
+			"hits":          csHits,
+			"misses":        csMisses,
+			"stale_dropped": csStale,
+			"invalidations": csInval,
+		} {
+			o.ObserveInt64(crdSchemaMemo, int64(v),
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+
+		// --- upstream controller / webhook health ---
+		ctrlHealthy, ctrlUnhealthy, whTotal, whFail := cache.UpstreamHealthSnapshot()
+		o.ObserveInt64(upstreamControllers, ctrlHealthy,
+			metric.WithAttributes(attribute.String("health", "healthy")))
+		o.ObserveInt64(upstreamControllers, ctrlUnhealthy,
+			metric.WithAttributes(attribute.String("health", "unhealthy")))
+		o.ObserveInt64(upstreamWebhooks, whTotal,
+			metric.WithAttributes(attribute.String("policy", "total")))
+		o.ObserveInt64(upstreamWebhooks, whFail,
+			metric.WithAttributes(attribute.String("policy", "fail")))
+
+		// --- dispatch L1 aggregate ---
+		l1Hit, l1Miss := dispatchers.DispatchL1LookupTotals()
+		o.ObserveInt64(dispatchL1, int64(l1Hit),
+			metric.WithAttributes(attribute.String("outcome", "hit")))
+		o.ObserveInt64(dispatchL1, int64(l1Miss),
+			metric.WithAttributes(attribute.String("outcome", "miss")))
+
+		// --- RAFullList serve outcomes + index drift canary ---
+		ra := cache.RAFullListServeSnapshot()
+		for outcome, v := range map[string]uint64{
+			"hit":            ra.Hit,
+			"repopulate":     ra.Repopulate,
+			"verified_slice": ra.VerifiedSlice,
+			"fallback":       ra.Fallback,
+		} {
+			o.ObserveInt64(raFullListServe, int64(v),
+				metric.WithAttributes(attribute.String("outcome", outcome)))
+		}
+		o.ObserveInt64(bindingsDeltaSkipped, int64(cache.BindingsIndexDeltaSkippedNonTyped()))
 		return nil
 	},
 		fallthroughTotal, assertionViolations, rbacPublishSeq, crdDiscovery,
 		registeredGVRs, prewarmDone, prewarmElapsed,
 		refreshPublished, refreshDelivered, refreshDropped, refreshCoalesced, refreshSubscribers,
 		memoHits, memoMisses, memoSwaps, memoRefused, memoDenyUncached, memoEntries,
+		prewarmEngEnqueued, prewarmEngProcessed, prewarmEngYield, prewarmEngPending,
+		phase1UnitsPlanned, phase1UnitsSeeded, phase1ApiRefPages, phase1EligibleNoContinue,
+		phase1WalkZeroChildren, phase1WalkObservations,
+		phase1SeedResolves, phase1SeedFailures, phase1SeedRBACDeny, phase1SeedOpFail,
+		refresher, refresherQueueDepth,
+		saDiscovery, crdSchemaMemo,
+		upstreamControllers, upstreamWebhooks,
+		dispatchL1, raFullListServe, bindingsDeltaSkipped,
 	)
 	return err
 }
