@@ -40,6 +40,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -58,13 +59,25 @@ func buildTwoUserRBACWatcher(t *testing.T) {
 	crGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
 	scheme := runtime.NewScheme()
 	_ = rbacv1.AddToScheme(scheme)
+	compGVR := schema.GroupVersionResource{Group: "composition.krateo.io", Version: "v1alpha1", Resource: "compositions"}
+	panelGVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels"}
 	listKinds := map[schema.GroupVersionResource]string{
 		crbGVR: "ClusterRoleBindingList",
 		crGVR:  "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}: "RoleBindingList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:        "RoleList",
+		compGVR:  "CompositionList",
+		panelGVR: "PanelList",
 	}
-	compRule := []rbacv1.PolicyRule{{Verbs: []string{"get", "list"}, APIGroups: []string{"composition.krateo.io"}, Resources: []string{"compositions"}}}
+	// #64: grant compositions AND panels get/list — both classWidgets and
+	// widgetContent coords (compositionsCoords + the WidgetContentSharedShell
+	// panels coord) now fetch their CR via subscriptionKeyExtras→objects.Get
+	// (RBAC-gated under the connection identity). Without the panels grant the
+	// widgetContent fetch fail-closes (C64-1) and the shared-shell test can't arm.
+	compRule := []rbacv1.PolicyRule{
+		{Verbs: []string{"get", "list"}, APIGroups: []string{"composition.krateo.io"}, Resources: []string{"compositions"}},
+		{Verbs: []string{"get", "list"}, APIGroups: []string{"widgets.templates.krateo.io"}, Resources: []string{"panels"}},
+	}
 	mkCR := func(name string, rules []rbacv1.PolicyRule) *rbacv1.ClusterRole {
 		return &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: name}, Rules: rules}
 	}
@@ -81,6 +94,27 @@ func buildTwoUserRBACWatcher(t *testing.T) {
 		// the per-binding cell identity (BindingUID) differs per user.
 		mkCRB("a-bind", "uid-A", "comp-reader", rbacv1.Subject{Kind: "User", Name: "userA"}),
 		mkCRB("b-bind", "uid-B", "comp-reader", rbacv1.Subject{Kind: "User", Name: "userB"}),
+		// #64: the compositionsCoords() class is classWidgets, which now (post-#64)
+		// fetches the widget CR via subscriptionKeyExtras→objects.Get to fold the
+		// inline-extras union. Seed the compositions CR (no inline extras → the
+		// union == request-only, so the distinct-BindingUID key invariant is
+		// unchanged) so the fetch succeeds and the test exercises the real arming
+		// path rather than fail-closed-skipping (C64-1).
+		&unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "composition.krateo.io/v1alpha1",
+			"kind":       "Composition",
+			"metadata":   map[string]any{"name": "demo-1", "namespace": "team-a"},
+			"spec":       map[string]any{},
+		}},
+		// #64: the WidgetContentSharedShell panels coord (dashboard-piechart/
+		// krateo-system) — no inline extras → union==request-only, shared-shell
+		// key invariant unchanged.
+		&unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "widgets.templates.krateo.io/v1beta1",
+			"kind":       "Panel",
+			"metadata":   map[string]any{"name": "dashboard-piechart", "namespace": "krateo-system"},
+			"spec":       map[string]any{},
+		}},
 	}
 
 	wctx, wcancel := context.WithCancel(context.Background())
@@ -97,6 +131,12 @@ func buildTwoUserRBACWatcher(t *testing.T) {
 		wcancel()
 		t.Fatalf("WaitForCacheSync: %v", err)
 	}
+	// #64: make the compositions GVR servable so objects.Get serves the seeded
+	// CR from the informer (subscriptionKeyExtras' read), not an apiserver
+	// fallthrough.
+	_, _ = rw.EnsureResourceType(compGVR)
+	_, _ = rw.EnsureResourceType(panelGVR)
+	_ = rw.WaitForCacheSync(ctx, 5*time.Second)
 	cache.RebuildRBACSnapshotForTest(rw)
 	prev := cache.Global()
 	cache.SetGlobal(rw)
