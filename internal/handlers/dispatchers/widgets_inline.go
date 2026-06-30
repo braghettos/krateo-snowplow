@@ -16,14 +16,19 @@
 // automatic, and RBAC is enforced under the requesting identity by
 // ResolveNestedCall's checkDispatchRBAC gate (C-INLINE-1's runtime half).
 //
-// A1 single-encode (C-INLINE-0 / task #30): ResolveNestedCall returns the child
-// ALREADY ENCODED ONCE. We splice those bytes as a json.RawMessage into the
-// parent dict so the parent's single encodeResolvedJSON copies them VERBATIM —
-// no second per-child encode. (encodeResolvedJSON uses encoding/json, which
-// emits a json.RawMessage map value verbatim.) The Phase-1 falsifier verifies
-// the RawMessage splice survives the unstructured-map encode; if it does not,
-// the documented fallback is decode-into-map (option i) gated by the §6 RSS
-// bench — Phase-1 dev reports which path landed (RawMessage preferred).
+// A1 (C-INLINE-0 / task #30) — AS-BUILT IS PATH (i) decode-into-map, the
+// design's documented FALLBACK, NOT the doc's preferred RawMessage (ii).
+// ResolveNestedCall returns the child already encoded once; we json.Unmarshal
+// those bytes into a map[string]any and splice the MAP into the parent dict.
+// Path (ii) (splice the json.RawMessage verbatim) encodes fine but PANICS the
+// parent's unstructured deep-copy on the cache-Put/refresher path
+// (runtime.DeepCopyJSONValue rejects json.RawMessage) — caught pre-ship by the
+// §3/§5 falsifier (controller-gen deepcopy-gen also can't handle the field).
+// Path (i) keeps the carrier a standard map (deep-copy-safe). Cost: a bounded
+// per-child decode + the parent's SINGLE encode re-encodes the tree once (NOT a
+// second independent whole-parent encode per child) — LINEAR in child count
+// (§6 hermetic proxy: alloc ratio ~8 for 8× children). The full 50K RSS arm
+// (tester Phase 3) gates the re-encode constant at scale.
 //
 // DEPTH — ONE LEVEL HARD (C-INLINE-2): this walk resolves an inline ref's child
 // but does NOT re-enter the inline-walk on that child's own inline refs — the

@@ -289,8 +289,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// items[i].rendered, server-side under THIS per-user ctx (carrying
 	// WithUserInfo + the SA transport + WithL1KeyContext(cacheKey)). No-op when
 	// no item carries inline → byte-identical to today. Runs BEFORE the single
-	// encodeResolvedJSON so the spliced json.RawMessage children are encoded
-	// once with the parent. RBAC is enforced per-child by ResolveNestedCall;
+	// encodeResolvedJSON; each inline child is decoded into a map (deep-copy-safe,
+	// A1 path i — NOT json.RawMessage, which panics the unstructured deep-copy)
+	// and re-encoded once with the parent. RBAC is enforced per-child by ResolveNestedCall;
 	// the inline widget is routed to the per-user `widgets` L1 (not the shared
 	// content cell) by isRBACSensitiveApiRefWidget's hasInlineGETRef OR-clause.
 	if n := embedInlineChildren(ctx, log, res, perPage, page, extras); n > 0 {
