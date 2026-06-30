@@ -370,6 +370,19 @@ func isRBACSensitiveApiRefWidget(obj map[string]any) bool {
 	if obj == nil {
 		return false
 	}
+	// #72 / C-INLINE-1 (HARD) — independent OR-clause AT THE TOP, BEFORE the
+	// apiRef short-circuit below. A widget bearing any inline+GET resourcesRefs
+	// item embeds a server-resolved child `rendered` body that is narrowed per
+	// requesting-user identity; it MUST route to the per-user `widgets` L1, NEVER
+	// the shared identity-free `widgetContent` cell (or the SA-maximal child
+	// render would leak cross-user — the task #69 leak class). This MUST run
+	// before the `apiRef.Name == ""` return at the next stmt: an inline widget
+	// with NO apiRef would otherwise fall through to `return false` → shared
+	// cell → leak. Gates symmetrically at the serve-READ (widgets.go) and the
+	// populate-WRITE (widget_content.go) sites that both call this predicate.
+	if hasInlineGETRef(obj) {
+		return true
+	}
 	apiRef, err := widgets.GetApiRef(obj)
 	if err != nil || apiRef.Name == "" {
 		return false

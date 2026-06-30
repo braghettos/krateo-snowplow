@@ -23,6 +23,12 @@ type ResourceRef struct {
 	Verb string `json:"verb,omitempty"`
 	// Slice is used for pagination
 	Slice *Slice `json:"slice,omitempty"`
+	// Inline, when true on a GET ref, asks snowplow to resolve this child
+	// server-side under the requesting user's identity and embed the resolved
+	// envelope into the result's Rendered field (#72, inline-rendered-children).
+	// Additive + opt-in: a ref without Inline is byte-identical to today. A
+	// non-GET / not-allowed inline ref is NOT embedded.
+	Inline bool `json:"inline,omitempty"`
 }
 
 // ResourceRefResult defines the action result after evaluating a template.
@@ -37,6 +43,22 @@ type ResourceRefResult struct {
 	Payload *ResourceRefPayload `json:"payload,omitempty"`
 	// Allowed is this resource reference allowed (or not) for the user
 	Allowed bool `json:"allowed"`
+	// Inline carries the source ref's Inline flag through to the dispatcher,
+	// which (post-resolve) decides whether to embed the child (#72). Carried,
+	// not re-read — the dispatcher inline-walk consumes it.
+	Inline bool `json:"inline,omitempty"`
+	// Rendered is the resolved child envelope, embedded server-side when this
+	// ref is Inline+Allowed+GET (#72). Empty/omitted for every non-inline ref —
+	// so the served shape is byte-identical to today until a widget authors
+	// inline:true. map[string]any (NOT json.RawMessage): the dispatcher embeds
+	// it into the resolved *unstructured.Unstructured, which is deep-copied on
+	// the cache Put / refresher path — runtime.DeepCopyJSONValue PANICS on a
+	// json.RawMessage but handles a standard map. So the child is decoded once
+	// into a map and re-encoded with the parent's single encode (A1 path i, the
+	// design's documented fallback; §6-bench-gated). NOTE: path ii
+	// (RawMessage-verbatim) encodes fine but is unsound here — it panics the
+	// unstructured deep-copy.
+	Rendered map[string]any `json:"rendered,omitempty"`
 }
 
 // ResourceRefPayload is the template action result payload.
