@@ -170,13 +170,14 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 		return nil, false, nil
 	}
 
-	// Gate 2: shape. ParseAPIServerDiscoveryPath returns ok=true ONLY for
-	// the bare group-discovery shape (/apis/<g>/<v> or /api/<v>, no
-	// resource segment). It returns false for every resource path (F4 —
-	// the RBAC boundary), every non-apiserver / external / ${...} path,
-	// and the bare /apis | /api roots (F3).
-	gv, ok := cache.ParseAPIServerDiscoveryPath(call.Path)
-	if !ok {
+	// Gate 2: shape. A discovery-shaped path is either a single-GroupVersion
+	// path (/apis/<g>/<v> or /api/<v>) OR a bare discovery ROOT (/api | /apis,
+	// #74 Class 1). Both are SA-served via the CA-bearing transport; both
+	// reject every resource path (the RBAC boundary). A non-discovery path
+	// (resource / external / ${...} / malformed) falls through here.
+	gv, gvOK := cache.ParseAPIServerDiscoveryPath(call.Path)
+	root, rootOK := cache.ParseAPIServerDiscoveryRoot(call.Path)
+	if !gvOK && !rootOK {
 		return nil, false, nil
 	}
 
@@ -195,6 +196,22 @@ func dispatchViaDiscovery(ctx context.Context, call httpcall.RequestOptions) ([]
 		return nil, false, cliErr
 	}
 
+	// #74 Class 1 — bare discovery ROOT (/api | /apis): serve the apiserver's
+	// own multi-group index via the discovery client's RESTClient AbsPath,
+	// over the SAME CA-bearing SA transport. DoRaw returns the raw wire bytes
+	// (the apiserver's APIVersions / APIGroupList JSON), so the downstream JQ
+	// pipeline is invariant (feedback_cache_must_not_constrain_jq). This is
+	// the #18/#19 mechanism extended to the discovery root.
+	if rootOK {
+		raw, dErr := cli.RESTClient().Get().AbsPath(root).DoRaw(ctx)
+		if dErr != nil {
+			return nil, false, dErr
+		}
+		return raw, true, nil
+	}
+
+	// Single-GroupVersion discovery (/apis/<g>/<v> or /api/<v>) — the #18/#19
+	// path, unchanged.
 	list, dErr := cli.ServerResourcesForGroupVersion(gv)
 	if dErr != nil {
 		return nil, false, dErr

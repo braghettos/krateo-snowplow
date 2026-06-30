@@ -1346,6 +1346,11 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 			// (external link, malformed) — nothing to recurse into.
 			continue
 		}
+		// #74 Class 5 — skip a ref whose name/namespace still carries an
+		// UNSUBSTITUTED widget-template token. See refHasUnresolvedTemplateToken.
+		if refHasUnresolvedTemplateToken(ref) {
+			continue
+		}
 		key := navWidgetEndpointKey(ref)
 		if _, seen := w.visited[key]; seen {
 			// Already walked (cycle-safety + shared-subtree dedup). The
@@ -1532,4 +1537,22 @@ func extractResourcesRefsItems(obj map[string]any) []navChildRef {
 // key the visited-set is keyed on.
 func navWidgetEndpointKey(ref templatesv1.ObjectReference) string {
 	return ref.APIVersion + "|" + ref.Resource + "|" + ref.Namespace + "|" + ref.Name
+}
+
+// refHasUnresolvedTemplateToken reports whether a resolved child ref still
+// carries an UNSUBSTITUTED widget-template token ('{') in its name or
+// namespace (#74 Class 5). A widget resourcesRefsTemplate may emit refs like
+// name="{name}-composition-tablist" / namespace="{namespace}" whose `{…}`
+// placeholders are substituted at FRONTEND render time, NOT at snowplow resolve
+// time. The prewarm walk must NOT GET such a literal — it is a guaranteed 404
+// (get.go) + ERROR log-noise, never a real object.
+//
+// PROVABLY NON-LOSSY: a Kubernetes object name/namespace cannot contain '{' (it
+// is an RFC1123 label/subdomain — lowercase alphanumerics, '-', '.'), so a
+// '{'-bearing ref can NEVER name a real resource; skipping it loses nothing.
+// STRUCTURAL token test (feedback_no_special_cases) — keyed on "carries an
+// unresolved template token", uniform across every ref, never a literal
+// resource/name match.
+func refHasUnresolvedTemplateToken(ref templatesv1.ObjectReference) bool {
+	return strings.Contains(ref.Name, "{") || strings.Contains(ref.Namespace, "{")
 }

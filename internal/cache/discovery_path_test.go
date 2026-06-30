@@ -64,3 +64,54 @@ func TestParseAPIServerDiscoveryPath(t *testing.T) {
 		})
 	}
 }
+
+// TestParseAPIServerDiscoveryRoot — #74 Class 1: the bare-root sibling. ok=true
+// for EXACTLY /api and /apis (the multi-group discovery indexes the
+// group-version predicate rejects), false for every GroupVersion path, every
+// resource path (the RBAC boundary — a root predicate that matched a resource
+// path would reopen the leak), and external/${}/malformed.
+func TestParseAPIServerDiscoveryRoot(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		wantRoot string
+		wantOK   bool
+	}{
+		// --- the two bare roots (ok=true) ---
+		{"core root", "/api", "/api", true},
+		{"multi-group root", "/apis", "/apis", true},
+		{"core root trailing slash", "/api/", "/api", true},
+		{"multi-group root slash", "/apis/", "/apis", true},
+		{"core root with query", "/api?timeout=30s", "/api", true},
+		{"multi-group root with query", "/apis?x=1", "/apis", true},
+
+		// --- GroupVersion paths (ok=false — these go to the GV predicate) ---
+		{"core GroupVersion", "/api/v1", "", false},
+		{"named GroupVersion", "/apis/apps/v1", "", false},
+		{"group version-list", "/apis/templates.krateo.io", "", false},
+
+		// --- resource paths (ok=false — the RBAC boundary, RED arm) ---
+		{"core namespaces LIST", "/api/v1/namespaces", "", false},
+		{"core GET-by-name", "/api/v1/namespaces/krateo", "", false},
+		{"group namespaced GET", "/apis/apps/v1/namespaces/krateo/deployments/x", "", false},
+
+		// --- non-apiserver / malformed (ok=false) ---
+		{"external URL", "https://example.com/api", "", false},
+		{"unresolved JQ", "/api${x}", "", false},
+		{"empty", "", "", false},
+		{"root slash", "/", "", false},
+		{"random", "/healthz", "", false},
+		{"apiserver-ish prefix not root", "/apiserver", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root, ok := ParseAPIServerDiscoveryRoot(tc.path)
+			if ok != tc.wantOK {
+				t.Fatalf("ParseAPIServerDiscoveryRoot(%q) ok = %v, want %v (root=%q)", tc.path, ok, tc.wantOK, root)
+			}
+			if root != tc.wantRoot {
+				t.Fatalf("ParseAPIServerDiscoveryRoot(%q) root = %q, want %q", tc.path, root, tc.wantRoot)
+			}
+		})
+	}
+}

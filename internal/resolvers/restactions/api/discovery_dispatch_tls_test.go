@@ -235,6 +235,79 @@ func TestDiscoveryDispatch_CoreGroupShape(t *testing.T) {
 	}
 }
 
+// TestDiscoveryDispatch_BareRootServed is the #74 Class 1 POSITIVE arm: the
+// bare discovery ROOTS /api and /apis are served by the discovery branch over
+// the CA-bearing SA transport (via RESTClient AbsPath), returning the
+// apiserver's raw root index — NOT falling through to the external plumbing
+// branch (whose token-auth TLS drops the cluster CA → x509). This is the fix
+// for the seed bare-/api x509 noise. The synthetic TLS server answers any path
+// with a discovery-index body; the assertion is served=true + no x509 + the
+// body round-trips.
+func TestDiscoveryDispatch_BareRootServed(t *testing.T) {
+	for _, root := range []string{"/api", "/apis"} {
+		t.Run(root, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				// The apiserver root index shape (APIVersions for /api,
+				// APIGroupList for /apis). Body content is incidental to the
+				// fix — what matters is it's SA-served over the CA-bearing
+				// transport, not external-fall-through. Return a minimal valid
+				// JSON index.
+				_, _ = io.WriteString(w, `{"kind":"APIVersions","versions":["v1"]}`)
+			}))
+			t.Cleanup(srv.Close)
+			caPEM := pemEncodeCert(srv.Certificate())
+			rc := &rest.Config{Host: srv.URL, BearerToken: "fake-sa-jwt", TLSClientConfig: rest.TLSClientConfig{CAData: caPEM}}
+			withDiscoverySARESTConfig(t, rc)
+
+			raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+				RequestInfo: httpcall.RequestInfo{Path: root},
+			})
+			if err != nil {
+				// A bare-root that fell to the external branch over the
+				// system-root-store TLS would x509 here; the fix routes it to
+				// the CA-bearing SA transport instead.
+				t.Fatalf("Class 1: bare root %q dispatch failed (x509 if it fell external): %v", root, err)
+			}
+			if !served {
+				t.Fatalf("Class 1: bare root %q must be SERVED by the discovery branch (the seed /api x509 fix), "+
+					"not fall through to the external token-auth TLS path", root)
+			}
+			if len(raw) == 0 {
+				t.Fatalf("Class 1: served root %q returned empty bytes", root)
+			}
+		})
+	}
+}
+
+// TestDiscoveryDispatch_BareRootLeakGuard is the #74 Class 1 RBAC-boundary RED
+// arm: widening the dispatch to the bare roots must NOT widen it to any
+// resource path. A resource path under /api or /apis is STILL not served (the
+// root predicate matches ONLY the two exact roots). Pairs with F4.
+func TestDiscoveryDispatch_BareRootLeakGuard(t *testing.T) {
+	withDiscoverySARESTConfig(t, &rest.Config{Host: "https://kubernetes.default.svc"})
+	for _, p := range []string{
+		"/api/v1/namespaces",                // core LIST
+		"/api/v1/namespaces/krateo",         // core GET
+		"/apis/apps/v1/deployments",         // group LIST
+		"/apis/apps/v1/namespaces/x/pods/p", // group namespaced GET
+	} {
+		raw, served, err := dispatchViaDiscovery(context.Background(), httpcall.RequestOptions{
+			RequestInfo: httpcall.RequestInfo{Path: p},
+		})
+		if err != nil {
+			t.Fatalf("Class 1 leak-guard: %q errored (should just not-serve): %v", p, err)
+		}
+		if served {
+			t.Fatalf("Class 1 LEAK: resource path %q was SA-served by the discovery branch — the bare-root "+
+				"widening must NOT route resource paths (RBAC boundary)", p)
+		}
+		if raw != nil {
+			t.Fatalf("Class 1 leak-guard: %q returned %d bytes, want nil (not served)", p, len(raw))
+		}
+	}
+}
+
 // TestDiscoveryDispatch_NonAPIServerPathFallsThrough is F3, behaviour-
 // neutral: a non-discovery (external / non-apiserver) path is NOT served
 // by the discovery branch.
@@ -268,6 +341,14 @@ func TestDiscoveryDispatch_ResourcePathNotRouted(t *testing.T) {
 	// THIS rc; swapping it lets us assert served=false purely on the shape.
 	withDiscoverySARESTConfig(t, &rest.Config{Host: "https://kubernetes.default.svc"})
 
+	// NOTE (#74 Class 1): /apis and /api (the bare ROOTS) were here as
+	// "not served"; they are now SERVED via the dispatch's bare-root branch
+	// (TestDiscoveryDispatch_BareRootServed). They remain NOT-a-single-GV at
+	// the ParseAPIServerDiscoveryPath predicate level (still false there —
+	// asserted in discovery_path_test.go + TestParseAPIServerDiscoveryRoot), so
+	// the GroupVersion predicate's RBAC boundary is unchanged. This list keeps
+	// only the RESOURCE paths + the group-version-list, which must STILL never
+	// be served by EITHER predicate.
 	resourcePaths := []string{
 		"/apis/templates.krateo.io/v1/compositiondefinitions",                              // group LIST
 		"/apis/templates.krateo.io/v1/compositiondefinitions/foo",                          // group GET-by-name
@@ -276,9 +357,7 @@ func TestDiscoveryDispatch_ResourcePathNotRouted(t *testing.T) {
 		"/api/v1/namespaces",        // core LIST
 		"/api/v1/namespaces/krateo", // core GET-by-name
 		"/api/v1/pods",              // core cluster LIST
-		"/apis",                     // multi-group discovery index (not a single GV)
-		"/api",                      // core root (not a single GV)
-		"/apis/templates.krateo.io", // group version list (not a single GV)
+		"/apis/templates.krateo.io", // group version list (not a single GV, not a bare root)
 	}
 	for _, p := range resourcePaths {
 		// Predicate-level: ParseAPIServerDiscoveryPath must return false.
