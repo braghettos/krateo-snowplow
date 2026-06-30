@@ -182,32 +182,58 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 		return nil
 	}
 
+	// #74 Class 3 R1' — PROVENANCE-DISCRIMINATED flatten. A bare []any element
+	// `tmp` is SPLICED into the accumulator (its members appended element-wise)
+	// ONLY when it is FILTER-PRODUCED — `opts.filter != nil`, i.e. the per-stage
+	// gojq filter constructed the array (e.g. composition-schema's
+	// `getCompositionDefinitionNamespace … | map(.metadata.namespace)`, where
+	// element-wise concat is intended). A RAW-RESPONSE []any (`opts.filter ==
+	// nil`) is appended as a SINGLE element, never spliced.
+	//
+	// Why: the dispatch never returns a bare []any for a no-filter step — a
+	// GET-by-name is an object, a LIST GET is the {items} envelope OBJECT
+	// (listEnvelopeValue, apistage.go), discovery is an APIResourceList OBJECT.
+	// A no-filter bare []any arises ONLY when a resolve:true nested element
+	// resolves to an RA/widget whose top-level value is an array — the Class 3
+	// `allCompositionResources` self/nested resolve returning ["v1", …].
+	// Splicing THAT poisons the parent list with bare scalars ("v1"), which the
+	// downstream portal filter then indexes as `.metadata` → "expected an object
+	// but got: string". Corpus-proven safe (docs/errzero-class3-decision §7.2):
+	// getCompositionDefinitionNamespace = 10/10 filter-bearing (still flattens),
+	// allCompositionResources = 0/34 (stops splicing), no identity-passthrough
+	// filter exists, no no-filter LIST-GET returns a bare []any.
+	//
+	// STRUCTURAL predicate (feedback_no_special_cases) — keyed on
+	// `opts.filter != nil`, never on a resource/name/GVR literal. Global, no
+	// per-RA config, no CRD field.
+	flatten := opts.filter != nil
 	switch existingSlice := got.(type) {
 	case []any:
-		if v := wrapAsSlice(tmp); len(v) > 0 {
-			opts.out[opts.key] = append(existingSlice, v...)
+		if arr, isArr := tmp.([]any); isArr {
+			if flatten && len(arr) > 0 {
+				// (A) filter-produced array → splice members (preserves the
+				// pre-R1' len>0 empty-slice skip).
+				opts.out[opts.key] = append(existingSlice, arr...)
+			} else if !flatten {
+				// (B) raw-response array → single element, never spliced.
+				opts.out[opts.key] = append(existingSlice, tmp)
+			}
+			// flatten && len==0: empty filtered array contributes nothing
+			// (unchanged from the pre-R1' len(v) > 0 guard).
+		} else {
+			// scalar/object element → single element (wrapAsSlice's old
+			// default branch).
+			opts.out[opts.key] = append(existingSlice, tmp)
 		}
 	default:
-		opts.out[opts.key] = []any{got, tmp}
-
-		switch v := tmp.(type) {
-		case []any:
-			all := []any{got}
-			all = append(all, v...)
-			opts.out[opts.key] = all
-		default:
-			opts.out[opts.key] = []any{got, v}
+		// Second element arriving (existing accumulator value is not yet a
+		// slice). Same A/B discrimination as above.
+		if arr, isArr := tmp.([]any); isArr && flatten {
+			opts.out[opts.key] = append([]any{got}, arr...)
+		} else {
+			opts.out[opts.key] = []any{got, tmp}
 		}
 	}
 
 	return nil
-}
-
-func wrapAsSlice(value any) []any {
-	switch v := value.(type) {
-	case []any:
-		return v
-	default:
-		return []any{v}
-	}
 }
