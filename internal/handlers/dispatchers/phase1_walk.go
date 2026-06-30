@@ -87,6 +87,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -971,7 +972,76 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	// discovery = default-bounded-parallel, content pass = serial. The
 	// cache.WithPhase1Resolution marker was REMOVED this ship — its sole
 	// consumer (phase1IteratorCap) is gone, so the marker is dead.
+	//
+	// #57 (C-a) — SEED LOOPBACK TOKEN. The prewarm seed runs under the SA
+	// identity but historically carried NO xcontext.WithAccessToken, so a
+	// nested loopback `/call` api-step (a literal /call?... path with the
+	// snowplow-endpoint EndpointRef) re-entered snowplow's own JWT-gated
+	// /call with no Authorization → 401 "missing authorization header" →
+	// the nested RA never warmed (rca-prewarm-nested-loopback-jwt §1-3).
+	// The SA's apiserver token is the WRONG issuer for snowplow's
+	// jwtutil.Validate (§4); the seed must present an authn-ISSUED JWT.
+	// seedTokenProvider (wired from main.go to the authn.Client) fetches
+	// one. DEGRADE-not-fail (C-a): on a token-acquisition error or no
+	// provider wired, WARN + bump the expvar and proceed token-less —
+	// warmup is best-effort, the nested loopback stays cold this boot but
+	// the pod still serves. The token install is what lets the 3b
+	// self-loopback bearer-append (resolve.go) fire on the seed path.
+	rctx = installSeedLoopbackToken(rctx)
 	return rctx
+}
+
+// seedTokenProvider is the hook the seed path calls to obtain an authn-issued
+// JWT for the nested loopback /call. Wired ONCE at startup (main.go) to the
+// authn.Client's Token method; nil when authn is not configured (then the
+// seed runs token-less, the pre-#57 behaviour). Mirrors SetCustomerInflightHook
+// / SetRefreshHook — a package-level injection, not a threaded parameter.
+var (
+	seedTokenProviderMu sync.RWMutex
+	seedTokenProvider   func(ctx context.Context) (string, error)
+)
+
+// SetSeedLoopbackTokenProvider wires the seed's authn-token source. Safe to
+// call multiple times (later calls replace). A nil fn disables the install
+// (seed runs token-less — the pre-#57 degrade posture).
+func SetSeedLoopbackTokenProvider(fn func(ctx context.Context) (string, error)) {
+	seedTokenProviderMu.Lock()
+	seedTokenProvider = fn
+	seedTokenProviderMu.Unlock()
+}
+
+// seedLoopbackTokenErrTotal counts token-acquisition failures on the seed path
+// (C-a observability — "prewarm loopback ran token-less, nested RA cold").
+var seedLoopbackTokenErrTotal atomic.Uint64
+
+// SeedLoopbackTokenErrTotal exposes the C-a degrade counter (expvar-published
+// in the metrics block + read by the falsifier).
+func SeedLoopbackTokenErrTotal() uint64 { return seedLoopbackTokenErrTotal.Load() }
+
+// installSeedLoopbackToken acquires an authn JWT via the wired provider and
+// installs it on ctx (xcontext.WithAccessToken). DEGRADE-not-fail: a missing
+// provider or a token error leaves ctx unchanged (token-less seed) + WARN +
+// counter — never fails the boot/warmup.
+func installSeedLoopbackToken(ctx context.Context) context.Context {
+	seedTokenProviderMu.RLock()
+	fn := seedTokenProvider
+	seedTokenProviderMu.RUnlock()
+	if fn == nil {
+		return ctx // authn not configured — token-less seed (pre-#57 behaviour)
+	}
+	tok, err := fn(ctx)
+	if err != nil || tok == "" {
+		seedLoopbackTokenErrTotal.Add(1)
+		slog.Warn("prewarm.seed_loopback_token_unavailable",
+			slog.String("subsystem", "cache"),
+			slog.Any("err", err),
+			slog.String("effect", "prewarm loopback ran token-less; a nested loopback /call RA is not warmed this boot (degraded, not fatal)"),
+		)
+		return ctx
+	}
+	// xcontext.WithAccessToken is a BuildContext option (returns a
+	// WithContextFunc), not a direct ctx mutator — apply it via BuildContext.
+	return xcontext.BuildContext(ctx, xcontext.WithAccessToken(tok))
 }
 
 func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, gvr schema.GroupVersionResource, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, harvester *contentPrewarmHarvester, navHarvester *navWidgetHarvester, pagCollector *apiRefPaginationCollector) error {

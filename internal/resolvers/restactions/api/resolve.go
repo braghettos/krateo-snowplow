@@ -1216,14 +1216,48 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 	// per-stage.
 	uafActive := apiCall.UserAccessFilter != nil
 
-	// User-bearer-token append: only for non-UAF stages. When
-	// UAF is active the SA endpoint carries the SA token (no
-	// user-bearer override needed); appending the user token
-	// here would route the call through the user's credentials
-	// instead of the SA's — breaking the entire UAF mechanism.
+	// Resolve the endpoint. UAF stages use the snowplow-SA
+	// endpoint; non-UAF stages go through the per-user
+	// clientconfig (or the named EndpointRef) as before. The
+	// orchestrator owns the recordStageTiming()-before-exit on the
+	// two early-exit actions (C-2 stageContinue / R-2 stageReturn).
+	//
+	// #57 (C-b): the user-bearer-token append moved to AFTER endpoint
+	// resolution (was before) so the self-loopback arm can compare the
+	// RESOLVED endpoint host against the configured self-host.
+	ep, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
+	switch epAction {
+	case stageContinue:
+		recordStageTiming()
+		return false
+	case stageReturn:
+		recordStageTiming()
+		return true
+	}
+
+	// User-bearer-token append: only for non-UAF stages. When UAF is active
+	// the SA endpoint carries the SA token (no user-bearer override needed);
+	// appending the user token here would route the call through the user's
+	// credentials instead of the SA's — breaking the entire UAF mechanism.
+	// (UAF stages resolve to the SA endpoint at resolveStageEndpoint:385,
+	// never an external/loopback ref, so the `!uafActive` guard is preserved
+	// EXACTLY — UAF is untouched by the #57 self-loopback arm.)
 	if !uafActive {
 		if accessToken, _ := xcontext.AccessToken(r.ctx); accessToken != "" {
-			if apiCall.EndpointRef == nil || ptr.Deref(apiCall.ExportJWT, false) {
+			// The append fires when EITHER:
+			//   - the original gate: no named endpoint, or exportJWT:true
+			//     (a named endpoint is assumed to carry its own auth); OR
+			//   - #57 (C-b) self-loopback arm (ADDITIVE): the resolved
+			//     endpoint host EXACTLY equals the configured self-host
+			//     (URL_SELF) — i.e. the step is a /call loopback back at
+			//     snowplow's OWN JWT-gated endpoint, which DOES need the
+			//     bearer even though it has a named EndpointRef
+			//     (snowplow-endpoint). Exact scheme+host+port equality
+			//     (parsedHostEqualsSelf) — NEVER a substring/Contains match,
+			//     so an EXTERNAL endpoint whose host merely CONTAINS
+			//     "snowplow" (e.g. snowplow-foo.example.com) does NOT match
+			//     and the bearer stays OFF it (the leak guard).
+			if bearerAppendForStage(apiCall, ep) {
 				// 0.30.164: stage-local Headers — never write the user
 				// bearer back into the shared CR slice (the CR is marshaled
 				// into the /call response body at restactions.go:149; an
@@ -1238,21 +1272,6 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 				apiCall = &local
 			}
 		}
-	}
-
-	// Resolve the endpoint. UAF stages use the snowplow-SA
-	// endpoint; non-UAF stages go through the per-user
-	// clientconfig (or the named EndpointRef) as before. The
-	// orchestrator owns the recordStageTiming()-before-exit on the
-	// two early-exit actions (C-2 stageContinue / R-2 stageReturn).
-	ep, epAction := r.resolveStageEndpoint(id, apiCall, uafActive)
-	switch epAction {
-	case stageContinue:
-		recordStageTiming()
-		return false
-	case stageReturn:
-		recordStageTiming()
-		return true
 	}
 	// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
 	// is the single largest transient-memory consumer (~1.94 GiB
