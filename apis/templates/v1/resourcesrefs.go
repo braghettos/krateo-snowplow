@@ -32,6 +32,20 @@ type ResourceRef struct {
 }
 
 // ResourceRefResult defines the action result after evaluating a template.
+//
+// +k8s:deepcopy-gen=false
+// #72: ResourceRefResult is RESOLVED OUTPUT (built per-request from a template;
+// written into a widget's status.resourcesRefs at resolve time), NOT a stored
+// CRD spec/status type — it is referenced by no apis spec/status field, and
+// nothing calls its DeepCopy. The package default (+k8s:deepcopy-gen=package,
+// doc.go) speculatively generates deepcopy for every type; that GEN PANICS on
+// the additive Rendered map[string]any field (controller-tools v0.17.3 cannot
+// deepcopy an interface{}-valued field). deepcopy-gen=false skips this type
+// (it needs no generated deepcopy) and lets `make generate` pass while the
+// runtime carrier stays the deep-copy-safe map (NOT json.RawMessage, which
+// would panic the cache's runtime.DeepCopyJSONValue — feedback_no_rawmessage_
+// in_unstructured_status). The embedded child lives inside the resolved
+// *unstructured.Unstructured, which has its own (working) deep-copy path.
 type ResourceRefResult struct {
 	// ID of this action.
 	ID string `json:"id,omitempty"`
