@@ -131,6 +131,72 @@ func TestRBACSensitive_PredicateTruthTable(t *testing.T) {
 	}
 }
 
+// widgetWithInlineSpecRef builds a widget CR `.Object` whose SPEC declares one
+// resourcesRefs item, optionally inline + with the given verb, and optionally
+// an apiRef. This is the C-INLINE-1 (#72) classification surface: the predicate
+// reads spec.resourcesRefs.items[] for an inline GET ref.
+func widgetWithInlineSpecRef(inline bool, verb, apiRefName string) map[string]any {
+	spec := map[string]any{
+		"resourcesRefs": map[string]any{
+			"items": []any{
+				map[string]any{
+					"id": "child", "apiVersion": "widgets.templates.krateo.io/v1beta1",
+					"resource": "panels", "namespace": "demo", "name": "child-1",
+					"inline": inline, "verb": verb,
+				},
+			},
+		},
+	}
+	if apiRefName != "" {
+		spec["apiRef"] = map[string]any{"name": apiRefName, "namespace": "krateo-system"}
+	}
+	return map[string]any{
+		"apiVersion": "widgets.templates.krateo.io/v1beta1",
+		"kind":       "Panel",
+		"metadata":   map[string]any{"namespace": "krateo-system", "name": "detail-card"},
+		"spec":       spec,
+	}
+}
+
+// TestRBACSensitive_InlineGETRef_C_INLINE_1 — the #72 C-INLINE-1 arm: a widget
+// bearing an inline GET resourcesRefs ref MUST classify RBAC-sensitive so its
+// embedded `rendered` child never lands in the shared identity-free
+// widgetContent cell. The discriminating case is the NO-apiRef inline widget:
+// it must STILL classify true — which only holds because hasInlineGETRef is an
+// OR-clause BEFORE the apiRef.Name=="" short-circuit. (RED arm: move the clause
+// AFTER the short-circuit → this case returns false → shared cell → leak.)
+func TestRBACSensitive_InlineGETRef_C_INLINE_1(t *testing.T) {
+	cases := []struct {
+		name           string
+		inline         bool
+		verb           string
+		apiRefName     string
+		wantClassified bool
+	}{
+		// THE discriminator: inline GET ref, NO apiRef → MUST be classified
+		// (only true if the OR-clause runs before the apiRef short-circuit).
+		{"no-apiRef + inline GET ref (C-INLINE-1 discriminator)", true, "GET", "", true},
+		// inline GET ref WITH apiRef → classified (both clauses agree).
+		{"apiRef + inline GET ref", true, "GET", "compositions-list", true},
+		// inline ref but NON-GET → not an inline-render candidate; no apiRef/tpl
+		// → not classified.
+		{"no-apiRef + inline POST ref", true, "POST", "", false},
+		// non-inline GET ref, no apiRef → static widget, not classified
+		// (byte-identical to today; the inline clause does not over-fire).
+		{"no-apiRef + non-inline GET ref", false, "GET", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			obj := widgetWithInlineSpecRef(c.inline, c.verb, c.apiRefName)
+			if got := isRBACSensitiveApiRefWidget(obj); got != c.wantClassified {
+				t.Fatalf("isRBACSensitiveApiRefWidget(%s) = %v; want %v "+
+					"(C-INLINE-1: an inline GET ref must route to the per-user widgets L1, never the shared cell)",
+					c.name, got, c.wantClassified)
+			}
+		})
+	}
+}
+
 // TestRBACSensitive_ServeRoutingDecision — the serve path gates the ENTIRE
 // identity-free `widgetContent` lookup block on
 // `!isRBACSensitiveApiRefWidget(got.Unstructured.Object)` (widgets.go). This

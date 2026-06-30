@@ -284,6 +284,22 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// #72 inline-rendered-children PRODUCER (Phase 1, default-off): embed any
+	// inline+allowed+GET resourcesRefs child's resolved envelope into
+	// items[i].rendered, server-side under THIS per-user ctx (carrying
+	// WithUserInfo + the SA transport + WithL1KeyContext(cacheKey)). No-op when
+	// no item carries inline → byte-identical to today. Runs BEFORE the single
+	// encodeResolvedJSON so the spliced json.RawMessage children are encoded
+	// once with the parent. RBAC is enforced per-child by ResolveNestedCall;
+	// the inline widget is routed to the per-user `widgets` L1 (not the shared
+	// content cell) by isRBACSensitiveApiRefWidget's hasInlineGETRef OR-clause.
+	if n := embedInlineChildren(ctx, log, res, perPage, page, extras); n > 0 {
+		log.Info("inline-rendered-children embedded",
+			slog.Int("count", n),
+			slog.String("widget", got.Unstructured.GetNamespace()+"/"+got.Unstructured.GetName()),
+		)
+	}
+
 	encoded, err := encodeResolvedJSON(res)
 	if err != nil {
 		log.Error("unable to encode widget response", slog.Any("err", err))

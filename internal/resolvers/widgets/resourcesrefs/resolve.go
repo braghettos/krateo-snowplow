@@ -107,6 +107,9 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 		el := templatesv1.ResourceRefResult{
 			ID:   in.ID,
 			Verb: kubeToREST[verb],
+			// #72: carry the source ref's Inline flag through to the dispatcher
+			// inline-walk (it consumes it post-resolve; not re-read off spec).
+			Inline: in.Inline,
 		}
 
 		el.Allowed = rbac.UserCan(ctx, rbac.UserCanOptions{
