@@ -677,13 +677,33 @@ func deriveTargetGVRForClusterList(
 		return schema.GroupVersionResource{}, false
 	}
 
-	gvr, ns, _, parseOK := cache.ParseAPIServerPathToDep(resolvedPath)
+	gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(resolvedPath)
 	if !parseOK {
 		return schema.GroupVersionResource{}, false
 	}
 	if ns == "" {
 		// Cluster-scope path already — no collapse needed. The RA's
 		// iterator does not fan out over namespaces; keep verbatim.
+		return schema.GroupVersionResource{}, false
+	}
+	if name != "" {
+		// #74 Class 3 — the iterator's first element resolves to a
+		// BY-NAME GET (/…/namespaces/<ns>/<resource>/<name>), NOT a
+		// per-namespace LIST. A by-name fan-out must NEVER collapse: the
+		// collapse replaces N targeted GET-by-name fetches with ONE
+		// cluster-wide LIST, returning the {apiVersion,kind,items} LIST
+		// ENVELOPE (an OBJECT) instead of the per-element bare objects the
+		// RA filter expects. The RA then runs `map(select(.metadata.name…))`
+		// over the OBJECT and indexes its first scalar field (apiVersion
+		// "v1") → gojq "expected an object but got: string". It is ALSO a
+		// correctness bug (a cluster-wide LIST returns ALL N resources, not
+		// the composition's by-name subset). Collapse is valid ONLY for a
+		// name=="" per-namespace LIST. Bug introduced at Ship 0.30.216
+		// (911b1a8) when collapse flipped on; this restores the by-name
+		// fan-out (= the bare array the RA filter consumes).
+		//
+		// STRUCTURAL guard (feedback_no_special_cases) — keyed on the parsed
+		// path SHAPE (a name segment present), never a resource/name literal.
 		return schema.GroupVersionResource{}, false
 	}
 	return gvr, true
