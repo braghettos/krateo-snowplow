@@ -820,6 +820,64 @@ func TestDeriveTargetGVRForClusterList_NilIterator(t *testing.T) {
 	}
 }
 
+// TestDeriveTargetGVRForClusterList_ByNamePathNotCollapsed is the #74 Class 3
+// RED arm. The iterator's first element resolves to a BY-NAME GET
+// (/…/namespaces/<ns>/<resource>/<name>) — a TARGETED fan-out, not a
+// per-namespace LIST. The collapse must be REJECTED (ok=false): collapsing a
+// by-name fan-out into ONE cluster-wide LIST returns the {apiVersion,kind,items}
+// LIST ENVELOPE (an OBJECT) instead of the per-element bare objects the RA
+// filter `map(select(.metadata.name…))` consumes — the filter then indexes the
+// envelope's first scalar (apiVersion "v1") → "expected an object but got:
+// string". It is also a correctness bug (cluster-wide returns ALL resources,
+// not the composition's by-name subset). This was the live 1.5.18 defect
+// (introduced 0.30.216/911b1a8). RED on the pre-fix code (name discarded → the
+// by-name path reached ok=true), GREEN after the `name != ""` guard.
+func TestDeriveTargetGVRForClusterList_ByNamePathNotCollapsed(t *testing.T) {
+	apiCall := &templates.API{
+		Name: "allCompositionResources",
+		// First element resolves to a by-name GET — note the trailing
+		// /<name> segment (the composition's specific resource).
+		Path: `${ "/api/v1/namespaces/" + .ns + "/configmaps/" + .name }`,
+		DependsOn: &templates.Dependency{
+			Iterator: ptr.To(`[{"ns":"demo-system","name":"fsa-y2-cm"},{"ns":"demo-system","name":"fsa-y2-cm2"}]`),
+		},
+	}
+	gvr, ok := deriveTargetGVRForClusterList(
+		context.Background(), clusterListLogger(t), apiCall, map[string]any{})
+	if ok {
+		t.Fatalf("Class 3 RED: a BY-NAME iterator fan-out must NOT collapse (got ok=true, gvr=%s) — "+
+			"collapsing it to a cluster-wide LIST yields the {apiVersion,items} envelope the RA filter "+
+			"can't consume (\"expected an object but got: string\")", gvr)
+	}
+}
+
+// TestDeriveTargetGVRForClusterList_PerNamespaceListStillCollapses is the #74
+// Class 3 GREEN-guard. A name=="" per-namespace LIST path
+// (/…/namespaces/<ns>/<resource>, NO trailing name) is the LEGITIMATE collapse
+// target — it must STILL collapse (ok=true) after the by-name guard. This is the
+// regression arm proving the fix did not over-reject the real collapse case
+// (routes/navmenuitems/compositionspanels). GREEN before AND after the fix.
+func TestDeriveTargetGVRForClusterList_PerNamespaceListStillCollapses(t *testing.T) {
+	apiCall := &templates.API{
+		Name: "compositionspanels",
+		// LIST path — namespace segment, NO trailing /<name>.
+		Path: `${ "/api/v1/namespaces/" + .ns + "/configmaps" }`,
+		DependsOn: &templates.Dependency{
+			Iterator: ptr.To(`[{"ns":"demo-system"},{"ns":"krateo-system"}]`),
+		},
+	}
+	gvr, ok := deriveTargetGVRForClusterList(
+		context.Background(), clusterListLogger(t), apiCall, map[string]any{})
+	if !ok {
+		t.Fatalf("Class 3 GREEN-guard: a name=='' per-namespace LIST is the legitimate collapse target — "+
+			"the by-name guard must NOT over-reject it (got ok=false)")
+	}
+	want := schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
+	if gvr != want {
+		t.Fatalf("Class 3 GREEN-guard: collapsed gvr=%s want %s", gvr, want)
+	}
+}
+
 // ---------- AC-D5.5 race seal — concurrent validateClusterListShape ----------
 
 // The shape check is a pure function over the input bytes — no shared
