@@ -416,6 +416,46 @@ func ParseAPIServerDiscoveryPath(path string) (groupVersion string, ok bool) {
 	return "", false
 }
 
+// ParseAPIServerDiscoveryRoot returns ok=true for EXACTLY the two bare
+// discovery ROOTS the apiserver serves as multi-group indexes:
+//   - "/api"  → the core-group *metav1.APIVersions index
+//   - "/apis" → the *metav1.APIGroupList index
+//
+// (#74 Class 1) These are the discovery shape ParseAPIServerDiscoveryPath
+// deliberately rejects (a multi-group index, not a single GroupVersion). A
+// seed/discovery api-step with a BARE `/api` (or `/apis`) path needs the SAME
+// CA-bearing SA transport the #18/#19 group-discovery dispatch uses — without
+// it the bare-root call falls to the external plumbing branch whose token-auth
+// TLS drops the cluster CA → x509 unknown-authority. This sibling lets
+// dispatchViaDiscovery serve the roots via the discovery client's
+// RESTClient().AbsPath(root) (raw apiserver wire bytes — no JQ-contract change).
+//
+// RBAC posture identical to #19: `/api` and `/apis` are anonymous-readable via
+// the system:discovery ClusterRole and carry NO tenant data, so SA-serving them
+// leaks nothing. The predicate matches ONLY the two exact roots (any extra
+// segment → a GroupVersion/resource path → not a root), so the resource-path
+// RBAC boundary the #19 doc relies on is untouched. No special-case
+// (feedback_no_special_cases): keyed on the structural "bare discovery root"
+// shape, never a literal resource/group value.
+func ParseAPIServerDiscoveryRoot(path string) (root string, ok bool) {
+	// Strip query string + trailing slash (so "/api/" and "/apis/?x=1" match).
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	path = strings.TrimRight(path, "/")
+
+	// Reject unresolved JQ template fragments.
+	if strings.Contains(path, "${") {
+		return "", false
+	}
+
+	switch path {
+	case "/api", "/apis":
+		return path, true
+	}
+	return "", false
+}
+
 // unstructuredSliceField pulls obj[fields...] as []any. Returns
 // (nil, false, nil) when the path is missing or the leaf is not a
 // slice. An error is returned only when an intermediate node has the
