@@ -195,6 +195,23 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContext(ctx, cacheKey)
 	}
+	// #83 Option A — seed THIS top-level RESTAction as an ancestor of the
+	// nested-resolve descent BEFORE resolving. The #79 cycle-stop
+	// (nested_call.go Step 3.5) only sees nodes registered on descent via
+	// ResolveNestedCall; the OUTERMOST node (this request's own CR) was never
+	// registered, so a composition RA whose allCompositionResources managed set
+	// includes ITSELF recursed one full hop before the cycle detector could
+	// fire — the inner self-resolve then ran its own top-level jq filter on an
+	// empty `.discovery` stage (cannot iterate over: null), producing a per-item
+	// stage error → decline-to-cache → permanent cold re-fan-out (~1500× per
+	// /call, never converging). Seeding the node here makes the FIRST
+	// self-reentry an immediate cycle-stop (1 hop, raw CR, no inner resolve, no
+	// null-iterate, clean parent Put → convergence). The node string uses the
+	// SAME shared derivation the cycle-stop membership-checks (nested_call.go),
+	// so the seed and the check cannot drift. No-op for a non-self-referential
+	// RA (the node is simply never reencountered on descent).
+	ctx = cache.WithNestedResolveAncestor(ctx,
+		nestedResolveNodeKey(got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName()))
 	// Ship 0.30.257 (#313) Cache-A — request-path error-aware Put-gate.
 	// Install a stage-error sink on the resolve ctx (the SAME seam the
 	// background refresher uses at resolve_populate.go:206). The api

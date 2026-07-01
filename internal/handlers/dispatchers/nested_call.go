@@ -62,6 +62,21 @@ const (
 	nestedResolveWidgetsResource     = "widgets"
 )
 
+// nestedResolveNodeKey builds the cycle identity of a resolve target —
+// canonically "<resource>/<namespace>/<name>". It is the SINGLE derivation of
+// the ancestor-set node string, shared by BOTH the cycle-stop check in
+// ResolveNestedCall (Step 3.5) AND the #83 Option-A top-level seed at the
+// dispatcher request entry (RESTAction()/Widgets() ServeHTTP). Extracting it
+// keeps the two sites from drifting: the seed must produce the EXACT string the
+// cycle-stop later membership-checks, or the first self-reentry would not match
+// (feedback: shared derivation, never a parallel copy — the #64/#66 anti-drift
+// lesson). The <resource> component is the apiserver-discovered GVR.Resource
+// (canonical CRD plural), matching cache.ParseAPIServerPathToDep's GVR and
+// objects.Get's filled GVR — NOT a path/name literal (feedback_no_special_cases).
+func nestedResolveNodeKey(resource, namespace, name string) string {
+	return resource + "/" + namespace + "/" + name
+}
+
 // ResolveNestedCall resolves a referenced RA/widget CR IN-PROCESS. It is the
 // implementation wired into the api.nestedCallResolver seam at startup, and
 // is invoked by the api resolver's direct-apiserver-path + `resolve: true`
@@ -150,7 +165,7 @@ func ResolveNestedCall(
 	// either) — only a node ALREADY on the path to here is a cycle (RC-1). The
 	// depth-8 guard above stays as the backstop for a non-cyclic pathologically
 	// deep chain (RC-3).
-	node := got.GVR.Resource + "/" + got.Unstructured.GetNamespace() + "/" + got.Unstructured.GetName()
+	node := nestedResolveNodeKey(got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 	if cache.NestedResolveAncestorPresent(ctx, node) {
 		log.Debug("nested resolve cycle-stop: node already an ancestor — returning raw CR",
 			slog.String("node", node),
