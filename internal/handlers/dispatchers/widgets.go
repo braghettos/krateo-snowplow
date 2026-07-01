@@ -99,6 +99,38 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// R (composition-resources loopback guard) — HTTP-edge cycle-stop (twin of
+	// the restactions.go block; see there for the full rationale). PLACEMENT
+	// (C3): strictly AFTER fetchObject + checkDispatchRBAC above and BEFORE any
+	// L1 lookup below. TRUSTED self-loopback only (isTrustedSelfLoopback); an
+	// untrusted caller's headers are ignored → no stop → normal resolve (C2). The
+	// widget arm exists because a top-level widget whose nested resolve fans back
+	// to ITSELF over HTTP hits the same self-recursion as a RESTAction (the seam
+	// has a widget resolve arm, nested_call.go).
+	if !cache.Disabled() {
+		// Seed ONLY the inbound header ancestors (see restactions.go for the full
+		// rationale — do NOT add THIS node before the check; a self-reference is
+		// detected because a prior hop already put it in the emitted header set).
+		guardCtx := reseedNestedGuardsFromHeaders(req.Context(), req)
+		if stop, raw := httpEdgeGuardStop(guardCtx, log,
+			got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName()); stop {
+			if raw {
+				encoded, encErr := encodeResolvedJSON(got.Unstructured.Object)
+				if encErr != nil {
+					response.InternalError(wri, encErr)
+					return
+				}
+				writeResolvedJSON(wri, encoded)
+				return
+			}
+			response.Encode(wri, response.New(http.StatusLoopDetected,
+				fmt.Errorf("nested resolve depth limit exceeded (%d) for %s/%s/%s over HTTP self-loopback",
+					cache.NestedCallMaxDepth(), got.GVR.Resource,
+					got.Unstructured.GetNamespace(), got.Unstructured.GetName())))
+			return
+		}
+	}
+
 	perPage, page := paginationInfo(log, req)
 
 	// inline-extras design P §1/§4.3 — the cache-key union. The widget CR is
@@ -249,6 +281,11 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// drift. No-op for a non-self-referential widget.
 	ctx = cache.WithNestedResolveAncestor(ctx,
 		nestedResolveNodeKey(got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName()))
+	// R (composition-resources loopback guard) — re-seed the resolve ctx from the
+	// inbound guard headers (TRUSTED self-loopback ONLY; no-op otherwise), twin of
+	// restactions.go. Placed AFTER the #83 self-seed so the resolve ctx carries
+	// {header ancestors} ∪ {this node}; the depth continues from the inbound hop.
+	ctx = reseedNestedGuardsFromHeaders(ctx, req)
 
 	// Ship 0.30.257 (#313) Cache-A — request-path error-aware Put-gate
 	// (see restactions.go for the full rationale). A widget's apiRef
@@ -324,9 +361,18 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// PERSISTED, so a transient apiRef-item failure self-heals on the next
 	// resolve instead of pinning a partial cell for the TTL.
 	if stageErrSink.Count() > 0 {
+		// D (bounded partial-cache backstop, default-off) — twin of restactions.go;
+		// Put the partial under the SAME per-user widgets cacheKey with a bounded
+		// PARTIAL_RESULT_TTL_SECONDS window. No-op when the env is 0 (default). With
+		// R landed the widget path resolves clean so this branch is not reached for
+		// a self-referential widget (C6).
+		staleCached := putPartialWithTTL(cacheHandle, cacheKey, encoded, cacheInputs,
+			got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 		log.Warn("Widget served with per-item stage error(s); declining to cache the partial result",
 			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+			slog.Bool("partial_bounded_stale_cached", staleCached),
+			slog.String("partial_ttl_s", partialResultTTL().String()),
+			slog.String("effect", "partial body served (200); not persisted under the full TTL — transient item failures self-heal on next resolve (D bounded-stale window if enabled)"),
 		)
 	} else if extTouchedSink.Count() > 0 {
 		// External-no-cache (proposal 2026-06-22) — the widget's resolve

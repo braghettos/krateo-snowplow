@@ -1010,6 +1010,31 @@ func SetSeedLoopbackTokenProvider(fn func(ctx context.Context) (string, error)) 
 	seedTokenProviderMu.Unlock()
 }
 
+// currentSeedLoopbackToken returns the CURRENT authn-issued seed JWT (the same
+// credential installSeedLoopbackToken installs on the prewarm ctx), or ("",
+// false) when no provider is wired or the exchange fails. Used by the R
+// self-loopback ingest guard (nested_resolve_ingest.go) to recognise snowplow's
+// OWN seed loopback by TOKEN PROVENANCE: the seed JWT is minted from snowplow's
+// projected SA token (authn /serviceaccount/login) and never leaves the pod
+// except on a self-host loopback, so an EXTERNAL caller cannot present it. The
+// provider caches the JWT until shortly before expiry (authn.Client refreshSkew),
+// so the token an in-flight loopback carries is the SAME string this returns —
+// no rotation gap in practice, and the depth-8 backstop covers any edge miss.
+// Read-only wrapper over the wired provider; never mutates ctx.
+func currentSeedLoopbackToken(ctx context.Context) (string, bool) {
+	seedTokenProviderMu.RLock()
+	fn := seedTokenProvider
+	seedTokenProviderMu.RUnlock()
+	if fn == nil {
+		return "", false
+	}
+	tok, err := fn(ctx)
+	if err != nil || tok == "" {
+		return "", false
+	}
+	return tok, true
+}
+
 // seedLoopbackTokenErrTotal counts token-acquisition failures on the seed path
 // (C-a observability — "prewarm loopback ran token-less, nested RA cold").
 var seedLoopbackTokenErrTotal atomic.Uint64
