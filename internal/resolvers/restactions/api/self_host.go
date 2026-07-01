@@ -9,15 +9,32 @@
 // true for a genuine external endpoint, false for the self-loopback). The
 // self-host is the discriminator.
 //
-// HARD (C-b): the comparison is EXACT (scheme, host, port) field-equality
-// against the PARSED URL_SELF — NEVER strings.Contains / suffix / prefix. An
-// external endpoint whose host merely CONTAINS "snowplow"
-// (snowplow-foo.example.com) must NOT match → the bearer stays off it. No
-// resource/name/path literal — a uniform host predicate (feedback_no_special_cases).
+// HARD (C-b): the comparison is EXACT (scheme, port) field-equality against the
+// PARSED URL_SELF plus a HOST match that is EITHER exact-string OR — when BOTH
+// hosts are in-cluster Kubernetes Service DNS names of the SAME (name,
+// namespace) — svc short/FQDN equivalence (#57 fix B, host-form-agnostic). It
+// is NEVER strings.Contains / suffix / prefix. An external endpoint whose host
+// merely CONTAINS "snowplow" (snowplow-foo.example.com) must NOT match → the
+// bearer stays off it. No resource/name/path literal — a uniform host predicate
+// (feedback_no_special_cases).
+//
+// #57 FIX B (host-form normalization) — WHY: URL_SELF is snowplow-chart-owned
+// (the FQDN form `snowplow.krateo-system.svc.cluster.local:8081`) while the
+// snowplow-endpoint the composition-resources RAs loop back through is
+// PORTAL-chart-owned (the short form `snowplow.krateo-system.svc:8081`). The two
+// charts are mutually blind, so the exact-string predicate never fired for the
+// short form → those loopbacks got no seed bearer → 401. Normalizing the
+// canonical in-cluster Service DNS forms of the SAME (name, namespace) makes
+// snowplow recognize its own service regardless of which form the endpoint uses.
+// Mirrors the existing endpoints.go internal-host normalization precedent
+// (isInternal → ServerURL rewritten to https://kubernetes.default.svc). The
+// leak guard is PRESERVED: any host that is not the canonical svc-DNS shape of
+// the SAME name+ns falls back to EXACT string equality.
 package api
 
 import (
 	"net/url"
+	"strings"
 	"sync/atomic"
 
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -59,10 +76,65 @@ func SetSelfHost(rawURL string) bool {
 	return true
 }
 
-// parsedHostEqualsSelf reports whether rawURL's (scheme, host, port) EXACTLY
-// equals the configured self-host. False when self-host is unconfigured, when
-// rawURL is unparseable, or on ANY field mismatch. Exact field-equality only
-// — a substring/suffix near-miss (snowplow-foo.example.com) returns false.
+// svcCanonicalKey reports whether host is an in-cluster Kubernetes Service DNS
+// name and, if so, returns its canonical (name, namespace) identity. The
+// recognized shapes are EXACTLY (labels split on '.'):
+//   - name.namespace                       (2 labels)
+//   - name.namespace.svc                   (3 labels, trailing "svc")
+//   - name.namespace.svc.cluster.local     (5 labels, trailing "svc.cluster.local")
+// Any other shape (an external FQDN, a subdomain-of-self leak attempt, a
+// trailing-garbage prefix attempt, a bare hostname) returns ok=false, so the
+// caller falls back to exact-string host equality — the leak guard.
+//
+// This is DELIBERATELY NOT a suffix/prefix/Contains match:
+//   - evil.snowplow.krateo-system.svc.cluster.local → labels[0]="evil" (name),
+//     [1]="snowplow" (ns), trailing {"krateo-system","svc","cluster","local"}
+//     is NOT an allowed trailing set → ok=false → exact-string fallback → no match.
+//   - snowplow.krateo-system.svc.cluster.local.evil.com → trailing set includes
+//     "evil"/"com" → not allowed → ok=false → exact-string fallback → no match.
+//   - snowplow-foo.example.com → trailing {"com"} → not allowed → ok=false.
+// Only the SAME (name, namespace) with a canonical svc trailing set collapses.
+func svcCanonicalKey(host string) (name, namespace string, ok bool) {
+	labels := strings.Split(host, ".")
+	switch len(labels) {
+	case 2: // name.namespace
+	case 3: // name.namespace.svc
+		if labels[2] != "svc" {
+			return "", "", false
+		}
+	case 5: // name.namespace.svc.cluster.local
+		if labels[2] != "svc" || labels[3] != "cluster" || labels[4] != "local" {
+			return "", "", false
+		}
+	default:
+		return "", "", false
+	}
+	if labels[0] == "" || labels[1] == "" {
+		return "", "", false
+	}
+	return labels[0], labels[1], true
+}
+
+// hostsMatch reports whether candidate host a equals self host b — either by
+// EXACT string equality, or (#57 fix B) when BOTH are canonical in-cluster
+// Service DNS names of the SAME (name, namespace). Exact-string is the leak-guard
+// fallback for anything that is not the recognized svc-DNS shape.
+func hostsMatch(a, b string) bool {
+	if a == b {
+		return true
+	}
+	an, ans, aok := svcCanonicalKey(a)
+	bn, bns, bok := svcCanonicalKey(b)
+	return aok && bok && an == bn && ans == bns
+}
+
+// parsedHostEqualsSelf reports whether rawURL matches the configured self-host:
+// EXACT scheme+port equality, plus a host match that is exact-string OR svc
+// short/FQDN equivalence of the SAME (name, namespace) — #57 fix B. False when
+// self-host is unconfigured, rawURL is unparseable, or on any scheme/port
+// mismatch or a host that is neither the exact string nor the same in-cluster
+// Service (a substring/suffix near-miss like snowplow-foo.example.com returns
+// false — the JWT-leak guard).
 func parsedHostEqualsSelf(rawURL string) bool {
 	sh := selfHost.Load()
 	if sh == nil || rawURL == "" {
@@ -72,7 +144,7 @@ func parsedHostEqualsSelf(rawURL string) bool {
 	if err != nil {
 		return false
 	}
-	return u.Scheme == sh.scheme && u.Hostname() == sh.host && u.Port() == sh.port
+	return u.Scheme == sh.scheme && u.Port() == sh.port && hostsMatch(u.Hostname(), sh.host)
 }
 
 // bearerAppendForStage is the #57 (C-b) user-bearer-append DECISION for a

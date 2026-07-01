@@ -70,6 +70,88 @@ func TestParsedHostEqualsSelf_ExactMatchOnly(t *testing.T) {
 	}
 }
 
+// TestParsedHostEqualsSelf_SvcShortFQDNEquivalence is the #57 fix-B falsifier:
+// the self-loopback arm MUST fire when the resolved endpoint host is the SHORT
+// in-cluster Service form of the SAME service the FQDN URL_SELF names (and vice
+// versa) — because URL_SELF is snowplow-chart-owned (FQDN) while the
+// snowplow-endpoint the composition-resources RAs loop back through is
+// portal-chart-owned (short svc form). Pre-fix (exact-string only) the RED arms
+// below returned false → those loopbacks 401'd. The GUARD arms prove fix B did
+// NOT weaken the leak guard: near-misses + different name/ns stay OFF.
+//
+// RED-proven: with the exact-string-only predicate, the "self FQDN vs candidate
+// short" and "self short vs candidate FQDN" arms FAIL (want true, got false) —
+// they discriminate fix B from the status quo. The GUARD arms pass either way;
+// a suffix/Contains mis-implementation of B would FAIL them.
+func TestParsedHostEqualsSelf_SvcShortFQDNEquivalence(t *testing.T) {
+	const (
+		fqdn  = "http://snowplow.krateo-system.svc.cluster.local:8081"
+		short = "http://snowplow.krateo-system.svc:8081"
+		twoL  = "http://snowplow.krateo-system:8081" // name.namespace (2-label short form)
+	)
+
+	// selfFQDN: URL_SELF is the FQDN (the chart default) — a short-form or
+	// 2-label candidate of the SAME svc MUST match (the #57 fix-B positive).
+	t.Run("self=FQDN", func(t *testing.T) {
+		if !SetSelfHost(fqdn) {
+			t.Fatalf("SetSelfHost(%q) failed", fqdn)
+		}
+		t.Cleanup(func() { SetSelfHost("") })
+		cases := []struct {
+			name   string
+			rawURL string
+			want   bool
+			why    string
+		}{
+			{"RED: short svc form of same svc → MATCH", short, true,
+				"the portal endpoint uses the short svc form; fix B must recognize it as self"},
+			{"RED: 2-label name.ns of same svc → MATCH", twoL, true,
+				"name.namespace is a valid in-cluster short form of the same service"},
+			{"FQDN self → MATCH", fqdn, true, "exact-string still matches"},
+			// GUARD arms — must stay OFF (leak guard preserved):
+			{"GUARD: external contains snowplow → NO", "http://snowplow-foo.example.com:8081", false,
+				"substring 'snowplow' is not a canonical svc form → exact-string fallback → no match"},
+			{"GUARD: self as subdomain suffix → NO", "http://evil.snowplow.krateo-system.svc.cluster.local:8081", false,
+				"labels[0]=evil,[1]=snowplow → different (name,ns) AND non-canonical trailing → no match"},
+			{"GUARD: self as prefix + garbage → NO", "http://snowplow.krateo-system.svc.cluster.local.evil.com:8081", false,
+				"trailing labels include evil/com → not an allowed svc trailing set → exact-string fallback → no match"},
+			{"GUARD: different svc name, same ns → NO", "http://other.krateo-system.svc:8081", false,
+				"name mismatch → not the same service"},
+			{"GUARD: same name, different ns → NO", "http://snowplow.other-ns.svc:8081", false,
+				"namespace mismatch → not the same service"},
+			{"GUARD: wrong port on short form → NO", "http://snowplow.krateo-system.svc:9999", false,
+				"port is still exact-equality — svc equivalence never relaxes scheme/port"},
+			{"GUARD: wrong scheme on short form → NO", "https://snowplow.krateo-system.svc:8081", false,
+				"scheme is still exact-equality"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := parsedHostEqualsSelf(tc.rawURL); got != tc.want {
+					t.Fatalf("parsedHostEqualsSelf(%q) = %v, want %v — %s", tc.rawURL, got, tc.want, tc.why)
+				}
+			})
+		}
+	})
+
+	// selfShort: URL_SELF is the SHORT form — the FQDN candidate of the same svc
+	// MUST match (symmetry; a cluster could configure URL_SELF either way).
+	t.Run("self=short", func(t *testing.T) {
+		if !SetSelfHost(short) {
+			t.Fatalf("SetSelfHost(%q) failed", short)
+		}
+		t.Cleanup(func() { SetSelfHost("") })
+		if !parsedHostEqualsSelf(fqdn) {
+			t.Fatalf("RED: self=short, candidate=FQDN of same svc must MATCH (symmetry)")
+		}
+		if !parsedHostEqualsSelf(twoL) {
+			t.Fatalf("RED: self=short, candidate=name.ns of same svc must MATCH")
+		}
+		if parsedHostEqualsSelf("http://snowplow-foo.example.com:8081") {
+			t.Fatalf("GUARD: external near-miss must NOT match even when self is short-form")
+		}
+	})
+}
+
 // TestParsedHostEqualsSelf_UnconfiguredNeverMatches: with no self-host set
 // (URL_SELF empty), the self-loopback arm is disabled — the predicate is
 // always false, so the bearer-append falls back to the pre-#57 gate exactly.
