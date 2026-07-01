@@ -479,3 +479,110 @@ func TestF3_NestedCall_AuthorizedResolveNonEmpty(t *testing.T) {
 			"want 0 (the error-aware Put-gate must not false-fire on a good resolve)", got)
 	}
 }
+
+// --- RC-2 / RC-5 / RC-6 — #79 resolve-cycle self-reference cycle-stop --------
+
+// TestRC2_SelfReferenceReturnsRawCR is the #79 crux RED arm. When the target
+// node is ALREADY on the descent path (self-reference: A resolve:true-refs A),
+// ResolveNestedCall must STOP the cycle by returning the RAW CR (resolve:false
+// semantics) — NOT recurse into restactions.Resolve, NOT hit the depth-8 error.
+// We seed an inner RA whose recursive resolve would yield a distinct
+// (filter-projected) status, mark its node as an ancestor on ctx, and assert
+// the returned bytes are the RAW CR (its status is the UNRESOLVED spec.filter
+// string, not the resolved projection) with NO error and NO depth-limit.
+//
+// This is the on-cluster fsa-yN-composition-resources self-reference that
+// exploded 250×/composition on 1.5.20 (#77 re-enabled the recursion). Neuter
+// the cycle-stop (remove the NestedResolveAncestorPresent branch) → this RA
+// recurses to the depth-8 backstop instead of stopping at reentry.
+func TestRC2_SelfReferenceReturnsRawCR(t *testing.T) {
+	const ns, name = "demo-system", "fsa-y7-composition-resources"
+	// Inner RA with an ARRAY-yielding filter — a RECURSIVE resolve would write
+	// the projected array into status; the RAW CR's status carries no such
+	// projection (spec.filter is the literal string). So raw-vs-resolved is
+	// distinguishable.
+	newNestedCallWatcherWithInner(t, ns, name,
+		nestedInnerRESTActionArrayStatus(ns, name),
+		nestedCallRoleBinding(ns, "authorized-user"))
+
+	base := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "authorized-user"}),
+	)
+	// Mark THIS node as already-an-ancestor — i.e. we are resolving A from
+	// within A's own resolve chain (the self-reference). node identity is the
+	// FETCHED GVR.Resource/ns/name (matches ResolveNestedCall's construction).
+	node := nestedCallInnerGVR.Resource + "/" + ns + "/" + name
+	ctx := cache.WithNestedResolveAncestor(base, node)
+
+	ref := templates.ObjectReference{
+		Reference:  templates.Reference{Name: name, Namespace: ns},
+		Resource:   nestedCallInnerGVR.Resource,
+		APIVersion: nestedCallInnerGVR.Group + "/" + nestedCallInnerGVR.Version,
+	}
+	raw, err := ResolveNestedCall(ctx, ref, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("RC-2: self-reference must cycle-STOP cleanly (raw CR), got error: %v", err)
+	}
+	if strings.Contains(err2s(err), "depth limit exceeded") {
+		t.Fatalf("RC-2: self-reference must stop at reentry, NOT recurse to the depth-8 backstop")
+	}
+	if len(raw) == 0 {
+		t.Fatalf("RC-2: cycle-stop must return the raw CR, got empty")
+	}
+	var envelope map[string]any
+	if uerr := json.Unmarshal(raw, &envelope); uerr != nil {
+		t.Fatalf("RC-2: cycle-stop result is not a JSON object: %v\n got %s", uerr, raw)
+	}
+	// RAW CR: the status must NOT carry the resolved array projection — the raw
+	// object has spec.filter as a literal string and an unresolved/empty status.
+	// The resolved form would put the array under .status; the raw form does
+	// not. Assert the spec.filter literal survived (raw), i.e. we returned the
+	// object as fetched.
+	specBytes, _ := json.Marshal(envelope["spec"])
+	if !strings.Contains(string(specBytes), "team-a") {
+		t.Fatalf("RC-2: expected the RAW CR (spec.filter literal intact), got spec=%s", specBytes)
+	}
+	statusBytes, _ := json.Marshal(envelope["status"])
+	if strings.Contains(string(statusBytes), "team-a") {
+		t.Fatalf("RC-2: status carries the RESOLVED projection — the cycle did NOT stop "+
+			"(it recursed and resolved instead of returning the raw CR); status=%s", statusBytes)
+	}
+}
+
+// TestRC5_CycleStopStillEnforcesRBAC — the cycle-stop happens AFTER
+// objects.Get + checkDispatchRBAC (RC-5: stop != bypass). An UNAUTHORIZED
+// identity hitting a self-reference must STILL get a denial error, never the raw
+// CR. (Proves the stop did not short-circuit ahead of the RBAC gate.)
+func TestRC5_CycleStopStillEnforcesRBAC(t *testing.T) {
+	const ns, name = "demo-system", "fsa-y7-composition-resources"
+	// No RoleBinding for "denied-user" → objects.Get / checkDispatchRBAC denies.
+	newNestedCallWatcherWithInner(t, ns, name,
+		nestedInnerRESTActionArrayStatus(ns, name))
+
+	base := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "denied-user"}),
+	)
+	node := nestedCallInnerGVR.Resource + "/" + ns + "/" + name
+	ctx := cache.WithNestedResolveAncestor(base, node) // ancestor present (would cycle-stop)
+
+	ref := templates.ObjectReference{
+		Reference:  templates.Reference{Name: name, Namespace: ns},
+		Resource:   nestedCallInnerGVR.Resource,
+		APIVersion: nestedCallInnerGVR.Group + "/" + nestedCallInnerGVR.Version,
+	}
+	raw, err := ResolveNestedCall(ctx, ref, 0, 0, nil)
+	if err == nil {
+		t.Fatalf("RC-5: an UNAUTHORIZED self-reference must be DENIED (error), not " +
+			"cycle-stopped to the raw CR — the stop must sit AFTER the RBAC gate")
+	}
+	if raw != nil {
+		t.Fatalf("RC-5: denied cycle-stop must return nil bytes, got %d", len(raw))
+	}
+}
+
+func err2s(e error) string {
+	if e == nil {
+		return ""
+	}
+	return e.Error()
+}

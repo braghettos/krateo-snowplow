@@ -132,14 +132,48 @@ func ResolveNestedCall(
 		}
 	}
 
+	// Step 3.5 — CYCLE-STOP (#79). Build this node's cycle identity from the
+	// FETCHED object's GVR + namespace + name (post-Get, post-RBAC: RC-5 the
+	// stop happens only AFTER the identity is confirmed a real, authorized CR —
+	// a cycle-stop is NOT an RBAC bypass). If this exact node is already on the
+	// current root→here descent path, resolving it again is a SELF-REFERENCE
+	// (the composition's managed set includes its own fsa-yN-composition-* RAs,
+	// so allCompositionResources resolves the RA from within itself). Return the
+	// RAW CR (resolve:false semantics — the same encodeResolvedJSON(raw) the
+	// default arm returns) INSTEAD of recursing. This stops the cycle at the
+	// first reentry (not at the depth-8 backstop after 8 wasted hops + 250×
+	// redundant resolves), with NO ERROR — a self-ref is a legitimate graph
+	// shape, not a failure.
+	//
+	// The ancestor SET (not a global visited set): a diamond P→{C1,C2}→L still
+	// resolves L on both independent branches (L is not an ancestor of itself on
+	// either) — only a node ALREADY on the path to here is a cycle (RC-1). The
+	// depth-8 guard above stays as the backstop for a non-cyclic pathologically
+	// deep chain (RC-3).
+	node := got.GVR.Resource + "/" + got.Unstructured.GetNamespace() + "/" + got.Unstructured.GetName()
+	if cache.NestedResolveAncestorPresent(ctx, node) {
+		log.Debug("nested resolve cycle-stop: node already an ancestor — returning raw CR",
+			slog.String("node", node),
+			slog.Int("depth", depth),
+		)
+		encoded, err := encodeResolvedJSON(got.Unstructured.Object)
+		if err != nil {
+			return nil, fmt.Errorf("nested resolve: encode raw object (cycle-stop) %s/%s: %w",
+				ref.Resource, ref.Name, err)
+		}
+		return encoded, nil
+	}
+
 	// Step 4/5 — resolve the inner object under a ctx whose nested-call depth
 	// is incremented by 1 (so a resolve WITHIN this inner object enters one
-	// level deeper and the depth cap bounds the whole recursion). The
-	// L1KeyFromContext on `ctx` (the outer entry's key) is preserved by
-	// WithNestedCallDepth (context.WithValue keeps parent values), so the
+	// level deeper and the depth cap bounds the whole recursion) AND whose
+	// ancestor set is extended with this node (immutable copy-on-descend —
+	// #79). The L1KeyFromContext on `ctx` (the outer entry's key) is preserved
+	// by WithNestedCallDepth (context.WithValue keeps parent values), so the
 	// inner resolve's apiserver-call dep edges land on the OUTER L1 key —
 	// transitive data invalidation works (proposal §5).
-	innerCtx := cache.WithNestedCallDepth(ctx, depth+1)
+	innerCtx := cache.WithNestedResolveAncestor(
+		cache.WithNestedCallDepth(ctx, depth+1), node)
 
 	switch got.GVR.Resource {
 	case nestedResolveRestActionsResource:
