@@ -238,6 +238,17 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if cacheKey != "" {
 		ctx = cache.WithL1KeyContext(ctx, cacheKey)
 	}
+	// #83 Option A — seed THIS top-level widget as an ancestor of the
+	// nested-resolve descent BEFORE resolving (symmetric with restactions.go).
+	// The seam has a widget resolve arm (nested_call.go), so a top-level widget
+	// whose nested resolve fans back to ITSELF would hit the same #79 off-by-one
+	// as a self-referential RESTAction — the outermost node was never registered
+	// so the cycle-stop fired one hop too late. Seeding it here makes the first
+	// self-reentry an immediate cycle-stop. Same shared node derivation the
+	// cycle-stop membership-checks (nested_call.go), so seed and check cannot
+	// drift. No-op for a non-self-referential widget.
+	ctx = cache.WithNestedResolveAncestor(ctx,
+		nestedResolveNodeKey(got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName()))
 
 	// Ship 0.30.257 (#313) Cache-A — request-path error-aware Put-gate
 	// (see restactions.go for the full rationale). A widget's apiRef
