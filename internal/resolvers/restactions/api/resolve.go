@@ -615,12 +615,23 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// whose `path` is a direct apiserver path to a RESTAction/Widget CR is
 	// fetched (cacheably, dep-tracked) by the informer-pivot / apistage /
 	// internal-rest-config branches below, which yield the RAW CR envelope.
-	// With resolve:true (default) we then run that CR through the resolver
+	// With resolve:true (OPT-IN) we then run that CR through the resolver
 	// IN-PROCESS via maybeResolveInProcess and feed the RESOLVED envelope
 	// instead of the raw CR — byte-identical to an HTTP /call of that CR, no
-	// outbound HTTP. resolve:false (or a non-RA/widget path, a LIST, or cache
-	// off) feeds the raw bytes unchanged. Computed once per call.
-	resolve := ptr.Deref(apiCall.Resolve, true)
+	// outbound HTTP. resolve:false, OMITTED (nil pointer), or a non-RA/widget
+	// path / a LIST / cache off feeds the raw bytes unchanged. Computed once
+	// per call.
+	//
+	// The 2nd arg (nil fallback) is LOAD-BEARING as of the 2026-07-02 contract
+	// flip (docs/resolve-default-flip-plan-2026-07-02.md §1): the CRD no longer
+	// carries +kubebuilder:default=true, so an omitted `resolve` arrives here as
+	// a NIL pointer and this fallback decides its meaning. It MUST be false to
+	// agree with the CRD contract (omit→false). This is coupled to the CRD
+	// change: removing the CRD default (nil reachable) + this false fallback
+	// (nil means false) must land together, or omitted-resolve behaviour would
+	// diverge from what the schema advertises. (Before the flip, the apiserver
+	// injected non-nil true on every omit, so this fallback was inert.)
+	resolve := ptr.Deref(apiCall.Resolve, false)
 
 	// feedRawOrResolved feeds the dispatched RAW envelope bytes downstream,
 	// UNLESS the step is a resolve:true direct-path RA/widget GET — in which
