@@ -1,0 +1,13 @@
+{
+  "args": {
+    "name": "Alice",
+    "email": "alice@example.com",
+    "age": "30",
+    "uid": "AA-BB-CC"
+  },
+  "headers": {
+    "Accept": "application/json",
+    "Host": "httpbin.local"
+  },
+  "url": "http://httpbin.local/get?name=Alice&email=alice@example.com&age=30&uid=AA-BB-CC"
+}

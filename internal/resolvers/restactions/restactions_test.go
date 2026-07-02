@@ -18,6 +18,7 @@ import (
 	"github.com/krateoplatformops/snowplow/apis"
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 
+	corev1 "k8s.io/api/core/v1"
 	serializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
@@ -34,6 +35,12 @@ var (
 	testenv     env.Environment
 	clusterName string
 	namespace   string
+	// fixtureSrv is the suite-local recorded-response server (B hermetify).
+	// Started in TestMain, closed at Finish; the per-test Setup rewrites the
+	// github/httpbin/typicode endpointRef Secrets' server-url to fixtureSrv.URL()
+	// so those three RAs resolve against recorded JSON, not live third-party hosts
+	// (docs/flaky-integration-gate-fix-design-2026-07-02.md). httpfixture_test.go.
+	fixtureSrv *fixtureServer
 )
 
 const (
@@ -47,6 +54,11 @@ func TestMain(m *testing.M) {
 	namespace = "demo-system"
 	clusterName = "krateo"
 	testenv = env.New()
+
+	// B (hermetify): start the recorded-response server before the suite; the
+	// github/httpbin/typicode RAs resolve against it (Secret server-url rewritten
+	// at Setup) so the gate never touches a live third-party host. Closed at Finish.
+	fixtureSrv = newFixtureServer()
 
 	testenv.Setup(
 		envfuncs.CreateCluster(kind.NewProvider(), clusterName),
@@ -96,6 +108,13 @@ func TestMain(m *testing.M) {
 			return ctx, nil
 		},
 	).Finish(
+		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			// B (hermetify): stop the recorded-response server.
+			if fixtureSrv != nil {
+				fixtureSrv.Close()
+			}
+			return ctx, nil
+		},
 		envfuncs.DeleteNamespace(namespace),
 		envfuncs.TeardownCRDs(crdPath, "templates.krateo.io_restactions.yaml"),
 		envfuncs.DestroyCluster(clusterName),
@@ -138,6 +157,32 @@ func TestRESTAction(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
+			// B (hermetify): point the three formerly-live endpointRef Secrets at
+			// the recorded-response server so github/httpbin/typicode resolve
+			// deterministically against local JSON, never a live third-party host
+			// (docs/flaky-integration-gate-fix-design-2026-07-02.md). The fixtures'
+			// authored URLs (api.github.com / httpbin.org / jsonplaceholder) stay
+			// human-readable defaults but are overwritten here before any resolve.
+			// Done AFTER the manifest-apply so the Secrets exist to patch.
+			for _, secretName := range []string{
+				"github-endpoint", "httpbin-endpoint", "typicode-endpoint",
+			} {
+				var sec corev1.Secret
+				if err := r.Get(ctx, secretName, namespace, &sec); err != nil {
+					t.Fatalf("hermetify: get endpoint Secret %q: %v", secretName, err)
+				}
+				if sec.StringData == nil {
+					sec.StringData = map[string]string{}
+				}
+				// stringData is write-only on apply; on a live object the value is
+				// in Data (base64). Overwrite via StringData (apiserver re-encodes)
+				// so the update is authoritative regardless of how it was created.
+				sec.StringData["server-url"] = fixtureSrv.URL()
+				if err := r.Update(ctx, &sec); err != nil {
+					t.Fatalf("hermetify: rewrite server-url on Secret %q: %v", secretName, err)
+				}
+			}
 			return ctx
 		}).
 		Assess("Resolve GitHub", resolveRESTAction("github")).
@@ -146,6 +191,36 @@ func TestRESTAction(t *testing.T) {
 		Assess("Resolve Cluster PODs", resolveRESTAction("cluster-pods")).
 		Assess("Resolve Kube Get", resolveRESTAction("kube-get")).
 		Assess("Resolve Cluster Namespaces", resolveRESTAction("cluster-namespaces")).
+		// B (hermetify) falsifier arm — decisive "zero live egress" proof. The
+		// three formerly-live RAs dispatch a KNOWN number of api-steps to the
+		// fixture server:
+		//   typicode: /users (1) + /todos × first-3-users (3)           = 4
+		//   github:   /runs (1)                                         = 1
+		//   httpbin:  /get (1) + /post (1)                              = 2
+		//                                                          total = 7
+		// github fires ONLY its /runs collection step, NOT the /runs/{id}/timing
+		// children: the resolver wraps each step's decoded body under pig[stepName]
+		// before running that step's jq filter (handler.go jsonHandlerCore), so the
+		// `all` step filter `.workflow_runs | map(…)` evaluates `.workflow_runs`
+		// against the WRAPPER object `{all: {…}}` → null → the filter errors
+		// non-fatally (logged, body left raw) → the dependent `jobs` iterator
+		// `.all | sort_by(.created_at)` then runs over the raw github_runs OBJECT's
+		// values → `.created_at` on a number → iterator yields nothing → 0 timing
+		// dispatches. This is a PRE-EXISTING resolver semantic, identical whether
+		// the step resolves against live github or the local fixture (the fixture
+		// body is byte-shaped like github's real /runs response), so it is NOT a
+		// hermetify artefact and NOT in scope to "fix" here. The honest full-
+		// hermetic dispatch count is therefore 7, not the pre-flight projection of
+		// 9 (which wrongly assumed the step filters resolve).
+		// If those requests reached the LOCAL fixture server (not the internet),
+		// its hit counter is >= 7. A live-dispatch regression (Secret URL not
+		// overridden) leaves the counter at 0 → this arm FAILS. This is the
+		// design's counter-based alternative to running under `unshare -n`
+		// (kind needs docker egress, so full network isolation is impractical).
+		Assess("Hermetic — all live dispatch served locally", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			fixtureSrv.assertServedAtLeast(t, 7)
+			return ctx
+		}).
 		Feature()
 
 	testenv.Test(t, f)
