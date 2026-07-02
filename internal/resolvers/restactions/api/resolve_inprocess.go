@@ -150,14 +150,17 @@ func (r *resolveRun) maybeResolveInProcess(
 		APIVersion: apiVersion,
 	}
 
-	// (c) cold-fan-out aggregate-footprint bound — applied at the OUTERMOST
+	// (c) cold-fan-out AGGREGATE-footprint bound — applied at the OUTERMOST
 	// nested resolve ONLY (depth 0). Gates 1-4 above guarantee this is a real
 	// cold single-CR RA/widget resolve that WILL recursively fan out
 	// (resolve:true); a warm apistage/cache hit never reaches here. The
-	// outermost entry holds ONE permit for the whole subtree — inner recursive
-	// resolves (depth>0) inherit it and do NOT re-enter, so there is no
-	// per-node explosion and no self-deadlock. Default-off (budget 0) ⇒
-	// transparent pass-through. See nested_resolve_bound.go.
+	// outermost entry holds ONE process-wide admission for the whole subtree —
+	// inner recursive resolves (depth>0) inherit it and do NOT re-enter, so
+	// there is no per-node explosion and no self-deadlock. Admission is against
+	// LIVE headroom (GOMEMLIMIT − live heap), sampled at entry, aggregated
+	// across ALL concurrent outermost trees process-wide (the per-tree #78 bound
+	// missed the concurrent-tree page fan-out → 8Gi OOM). Transparent when
+	// GOMEMLIMIT is unset. See nested_resolve_bound.go.
 	if isOutermostNestedResolve(gctx) {
 		release, berr := enterNestedResolveUnit(gctx)
 		if berr != nil {

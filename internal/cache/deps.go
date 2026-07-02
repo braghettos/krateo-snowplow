@@ -268,6 +268,42 @@ func ApistagePrewarmFromContext(ctx context.Context) bool {
 	return v
 }
 
+// ctxKeyBackgroundResolveType is the typed context key marking a resolve as
+// BACKGROUND (non-customer): the refresher re-resolve + the prewarm/seed
+// content-population passes. A customer /call carries NO such marker.
+type ctxKeyBackgroundResolveType struct{}
+
+var ctxKeyBackgroundResolve = ctxKeyBackgroundResolveType{}
+
+// WithBackgroundResolve marks ctx as a background (non-customer) resolve. Used
+// by the aggregate cold-fan-out admission gate (nested_resolve_bound.go, C5)
+// to give a CUSTOMER /call ABSOLUTE priority: a background tree YIELDS the
+// admission race to any waiting/arriving customer tree (customer-preferring
+// acquire) and never gets an honest-503 terminal (it has no browser deadline —
+// it waits, ctx-bounded by its own ctx). It is NOT a per-tree RBAC/behaviour
+// change: a background tree, ONCE ADMITTED, weighs against the aggregate
+// exactly like a customer tree (the OOM floor is preserved — background differs
+// only at admission, never in accounting). This is a code-internal signal, not
+// an operator knob.
+func WithBackgroundResolve(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyBackgroundResolve, true)
+}
+
+// BackgroundResolveFromContext reports whether ctx was marked by
+// WithBackgroundResolve — i.e. whether this resolve is background (refresher /
+// prewarm), which the aggregate admission gate de-prioritises behind customer
+// /calls.
+func BackgroundResolveFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyBackgroundResolve).(bool)
+	return v
+}
+
 // ctxKeyRefreshTriggerGVRType is the typed context key for the R1 Layer 1
 // refresh-trigger-GVR marker.
 type ctxKeyRefreshTriggerGVRType struct{}
