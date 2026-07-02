@@ -114,11 +114,11 @@ spec:
                       description: Payload is the request body
                       type: string
                     resolve:
-                      default: true
                       description: |-
                         Resolve controls post-fetch behaviour when this api-step fetches a
                         snowplow RESTAction or Widget CR from a DIRECT apiserver path
-                        (internal proposal 2026-06-22, Diego-ratified). Default true.
+                        (internal proposal 2026-06-22, Diego-ratified). OPT-IN — default
+                        false (contract move 2026-07-02, docs/resolve-default-flip-plan-2026-07-02.md).
 
                           - resolve: true  — after fetching the CR from the (cacheable,
                             dep-tracked) internal apiserver path, snowplow runs the fetched
@@ -128,15 +128,23 @@ spec:
                             with NO outbound /call HTTP round-trip. RBAC- and depth-gated
                             exactly as the HTTP /call. For any other kind (e.g. a configmap)
                             it is a harmless no-op (the raw fetched object is fed unchanged).
-                          - resolve: false — return the RAW stored CR (the pre-proposal
-                            plain objects.Get / informer-serve behaviour), unresolved.
+                          - resolve: false (or OMITTED) — return the RAW stored CR (the
+                            pre-proposal plain objects.Get / informer-serve behaviour),
+                            unresolved.
 
-                        Default-true is the right ergonomic default — the common reason to
-                        reference another RA/widget by its apiserver path is to consume its
-                        RESOLVED data, which is exactly what resolve:true gives. An existing
-                        RA that fetches a raw RA/widget CR by direct path and consumes the
-                        RAW spec must set resolve:false to preserve its output (corpus audit
-                        2026-06-22 §3: ZERO realized flips in the shipped corpus).
+                        The default is OMIT→false: aligned with progressive rendering
+                        (feedback_progressive_rendering — the frontend descends resourcesRefs
+                        level-by-level; the server returns raw refs/CRs by default) and with
+                        the #72 inline-rendered-children opt-in (resolve nested refs only where
+                        a widget/step explicitly asks). An api-step that CONSUMES a nested
+                        RA/widget's RESOLVED data (e.g. reads a child's resolved-only
+                        `.status.<field>`) MUST set resolve:true explicitly to preserve its
+                        output. With no kubebuilder default the apiserver injects NOTHING on
+                        omit → the field arrives NIL → the resolver's ptr.Deref(...Resolve,
+                        false) fallback (resolve.go, the single default-fallback site) is
+                        LOAD-BEARING for the nil case; the CRD contract and the resolver agree
+                        on nil→false. Removing the marker (rather than =false) keeps etcd clean
+                        on omit (no persisted false to disambiguate from an authored choice).
                       type: boolean
                     userAccessFilter:
                       description: |-
