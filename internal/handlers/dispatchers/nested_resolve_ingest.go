@@ -120,11 +120,12 @@ func requestArrivedOnSelfHost(req *http.Request) bool {
 // property was never "only the seed" — it was "only a snowplow-VALIDATED JWT
 // holder", which holds for ANY authenticated user.
 //
-// TRUST ANCHOR (TRACED): xcontext.UserInfo(ctx) is set (userconfig.go:230-231 /
-// refreshauth.go) ONLY AFTER the auth middleware's jwtutil.Validate(signingKey,
-// token) passes (userconfig.go:151); an invalid / missing / spoofed JWT returns
-// Unauthorized BEFORE the handler runs. So `UserInfo present` ⟺ the caller
-// presented a JWT signed by snowplow's OWN signing key — an external / no-JWT /
+// TRUST ANCHOR (TRACED): the auth middleware runs jwtutil.Validate(signingKey,
+// token) at userconfig.go:151 (mirrored in refreshauth.go) and, ONLY on success,
+// sets xcontext.WithUserInfo(userInfo) at userconfig.go:231; an invalid /
+// missing / spoofed JWT returns Unauthorized at userconfig.go:151 BEFORE the
+// handler runs. So `UserInfo present` ⟺ the caller presented a JWT signed by
+// snowplow's OWN signing key (validated at :151) — an external / no-JWT /
 // spoofed-JWT caller can NEVER reach the handler with UserInfo set. The C2 forge
 // hole stays closed by the middleware, not by a token compare here.
 //
