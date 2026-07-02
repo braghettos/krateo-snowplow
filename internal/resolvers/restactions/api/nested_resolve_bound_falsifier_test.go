@@ -19,6 +19,7 @@ package api
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -445,5 +446,98 @@ func TestAggCalibration_OneShot(t *testing.T) {
 	calibrateNestedEstUnit(-5) // ignored
 	if w := currentNestedEstUnit(); w != 100*mib {
 		t.Fatalf("non-positive delta changed weight: %d", w)
+	}
+}
+
+// TestAggNoGoroutineLeak_CtxWatcher asserts the sync.Cond ctx-watcher goroutine
+// (waitForReleaseOrCtx spawns one per wait) does NOT leak. The discriminating
+// scenario targets EXACTLY what close(stop) guards: a waiter whose Wait is woken
+// by a RELEASE broadcast (NOT its own ctx) and then ADMITS — its ctx never fires,
+// so the ONLY way its watcher exits is close(stop). Repeated sequentially, this
+// accumulates one such waiter per iteration.
+//
+// Each iteration: tree A holds all headroom; a waiter B (background ctx, never
+// cancelled) blocks (inFlight>0 + can't fit) → spawns a watcher; we release A →
+// B is woken by A's release-Broadcast, re-checks, now fits (inFlight==0) →
+// ADMITS, returns (ctx never fired), releases. With close(stop) B's watcher
+// exits; WITHOUT it, B's watcher strands on <-stop forever → NumGoroutine climbs
+// by ~1 per iteration.
+//
+// DISCRIMINATING (RED-then-GREEN, arch-required): GREEN with close(stop) intact
+// (delta ≈ 0 across ITER iterations). RED with close(stop) removed — the
+// release-woken-then-admitted watchers strand (delta ≈ ITER). Captured in the
+// artifact by a manual neuter run (the stop-path is prod code, not a test seam).
+// The arm ACTUALLY RUNS (=== RUN + in the -run 'TestAgg' count).
+func TestAggNoGoroutineLeak_CtxWatcher(t *testing.T) {
+	resetNestedResolveBoundForTest()
+	t.Cleanup(resetNestedResolveBoundForTest)
+
+	// Headroom fits EXACTLY one tree: base 200 + one 700 = 900 ≤ ceiling 896?
+	// ceiling = 1024 − 128(reserve) = 896; base 100 + 700 = 800 ≤ 896 (one fits),
+	// base 100 + 2×700 = 1500 > 896 (a second cannot while the first is in
+	// flight). So B blocks while A holds, and admits once A releases.
+	h := &headroomModel{
+		limit:            1024 * mib,
+		base:             100 * mib,
+		perTreeFootprint: 700 * mib,
+	}
+	setRuntimeSeamsForTest(h.limitFn, h.liveFn)
+	pinEstUnit(h.perTreeFootprint)
+
+	settle := func() {
+		for i := 0; i < 40; i++ {
+			runtime.GC()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	settle()
+	base := runtime.NumGoroutine()
+
+	const ITER = 25
+	for i := 0; i < ITER; i++ {
+		// A holds all headroom.
+		relA, errA := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+		if errA != nil {
+			t.Fatalf("iter %d: A admission failed: %v", i, errA)
+		}
+		h.occupy()
+
+		// B blocks (inFlight==1, base+2×700 > ceiling → can't fit). Background
+		// ctx → B's ctx NEVER fires; its watcher can only exit via close(stop).
+		bDone := make(chan struct{})
+		go func() {
+			relB, errB := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+			if errB == nil {
+				h.occupy()
+				h.vacate()
+				relB()
+			}
+			close(bDone)
+		}()
+
+		// Ensure B is blocked (in its Wait) before releasing A.
+		time.Sleep(20 * time.Millisecond)
+
+		// Release A → Broadcast wakes B → B re-checks, now inFlight==0 → ADMITS
+		// (its ctx never fired). B's watcher must exit via close(stop).
+		h.vacate()
+		relA()
+
+		select {
+		case <-bDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iter %d: B never admitted after A released (release→broadcast→admit path stuck)", i)
+		}
+	}
+
+	settle()
+	after := runtime.NumGoroutine()
+
+	// A LEAK strands ~ITER watchers (25). Slack for scheduler/runtime.
+	const slack = 8
+	if after > base+slack {
+		t.Fatalf("GOROUTINE LEAK: NumGoroutine base=%d after=%d (delta %d > slack %d) — "+
+			"the ctx-watcher goroutines of release-woken-then-admitted waiters did NOT exit "+
+			"(%d iterations). The waitForReleaseOrCtx close(stop) path leaked.", base, after, after-base, slack, ITER)
 	}
 }
