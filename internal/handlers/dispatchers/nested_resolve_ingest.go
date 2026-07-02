@@ -19,31 +19,34 @@
 //
 // SECURITY (C1, the load-bearing line): the two headers are ADVISORY and
 // SELF-TRUSTED ONLY. isTrustedSelfLoopback gates whether they are read into ctx
-// at all. The trust check uses TOKEN PROVENANCE — the inbound bearer must EXACTLY
-// equal snowplow's OWN authn-issued seed JWT (currentSeedLoopbackToken) — which
-// is minted from snowplow's projected SA token (authn /serviceaccount/login,
-// phase1_walk.go) and never leaves the pod except on a self-host loopback, so an
-// EXTERNAL caller cannot present it. This is strictly stronger than matching an
-// authn-issued USERNAME (which is authn-config-dependent / UNPINNED — memory
-// project_prewarm_authn_loopback_identity_shift; a username match would need a
-// hardcoded subject, violating feedback_no_special_cases). A req.Host==self
-// check is belt-and-suspenders; the cryptographic token match is the primary
-// gate. Any request failing the token match has BOTH headers IGNORED (never read
-// into ctx) → it gets a NORMAL full resolve (C2 — a forged
-// X-Snowplow-Nested-Depth:8 + spoofed ancestor set from a non-seed caller cannot
-// force a premature raw-CR stop or suppress a legitimate resolve).
+// at all. The trust check requires a VALID snowplow-issued identity —
+// xcontext.UserInfo(ctx) present + non-error — which the auth middleware sets
+// ONLY after jwtutil.Validate passes (an external / no-JWT / spoofed-JWT caller
+// is rejected 401 upstream, never reaching the handler with UserInfo set). So
+// `UserInfo present` ⟺ a snowplow-VALIDATED JWT holder. A req.Host==self check
+// is belt-and-suspenders; the validated-identity check is the primary gate. Any
+// request failing it has BOTH headers IGNORED (never read into ctx) → it gets a
+// NORMAL full resolve (C2 — a forged X-Snowplow-Nested-Depth:8 + spoofed ancestor
+// set from an UNAUTHENTICATED caller cannot force a premature raw-CR stop or
+// suppress a legitimate resolve).
 //
-// BLAST-RADIUS BOUND: even a theoretical forge could only make snowplow return
-// THIS ONE call's raw CR (resolve:false) or a bounded depth-stop — it cannot read
-// cross-user data (the resolve still runs checkDispatchRBAC under the CALLER's
-// identity, restactions.go:96, UNCHANGED by R) and cannot poison another user's
-// L1 entry (per-user key). So the forge blast radius is self-DoS of the forger's
-// own call — and the token gate makes even that unreachable for non-seed callers.
+// 1.5.26 broadening (docs/user-path-loopback-storm-trace-fix-2026-07-02.md): the
+// predicate was seed-token-only in 1.5.25, which closed the SEED loopback but not
+// the USER loopback (a real user's JWT ≠ the seed token → guard never fired →
+// user-path storm). The security property was never "only the seed" but "only a
+// snowplow-VALIDATED JWT holder" — which holds for ANY authenticated user, seed
+// included. See isTrustedSelfLoopback for the full trust anchor.
+//
+// BLAST-RADIUS BOUND: even a theoretical forge by an AUTHENTICATED user could
+// only make snowplow return THIS ONE call's raw CR (resolve:false) or a bounded
+// depth-stop — it cannot read cross-user data (the resolve still runs
+// checkDispatchRBAC under the CALLER's identity, restactions.go:96, UNCHANGED by
+// R) and cannot poison another user's L1 entry (per-binding key). So the forge
+// blast radius is self-DoS of the forger's own call.
 package dispatchers
 
 import (
 	"context"
-	"crypto/subtle"
 	"log/slog"
 	"net"
 	"net/http"
@@ -99,65 +102,55 @@ func requestArrivedOnSelfHost(req *http.Request) bool {
 	return host == *sh
 }
 
-// isTrustedSelfLoopback is the C1 forge-guard. TRUE iff the inbound bearer
-// EXACTLY equals snowplow's own current authn-issued seed JWT (token provenance)
-// AND (belt-and-suspenders) the request arrived on the self-host. Only the seed
-// possesses snowplow's SA-minted authn JWT → unforgeable by an external caller.
-// For ANY request that fails EITHER condition the depth/ancestor headers are
-// ignored (the caller re-seeds NOTHING → a normal full resolve).
+// isTrustedSelfLoopback is the C1 forge-guard. TRUE iff the request carries a
+// VALID snowplow-issued identity (xcontext.UserInfo present + non-error) AND
+// (belt-and-suspenders) it arrived on the self-host. For ANY request that fails
+// EITHER condition the depth/ancestor headers are ignored (the caller re-seeds
+// NOTHING → a normal full resolve).
 //
-// TL refinement 1 — LIVE provider value: currentSeedLoopbackToken reads the LIVE
-// seedTokenProvider (authn.Client.Token), NOT a startup snapshot, so a ROTATED
-// seed token still matches. The provider caches the JWT until authn.Client's
-// refreshSkew (60s) before expiry, so an in-flight loopback and this read return
-// the SAME cached string — no rotation gap in practice; the depth-8 backstop
-// covers any theoretical edge miss during re-exchange.
+// 1.5.26 BROADENING (was seed-token-only, docs/user-path-loopback-storm-trace-fix-
+// 2026-07-02.md): 1.5.25 trusted a self-loopback ONLY when the inbound bearer
+// EXACTLY equalled snowplow's OWN seed JWT (token-provenance). That closed the
+// SEED loopback but NOT the USER loopback: a real user's composition-resources
+// /call runs under THEIR JWT ≠ the seed token → the guard returned false → the
+// depth/ancestor headers were ignored → the HTTP-edge cycle-stop never fired →
+// the user-path self-loopback recursed unbounded (the 1.5.24 storm, now
+// user-driven; concause: the per-BINDING L1 entry means the seed's warm entries
+// miss for a user → cold re-resolve → each self-loops unguarded). The security
+// property was never "only the seed" — it was "only a snowplow-VALIDATED JWT
+// holder", which holds for ANY authenticated user.
 //
-// TL refinement 2 — CONSTANT-TIME compare: the bearer is a secret at a trust
-// boundary, so the equality uses subtle.ConstantTimeCompare (no early-exit
-// length/byte-position timing oracle a remote attacker could use to recover the
-// token byte-by-byte). ConstantTimeCompare returns 1 on equal, 0 otherwise, and
-// is itself length-safe (returns 0 for unequal lengths without leaking where).
+// TRUST ANCHOR (TRACED): the auth middleware runs jwtutil.Validate(signingKey,
+// token) at userconfig.go:151 (mirrored in refreshauth.go) and, ONLY on success,
+// sets xcontext.WithUserInfo(userInfo) at userconfig.go:231; an invalid /
+// missing / spoofed JWT returns Unauthorized at userconfig.go:151 BEFORE the
+// handler runs. So `UserInfo present` ⟺ the caller presented a JWT signed by
+// snowplow's OWN signing key (validated at :151) — an external / no-JWT /
+// spoofed-JWT caller can NEVER reach the handler with UserInfo set. The C2 forge
+// hole stays closed by the middleware, not by a token compare here.
 //
-// TL refinement 3 — EMPTY-TOKEN GUARD *BEFORE* the compare (THE fail-closed
-// correctness line): subtle.ConstantTimeCompare([]byte(""), []byte("")) returns 1
-// — so if either side could be empty and reached the compare, an UNAUTHENTICATED
-// caller (no Authorization header → inbound "") would be TRUSTED when the seed
-// token is also empty (provider unwired/errored). Both len>0 checks below are
-// therefore HARD gates that MUST precede the compare. RED-armed
-// (TestR_C2_EmptyInbound_NotTrusted / TestR_C2_ForgeGuard_NoSeedProviderWired).
+// FORGE-SAFE FOR ANY AUTHENTICATED USER (blast-radius, unchanged from R): the
+// WORST a malicious AUTHENTICATED user can do by forging depth/ancestor headers
+// on their OWN self-loopback is SELF-DoS of their own call — a raw CR
+// (resolve:false) or a bounded 508 for THAT call. They CANNOT read cross-user
+// data (the resolve still runs checkDispatchRBAC under THEIR identity,
+// restactions.go:96) and CANNOT poison another user's L1 entry (per-binding
+// key). No cross-user impact.
 //
-// TL refinement 4 — SAFE-DEGRADE fail-closed: no seed token / provider unwired or
-// erroring (currentSeedLoopbackToken → have=false) ⇒ NOTHING is trusted ⇒ headers
-// ignored. Consistent by construction: in that same state the #57 bearer-append
-// would not fire either (no authn token on the seed ctx), so there is no
-// authenticated self-loopback to guard — the guard being off cannot let a real
-// loopback storm through because a real loopback cannot exist without the token.
-//
-// CO-LOCATION (arch-enforced): the EMIT side appends the SAME token this ingest
-// trusts. Emit rides the #57 bearer-append arm (resolve.go, parsedHostEqualsSelf
-// gate); that bearer is xcontext.AccessToken(r.ctx) — which on the seed path was
-// installed by installSeedLoopbackToken (phase1_walk.go) from seedTokenProvider.
-// This ingest's currentSeedLoopbackToken reads the SAME seedTokenProvider. So the
-// token emit appends == the token ingest trusts, BY SHARED SOURCE — they cannot
-// desync (no parallel token derivation).
+// SEED STAYS TRUSTED: the seed's loopback is a real HTTP /call carrying the
+// authn-issued seed JWT (#57), which the SAME middleware validates → UserInfo is
+// set → trusted under this broadened predicate too (no seed-path regression;
+// gated by the seed-still-trusted falsifier arm).
 func isTrustedSelfLoopback(req *http.Request) bool {
-	// Refinement 3: empty inbound → NOT trusted (an unauthenticated caller must
-	// never reach the constant-time compare).
-	inbound, ok := xcontext.AccessToken(req.Context())
-	if !ok || len(inbound) == 0 {
+	// Primary gate: a snowplow-VALIDATED JWT holder. UserInfo present + non-error
+	// ⟺ the auth middleware ran jwtutil.Validate successfully before the handler
+	// (an unauth / invalid / spoofed JWT is rejected 401 upstream, never reaching
+	// here with UserInfo set) — the forge hole stays closed.
+	if _, err := xcontext.UserInfo(req.Context()); err != nil {
 		return false
 	}
-	// Refinement 1+4: LIVE provider read; unwired/errored/empty → NOT trusted.
-	seedTok, have := currentSeedLoopbackToken(req.Context())
-	if !have || len(seedTok) == 0 {
-		return false // no seed token wired → nothing to trust against (fail-closed)
-	}
-	// Refinement 2: constant-time compare, reached ONLY with both sides non-empty.
-	if subtle.ConstantTimeCompare([]byte(inbound), []byte(seedTok)) != 1 {
-		return false // not snowplow's own seed loopback — headers ignored (C2)
-	}
-	// Belt-and-suspenders secondary (token-provenance is the cryptographic primary).
+	// Belt-and-suspenders secondary (tightens only; returns true when URL_SELF
+	// is unconfigured). The validated-identity check above is the primary anchor.
 	return requestArrivedOnSelfHost(req)
 }
 

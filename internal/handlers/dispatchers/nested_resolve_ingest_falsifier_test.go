@@ -21,7 +21,6 @@
 package dispatchers
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -39,23 +38,16 @@ import (
 // testLogger is a discard slog logger for the guard arms (they read no logs).
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-const (
-	testSeedTok  = "SEED-JWT-snowplow-key-signed-unforgeable"
-	testSelfHost = "snowplow.krateo-system.svc.cluster.local:8081"
-)
+const testSelfHost = "snowplow.krateo-system.svc.cluster.local:8081"
 
-// setSeedProvider wires seedTokenProvider to return tok for the test (this is
-// snowplow's OWN seed JWT — the only credential isTrustedSelfLoopback trusts,
-// C1) and restores nil on cleanup.
-func setSeedProvider(t *testing.T, tok string) {
-	t.Helper()
-	SetSeedLoopbackTokenProvider(func(context.Context) (string, error) { return tok, nil })
-	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
-}
-
-// buildLoopbackReq builds a request carrying bearer as WithAccessToken (as the
-// auth middleware places it), a UserInfo, the depth/ancestor headers, and Host.
-func buildLoopbackReq(bearer, host, depth, ancestors string) *http.Request {
+// buildLoopbackReq builds a self-loopback request with explicit control over
+// whether a VALID UserInfo is present (the 1.5.26 trust anchor — set ONLY after
+// the auth middleware's jwtutil.Validate passes). username=="" ⇒ NO UserInfo on
+// ctx (models an unauthenticated / rejected-JWT caller that reached the ingest
+// helper hypothetically — the C4 forge arm). A non-empty username ⇒ a valid
+// snowplow-validated identity (any authenticated user, seed included). The
+// depth/ancestor headers + Host are set as the emit side would.
+func buildLoopbackReq(username, host, depth, ancestors string) *http.Request {
 	r := httptest.NewRequest("GET", "http://"+host+"/call?resource=restactions", nil)
 	r.Host = host
 	if depth != "" {
@@ -64,139 +56,121 @@ func buildLoopbackReq(bearer, host, depth, ancestors string) *http.Request {
 	if ancestors != "" {
 		r.Header.Set(cache.ResolveAncestorsHeader, ancestors)
 	}
-	ctx := xcontext.BuildContext(r.Context(),
-		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "some-user"}),
-	)
-	if bearer != "" {
-		ctx = xcontext.BuildContext(ctx, xcontext.WithAccessToken(bearer))
+	ctx := r.Context()
+	if username != "" {
+		// The auth middleware sets UserInfo (and AccessToken) ONLY after a
+		// successful jwtutil.Validate — model that with a present UserInfo.
+		ctx = xcontext.BuildContext(ctx,
+			xcontext.WithUserInfo(jwtutil.UserInfo{Username: username}),
+			xcontext.WithAccessToken("VALID-JWT-for-"+username),
+		)
 	}
 	return r.WithContext(ctx)
 }
 
-// TestR_C2_ForgeGuard_NonSeedHeadersIgnored is the HARD forge-guard RED arm. A
-// non-seed/external caller presents a spoofed depth:8 + a spoofed ancestor set
-// that INCLUDES this request's own node (the worst case — it would force a
-// premature raw-CR stop if trusted). It must NOT be trusted, the reseed must be a
-// no-op, and therefore the HTTP-edge stop must NOT fire (a normal full resolve).
-func TestR_C2_ForgeGuard_NonSeedHeadersIgnored(t *testing.T) {
-	setSeedProvider(t, testSeedTok)
+// TestR_C2_ForgeGuard_NonSeedUserFires — 1.5.26 C2 (the arm that would have
+// caught 1.5.25): a self-loopback under a VALID NON-SEED user identity + an
+// ancestor header containing this request's own node → isTrustedSelfLoopback
+// TRUE, reseed installs the ancestors, and the HTTP-edge cycle-stop FIRES. The
+// user-path storm is closed. RED arm (documented): reverting the predicate to the
+// seed-token compare makes a non-seed identity NOT trusted → guard does NOT fire
+// → the exact 1.5.25 bug (the storm) returns. This is the discriminating arm the
+// 1.5.25 seed-only test lacked.
+func TestR_C2_ForgeGuard_NonSeedUserFires(t *testing.T) {
 	SetSelfLoopbackHost("http://" + testSelfHost)
 	t.Cleanup(func() { SetSelfLoopbackHost("") })
 
 	const resource, ns, name = "restactions", "demo-system", "fsa-y7-composition-resources"
 	selfNode := nestedResolveNodeKey(resource, ns, name)
 
-	// External caller: a DIFFERENT bearer (not the seed token) + spoofed headers.
-	req := buildLoopbackReq("ATTACKER-JWT-not-the-seed-token", testSelfHost,
-		"8", selfNode+",restactions/other/decoy")
+	// A NON-seed authenticated user (e.g. admin) — NOT the seed token.
+	req := buildLoopbackReq("admin", testSelfHost, "1", selfNode)
+
+	if !isTrustedSelfLoopback(req) {
+		t.Fatal("C2: a VALID non-seed user self-loopback MUST be trusted (the 1.5.25 user-path gap) — " +
+			"broadened predicate must fire for any snowplow-validated JWT holder")
+	}
+	guardCtx := reseedNestedGuardsFromHeaders(req.Context(), req)
+	if !cache.NestedResolveAncestorPresent(guardCtx, selfNode) {
+		t.Fatal("C2: reseed must install the ancestor header for a trusted user request")
+	}
+	before := cache.HTTPEdgeCycleStop()
+	stop, raw := httpEdgeGuardStop(guardCtx, testLogger(), resource, ns, name)
+	if !stop || !raw {
+		t.Fatalf("C2: a trusted non-seed self-reentry must cycle-STOP with raw CR; got stop=%v raw=%v", stop, raw)
+	}
+	if cache.HTTPEdgeCycleStop() != before+1 {
+		t.Fatalf("C2: cycle-stop counter must increment (guard fired for the USER path); before=%d after=%d",
+			before, cache.HTTPEdgeCycleStop())
+	}
+}
+
+// TestR_C4_ForgeGuard_NoUserInfoIgnored — 1.5.26 C4 (forge arm preserved): an
+// UNAUTHENTICATED caller (NO UserInfo — an invalid/missing JWT would be 401'd
+// upstream, never reaching the handler with UserInfo set) presents a forged
+// depth:8 + a spoofed ancestor set INCLUDING this request's own node (the worst
+// case). It must NOT be trusted → reseed a no-op → the HTTP-edge stop does NOT
+// fire (normal full resolve). Asserts the DOWNSTREAM no-op, not just the boolean.
+func TestR_C4_ForgeGuard_NoUserInfoIgnored(t *testing.T) {
+	SetSelfLoopbackHost("http://" + testSelfHost)
+	t.Cleanup(func() { SetSelfLoopbackHost("") })
+
+	const resource, ns, name = "restactions", "demo-system", "fsa-y7-composition-resources"
+	selfNode := nestedResolveNodeKey(resource, ns, name)
+
+	// username=="" ⇒ NO UserInfo on ctx (unauthenticated). Forged headers.
+	req := buildLoopbackReq("", testSelfHost, "8", selfNode+",restactions/other/decoy")
 
 	if isTrustedSelfLoopback(req) {
-		t.Fatal("C2: a non-seed bearer must NOT be trusted (headers forgeable) — forge-guard breached")
+		t.Fatal("C4: a request with NO valid UserInfo (unauthenticated) must NOT be trusted — forge hole")
 	}
-	// The reseed must be a no-op: guardCtx carries NO depth, NO ancestors (both
-	// forged header types dropped because the caller is untrusted).
+	// Reseed must be a no-op: guardCtx carries NO depth, NO ancestors.
 	guardCtx := reseedNestedGuardsFromHeaders(req.Context(), req)
 	if cache.NestedCallDepthFromContext(guardCtx) != 0 {
-		t.Fatalf("C2: forged depth header was read into ctx (got depth %d) — headers not ignored",
+		t.Fatalf("C4: forged depth header was read into ctx (got %d) — headers not ignored",
 			cache.NestedCallDepthFromContext(guardCtx))
 	}
 	if cache.NestedResolveAncestorPresent(guardCtx, selfNode) {
-		t.Fatal("C2: forged ancestor header was read into ctx — headers not ignored")
+		t.Fatal("C4: forged ancestor header was read into ctx — headers not ignored")
 	}
-	// The handler wiring: NO local node add. With both forged headers dropped,
-	// the HTTP-edge stop must NOT fire → a normal full resolve. Neither counter
-	// moves.
 	beforeCycle := cache.HTTPEdgeCycleStop()
 	beforeDepth := cache.HTTPEdgeDepthStop()
 	stop, _ := httpEdgeGuardStop(guardCtx, testLogger(), resource, ns, name)
 	if stop {
-		t.Fatal("C2: a forged depth:8 + spoofed ancestors from a non-seed caller must NOT stop the resolve")
+		t.Fatal("C4: an unauthenticated caller's forged headers must NOT stop the resolve")
 	}
 	if cache.HTTPEdgeCycleStop() != beforeCycle || cache.HTTPEdgeDepthStop() != beforeDepth {
-		t.Fatal("C2: forged headers bumped a guard counter — headers were trusted")
+		t.Fatal("C4: forged headers bumped a guard counter — headers were trusted")
 	}
 }
 
-// TestR_C2_ForgeGuard_NoSeedProviderWired — with no seed provider (authn not
-// configured), NOTHING is trusted, even the real path. Fail-closed.
-func TestR_C2_ForgeGuard_NoSeedProviderWired(t *testing.T) {
-	SetSeedLoopbackTokenProvider(nil)
-	SetSelfLoopbackHost("http://" + testSelfHost)
-	t.Cleanup(func() { SetSelfLoopbackHost("") })
-	req := buildLoopbackReq(testSeedTok, testSelfHost, "3", "restactions/ns/x")
-	if isTrustedSelfLoopback(req) {
-		t.Fatal("C2: with no seed provider wired, no request may be trusted (fail-closed)")
-	}
-}
-
-// TestR_C2_EmptyInbound_NotTrusted is the TL-refinement-3 RED arm (THE
-// fail-closed correctness line). An UNAUTHENTICATED caller (no Authorization
-// header → empty inbound bearer) MUST NOT be trusted, even with a seed provider
-// wired and the request on the self-host — because subtle.ConstantTimeCompare(
-// "","")==1 would otherwise TRUST it if the empty-guard were missing. This arm
-// RED-proves the len>0 gate precedes the compare.
-func TestR_C2_EmptyInbound_NotTrusted(t *testing.T) {
-	setSeedProvider(t, testSeedTok) // provider wired
-	SetSelfLoopbackHost("http://" + testSelfHost)
-	t.Cleanup(func() { SetSelfLoopbackHost("") })
-
-	// No bearer at all (buildLoopbackReq with bearer=="" installs no AccessToken).
-	req := buildLoopbackReq("", testSelfHost, "8", "restactions/ns/x")
-	if isTrustedSelfLoopback(req) {
-		t.Fatal("C2/refinement-3: an unauthenticated (no-bearer) caller MUST NOT be trusted — " +
-			"the empty-token guard must precede the constant-time compare")
-	}
-}
-
-// TestR_C2_EmptySeedToken_NotTrusted — refinement 3 + 4 conjugate: even a caller
-// sending an EMPTY bearer must not be trusted when the provider ALSO returns empty
-// (the ConstantTimeCompare("","")==1 hole). The empty-seed guard catches it.
-func TestR_C2_EmptySeedToken_NotTrusted(t *testing.T) {
-	SetSeedLoopbackTokenProvider(func(context.Context) (string, error) { return "", nil }) // provider returns empty
-	SetSelfLoopbackHost("http://" + testSelfHost)
-	t.Cleanup(func() {
-		SetSeedLoopbackTokenProvider(nil)
-		SetSelfLoopbackHost("")
-	})
-	// A caller echoing an empty bearer — the classic ConstantTimeCompare("","") trap.
-	req := buildLoopbackReq("", testSelfHost, "8", "restactions/ns/x")
-	if isTrustedSelfLoopback(req) {
-		t.Fatal("C2/refinement-3+4: empty inbound + empty seed must NOT be trusted " +
-			"(subtle.ConstantTimeCompare(\"\",\"\")==1 trap — both empty-guards must fire)")
-	}
-}
-
-// TestR_GREEN_TrustedSelfLoopback_CycleStop is the guard-fires GREEN arm. The
-// TRUSTED seed self-loopback carries an ancestor header that already contains
-// THIS request's own node (the self-reentry). The stop must return raw=true (raw
-// CR) and bump the cycle-stop counter.
-func TestR_GREEN_TrustedSelfLoopback_CycleStop(t *testing.T) {
-	setSeedProvider(t, testSeedTok)
+// TestR_C3_SeedStillTrusted — 1.5.26 C3: the seed's own loopback (a valid
+// authn-issued identity, DISTINCT from C2's admin) is STILL trusted under the
+// broadened predicate → the guard fires. Proves no seed-path regression from the
+// broadening. The seed is modeled as a valid UserInfo holder (its authn JWT is
+// validated by the same middleware).
+func TestR_C3_SeedStillTrusted(t *testing.T) {
 	SetSelfLoopbackHost("http://" + testSelfHost)
 	t.Cleanup(func() { SetSelfLoopbackHost("") })
 
 	const resource, ns, name = "restactions", "demo-system", "fsa-y7-composition-resources"
 	selfNode := nestedResolveNodeKey(resource, ns, name)
 
-	// The seed loopback: the SEED token + an ancestor header that already has
-	// this node (a prior hop resolved it → it's on the descent path).
-	req := buildLoopbackReq(testSeedTok, testSelfHost, "1", selfNode)
+	// The seed identity (distinct from C2's "admin") — a valid snowplow-issued JWT
+	// holder. Same trust path as any authenticated user.
+	req := buildLoopbackReq("system:serviceaccount:krateo-system:snowplow", testSelfHost, "1", selfNode)
 
 	if !isTrustedSelfLoopback(req) {
-		t.Fatal("GREEN: the seed's own bearer on the self-host MUST be trusted")
+		t.Fatal("C3: the seed's own loopback (valid UserInfo) MUST stay trusted — no seed-path regression")
 	}
-	// EXACTLY the handler wiring: seed ONLY the inbound header ancestors (the
-	// self-reentry is detected because selfNode is ALREADY in the header set from
-	// a prior hop), then check WITHOUT adding selfNode locally.
 	guardCtx := reseedNestedGuardsFromHeaders(req.Context(), req)
-
 	before := cache.HTTPEdgeCycleStop()
 	stop, raw := httpEdgeGuardStop(guardCtx, testLogger(), resource, ns, name)
 	if !stop || !raw {
-		t.Fatalf("GREEN: a trusted self-reentry must cycle-STOP with raw CR; got stop=%v raw=%v", stop, raw)
+		t.Fatalf("C3: seed self-reentry must cycle-STOP with raw CR; got stop=%v raw=%v", stop, raw)
 	}
 	if cache.HTTPEdgeCycleStop() != before+1 {
-		t.Fatalf("GREEN: cycle-stop counter must increment (proof the guard fired); before=%d after=%d",
+		t.Fatalf("C3: cycle-stop counter must increment for the seed path; before=%d after=%d",
 			before, cache.HTTPEdgeCycleStop())
 	}
 }
@@ -205,14 +179,13 @@ func TestR_GREEN_TrustedSelfLoopback_CycleStop(t *testing.T) {
 // its own node but has reached depth==NestedCallMaxDepth trips the depth-8
 // backstop (raw=false → bounded error), bumping the depth counter.
 func TestR_DEPTH_Backstop_TrustedDepth8(t *testing.T) {
-	setSeedProvider(t, testSeedTok)
 	SetSelfLoopbackHost("http://" + testSelfHost)
 	t.Cleanup(func() { SetSelfLoopbackHost("") })
 
 	const resource, ns, name = "restactions", "demo-system", "fsa-deep-chain"
-	// depth == max, and an ancestor set that does NOT contain THIS node (so the
-	// cycle-stop does not fire first — the depth backstop is what trips).
-	req := buildLoopbackReq(testSeedTok, testSelfHost,
+	// A valid authenticated user; depth == max, and an ancestor set that does NOT
+	// contain THIS node (so the cycle-stop does not fire first — depth backstop).
+	req := buildLoopbackReq("admin", testSelfHost,
 		strconv.Itoa(cache.NestedCallMaxDepth()), "restactions/other/ancestor-a")
 
 	// Handler wiring: header ancestors only. THIS node is NOT in the header set
@@ -230,42 +203,14 @@ func TestR_DEPTH_Backstop_TrustedDepth8(t *testing.T) {
 	}
 }
 
-// TestR_TokenRotation_LiveProviderValue is the TL-refinement-1 arm: the guard
-// reads the LIVE provider value, so after the seed token ROTATES, a loopback
-// carrying the NEW token is trusted and one carrying the OLD token is not. A
-// startup-snapshot implementation would trust the stale token and reject the new
-// one — this arm RED-proves the live read.
-func TestR_TokenRotation_LiveProviderValue(t *testing.T) {
-	SetSelfLoopbackHost("http://" + testSelfHost)
-	t.Cleanup(func() { SetSelfLoopbackHost("") })
-
-	live := "OLD-seed-jwt" // the "current" seed token the provider returns
-	SetSeedLoopbackTokenProvider(func(context.Context) (string, error) { return live, nil })
-	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
-
-	// Before rotation: OLD (=current) token is trusted.
-	if !isTrustedSelfLoopback(buildLoopbackReq("OLD-seed-jwt", testSelfHost, "1", "restactions/ns/x")) {
-		t.Fatal("rotation: pre-rotation the OLD (=current) token must be trusted")
-	}
-	live = "NEW-seed-jwt" // rotate
-	// After rotation: NEW token trusted, OLD token rejected (LIVE read, not snapshot).
-	if !isTrustedSelfLoopback(buildLoopbackReq("NEW-seed-jwt", testSelfHost, "1", "restactions/ns/x")) {
-		t.Fatal("rotation: post-rotation the NEW (=current) token must be trusted — provider read must be LIVE")
-	}
-	if isTrustedSelfLoopback(buildLoopbackReq("OLD-seed-jwt", testSelfHost, "1", "restactions/ns/x")) {
-		t.Fatal("rotation: post-rotation the OLD token must be REJECTED (a snapshot impl would wrongly trust it)")
-	}
-}
-
-// TestR_HostMismatch_NotTrusted — even the seed token is not trusted if the
-// request did not arrive on the self-host (belt-and-suspenders, C1).
+// TestR_HostMismatch_NotTrusted — even a valid authenticated user is not trusted
+// if the request did not arrive on the self-host (belt-and-suspenders secondary).
 func TestR_HostMismatch_NotTrusted(t *testing.T) {
-	setSeedProvider(t, testSeedTok)
 	SetSelfLoopbackHost("http://" + testSelfHost)
 	t.Cleanup(func() { SetSelfLoopbackHost("") })
-	req := buildLoopbackReq(testSeedTok, "evil.example.com:8081", "1", "restactions/ns/x")
+	req := buildLoopbackReq("admin", "evil.example.com:8081", "1", "restactions/ns/x")
 	if isTrustedSelfLoopback(req) {
-		t.Fatal("host-mismatch: seed token on a NON-self host must not be trusted (belt-and-suspenders)")
+		t.Fatal("host-mismatch: a valid user on a NON-self host must not be trusted (belt-and-suspenders)")
 	}
 }
 
