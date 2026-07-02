@@ -357,6 +357,15 @@ func isIdentityFreeClass(class string) bool {
 func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byte, error) {
 	authnNS := env.String("AUTHN_NAMESPACE", "")
 
+	// C5 (aggregate OOM bound): the refresher is BACKGROUND — its nested-resolve
+	// trees must YIELD the aggregate admission gate to a customer /call (which
+	// has a browser deadline; the refresher does not). Mark the ctx so
+	// enterNestedResolveUnit de-prioritises this tree behind waiting customers
+	// (it still COUNTS toward the aggregate once admitted — the OOM floor is
+	// preserved). Covers BOTH the content-refresh and RA/widget-refresh branches
+	// below (this is the single refresher resolve entry).
+	ctx = cache.WithBackgroundResolve(ctx)
+
 	// Ship F1 (0.30.119): an api-stage entry is a CONTENT-keyed K8s call
 	// (gvr, namespace, name-or-empty) — NOT a RESTAction. Its refresh is
 	// a single un-gated K8s re-dispatch + re-Put under the same content

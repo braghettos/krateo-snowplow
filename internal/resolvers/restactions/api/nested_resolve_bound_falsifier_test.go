@@ -1,15 +1,25 @@
-// nested_resolve_bound_falsifier_test.go — (c) cold-fan-out bound falsifiers
-// (CN-1..6). The real heap-climb is not hermetically assertable, so the
-// discriminating proof is on the SEMAPHORE ADMISSION behaviour: the bound caps
-// the number of concurrently-in-flight nested subtrees to floor(budget/weight),
-// the excess BLOCKS (completes, never drops), and budget=0 is transparent
-// (unbounded). Concurrency is driven > cap (CN-1 non-degenerate: M>1 AND
-// concurrency>cap). Hermetic / in-process ONLY — no kind, no remote, no
-// apiserver.
+// nested_resolve_bound_falsifier_test.go — AGGREGATE OOM bound falsifiers
+// (C1-C4, docs/oom-aggregate-adaptive-bound-2026-07-02.md). Successor to the
+// #78 count-cap falsifiers (peak <= floor(budget/weight)), which are FORBIDDEN
+// here: a count-cap does NOT prove the BYTE bound (the 1.5.1 180× lesson, and
+// the #78 single-tree probe that passed while the N-tree page OOMed). These
+// arms drive the gate through the runtime-headroom TEST SEAM (injected
+// GOMEMLIMIT + a live-heap sampler that TRACKS admitted weight), NOT a
+// resurrected env (C4), and assert on BYTES: peak modeled live heap stays under
+// GOMEMLIMIT − reserve AND all N trees complete content-correct.
+//
+// The model: each admitted tree "allocates" estUnit of live heap for the
+// duration it holds its admission; the injected liveHeapFn returns a base plus
+// the sum of currently-admitted footprints. This is the faithful hermetic proxy
+// for the real decode-into-map concurrent-tree footprint the gate must bound —
+// the gate samples THIS live heap at each admission, so if it admits too many
+// concurrently the modeled peak breaches the ceiling exactly as the real pod
+// OOMed. Hermetic / in-process ONLY — no kind, no remote, no apiserver.
 package api
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,14 +28,71 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 )
 
-// runConcurrentNestedUnits drives n goroutines each through one
-// enterNestedResolveUnit bracket, holding the permit for `hold` while it counts
-// the peak number concurrently in-flight. Returns the observed peak. Every unit
-// must complete (CN-4 completes-not-drops). ctx depth is 0 (outermost) for all.
-func runConcurrentNestedUnits(t *testing.T, n int, hold time.Duration) (peak int32, completed int32) {
+// headroomModel is the shared test seam state: a fixed GOMEMLIMIT + a live-heap
+// counter that tracks the aggregate footprint of currently-admitted trees. Each
+// admitted tree adds perTreeFootprint on entry (via the harness, mirroring the
+// gate's own inFlight accounting) and subtracts on release; liveHeap() returns
+// base + admittedFootprint, and peak records the high-water mark. The gate's
+// admissionCeiling() samples liveHeap() → if it over-admits, peak breaches
+// limit − reserve.
+type headroomModel struct {
+	limit           int64
+	base            int64
+	perTreeFootprint int64
+	mu              sync.Mutex
+	admittedFootprint int64
+	peakLiveHeap    int64
+}
+
+func (h *headroomModel) limitFn() int64 { return h.limit }
+
+func (h *headroomModel) liveFn() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	v := h.base + h.admittedFootprint
+	if v > h.peakLiveHeap {
+		h.peakLiveHeap = v
+	}
+	return v
+}
+
+// occupy/vacate model a tree's real footprint arriving AFTER admission and
+// leaving on release — so the live-heap the NEXT admission samples reflects the
+// trees already running. Called by the harness around the held region.
+func (h *headroomModel) occupy() {
+	h.mu.Lock()
+	h.admittedFootprint += h.perTreeFootprint
+	if h.base+h.admittedFootprint > h.peakLiveHeap {
+		h.peakLiveHeap = h.base + h.admittedFootprint
+	}
+	h.mu.Unlock()
+}
+
+func (h *headroomModel) vacate() {
+	h.mu.Lock()
+	h.admittedFootprint -= h.perTreeFootprint
+	if h.admittedFootprint < 0 {
+		h.admittedFootprint = 0
+	}
+	h.mu.Unlock()
+}
+
+func (h *headroomModel) peak() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.peakLiveHeap
+}
+
+const mib = int64(1024 * 1024)
+
+// runAggregateTrees launches n goroutines, each: enter the gate (depth-0),
+// occupy() its footprint, hold, vacate(), release. Returns completed count and
+// the count of ctx/admission errors. estUnit is pinned via calibration seed so
+// the gate's weight == the model's perTreeFootprint (deterministic).
+func runAggregateTrees(t *testing.T, h *headroomModel, n int, hold time.Duration) (completed, errored int32) {
 	t.Helper()
 	ctx := cache.WithNestedCallDepth(context.Background(), 0)
-	var inFlight, peakInFlight, done int32
+	var done, errs int32
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -33,197 +100,114 @@ func runConcurrentNestedUnits(t *testing.T, n int, hold time.Duration) (peak int
 			defer wg.Done()
 			release, err := enterNestedResolveUnit(ctx)
 			if err != nil {
-				t.Errorf("enterNestedResolveUnit unexpected err: %v", err)
+				atomic.AddInt32(&errs, 1)
 				return
 			}
-			cur := atomic.AddInt32(&inFlight, 1)
-			for {
-				p := atomic.LoadInt32(&peakInFlight)
-				if cur <= p || atomic.CompareAndSwapInt32(&peakInFlight, p, cur) {
-					break
-				}
-			}
+			h.occupy()
 			time.Sleep(hold)
-			atomic.AddInt32(&inFlight, -1)
-			atomic.AddInt32(&done, 1)
+			h.vacate()
 			release()
+			atomic.AddInt32(&done, 1)
 		}()
 	}
 	wg.Wait()
-	return atomic.LoadInt32(&peakInFlight), atomic.LoadInt32(&done)
+	return atomic.LoadInt32(&done), atomic.LoadInt32(&errs)
 }
 
-// TestCN1_BoundCapsConcurrentSubtrees_RED is the CN-1 RED discriminating arm.
-// M=8 concurrent nested subtrees, each weight=budget/2 (so M×weight ≫ budget,
-// concurrency ≫ cap=2). The bound must cap the peak in-flight at
-// floor(budget/weight)==2. RED arm: budget=0 (gate removed) → all 8 run
-// concurrently (unbounded — the OOM climb). NON-DEGENERATE: M=8>1 AND
-// concurrency(8) > cap(2).
-func TestCN1_BoundCapsConcurrentSubtrees_RED(t *testing.T) {
-	const M = 8
-	const weight = 100
-	const budget = 200 // cap = floor(200/100) = 2
+// pinEstUnit seeds the calibration so currentNestedEstUnit()==w deterministically
+// (the gate weighs each admission by w). Uses the one-shot calibrate path.
+func pinEstUnit(w int64) {
+	calibrateNestedEstUnit(w)
+}
 
-	// Pin the per-subtree weight (skip the empirical calibration so the test is
-	// deterministic) via the fallback env = weight, budget via its env.
-	t.Setenv(envNestedResolveEstUnitBytesFallback, "100")
-	t.Setenv(envNestedResolveFootprintBudgetBytes, "200")
+// TestAggC1_ByteCeilingHeld_GREEN is the LOAD-BEARING C1 arm. N=20 concurrent
+// outermost trees, each footprint 256 MiB, GOMEMLIMIT 8 GiB, reserve = 1/8 =
+// 1 GiB → ceiling ≈ 7 GiB. N×footprint = 5 GiB (fits the raw limit) but the gate
+// must keep the SAMPLED peak live heap under limit − reserve = 7 GiB throughout.
+// Assert: (1) peak modeled live heap < limit − reserve (BYTE bound, not a count
+// cap); (2) all N trees complete (bounded event still happens — no dropped tree).
+func TestAggC1_ByteCeilingHeld_GREEN(t *testing.T) {
 	resetNestedResolveBoundForTest()
 	t.Cleanup(resetNestedResolveBoundForTest)
 
-	if _, b := nestedResolveBound(); b != budget {
-		t.Fatalf("setup: budget=%d want %d", b, budget)
+	h := &headroomModel{
+		limit:            8 * 1024 * mib, // 8 GiB
+		base:             512 * mib,      // non-resolve baseline
+		perTreeFootprint: 512 * mib,      // N×fp = 10 GiB ≫ ceiling 7 GiB (the page shape that OOMed)
 	}
-	if w := currentNestedEstUnit(budget); w != weight {
-		t.Fatalf("setup: weight=%d want %d", w, weight)
-	}
+	setRuntimeSeamsForTest(h.limitFn, h.liveFn)
+	pinEstUnit(h.perTreeFootprint)
 
-	peak, completed := runConcurrentNestedUnits(t, M, 40*time.Millisecond)
-	if completed != M {
-		t.Fatalf("CN-4 completes-not-drops: completed=%d want %d", completed, M)
-	}
-	if peak > 2 {
-		t.Fatalf("CN-1: peak concurrent subtrees=%d, want <=2 (budget %d / weight %d) — "+
-			"the bound did not cap the cold fan-out", peak, budget, weight)
-	}
+	const N = 20
+	completed, errored := runAggregateTrees(t, h, N, 25*time.Millisecond)
 
-	// RED CONTROL: budget=0 (gate removed) → unbounded, peak should reach M.
-	t.Setenv(envNestedResolveFootprintBudgetBytes, "0")
-	resetNestedResolveBoundForTest()
-	peakOff, completedOff := runConcurrentNestedUnits(t, M, 40*time.Millisecond)
-	if completedOff != M {
-		t.Fatalf("RED control: completed=%d want %d", completedOff, M)
+	if completed != N {
+		t.Fatalf("C1/C2 bounded-event: completed=%d errored=%d, want all %d trees to complete "+
+			"(the bound SERIALIZES, never drops)", completed, errored, N)
 	}
-	if peakOff <= 2 {
-		t.Fatalf("CN-1 RED control INVALID: with budget=0 the peak should be unbounded (≈%d), "+
-			"got %d — the harness is not actually discriminating", M, peakOff)
+	reserve := h.limit / reserveFractionDen * reserveFractionNum
+	ceiling := h.limit - reserve
+	if h.peak() >= ceiling {
+		t.Fatalf("C1 BYTE-CEILING BREACHED: peak sampled live heap = %d MiB >= ceiling %d MiB "+
+			"(limit %d MiB − reserve %d MiB) — the aggregate gate admitted too many concurrent "+
+			"trees; the pod would OOM", h.peak()/mib, ceiling/mib, h.limit/mib, reserve/mib)
+	}
+	// Sanity: the workload MUST be capable of breaching (else the arm is
+	// degenerate) — N × footprint + base must exceed the ceiling if unbounded.
+	if h.base+int64(N)*h.perTreeFootprint <= ceiling {
+		t.Fatalf("C1 DEGENERATE: N×footprint+base (%d MiB) <= ceiling (%d MiB) — the workload "+
+			"cannot breach even unbounded; increase N/footprint", (h.base+int64(N)*h.perTreeFootprint)/mib, ceiling/mib)
 	}
 }
 
-// TestCN2_CostProportional_NoSerializationUnderCap is the CN-2 GREEN arm (the
-// 1.5.1 lesson). When M < cap, NO unit serializes — a light/warm subtree is not
-// starved by the bound. M=2, cap=4 (budget=4×weight) → peak should reach all M
-// (no blocking).
-func TestCN2_CostProportional_NoSerializationUnderCap(t *testing.T) {
-	const M = 2
-	t.Setenv(envNestedResolveEstUnitBytesFallback, "100")
-	t.Setenv(envNestedResolveFootprintBudgetBytes, "400") // cap = 4 > M
+// TestAggC1_ByteCeilingBreached_RED proves the gate is LOAD-BEARING: force
+// admit-unconditionally (simulate the removed gate) and the SAME N-tree workload
+// drives peak live heap PAST the ceiling. This is the K>1 concurrency
+// discriminator the #78 single-tree probe lacked.
+func TestAggC1_ByteCeilingBreached_RED(t *testing.T) {
 	resetNestedResolveBoundForTest()
 	t.Cleanup(resetNestedResolveBoundForTest)
 
-	peak, completed := runConcurrentNestedUnits(t, M, 30*time.Millisecond)
-	if completed != M {
-		t.Fatalf("CN-2: completed=%d want %d", completed, M)
+	h := &headroomModel{
+		limit:            8 * 1024 * mib,
+		base:             512 * mib,
+		perTreeFootprint: 512 * mib, // N×fp = 10 GiB ≫ ceiling 7 GiB (same shape as GREEN)
 	}
-	if peak != M {
-		t.Fatalf("CN-2 cost-proportional: M=%d < cap=4 must pay ZERO serialization "+
-			"(peak should reach %d), got peak=%d — the bound is over-serializing", M, M, peak)
+	// RED: GOMEMLIMIT "unlimited" makes the gate transparent (admit all) — the
+	// exact behaviour of NO aggregate bound. The workload then over-admits.
+	unlimited := func() int64 { return 1<<63 - 1 } // math.MaxInt64 → transparent
+	setRuntimeSeamsForTest(unlimited, h.liveFn)
+	pinEstUnit(h.perTreeFootprint)
+
+	const N = 20
+	completed, _ := runAggregateTrees(t, h, N, 25*time.Millisecond)
+	if completed != N {
+		t.Fatalf("RED control: completed=%d want %d (workload must still run)", completed, N)
+	}
+	// With the gate transparent, all N occupy concurrently → peak ≈ base + N×fp.
+	realLimit := int64(8) * 1024 * mib
+	ceiling := realLimit - realLimit/reserveFractionDen*reserveFractionNum
+	if h.peak() < ceiling {
+		t.Fatalf("C1 RED INVALID: unbounded peak %d MiB did NOT breach ceiling %d MiB — the "+
+			"harness is not discriminating (N/footprint too small)", h.peak()/mib, ceiling/mib)
 	}
 }
 
-// TestCN3_Depth0OnlyNoSelfDeadlock verifies the depth-0 gate + that a deep
-// recursive subtree does NOT self-deadlock. isOutermostNestedResolve is true at
-// depth 0, false at depth>0; and acquiring at depth 0 while the SAME budget
-// would not admit a second permit must not block the (non-acquiring) inner
-// resolves.
-func TestCN3_Depth0OnlyNoSelfDeadlock(t *testing.T) {
-	t.Setenv(envNestedResolveEstUnitBytesFallback, "100")
-	t.Setenv(envNestedResolveFootprintBudgetBytes, "100") // cap = 1 (one permit total)
+// TestAggC1_ProgressWhenTight admits UNCONDITIONALLY when inFlight==0 even if a
+// single tree "won't fit" (headroom < estUnit) — the anti-deadlock invariant.
+// Live heap pinned already above the limit; a lone tree must STILL be admitted.
+func TestAggC1_ProgressWhenTight(t *testing.T) {
 	resetNestedResolveBoundForTest()
 	t.Cleanup(resetNestedResolveBoundForTest)
 
-	// Depth gate.
-	if !isOutermostNestedResolve(cache.WithNestedCallDepth(context.Background(), 0)) {
-		t.Fatal("CN-3: depth 0 must be the outermost (acquire) point")
+	h := &headroomModel{
+		limit:            2 * 1024 * mib, // 2 GiB
+		base:             3 * 1024 * mib, // ALREADY over the limit — negative headroom
+		perTreeFootprint: 256 * mib,
 	}
-	for _, d := range []int{1, 2, 8} {
-		if isOutermostNestedResolve(cache.WithNestedCallDepth(context.Background(), d)) {
-			t.Fatalf("CN-3: depth %d must NOT acquire (inner resolves inherit the permit)", d)
-		}
-	}
+	setRuntimeSeamsForTest(h.limitFn, h.liveFn)
+	pinEstUnit(h.perTreeFootprint)
 
-	// Self-deadlock: outermost acquires the only permit; an inner resolve
-	// (depth>0) must NOT try to acquire (so it cannot block on the held permit).
-	// Simulate: hold the depth-0 permit, then run a depth-2 "inner" through the
-	// SAME guarded entry — it must skip Acquire and return immediately.
-	outerCtx := cache.WithNestedCallDepth(context.Background(), 0)
-	release, err := enterNestedResolveUnit(outerCtx)
-	if err != nil {
-		t.Fatalf("CN-3: outermost acquire failed: %v", err)
-	}
-	defer release()
-
-	done := make(chan struct{})
-	go func() {
-		innerCtx := cache.WithNestedCallDepth(context.Background(), 2)
-		// The production guard: inner (depth>0) skips enterNestedResolveUnit
-		// entirely. Assert the gate says "do not acquire" so the inner path
-		// never touches the (exhausted) semaphore.
-		if isOutermostNestedResolve(innerCtx) {
-			t.Errorf("CN-3: inner depth-2 wrongly classified as outermost → would self-deadlock")
-		}
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("CN-3: inner resolve blocked → self-deadlock (the cap=1 permit is held by the outermost)")
-	}
-}
-
-// TestCN4_ExcessBlocksThenCompletes proves excess does not DROP: with cap=1 and
-// M=4, all 4 must complete (serialized), none abandoned.
-func TestCN4_ExcessBlocksThenCompletes(t *testing.T) {
-	const M = 4
-	t.Setenv(envNestedResolveEstUnitBytesFallback, "100")
-	t.Setenv(envNestedResolveFootprintBudgetBytes, "100") // cap = 1
-	resetNestedResolveBoundForTest()
-	t.Cleanup(resetNestedResolveBoundForTest)
-
-	peak, completed := runConcurrentNestedUnits(t, M, 15*time.Millisecond)
-	if completed != M {
-		t.Fatalf("CN-4: completed=%d want %d (excess must BLOCK then complete, never drop)", completed, M)
-	}
-	if peak > 1 {
-		t.Fatalf("CN-4: cap=1 but peak=%d — bound not enforced", peak)
-	}
-}
-
-// TestCN_TransparentWhenDisabled — budget=0 is byte-identical pass-through:
-// Acquire skipped, release a no-op, no calibration. (The default posture.)
-func TestCN_TransparentWhenDisabled(t *testing.T) {
-	t.Setenv(envNestedResolveFootprintBudgetBytes, "0")
-	resetNestedResolveBoundForTest()
-	t.Cleanup(resetNestedResolveBoundForTest)
-
-	sem, budget := nestedResolveBound()
-	if sem != nil || budget != 0 {
-		t.Fatalf("disabled: sem=%v budget=%d want nil/0", sem, budget)
-	}
-	release, err := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
-	if err != nil {
-		t.Fatalf("disabled: unexpected err %v", err)
-	}
-	release() // must be a safe no-op
-	if _, calibrated := calibratedNestedEstUnitForTest(); calibrated {
-		t.Fatal("disabled: must NOT calibrate (no Acquire path ran)")
-	}
-}
-
-// TestCN_AcquireWeightClampedToBudget — a single subtree larger than the whole
-// budget runs ALONE (weight clamped to budget) rather than blocking forever
-// (guaranteed-progress).
-func TestCN_AcquireWeightClampedToBudget(t *testing.T) {
-	t.Setenv(envNestedResolveEstUnitBytesFallback, "1000") // > budget
-	t.Setenv(envNestedResolveFootprintBudgetBytes, "200")
-	resetNestedResolveBoundForTest()
-	t.Cleanup(resetNestedResolveBoundForTest)
-
-	if w := currentNestedEstUnit(200); w != 200 {
-		t.Fatalf("clamp: weight=%d want 200 (clamped to budget)", w)
-	}
-	// A single unit must still complete (not block forever on an unsatisfiable
-	// Acquire).
 	done := make(chan struct{})
 	go func() {
 		release, err := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
@@ -235,6 +219,325 @@ func TestCN_AcquireWeightClampedToBudget(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("clamp: an oversized single subtree blocked forever — guaranteed-progress violated")
+		t.Fatal("progress invariant VIOLATED: a lone tree blocked forever under negative headroom " +
+			"(inFlight==0 must admit unconditionally)")
+	}
+}
+
+// TestAggC3_FallThroughHonest503 is the C3 fall-through arm: headroom pinned low
+// + one tree ALREADY in flight (so inFlight>0, the unconditional-admit escape
+// does not apply) + the second tree's ctx deadline expires while blocked → it
+// returns the ctx error (honest 503-class terminal), NOT empty/raw content, NOT
+// a dropped resolve. The caller (resolve_inprocess.go) propagates this err so
+// the outer /call surfaces a 503.
+func TestAggC3_FallThroughHonest503(t *testing.T) {
+	resetNestedResolveBoundForTest()
+	t.Cleanup(resetNestedResolveBoundForTest)
+
+	h := &headroomModel{
+		limit:            1024 * mib, // 1 GiB
+		base:             0,
+		perTreeFootprint: 900 * mib, // one tree ~fills headroom; a second cannot fit
+	}
+	setRuntimeSeamsForTest(h.limitFn, h.liveFn)
+	pinEstUnit(h.perTreeFootprint)
+
+	// Tree 1: admit and HOLD (occupies 900 MiB → ceiling = 1024 − 128 = 896 MiB,
+	// so a second 900 MiB tree cannot fit while tree 1 is in flight).
+	rel1, err1 := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+	if err1 != nil {
+		t.Fatalf("C3 setup: tree 1 admission failed: %v", err1)
+	}
+	h.occupy()
+	defer func() { h.vacate(); rel1() }()
+
+	// Tree 2: short ctx deadline; inFlight==1 so it does NOT get the
+	// unconditional escape → it BLOCKS on insufficient headroom → ctx expires →
+	// honest error.
+	ctx2, cancel := context.WithTimeout(cache.WithNestedCallDepth(context.Background(), 0), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	rel2, err2 := enterNestedResolveUnit(ctx2)
+	elapsed := time.Since(start)
+
+	if err2 == nil {
+		rel2()
+		t.Fatalf("C3 FALL-THROUGH FAIL: tree 2 was ADMITTED despite insufficient headroom + a live "+
+			"tree — it should have blocked then returned an honest ctx error (503), not admitted")
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("C3: tree 2 returned err in %v — it did NOT block on the bound (expected ~ctx deadline)", elapsed)
+	}
+	// The error is the ctx deadline (honest, retryable) — NOT a nil release, NOT
+	// empty content. resolve_inprocess.go returns (nil,false,err) on this.
+	if ctx2.Err() == nil {
+		t.Fatalf("C3: expected ctx deadline exceeded, got err=%v ctxErr=%v", err2, ctx2.Err())
+	}
+}
+
+// TestAggC4_DrivenBySeamNotEnv confirms the gate is driven by the injected
+// runtime seam (GOMEMLIMIT/liveHeap), NOT any env — proves the env is gone and
+// the arms exercise the real headroom decision. Also asserts transparent
+// pass-through when GOMEMLIMIT is "unset" (unlimited).
+func TestAggC4_DrivenBySeamNotEnv(t *testing.T) {
+	resetNestedResolveBoundForTest()
+	t.Cleanup(resetNestedResolveBoundForTest)
+
+	// Unlimited GOMEMLIMIT → transparent: admission always granted, no blocking,
+	// release a safe no-op, and NO calibration pressure changes the decision.
+	setRuntimeSeamsForTest(func() int64 { return 1<<63 - 1 }, func() int64 { return 4 * 1024 * mib })
+	_, unlimited := admissionCeiling()
+	if !unlimited {
+		t.Fatal("C4: MaxInt64 GOMEMLIMIT must be classified unlimited (transparent)")
+	}
+	release, err := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+	if err != nil {
+		t.Fatalf("C4 transparent: unexpected err %v", err)
+	}
+	release() // safe no-op
+
+	// A finite limit engages the ceiling math off the SEAM.
+	setRuntimeSeamsForTest(func() int64 { return 8 * 1024 * mib }, func() int64 { return 1024 * mib })
+	ceiling, unlimited2 := admissionCeiling()
+	if unlimited2 {
+		t.Fatal("C4: finite GOMEMLIMIT must NOT be unlimited")
+	}
+	// ceiling = (8Gi − 1Gi liveHeap) − 8Gi/8 reserve = 7Gi − 1Gi = 6 GiB.
+	wantCeiling := int64(8)*1024*mib - 1024*mib - int64(8)*1024*mib/reserveFractionDen*reserveFractionNum
+	if ceiling != wantCeiling {
+		t.Fatalf("C4: ceiling=%d MiB want %d MiB (headroom − reserve off the seam)", ceiling/mib, wantCeiling/mib)
+	}
+}
+
+// TestAggCostProportional_WarmNotGated — a warm-hit-equivalent (never reaching
+// the depth-0 gate) does not touch admission. The gate is only entered at
+// depth-0; depth>0 (inner/inherited) is classified not-outermost so the caller
+// skips enterNestedResolveUnit entirely. Assert the depth classification.
+func TestAggCostProportional_WarmNotGated(t *testing.T) {
+	if !isOutermostNestedResolve(cache.WithNestedCallDepth(context.Background(), 0)) {
+		t.Fatal("depth 0 must be the outermost (gated) point")
+	}
+	for _, d := range []int{1, 2, 8} {
+		if isOutermostNestedResolve(cache.WithNestedCallDepth(context.Background(), d)) {
+			t.Fatalf("depth %d must NOT be gated (inner resolves inherit the one admission)", d)
+		}
+	}
+}
+
+// TestAggC5_CustomerPriority_BackgroundYields is the C5 arm. Under pinned-low
+// headroom with a BACKGROUND tree in flight (so inFlight>0, no unconditional
+// escape), assert:
+//   (a) an arriving CUSTOMER tree is admitted AHEAD of a queued BACKGROUND tree
+//       (customer preference — the no-new-background-ahead-of-a-waiting-customer
+//       rule), AND
+//   (b) background trees still COUNT toward the aggregate (peak sampled live
+//       heap stays < GOMEMLIMIT − reserve — no OOM introduced by background).
+// RED = background not yielding (customer waits behind background → customer
+// admitted LAST) OR background not counting (peak breaches → OOM from background).
+func TestAggC5_CustomerPriority_BackgroundYields(t *testing.T) {
+	resetNestedResolveBoundForTest()
+	t.Cleanup(resetNestedResolveBoundForTest)
+
+	// 8 GiB limit, reserve 1 GiB → ceiling ~7 GiB. Pin base HIGH (6.5 GiB) so
+	// that with one 512 MiB tree in flight, headroom cannot fit a second — a
+	// second tree of EITHER kind must WAIT, forcing the priority contention.
+	// base 6400 MiB: base+1tree = 6912 < ceiling 7168 (one tree fits, sits
+	// under); base+2trees = 7424 > ceiling (a SECOND concurrent tree would
+	// breach). So peak < ceiling proves only ONE tree was ever concurrent =
+	// the second yielded/waited (both accounting AND priority under test).
+	h := &headroomModel{
+		limit:            8 * 1024 * mib,
+		base:             6400 * mib,
+		perTreeFootprint: 512 * mib,
+	}
+	setRuntimeSeamsForTest(h.limitFn, h.liveFn)
+	pinEstUnit(h.perTreeFootprint)
+
+	bgCtx := cache.WithBackgroundResolve(cache.WithNestedCallDepth(context.Background(), 0))
+	custCtx := cache.WithNestedCallDepth(context.Background(), 0) // no background marker
+
+	// Tree 1 (BACKGROUND): inFlight==0 → unconditional admit; occupy → headroom
+	// now tight, a second tree cannot fit until tree 1 releases.
+	rel1, err1 := enterNestedResolveUnit(bgCtx)
+	if err1 != nil {
+		t.Fatalf("C5 setup: background tree 1 admission failed: %v", err1)
+	}
+	h.occupy()
+
+	var order []string
+	var orderMu sync.Mutex
+	record := func(who string) { orderMu.Lock(); order = append(order, who); orderMu.Unlock() }
+
+	// Tree 2 (BACKGROUND) queues FIRST; Tree 3 (CUSTOMER) arrives after. When
+	// tree 1 releases the single freed slot, the customer must win it even
+	// though the background tree queued earlier.
+	bgAdmitted := make(chan struct{})
+	go func() {
+		rel, err := enterNestedResolveUnit(bgCtx)
+		if err == nil {
+			record("background")
+			rel()
+		}
+		close(bgAdmitted)
+	}()
+	time.Sleep(80 * time.Millisecond) // let bg reach its wait state
+
+	custAdmitted := make(chan struct{})
+	go func() {
+		rel, err := enterNestedResolveUnit(custCtx)
+		if err == nil {
+			record("customer")
+			rel()
+		}
+		close(custAdmitted)
+	}()
+	time.Sleep(80 * time.Millisecond) // let customer register its waiting-mark
+
+	h.vacate()
+	rel1() // free one slot → customer must take it ahead of the queued background
+
+	select {
+	case <-custAdmitted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("C5: customer tree never admitted — starved behind background (yield failed)")
+	}
+	select {
+	case <-bgAdmitted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("C5: background tree never completed")
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if len(order) != 2 || order[0] != "customer" {
+		t.Fatalf("C5 CUSTOMER-PRIORITY FAIL: admission order = %v, want customer FIRST "+
+			"(background must yield the freed slot to the waiting customer)", order)
+	}
+	reserve := h.limit / reserveFractionDen * reserveFractionNum
+	ceiling := h.limit - reserve
+	if h.peak() >= ceiling {
+		t.Fatalf("C5 COUNTS-WHILE-IN-FLIGHT FAIL: peak %d MiB >= ceiling %d MiB — a background "+
+			"tree did not weigh against the aggregate (OOM floor defeated)", h.peak()/mib, ceiling/mib)
+	}
+}
+
+// TestAggCalibration_OneShot verifies the C46-1 one-shot calibration: the first
+// tree's measured live-heap delta becomes the weight; subsequent deltas do not
+// overwrite it; a delta <= 0 is ignored.
+func TestAggCalibration_OneShot(t *testing.T) {
+	resetNestedResolveBoundForTest()
+	t.Cleanup(resetNestedResolveBoundForTest)
+
+	if _, cal := calibratedNestedEstUnitForTest(); cal {
+		t.Fatal("fresh: must not be calibrated")
+	}
+	if w := currentNestedEstUnit(); w != defaultNestedEstUnitBytes {
+		t.Fatalf("pre-calibration weight=%d want fallback %d", w, defaultNestedEstUnitBytes)
+	}
+	calibrateNestedEstUnit(100 * mib)
+	if w, cal := currentNestedEstUnit(), true; w != 100*mib || !cal {
+		t.Fatalf("post-calibration weight=%d want 100MiB", w)
+	}
+	calibrateNestedEstUnit(500 * mib) // must NOT overwrite (one-shot)
+	if w := currentNestedEstUnit(); w != 100*mib {
+		t.Fatalf("calibration overwritten: weight=%d want 100MiB (one-shot)", w)
+	}
+	calibrateNestedEstUnit(0)  // ignored
+	calibrateNestedEstUnit(-5) // ignored
+	if w := currentNestedEstUnit(); w != 100*mib {
+		t.Fatalf("non-positive delta changed weight: %d", w)
+	}
+}
+
+// TestAggNoGoroutineLeak_CtxWatcher asserts the sync.Cond ctx-watcher goroutine
+// (waitForReleaseOrCtx spawns one per wait) does NOT leak. The discriminating
+// scenario targets EXACTLY what close(stop) guards: a waiter whose Wait is woken
+// by a RELEASE broadcast (NOT its own ctx) and then ADMITS — its ctx never fires,
+// so the ONLY way its watcher exits is close(stop). Repeated sequentially, this
+// accumulates one such waiter per iteration.
+//
+// Each iteration: tree A holds all headroom; a waiter B (background ctx, never
+// cancelled) blocks (inFlight>0 + can't fit) → spawns a watcher; we release A →
+// B is woken by A's release-Broadcast, re-checks, now fits (inFlight==0) →
+// ADMITS, returns (ctx never fired), releases. With close(stop) B's watcher
+// exits; WITHOUT it, B's watcher strands on <-stop forever → NumGoroutine climbs
+// by ~1 per iteration.
+//
+// DISCRIMINATING (RED-then-GREEN, arch-required): GREEN with close(stop) intact
+// (delta ≈ 0 across ITER iterations). RED with close(stop) removed — the
+// release-woken-then-admitted watchers strand (delta ≈ ITER). Captured in the
+// artifact by a manual neuter run (the stop-path is prod code, not a test seam).
+// The arm ACTUALLY RUNS (=== RUN + in the -run 'TestAgg' count).
+func TestAggNoGoroutineLeak_CtxWatcher(t *testing.T) {
+	resetNestedResolveBoundForTest()
+	t.Cleanup(resetNestedResolveBoundForTest)
+
+	// Headroom fits EXACTLY one tree: base 200 + one 700 = 900 ≤ ceiling 896?
+	// ceiling = 1024 − 128(reserve) = 896; base 100 + 700 = 800 ≤ 896 (one fits),
+	// base 100 + 2×700 = 1500 > 896 (a second cannot while the first is in
+	// flight). So B blocks while A holds, and admits once A releases.
+	h := &headroomModel{
+		limit:            1024 * mib,
+		base:             100 * mib,
+		perTreeFootprint: 700 * mib,
+	}
+	setRuntimeSeamsForTest(h.limitFn, h.liveFn)
+	pinEstUnit(h.perTreeFootprint)
+
+	settle := func() {
+		for i := 0; i < 40; i++ {
+			runtime.GC()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	settle()
+	base := runtime.NumGoroutine()
+
+	const ITER = 25
+	for i := 0; i < ITER; i++ {
+		// A holds all headroom.
+		relA, errA := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+		if errA != nil {
+			t.Fatalf("iter %d: A admission failed: %v", i, errA)
+		}
+		h.occupy()
+
+		// B blocks (inFlight==1, base+2×700 > ceiling → can't fit). Background
+		// ctx → B's ctx NEVER fires; its watcher can only exit via close(stop).
+		bDone := make(chan struct{})
+		go func() {
+			relB, errB := enterNestedResolveUnit(cache.WithNestedCallDepth(context.Background(), 0))
+			if errB == nil {
+				h.occupy()
+				h.vacate()
+				relB()
+			}
+			close(bDone)
+		}()
+
+		// Ensure B is blocked (in its Wait) before releasing A.
+		time.Sleep(20 * time.Millisecond)
+
+		// Release A → Broadcast wakes B → B re-checks, now inFlight==0 → ADMITS
+		// (its ctx never fired). B's watcher must exit via close(stop).
+		h.vacate()
+		relA()
+
+		select {
+		case <-bDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iter %d: B never admitted after A released (release→broadcast→admit path stuck)", i)
+		}
+	}
+
+	settle()
+	after := runtime.NumGoroutine()
+
+	// A LEAK strands ~ITER watchers (25). Slack for scheduler/runtime.
+	const slack = 8
+	if after > base+slack {
+		t.Fatalf("GOROUTINE LEAK: NumGoroutine base=%d after=%d (delta %d > slack %d) — "+
+			"the ctx-watcher goroutines of release-woken-then-admitted waiters did NOT exit "+
+			"(%d iterations). The waitForReleaseOrCtx close(stop) path leaked.", base, after, after-base, slack, ITER)
 	}
 }
