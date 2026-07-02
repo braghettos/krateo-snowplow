@@ -33,7 +33,11 @@
 
 package cache
 
-import "context"
+import (
+	"context"
+	"sort"
+	"strings"
+)
 
 // ctxKeyNestedResolveAncestorType is the typed empty-struct context key.
 type ctxKeyNestedResolveAncestorType struct{}
@@ -76,4 +80,74 @@ func NestedResolveAncestorPresent(ctx context.Context, node string) bool {
 	}
 	_, present := set[node]
 	return present
+}
+
+// R (composition-resources loopback guard) — the HTTP header names that carry
+// the in-process recursion guards across the self-loopback boundary. Defined
+// HERE (the codec's home) so the emit site (api resolver) and the ingest sites
+// (restactions/widgets dispatch handlers) reference the SAME canonical strings —
+// no parallel copy (the #66 anti-drift lesson). Advisory + self-trusted only:
+// the ingest re-seeds ctx from them ONLY when isTrustedSelfLoopback holds.
+const (
+	// NestedDepthHeader carries NestedCallDepthFromContext(ctx)+1 for the next
+	// hop, mirroring the in-process WithNestedCallDepth increment.
+	NestedDepthHeader = "X-Snowplow-Nested-Depth"
+	// ResolveAncestorsHeader carries AncestorsHeaderValue(ctx) — the serialized
+	// {ancestors ∪ current node} set for the current descent path.
+	ResolveAncestorsHeader = "X-Snowplow-Resolve-Ancestors"
+)
+
+// ancestorsHeaderDelim is the element delimiter for the serialized ancestor
+// set. A comma is HTTP-header-safe (no quoting) and is OUTSIDE the RFC-1123 DNS
+// label set ([a-z0-9.-]) that every node component (resource/namespace/name) is
+// drawn from — as is the node's own "/" separator. So a comma can never appear
+// inside a node string, making the join collision-free with no escaping.
+const ancestorsHeaderDelim = ","
+
+// AncestorsHeaderValue serializes the ancestor SET attached to ctx into a single
+// HTTP-header-safe string, for propagation across the self-loopback HTTP hop
+// (the #66 anti-drift lesson: this is the ONE codec both the emit site — the api
+// resolver — and the ingest site — the dispatcher handler, via
+// ParseAncestorsHeader — share; no parallel copy).
+//
+// The set is unordered; nodes are joined with a comma. The elements are SORTED
+// only for test-determinism (the wire is a set; parse re-inserts into a fresh
+// map, so order is irrelevant to correctness). Returns "" when ctx carries no
+// ancestor set (the outermost request-path resolve) — the emit site then omits
+// the header entirely.
+func AncestorsHeaderValue(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	set, _ := ctx.Value(ctxKeyNestedResolveAncestor).(map[string]struct{})
+	if len(set) == 0 {
+		return ""
+	}
+	nodes := make([]string, 0, len(set))
+	for k := range set {
+		nodes = append(nodes, k)
+	}
+	sort.Strings(nodes) // determinism only — not a correctness requirement
+	return strings.Join(nodes, ancestorsHeaderDelim)
+}
+
+// ParseAncestorsHeader splits a serialized ancestor-set header value (produced by
+// AncestorsHeaderValue) back into its node strings, dropping empty tokens. It is
+// the parse half of the ONE shared codec (anti-drift). Set semantics are
+// restored by the caller re-inserting each node via WithNestedResolveAncestor
+// (into a fresh map) — so wire order is irrelevant and duplicate nodes collapse,
+// exactly like the in-process copy-on-descend map. A comma cannot appear inside
+// a node (RFC-1123 labels + "/"), so Split never over-splits a node.
+func ParseAncestorsHeader(s string) []string {
+	if s == "" {
+		return nil
+	}
+	raw := strings.Split(s, ancestorsHeaderDelim)
+	out := make([]string, 0, len(raw))
+	for _, n := range raw {
+		if n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
 }

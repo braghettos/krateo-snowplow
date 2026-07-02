@@ -107,6 +107,52 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		}
 	}
 
+	// R (composition-resources loopback guard) — HTTP-edge cycle-stop.
+	// PLACEMENT (C3): strictly AFTER fetchObject + checkDispatchRBAC above
+	// (the stop is NEVER an RBAC bypass — it fires only on an authorized, real
+	// CR) and BEFORE the L1 lookup below. Re-seed the nested-resolve guards from
+	// the inbound X-Snowplow-{Nested-Depth,Resolve-Ancestors} headers — but ONLY
+	// for a TRUSTED self-loopback (isTrustedSelfLoopback; an untrusted/external
+	// caller's headers are ignored → guardCtx carries no guards → no stop → a
+	// normal full resolve, C2) — then add THIS request's own node and check the
+	// HTTP-edge twin of the #79 in-process stop (nested_call.go:114,169). On a
+	// self-reference over the HTTP boundary we serve the RAW CR (resolve:false
+	// semantics) instead of recursing; the depth-8 backstop trips a bounded
+	// error for a non-cyclic pathologically deep chain. guardCtx is throwaway
+	// (only the stop decision is read from it); the resolve ctx is re-seeded
+	// separately below so its guards flow into the resolver.
+	if !cache.Disabled() {
+		// Seed ONLY the inbound header ancestors (the parent descent path); do
+		// NOT add THIS node before the check — the in-process contract
+		// (nested_call.go Step 3.5) membership-checks the node against the
+		// INBOUND ancestors BEFORE adding it, so a self-reference is detected
+		// because a PRIOR hop of this same node already put it in the emitted
+		// header set. Adding it here first would make every call self-match.
+		guardCtx := reseedNestedGuardsFromHeaders(req.Context(), req)
+		if stop, raw := httpEdgeGuardStop(guardCtx, log,
+			got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName()); stop {
+			if raw {
+				// Self-reference: return the RAW CR (the same bytes the
+				// in-process cycle-stop returns, nested_call.go:174) — the
+				// outer resolve then completes with Count()==0 and caches.
+				encoded, encErr := encodeResolvedJSON(got.Unstructured.Object)
+				if encErr != nil {
+					response.InternalError(wri, encErr)
+					return
+				}
+				writeResolvedJSON(wri, encoded)
+				return
+			}
+			// Depth-8 backstop: bounded 508-class error (never empty, never a
+			// panic), mirroring the in-process depth guard (nested_call.go:114).
+			response.Encode(wri, response.New(http.StatusLoopDetected,
+				fmt.Errorf("nested resolve depth limit exceeded (%d) for %s/%s/%s over HTTP self-loopback",
+					cache.NestedCallMaxDepth(), got.GVR.Resource,
+					got.Unstructured.GetNamespace(), got.Unstructured.GetName())))
+			return
+		}
+	}
+
 	perPage, page := paginationInfo(log, req)
 
 	// Tag 0.30.7: L1 resolved-output cache lookup. Runs strictly
@@ -212,6 +258,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// RA (the node is simply never reencountered on descent).
 	ctx = cache.WithNestedResolveAncestor(ctx,
 		nestedResolveNodeKey(got.GVR.Resource, got.Unstructured.GetNamespace(), got.Unstructured.GetName()))
+	// R (composition-resources loopback guard) — re-seed the resolve ctx from
+	// the inbound X-Snowplow-{Nested-Depth,Resolve-Ancestors} headers (TRUSTED
+	// self-loopback ONLY — reseedNestedGuardsFromHeaders no-ops otherwise), so
+	// the DEEPER descent's guards flow into the resolver: the next self-dispatch
+	// emits depth+1 and the header ancestor set, and a deeper self-reentry stops
+	// at THIS handler's HTTP-edge check (above) on the next hop. Placed AFTER the
+	// #83 self-seed so the resolve ctx carries {header ancestors} ∪ {this node};
+	// the depth-8 counter continues from the inbound hop's value.
+	ctx = reseedNestedGuardsFromHeaders(ctx, req)
 	// Ship 0.30.257 (#313) Cache-A — request-path error-aware Put-gate.
 	// Install a stage-error sink on the resolve ctx (the SAME seam the
 	// background refresher uses at resolve_populate.go:206). The api
@@ -272,11 +327,23 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// result" posture. sink==nil is nil-receiver-safe (Count()==0). A clean
 	// resolve (Count()==0) caches exactly as before.
 	if stageErrSink.Count() > 0 {
+		// D (bounded partial-cache backstop, default-off) — instead of a bare
+		// decline, Put the partial under the SAME per-user cacheKey with a
+		// bounded PARTIAL_RESULT_TTL_SECONDS window so a residual un-cacheable RA
+		// does not re-storm cold every /call. No-op when PARTIAL_RESULT_TTL_SECONDS
+		// is 0 (default) → byte-identical to the pre-D bare decline. With R landed
+		// composition-resources resolves clean (Count()==0) so this branch is not
+		// even reached for it (C6). Post-serve: the body is written below either
+		// way; D only decides whether it is ALSO cached for the bounded window.
+		staleCached := putPartialWithTTL(cacheHandle, cacheKey, encoded, cacheInputs,
+			got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 		log.Warn("RESTAction served with per-item stage error(s); declining to cache the partial result",
 			slog.String("name", cr.Name),
 			slog.String("namespace", cr.Namespace),
 			slog.Int64("stage_errors", stageErrSink.Count()),
-			slog.String("effect", "partial body served (200); not persisted — transient item failures self-heal on next resolve"),
+			slog.Bool("partial_bounded_stale_cached", staleCached),
+			slog.String("partial_ttl_s", partialResultTTL().String()),
+			slog.String("effect", "partial body served (200); not persisted under the full TTL — transient item failures self-heal on next resolve (D bounded-stale window if enabled)"),
 		)
 	} else if extTouchedSink.Count() > 0 {
 		// External-no-cache (proposal 2026-06-22) — the resolve touched a

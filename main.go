@@ -184,6 +184,10 @@ func main() {
 	// seed runs token-less (WARN+expvar, not fatal — phase1_walk C-a).
 	authnClient := authn.New(*urlAuthn, *saTokenPath)
 	dispatchers.SetSeedLoopbackTokenProvider(authnClient.Token)
+	// R (composition-resources loopback guard) — install the SAME URL_SELF host
+	// on the dispatcher-side ingest belt-and-suspenders check, mirroring
+	// api.SetSelfHost below (both derive from the one URL_SELF value).
+	dispatchers.SetSelfLoopbackHost(*urlSelf)
 	if restactionsapi.SetSelfHost(*urlSelf) {
 		log.Info("prewarm seed loopback auth wired (#57)",
 			slog.String("url_authn", *urlAuthn),

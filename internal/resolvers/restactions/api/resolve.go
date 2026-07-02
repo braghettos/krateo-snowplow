@@ -1263,10 +1263,49 @@ func (r *resolveRun) runStage(id string, apiMap map[string]*templates.API) (stop
 				// into the /call response body at restactions.go:149; an
 				// in-place append leaked the JWT to the wire — see
 				// /tmp/snowplow-runs/ship-307/before/.../call-namespaces.json).
-				stageHeaders := make([]string, len(apiCall.Headers), len(apiCall.Headers)+1)
+				stageHeaders := make([]string, len(apiCall.Headers), len(apiCall.Headers)+3)
 				copy(stageHeaders, apiCall.Headers)
 				stageHeaders = append(stageHeaders,
 					fmt.Sprintf("Authorization: Bearer %s", accessToken))
+
+				// R (composition-resources loopback guard): propagate the
+				// in-process recursion guards ACROSS the HTTP self-loopback
+				// boundary. The depth-8 counter + #79 ancestor-set are
+				// context.Value seams consumed only inside the IN-PROCESS
+				// ResolveNestedCall (nested_call.go:98,154); they do NOT survive
+				// an HTTP hop, so a composition-resources RA that self-dispatches
+				// as a `/call?resource=restactions&name=<self>` loopback re-enters
+				// restActionHandler.ServeHTTP as a FRESH request with NO depth,
+				// NO ancestor set — the guards never fire → unbounded HTTP
+				// self-recursion (the 3121-hop storm, RCA §0).
+				//
+				// Emit the two guards as advisory headers ONLY on the self-loopback
+				// arm — the SAME parsedHostEqualsSelf(ep.ServerURL) predicate the
+				// bearer-append already gated on (bearerAppendForStage), so an
+				// EXTERNAL endpoint never receives them (leak/forge surface stays
+				// off the wire for non-self hosts). The ingest side
+				// (restactions.go / widgets.go) re-seeds ctx from these headers
+				// ONLY when isTrustedSelfLoopback (C1) — they are advisory, never
+				// trusted from an untrusted caller.
+				//
+				// Node identity is NOT re-derived here: r.ctx already carries the
+				// CURRENT descent's ancestor set (the #83 Option-A handler seed +
+				// any prior HTTP-hop re-seed), so AncestorsHeaderValue(r.ctx)
+				// serializes exactly {ancestors ∪ this node}. The depth is
+				// this hop's depth + 1 (the next hop is one deeper), mirroring the
+				// in-process WithNestedCallDepth(ctx, depth+1) at nested_call.go:191.
+				// Emitting only on the self-host arm keeps external calls
+				// byte-identical to pre-R.
+				if parsedHostEqualsSelf(ep.ServerURL) {
+					stageHeaders = append(stageHeaders,
+						fmt.Sprintf("%s: %d", cache.NestedDepthHeader,
+							cache.NestedCallDepthFromContext(r.ctx)+1))
+					if anc := cache.AncestorsHeaderValue(r.ctx); anc != "" {
+						stageHeaders = append(stageHeaders,
+							fmt.Sprintf("%s: %s", cache.ResolveAncestorsHeader, anc))
+					}
+				}
+
 				local := *apiCall
 				local.Headers = stageHeaders
 				apiCall = &local
