@@ -569,27 +569,28 @@ type paginationDrainFn func(ctx context.Context)
 // step (flag-off / tests); production passes runContentPrewarmPass.
 type contentPrewarm func(ctx context.Context)
 
-// pipSeedFn is the Ship PIP (0.30.173) Step-7.6 callback, RE-WIRED to a
-// BACKGROUND best-effort warm at Ship 2 / 0.30.196.
+// pipSeedFn is the Ship PIP (0.30.173) Step-7.6 callback.
 //
-// 0.30.196 — COHORT-COUNT-INDEPENDENT READINESS (the not-Ready-forever
-// landmine removal). Readiness MUST gate ONLY on the cohort-independent
-// substrate (meta-query seeds + CRD-watch settled + all registered
-// informers HasSynced) — never on the per-cohort seed, whose work scales
-// with cohort count. The architecture gate proved a cold customer nav is
-// served entirely from the in-memory informer substrate (0 apiserver
-// round-trips), so the per-cohort response seed does NOT carry the cold
-// path; the substrate does.
+// LINEAGE — Ship 2 / 0.30.196 → PREWARM-GATED READINESS (2026-07-02):
+//   - 0.30.196 RE-WIRED this seed to a BACKGROUND best-effort warm and moved
+//     MarkPhase1Done BEFORE it, for COHORT-COUNT-INDEPENDENT readiness: gate
+//     only on the cohort-independent substrate (sync barrier + content pass),
+//     never on the per-cohort seed. Rationale: a cold nav is served from the
+//     in-memory informer substrate (0 apiserver round-trips), so the seed did
+//     not carry the cold path. It also removed the not-Ready-forever landmine
+//     (the PREWARM_PIP_COHORT_CAP fail-closed branch, DELETED — see runPIPSeed).
+//   - 2026-07-02 REVERSES the ready-TIMING half (docs/readiness-gate-prewarm-
+//     complete-2026-07-02.md, shape A): empirically (1.5.27 + the #86 aggregate
+//     OOM serialize) a cold-but-synced pod serializes/503s the compositions-page
+//     fan-out during the prewarm window, so "synced ≠ safe to route" for the
+//     heavy composition surface. The seed now runs SYNCHRONOUSLY BEFORE
+//     MarkPhase1Done (Step 7.6/8 in phase1WarmupWith) so /readyz gates on
+//     prewarm-complete. The cohort-count-independence cost is re-bounded by the
+//     seed's OWN pipGlobalTimeout backstop (the flip fires REGARDLESS at
+//     min(seed-complete, pipGlobalTimeout) — the landmine guard is PRESERVED,
+//     not resurrected). The cohort CAP stays DELETED.
 //
-// So phase1WarmupWith now calls cache.MarkPhase1Done (Step 8) IMMEDIATELY
-// after the informer sync barrier (Step 7) + the content pass (Step 7.5),
-// then launches the per-cohort seed (this callback) as a bounded
-// best-effort BACKGROUND goroutine (Step 7.6). The seed's outcome is
-// log-only — it NEVER withholds readiness and NEVER fail-closes. A pod
-// with O(users) cohorts reaches /readyz 200 in the same bounded time as a
-// 34-cohort pod; the old PREWARM_PIP_COHORT_CAP fail-closed-forever
-// branch is DELETED (see runPIPSeed). nil disables the step (flag-off /
-// tests); production passes runPIPSeed.
+// nil disables the step (flag-off / tests); production passes runPIPSeed.
 type pipSeedFn func(ctx context.Context) error
 
 func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister rootsLister, resolve rootResolver, contentWarm contentPrewarm, clusterListPrewarm clusterListPrewarmFn, pipSeed pipSeedFn, paginationDrain paginationDrainFn) error {
@@ -708,68 +709,74 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		clusterListPrewarm(ctx)
 	}
 
-	// Step 8 — signal Phase1Done. /readyz flips to 200.
+	// Step 7.6 — Ship PIP (0.30.173): the per-identity prewarm seed. Seeds
+	// the per-user resolved-output L1 (top-level restactions + widgets cache
+	// classes) for EVERY enumerated RBAC cohort. nil when PIP is off —
+	// flag-off this is byte-identical to 0.30.172.
 	//
-	// Ship 2 / 0.30.196 — MarkPhase1Done is called HERE, immediately after
-	// the cohort-INDEPENDENT substrate is warm (meta-query seeds + CRD-watch
-	// settled + every registered informer HasSynced via WaitAllInformersSynced
-	// + the content pass), and BEFORE the per-cohort seed (Step 7.6 below).
-	// Readiness no longer waits on — and is no longer gated by — the
-	// per-cohort seed, whose work scales with cohort count. This removes the
-	// not-Ready-forever landmine (the old PREWARM_PIP_COHORT_CAP fail-closed
-	// branch) and makes boot wall-clock cohort-count-independent.
-	cache.MarkPhase1Done()
-
-	// Step 7.6 — Ship PIP (0.30.173), RE-WIRED to BACKGROUND at Ship 2 /
-	// 0.30.196: the per-identity prewarm seed. Seeds the per-user
-	// resolved-output L1 (top-level restactions + widgets cache classes)
-	// for EVERY enumerated RBAC cohort. nil when PIP is off — flag-off
-	// this is byte-identical to 0.30.172.
+	// PREWARM-GATED READINESS (2026-07-02, docs/readiness-gate-prewarm-complete-2026-07-02.md,
+	// shape A): the seed runs SYNCHRONOUSLY here — BEFORE MarkPhase1Done
+	// (Step 8) — so /readyz cannot flip 200 until the per-cohort first-nav L1
+	// is warm. K8s withholds the pod from Service endpoints until then, so the
+	// frontend is never routed to an informer-synced-but-cold pod that would
+	// serialize/503 the compositions-page fan-out under the #86 aggregate OOM
+	// gate. This REVERSES the Ship-2/0.30.196 background-rewire (which flipped
+	// Ready BEFORE the seed to make boot cohort-count-independent); the Q4
+	// backstop below re-bounds boot so the reversal cannot resurrect the
+	// not-Ready-forever landmine.
 	//
-	// BACKGROUND + BEST-EFFORT (Ship 2 / 0.30.196). The seed runs AFTER
-	// MarkPhase1Done on a bounded background goroutine — it NEVER withholds
-	// readiness and NEVER fail-closes. Its lifecycle bound is its OWN
-	// timeout context (pipGlobalTimeout, 8 min) derived from
-	// context.Background() — NOT the Phase1Warmup ctx, which main.go cancels
-	// the instant Phase1Warmup returns (the seed would otherwise be killed
-	// before it could warm a single cohort). The goroutine is therefore
-	// self-terminating (bounded by pipGlobalTimeout) and dies with the
-	// process on shutdown; it is not a leak. A panic inside the seed is
-	// recovered so a single bad cohort cannot crash the process. The seed's
-	// outcome is log-only.
+	// C2 BACKSTOP (fire-regardless, MANDATORY — mirrors clusterListPrewarm's
+	// "MarkPhase1Done fires regardless" and Step 7.5). MarkPhase1Done is in a
+	// DEFER placed BEFORE the seed call, so it fires on EVERY exit of this
+	// block — normal seed return, seed error, ctx/pipGlobalTimeout expiry, OR
+	// a panic unwinding through the recover. A stuck/panicking seed therefore
+	// yields Ready-degraded (serve cold, foreground-resolve-on-miss per #41),
+	// NEVER not-Ready-forever. The recover runs first (inner defer), then the
+	// MarkPhase1Done defer — so the flip cannot be bypassed by a panic.
+	//
+	// C3 CTX: the seed shares the Phase1Warmup ctx (bounded by pipGlobalTimeout
+	// via a child), NOT a context.Background() derivative. Safe under shape A
+	// because Phase1Warmup no longer returns until the seed completes, so
+	// main.go's p1Cancel (deferred to Phase1Warmup's return) cannot cancel the
+	// seed ctx mid-seed. pipGlobalTimeout is the seed's own budget → Ready
+	// flips at min(seed-complete, pipGlobalTimeout).
 	if pipSeed != nil {
-		go func() {
+		func() {
+			// C2: guaranteed flip — runs on normal return, error, timeout, AND
+			// after a panic-recover. Innermost so it is the LAST deferred to run.
+			defer cache.MarkPhase1Done()
 			defer func() {
 				if r := recover(); r != nil {
 					log.Error("phase1.seed.panic",
 						slog.String("subsystem", "cache"),
 						slog.Any("panic", r),
-						slog.String("effect", "per-cohort background seed aborted; "+
-							"readiness UNAFFECTED — first /call per cohort falls back to per-user resolve"),
+						slog.String("effect", "per-cohort SYNC seed aborted; readiness flips to "+
+							"Ready-DEGRADED (backstop) — first /call per cohort falls back to per-user resolve"),
 					)
 				}
 			}()
-			seedCtx, seedCancel := context.WithTimeout(context.Background(), pipGlobalTimeout)
+			// Bound the SYNC seed by pipGlobalTimeout (its own existing budget,
+			// no new env) as a child of the warmup ctx (C3). On expiry the seed
+			// ctx cancels, the seed returns best-effort, and the MarkPhase1Done
+			// defer flips Ready-degraded regardless (Q4 backstop).
+			seedCtx, seedCancel := context.WithTimeout(ctx, pipGlobalTimeout)
 			defer seedCancel()
-			// 0.30.207 — seedCtx is a bare context.Background() derivative
-			// (it must outlive Phase1Warmup's ctx). Like cacheCtx it carries
-			// no logger, so the cohort-seed resolves underneath would hit
-			// xcontext.Logger's hardcoded slog.LevelDebug fallback and emit
-			// full-dict DEBUG lines regardless of DEBUG=false. Inject the
-			// level-configured default logger so the seed resolve obeys the
-			// flag (level gating only — log content unchanged).
 			seedCtx = xcontext.BuildContext(seedCtx, xcontext.WithLogger(slog.Default()))
 			seedStart := time.Now()
 			if err := pipSeed(seedCtx); err != nil {
-				log.Warn("phase1.seed.background_incomplete",
+				log.Warn("phase1.seed.sync_incomplete",
 					slog.String("subsystem", "cache"),
 					slog.Any("err", err),
-					slog.String("effect", "readiness UNAFFECTED (already 200); first /call per "+
-						"affected cohort falls back to per-user resolve"),
+					slog.String("effect", "readiness flips (backstop); first /call per affected "+
+						"cohort falls back to per-user resolve"),
 					slog.Int64("elapsed_ms", time.Since(seedStart).Milliseconds()),
 				)
 			}
 		}()
+	} else {
+		// PIP off — nothing to seed; flip Ready right after the sync barrier +
+		// content pass (byte-identical to the pre-gate flip point for this case).
+		cache.MarkPhase1Done()
 	}
 
 	// Step 7.7 — Path 3.2.2.b (0.30.221) — the deferred apiRef pagination

@@ -42,7 +42,6 @@ package dispatchers
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -64,17 +63,27 @@ import (
 // the asserted ABSENCE invariant is now structural (no cap = no
 // cap-exceeded line possible).
 
-// TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes proves the
-// decoupling directly: while the per-cohort seed is still in flight
-// (blocked), readiness is ALREADY 200. This is the cohort-count-
-// INDEPENDENT boot-wall-clock invariant — the pod goes Ready on the
-// substrate alone and the seed warms behind it.
+// --- PREWARM-GATED READINESS successors (2026-07-02, shape A) ----------------
 //
-// A regression that runs the seed synchronously before MarkPhase1Done
-// would block phase1WarmupWith on the seed; the assertion that
-// phase1WarmupWith has returned AND Phase1Done is true WHILE the seed is
-// still blocked would FAIL.
-func TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes(t *testing.T) {
+// LINEAGE / INVARIANT REVERSAL. The two tests below REPLACE the Ship-2/0.30.196
+// falsifiers TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes +
+// _WhenSeedErrors, which asserted the OPPOSITE invariant (Ready flips
+// BEFORE/despite the seed — the seed was background + non-gating). The
+// prewarm-complete gate (docs/readiness-gate-prewarm-complete-2026-07-02.md,
+// shape A) makes the seed run SYNCHRONOUSLY before MarkPhase1Done, so Ready now
+// gates ON prewarm-complete. The successors preserve the Ship-2 503-forever
+// LANDMINE GUARD (the deleted PREWARM_PIP_COHORT_CAP fail-closed-forever branch)
+// by proving the backstop still flips Ready when the seed never completes.
+
+// TestPhase1_NotReady_WhileSyncSeedInFlight is the (i) arm: while the sync seed
+// is in flight (blocked), /readyz STAYS 503 (IsPhase1Done()==false). This is the
+// prewarm-gate invariant — the pod does not advertise Ready until the per-cohort
+// first-nav L1 is warm.
+//
+// RED on the wrong impl: if the flip did NOT move downstream of the seed (the
+// old Ship-2 background structure), Phase1Done would be true DURING the seed →
+// this FAILS. Discriminates the moved-flip.
+func TestPhase1_NotReady_WhileSyncSeedInFlight(t *testing.T) {
 	rw := phase1TestWatcher(t)
 	cache.ResetPhase1DoneForTest()
 	cache.ResetNavigationDiscoveredGroupsForTest()
@@ -89,9 +98,9 @@ func TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes(t *testing.T) {
 		return nil
 	}
 
-	// The seed blocks until the test releases it. If readiness were gated
-	// on the seed (the old synchronous path), phase1WarmupWith would block
-	// here and the test would hit its own deadline.
+	// The seed blocks until the test releases it. Under shape A,
+	// phase1WarmupWith BLOCKS on the seed — so run it in a goroutine and probe
+	// readiness while the seed is held.
 	release := make(chan struct{})
 	seedEntered := make(chan struct{})
 	pipSeed := func(ctx context.Context) error {
@@ -102,39 +111,61 @@ func TestPhase1_ReadinessFlips_BeforeBackgroundSeedCompletes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// phase1WarmupWith MUST return promptly — it launches the seed in the
-	// background and does not wait on it.
-	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed, nil); err != nil {
-		t.Fatalf("Ship 2: phase1WarmupWith returned error: %v", err)
-	}
+	warmupReturned := make(chan struct{})
+	go func() {
+		_ = phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed, nil)
+		close(warmupReturned)
+	}()
 
-	// Readiness is already flipped while the background seed is still blocked.
-	if !cache.IsPhase1Done() {
-		t.Fatalf("Ship 2 FAIL: Phase1Done is false after phase1WarmupWith returned, "+
-			"while the background seed is still blocked — readiness must not wait on the seed")
-	}
-
-	// Confirm the seed is genuinely in flight (entered, not yet released) —
-	// proving phase1WarmupWith returned WITHOUT waiting for the seed.
+	// Wait until the seed is genuinely in flight.
 	select {
 	case <-seedEntered:
-		// good — the background goroutine is running and blocked.
 	case <-time.After(5 * time.Second):
-		t.Fatalf("Ship 2: background seed goroutine never started")
+		t.Fatalf("prewarm-gate: sync seed never entered")
 	}
 
-	// Release the seed so the background goroutine can exit cleanly before
-	// test teardown.
+	// INVARIANT (i): readiness is STILL 503 while the seed is in flight.
+	if cache.IsPhase1Done() {
+		t.Fatalf("PREWARM-GATE FAIL: Phase1Done is TRUE while the sync seed is still in "+
+			"flight — readiness must gate ON prewarm-complete (the flip did not move "+
+			"downstream of the seed). RED = old Ship-2 background structure.")
+	}
+	// phase1WarmupWith must NOT have returned yet (it blocks on the seed).
+	select {
+	case <-warmupReturned:
+		t.Fatalf("PREWARM-GATE FAIL: phase1WarmupWith returned while the seed is still "+
+			"blocked — the seed is not synchronous")
+	default:
+	}
+
+	// Release → seed completes → flip fires → warmup returns → Ready.
 	close(release)
+	select {
+	case <-warmupReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("prewarm-gate: phase1WarmupWith did not return after seed release")
+	}
+	if !cache.IsPhase1Done() {
+		t.Fatalf("prewarm-gate: Phase1Done still false after the seed completed — the "+
+			"post-seed flip did not fire")
+	}
 }
 
-// TestPhase1_ReadinessFlips_WhenSeedErrors proves that even a per-cohort
-// seed that ERRORS (e.g. a pathological large topology that times out)
-// does not withhold readiness. The seed's outcome is log-only.
+// TestPhase1_Ready_WhenSeedNeverCompletes_Backstop is the (ii) arm — the
+// MANDATORY anti-landmine guard (the Ship-2 503-forever landmine, re-expressed
+// for shape A). A seed that NEVER completes on its own must NOT wedge readiness
+// forever: the backstop (the seed's pipGlobalTimeout child-ctx off the warmup
+// ctx) cancels the seed, it returns, and MarkPhase1Done fires REGARDLESS →
+// Ready-degraded, not not-Ready-forever.
 //
-// Pre-0.30.196 a non-nil pipSeed return caused phase1WarmupWith to return
-// WITHOUT calling MarkPhase1Done — this assertion would FAIL.
-func TestPhase1_ReadinessFlips_WhenSeedErrors(t *testing.T) {
+// The real backstop is pipGlobalTimeout (8 min); the test drives the SAME
+// timeout PATH via a short WARMUP ctx (the seed ctx is its child, so warmup-ctx
+// expiry cancels the seed ctx exactly as pipGlobalTimeout would). The seed
+// blocks on its ctx and returns ctx.Err() on cancel — modelling a stuck seed.
+//
+// RED (no backstop / flip not fire-regardless): phase1WarmupWith never flips →
+// IsPhase1Done() stays false → this FAILS (permanent-outage, the landmine).
+func TestPhase1_Ready_WhenSeedNeverCompletes_Backstop(t *testing.T) {
 	rw := phase1TestWatcher(t)
 	cache.ResetPhase1DoneForTest()
 	cache.ResetNavigationDiscoveredGroupsForTest()
@@ -149,27 +180,43 @@ func TestPhase1_ReadinessFlips_WhenSeedErrors(t *testing.T) {
 		return nil
 	}
 
-	seedDone := make(chan struct{})
+	// A stuck seed: blocks until its ctx (the pipGlobalTimeout child of the
+	// warmup ctx) is cancelled, then returns the ctx error — it NEVER completes
+	// on its own.
+	seedObservedCancel := make(chan struct{})
 	pipSeed := func(ctx context.Context) error {
-		defer close(seedDone)
-		return errors.New("simulated large-topology seed failure")
+		<-ctx.Done()
+		close(seedObservedCancel)
+		return ctx.Err()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Short WARMUP ctx = the backstop-path proxy (drives the same seed-ctx-cancel
+	// that pipGlobalTimeout would at 8 min). 2s so the test is fast.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed, nil); err != nil {
-		t.Fatalf("Ship 2: phase1WarmupWith must NOT propagate a background-seed error as "+
-			"a fatal return: %v", err)
-	}
-	if !cache.IsPhase1Done() {
-		t.Fatalf("Ship 2 FAIL: Phase1Done is false after a seed error — the background "+
-			"seed must never withhold readiness")
-	}
 
-	// Let the background goroutine observe its error + exit before teardown.
+	start := time.Now()
+	// phase1WarmupWith blocks until the backstop fires; it must RETURN (not hang)
+	// and flip Ready.
+	_ = phase1WarmupWith(ctx, rw, lister, resolver, nil, nil, pipSeed, nil)
+	elapsed := time.Since(start)
+
+	// The seed observed its ctx cancel (the backstop fired).
 	select {
-	case <-seedDone:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Ship 2: background seed goroutine never ran")
+	case <-seedObservedCancel:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("backstop: the stuck seed never observed a ctx cancel — the backstop path did not fire")
+	}
+	// LANDMINE GUARD: readiness FLIPPED despite the seed never completing.
+	if !cache.IsPhase1Done() {
+		t.Fatalf("BACKSTOP FAIL (503-FOREVER LANDMINE): Phase1Done is FALSE after a "+
+			"never-completing seed — the pod would be not-Ready FOREVER. MarkPhase1Done "+
+			"must fire REGARDLESS (the fire-regardless defer / backstop is missing).")
+	}
+	// Sanity: it flipped at ~the backstop, not instantly (proves it waited for
+	// the seed's timeout path, not a premature flip).
+	if elapsed < 1*time.Second {
+		t.Fatalf("backstop: flipped in %v — too fast; the seed was not actually gated "+
+			"(readiness must wait for the backstop, ~the warmup-ctx/pipGlobalTimeout deadline)", elapsed)
 	}
 }
