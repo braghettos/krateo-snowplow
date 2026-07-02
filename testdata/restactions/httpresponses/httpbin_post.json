@@ -1,0 +1,12 @@
+{
+  "args": {},
+  "data": "{\"compositionID\":\"AA-BB-CC\"}",
+  "headers": {
+    "Content-Type": "application/json",
+    "Host": "httpbin.local"
+  },
+  "json": {
+    "compositionID": "AA-BB-CC"
+  },
+  "url": "http://httpbin.local/post"
+}
