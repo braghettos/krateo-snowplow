@@ -170,25 +170,29 @@ func TestFAL_ContrastPhase1SAContext(t *testing.T) {
 	}
 }
 
-// --- FAL-5 — flag-off neutrality ----------------------------------------
+// --- FAL-5 — implicit-on-cache (REWORKED for the 2026-07-03 family fold) -----
 
-// TestFAL5_FlagOffNeutrality proves PREWARM_CONTENT_ENABLED off ⇒ the F2
-// feature is fully inert: PrewarmContentEnabled() is false, so Phase1Warmup
-// builds no harvester and no Step-7.5 callback — startup is byte-identical
-// to 0.30.124.
-func TestFAL5_FlagOffNeutrality(t *testing.T) {
-	// Unset / explicit-false / non-"true" — all OFF.
-	for _, v := range []string{"", "false", "0", "no", "TRUE", "yes"} {
+// TestFAL5_ContentImplicitOnCache — POST-FOLD (docs/prewarm-engine-implicit-on-
+// cache-2026-07-03.md): PREWARM_CONTENT_ENABLED is RETIRED; PrewarmContentEnabled()
+// is now implicit-on-cache. Pre-fold this asserted the opt-in "only \"true\"
+// enables" semantics (now void). New contract: content ON iff CACHE_ENABLED,
+// OFF iff cache off, and the retired env has NO effect.
+func TestFAL5_ContentImplicitOnCache(t *testing.T) {
+	// Cache off → content off, regardless of any (retired) content env value.
+	t.Setenv("CACHE_ENABLED", "false")
+	for _, v := range []string{"", "false", "true", "garbage"} {
 		t.Setenv("PREWARM_CONTENT_ENABLED", v)
 		if PrewarmContentEnabled() {
-			t.Fatalf("FAL-5: PREWARM_CONTENT_ENABLED=%q must NOT enable F2 — only the "+
-				"exact string \"true\" opts in", v)
+			t.Fatalf("FAL-5: content must be OFF when CACHE_ENABLED=false (retired env=%q ignored)", v)
 		}
 	}
-	// Exact "true" — ON.
-	t.Setenv("PREWARM_CONTENT_ENABLED", "true")
-	if !PrewarmContentEnabled() {
-		t.Fatalf("FAL-5: PREWARM_CONTENT_ENABLED=\"true\" must enable F2")
+	// Cache on → content ON (implicit), regardless of the retired env value.
+	t.Setenv("CACHE_ENABLED", "true")
+	for _, v := range []string{"", "false", "true", "garbage"} {
+		t.Setenv("PREWARM_CONTENT_ENABLED", v)
+		if !PrewarmContentEnabled() {
+			t.Fatalf("FAL-5: content must be ON when CACHE_ENABLED=true (implicit-on-cache; retired env=%q ignored)", v)
+		}
 	}
 }
 

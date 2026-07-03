@@ -360,25 +360,23 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	}
 
 	// Ship PIP (0.30.173): the per-identity prewarm seed harvester.
-	// Sibling of the content-prewarm harvester. When PIP is on the
-	// discovery walk harvests every resolved navigation widget CR + its
-	// (GVR, perPage, page) tuple into this set (Step 7.6a); the pipSeed
-	// callback below drains it together with the apiRef set to seed the
-	// top-level per-user resolved-output L1 for every enumerated RBAC
-	// cohort BEFORE phase1Done flips. Flag-off (PIP_ENABLED=false or
-	// PREWARM_CONTENT_ENABLED=false) the harvester stays nil — startup
-	// is byte-identical to 0.30.172.
+	// Sibling of the content-prewarm harvester. The discovery walk harvests
+	// every resolved navigation widget CR + its (GVR, perPage, page) tuple
+	// into this set (Step 7.6a); the ENGINE boot seed (rePrewarmBoot →
+	// seedScopeYielding) drains it together with the apiRef set to seed the
+	// top-level per-user resolved-output L1 for every per-binding target
+	// BEFORE phase1Done flips. Harvester stays nil when prewarm is off —
+	// startup byte-identical to the no-prewarm baseline.
 	//
-	// PIP rides the content-prewarm gate (it depends on the same
-	// apiRefHarvester for the restactions seed loop). A future ship may
-	// split the gates if the OOM profile justifies it.
+	// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md):
+	// all three gates below are now implicit-on-cache (each returns
+	// cache.PrewarmEnabled()), so this conjunction collapses to
+	// cache.PrewarmEnabled(). The legacy runPIPSeed errgroup drain that used
+	// to consume this harvester is DELETED; the engine boot seed is the ONLY
+	// consumer (navHarvester shared by reference with it).
 	var navHarvester *navWidgetHarvester
-	var pipSeed pipSeedFn
 	if cache.PrewarmEnabled() && PrewarmContentEnabled() && PrewarmPIPEnabled() {
 		navHarvester = newNavWidgetHarvester()
-		pipSeed = func(pctx context.Context) error {
-			return runPIPSeed(pctx, harvester, navHarvester, *saEP, rc, authnNS)
-		}
 	}
 
 	// Path 3.2.2.b (0.30.221) — the deferred apiRef pagination collector.
@@ -400,13 +398,21 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester, navHarvester, pagCollector)
 	}
 
-	// Ship 1 — the unified dynamic cohort-prewarm engine. When ON (and the
-	// PIP harvesters exist — the engine shares them), the background seed
-	// goroutine routes through the engine: it runs the post-sync re-walk
-	// (the boot-race fix), builds the BindingsByGVR index over the
-	// navigated GVRs, and seeds per-target-GVR-scoped cohorts — instead of
-	// the legacy global runPIPSeed. engineSeed is the background callback
-	// phase1WarmupWith invokes at Step 7.6 in place of pipSeed when set.
+	// The unified dynamic cohort-prewarm engine. When prewarm is on (and the
+	// PIP harvesters exist — the engine shares them), the seed goroutine
+	// routes through the engine: it runs the post-sync re-walk (the boot-race
+	// fix), builds the BindingsByGVR index over the navigated GVRs, and seeds
+	// per-target-GVR-scoped cohorts. engineSeed is the callback
+	// phase1WarmupWith invokes at Step 7.6.
+	//
+	// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md):
+	// PrewarmEngineEnabled() is now implicit-on-cache (== cache.PrewarmEnabled()),
+	// and navHarvester != nil iff cache.PrewarmEnabled() && PrewarmContentEnabled()
+	// && PrewarmPIPEnabled() (all three now implicit-on-cache). So when
+	// navHarvester != nil the engine gate is necessarily true — the engine is
+	// the ONLY seed path. The legacy runPIPSeed errgroup fallback is DELETED
+	// (its only reachable state, engine-off-cache-on, is now unreachable).
+	// Back-out = CACHE_ENABLED=false.
 	var engineSeed pipSeedFn
 	if PrewarmEngineEnabled() && navHarvester != nil {
 		deps := rePrewarmDeps{
@@ -476,14 +482,12 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		}
 	}
 
-	// Prefer the engine when enabled; else the legacy PIP seed — the
-	// engine's documented back-out lever (#341 ruling 2026-06-12):
-	// PREWARM_ENGINE_ENABLED=false flips production back to runPIPSeed/
-	// seedCohort in one helm --set. See seedCohort's header.
-	seedFn := pipSeed
-	if engineSeed != nil {
-		seedFn = engineSeed
-	}
+	// The engine is the single seed path (implicit-on-cache, fold 2026-07-03).
+	// engineSeed is nil only when the harvesters are absent (cache/prewarm
+	// off — no prewarm at all); phase1WarmupWith treats a nil seedFn as "flip
+	// Ready right after the sync barrier" (Step 8 else branch), the correct
+	// byte-identical no-seed behaviour for the cache-off case.
+	seedFn := engineSeed
 
 	// Path 3.2 / 0.30.218 — Step 7.5 cluster_list cell pre-warm. Runs
 	// BEFORE MarkPhase1Done (the cells must be warm by the time

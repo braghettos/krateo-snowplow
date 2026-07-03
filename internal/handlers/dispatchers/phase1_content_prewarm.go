@@ -72,11 +72,6 @@ import (
 )
 
 const (
-	// envPrewarmContentEnabled is the F2 opt-in gate. Chart default is
-	// false — the production default is decided by FAL-4 (the 50K MaxRSS
-	// bench), NOT pre-set. The validation deploy sets it true via --set.
-	envPrewarmContentEnabled = "PREWARM_CONTENT_ENABLED"
-
 	// envPrewarmContentMaxBytes is the per-envelope OBSERVABILITY
 	// threshold (bytes) — NOT a circuit-breaker, NOT an OOM mitigation. A
 	// prewarmed RESTAction whose resolved envelope exceeds it emits a WARN
@@ -106,10 +101,15 @@ const (
 	defaultPrewarmPageLimit = 5
 )
 
-// PrewarmContentEnabled reports whether the F2 Step-7.5 content pass is
-// opted in (PREWARM_CONTENT_ENABLED=="true"; default off).
+// PrewarmContentEnabled reports whether the F2 Step-7.5 content pass runs.
+// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md): the
+// standalone PREWARM_CONTENT_ENABLED env read is RETIRED (registered in
+// cache.retiredFlags). It is now IMPLICIT-ON-CACHE — the content pass runs
+// whenever prewarm runs, mirroring #57. (The sizing knobs PREWARM_CONTENT_MAX_BYTES
+// / PREWARM_PAGE_LIMIT are NOT folded — they are observability/pagination
+// params, not on/off gates.)
 func PrewarmContentEnabled() bool {
-	return env.String(envPrewarmContentEnabled, "") == "true"
+	return cache.PrewarmEnabled() // implicit-on-cache (#57); was env "PREWARM_CONTENT_ENABLED"=="true"
 }
 
 // prewarmContentMaxBytes returns the per-envelope oversize-WARN

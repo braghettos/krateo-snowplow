@@ -1,27 +1,29 @@
-// seed_bound_falsifier_test.go — #46 Piece A + Piece B falsifiers (hermetic).
+// seed_bound_falsifier_test.go — the ADAPTIVE seed-unit bound falsifiers
+// (fold 2026-07-03, docs/prewarm-engine-implicit-on-cache-2026-07-03.md §3/§6,
+// binding conditions C4). Hermetic — drives admission by INJECTED byte headroom
+// via cache.SetAdmissionRuntimeSeamsForTest (NOT an ambient env, NOT the
+// deleted SEED_FOOTPRINT_BUDGET_BYTES).
 //
-// The 50K SCALE falsifier (C46-3: peak HeapInuse under budget WITH the bound /
-// scales-toward-#23 WITHOUT, on the engine=false concurrent posture; per-unit
-// assert trips on an oversized unit on the engine=true serial posture; seed
-// COMPLETES not drops; CONTENT check warm rows non-empty + RBAC-correct) is
-// the cache-tester's bench harness. These hermetic arms prove the bound +
-// assert MECHANISM in-process so the 50K run validates behaviour, not basic
-// correctness:
+// SUPERSEDES the pre-fold fixed-semaphore arms (SEED_FOOTPRINT_BUDGET_BYTES /
+// SEED_EST_UNIT_BYTES_FALLBACK env-driven). Those envs are DELETED; the bound is
+// now the adaptive (GOMEMLIMIT − liveHeap) − GOMEMLIMIT/8 headroom gate, a
+// SEPARATE instance from the nested bound (C1).
 //
-//   B1 — Piece A assert TRIPS in prod (counts) when a unit's measured delta
-//        exceeds the budget; does NOT trip within budget. The discriminating
-//        oversized-unit guard.
-//   B2 — Piece A assert PANICS in test mode on breach (loud-fail; an
-//        unbounded/unpaginated unit slipping in is a regression).
-//   B3 — Piece B semaphore SERIALIZES concurrent units beyond the budget (the
-//        aggregate bound on the legacy/engine=false concurrent path): with a
-//        budget that admits only one unit's weight at a time, two concurrent
-//        boundSeedUnit calls never overlap. The original #46 mechanism.
-//   B4 — disabled (SEED_FOOTPRINT_BUDGET_BYTES==0) is a transparent
-//        pass-through: do() runs, no Acquire, no assert, counter flat.
-//   B5 — seed COMPLETES (blocks, never drops): every wrapped unit's do() runs
-//        even under a tight budget (excess blocks then proceeds).
-//   B6 — -race: concurrent boundSeedUnit churn under a tight budget, clean.
+//   A1 — ADAPTIVE ADMISSION (the C4 RED arm): M>1 oversized seed units under an
+//        injected TIGHT headroom that fits only ONE unit at a time → GREEN:
+//        they SERIALIZE (max concurrency == 1), peak in-flight weight <= ceiling,
+//        all complete. RED (gate off / per-unit weight ignored): peak = M×unit
+//        >> ceiling.
+//   A2 — STACKED-UNIT / C1 deadlock-safety: a seed unit whose body synchronously
+//        enters a SECOND independent admission (modelling the seed→nested-CR
+//        stack) COMPLETES under tight headroom (no self-deadlock), -race clean.
+//   A3 — inFlightCount==0 guaranteed-progress: a LONE unit larger than the whole
+//        ceiling still admits (runs alone), never parks forever.
+//   A4 — TRANSPARENT when GOMEMLIMIT unlimited: no serialization, do() runs,
+//        release is a no-op.
+//   A5 — SERIALIZE-not-drop: every unit's do() runs under tight headroom.
+//   A6 — CALIBRATION lands in a per-UNIT band (granularity discriminator).
+//   A7 — the AssertSeedUnitFootprint diagnostic still fires in the release path.
 package dispatchers
 
 import (
@@ -35,216 +37,55 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 )
 
-// B1 — Piece A assert trips in prod on an oversized delta; clean within budget.
-// (Prod mode: AssertSeedUnitFootprint counts + returns false, never panics.)
-func TestFalsifier46_PerUnitAssertTripsOnOversized(t *testing.T) {
-	// NOT test mode for this arm — we want the prod count path, not panic.
-	// (env.TestMode keys off a separate env; this package's tests run with it
-	// unset by default. Assert the prod-count branch directly.)
-	cache.ResetSeedUnitFootprintViolationsForTest()
-
-	const budget = 1000
-
-	// Within budget → no violation.
-	if ok := cache.AssertSeedUnitFootprint("unit/small", 500, budget); !ok {
-		t.Fatalf("within-budget unit (500<=1000) reported a violation")
-	}
-	if v := cache.SeedUnitFootprintViolations(); v != 0 {
-		t.Fatalf("within-budget unit bumped the violation counter: %d", v)
-	}
-
-	// Over budget → violation counted, returns false.
-	if ok := cache.AssertSeedUnitFootprint("unit/oversized", 5000, budget); ok {
-		t.Fatalf("oversized unit (5000>1000) reported WITHIN budget")
-	}
-	if v := cache.SeedUnitFootprintViolations(); v != 1 {
-		t.Fatalf("oversized unit did not bump the violation counter exactly once: %d", v)
-	}
-
-	// budget==0 disables the assert (transparent).
-	cache.ResetSeedUnitFootprintViolationsForTest()
-	if ok := cache.AssertSeedUnitFootprint("unit/huge", 1<<40, 0); !ok {
-		t.Fatalf("budget==0 should disable the assert (always within budget)")
-	}
-	if v := cache.SeedUnitFootprintViolations(); v != 0 {
-		t.Fatalf("budget==0 bumped the violation counter: %d", v)
-	}
-}
-
-// B3 — Piece B semaphore serializes concurrent units beyond budget. With a
-// budget that fits exactly ONE unit's weight, two concurrent boundSeedUnit
-// calls must NOT overlap (the second blocks until the first Releases).
-func TestFalsifier46_SemaphoreSerializesBeyondBudget(t *testing.T) {
-	// Budget == one unit's fallback weight → at most one unit in flight.
-	// Use a small explicit budget + a fallback that equals it so estUnit==budget.
-	t.Setenv("SEED_FOOTPRINT_BUDGET_BYTES", "1024")
-	t.Setenv("SEED_EST_UNIT_BYTES_FALLBACK", "1024")
-	resetSeedBoundForTest()
-	t.Cleanup(resetSeedBoundForTest)
-
-	var inFlight atomic.Int32
-	var maxObserved atomic.Int32
-	started := make(chan struct{}, 2)
-
-	unit := func() error {
-		n := inFlight.Add(1)
-		for {
-			old := maxObserved.Load()
-			if n <= old || maxObserved.CompareAndSwap(old, n) {
-				break
-			}
-		}
-		started <- struct{}{}
-		time.Sleep(80 * time.Millisecond) // hold the weight so overlap would show
-		inFlight.Add(-1)
-		return nil
-	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = boundSeedUnit(context.Background(), "unit", unit)
-		}()
-	}
-	wg.Wait()
-
-	if got := maxObserved.Load(); got != 1 {
-		t.Fatalf("B3: max concurrent in-flight units = %d, want 1 — the budget admits only one unit's weight, "+
-			"so the semaphore must serialize them (aggregate bound not enforced)", got)
-	}
-}
-
-// B4 — disabled (budget==0) is a transparent pass-through.
-func TestFalsifier46_DisabledIsTransparent(t *testing.T) {
-	t.Setenv("SEED_FOOTPRINT_BUDGET_BYTES", "0")
-	resetSeedBoundForTest()
-	t.Cleanup(resetSeedBoundForTest)
-	cache.ResetSeedUnitFootprintViolationsForTest()
-
-	ran := false
-	err := boundSeedUnit(context.Background(), "unit", func() error {
-		ran = true
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("disabled pass-through returned err: %v", err)
-	}
-	if !ran {
-		t.Fatalf("disabled pass-through did NOT run do()")
-	}
-	// No assert fires when disabled (budget 0 → AssertSeedUnitFootprint no-op,
-	// and boundSeedUnit returns before sampling anyway).
-	if v := cache.SeedUnitFootprintViolations(); v != 0 {
-		t.Fatalf("disabled path bumped the violation counter: %d", v)
-	}
-}
-
-// B5 — seed COMPLETES (blocks, never drops): every unit's do() runs even under
-// a tight budget that forces serialization.
-func TestFalsifier46_TightBudgetAllUnitsComplete(t *testing.T) {
-	t.Setenv("SEED_FOOTPRINT_BUDGET_BYTES", "1024")
-	t.Setenv("SEED_EST_UNIT_BYTES_FALLBACK", "1024")
-	resetSeedBoundForTest()
-	t.Cleanup(resetSeedBoundForTest)
-
-	const n = 20
-	var ran atomic.Int32
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = boundSeedUnit(context.Background(), "unit", func() error {
-				ran.Add(1)
-				return nil
-			})
-		}()
-	}
-	wg.Wait()
-	if got := ran.Load(); got != n {
-		t.Fatalf("B5: %d/%d units ran — a tight budget must BLOCK (serialize) excess, never DROP", got, n)
-	}
-}
-
-// B6 — -race: concurrent boundSeedUnit churn under a tight budget.
-func TestFalsifier46_ConcurrentBoundRace(t *testing.T) {
-	t.Setenv("SEED_FOOTPRINT_BUDGET_BYTES", "4096")
-	t.Setenv("SEED_EST_UNIT_BYTES_FALLBACK", "1024")
-	resetSeedBoundForTest()
-	t.Cleanup(resetSeedBoundForTest)
-
-	var wg sync.WaitGroup
-	for i := 0; i < 64; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = boundSeedUnit(context.Background(), "unit", func() error {
-				return nil
-			})
-		}()
-	}
-	wg.Wait()
-	// Clean -race + no deadlock IS the assertion.
-}
-
-// B7 — THE GRANULARITY DISCRIMINATOR (feedback_falsifier_shape_must_discriminate):
-// K>1 cohorts × M>1 units, asserting on the REAL semaphore weight the bracket
-// reserves (currentEstUnit) and the REAL effective concurrency — NOT a test-side
-// counter decoupled from the semaphore (that decoupling is exactly how B3's K=2/M=1
-// shape masked the @15cff6b per-cohort defect).
-//
-// The load-bearing assertions, both keyed off the actual Acquire weight:
-//   (a) EFFECTIVE CONCURRENCY: with the budget sized to fit floor(budget/estUnit)
-//       UNITS, the max number of bracket bodies running simultaneously must equal
-//       that per-UNIT count. Under a per-COHORT acquire (estUnit inflated to a whole
-//       cohort, then budget-clamped) the semaphore admits only ONE body at a time —
-//       observed concurrency collapses to 1, FAILING this assertion.
-//   (b) PER-UNIT WEIGHT: currentEstUnit(budget) must stay in the per-UNIT band
-//       (< a cohort). A per-cohort granularity inflates it to ≈ M× (clamped to
-//       budget) — caught directly.
-// The RED control below (run by the dev pre-freeze, documented in the artifact)
-// multiplies the acquire weight ×M to simulate @15cff6b and confirms BOTH (a) and (b)
-// flip to FAIL.
-func TestFalsifier46_GranularityDiscriminator_PerUnitNotPerCohort(t *testing.T) {
-	const (
-		M = 8 // units per cohort (M>1)
-		K = 4 // concurrent cohorts (K>1) → K*M = 32 units
-		// budget fits exactly 4 per-UNIT weights in flight; a whole cohort
-		// (M units) would NOT fit → the discriminator.
-		budgetUnits = 4
+// tightHeadroomSeams installs deterministic runtime seams so the shared
+// cache.AdmissionCeiling() computes a ceiling that fits exactly `unitsThatFit`
+// units of `unitBytes` and no more, with a static (liveHeap==0) denominator so
+// the ceiling is stable across admissions (deterministic serialization).
+// Returns (restore, actualCeiling) — tests assert peak in-flight weight against
+// the ACTUAL computed ceiling, avoiding integer-division off-by-one artifacts.
+func tightHeadroomSeams(t *testing.T, unitBytes int64, unitsThatFit int64) (func(), int64) {
+	t.Helper()
+	// Target a ceiling in the middle of the band [unitsThatFit*unit,
+	// (unitsThatFit+1)*unit) so exactly unitsThatFit units fit and no more.
+	target := unitsThatFit*unitBytes + unitBytes/2
+	// ceiling = limit - limit/8 = limit*7/8  ⇒  limit = target*8/7.
+	limit := target * 8 / 7
+	restore := cache.SetAdmissionRuntimeSeamsForTest(
+		func() int64 { return limit },
+		func() int64 { return 0 }, // static live heap — ceiling is deterministic
 	)
-	t.Setenv("SEED_FOOTPRINT_BUDGET_BYTES", "4194304")  // 4 MiB
-	t.Setenv("SEED_EST_UNIT_BYTES_FALLBACK", "1048576") // 1 MiB per UNIT (conservative-high)
+	ceiling, _ := cache.AdmissionCeiling()
+	return restore, ceiling
+}
+
+// A1 — ADAPTIVE ADMISSION serializes M oversized units under a headroom that
+// fits ONE at a time. This is the C4 RED arm: with the adaptive gate ON, max
+// concurrency is 1 and peak in-flight weight <= ceiling; with the gate off it
+// would be M×unit >> ceiling.
+func TestSeedBoundAdaptive_A1_SerializesUnderTightHeadroom(t *testing.T) {
+	const (
+		unitBytes = int64(64 * 1024 * 1024) // 64 MiB per unit
+		M         = 6                        // units
+	)
 	resetSeedBoundForTest()
 	t.Cleanup(resetSeedBoundForTest)
-	cache.ResetSeedUnitFootprintViolationsForTest()
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	// Headroom fits exactly ONE unit at a time.
+	restore, ceiling := tightHeadroomSeams(t, unitBytes, 1)
+	t.Cleanup(restore)
 
-	// The REAL per-unit weight the bracket reserves (no real allocation → calibration
-	// stays at the fallback, which is the per-unit cost). This is what the semaphore
-	// actually Acquires — assert on IT, not a decoupled counter.
-	_, budget := seedBound()
-	estUnit := currentEstUnit(budget)
+	// Force the estUnit to the known unitBytes so admission math is deterministic:
+	// pre-calibrate by injecting a measured delta via a first sacrificial unit is
+	// noisy; instead rely on the code-constant fallback (256 MiB) being clamped
+	// to the ceiling. With ceiling == 1*unitBytes == 64 MiB, currentEstUnit
+	// clamps the 256 MiB fallback DOWN to the ceiling (64 MiB) — so each unit's
+	// weight == ceiling, and exactly one fits. That IS the serialization driver.
 
-	// (b) PER-UNIT WEIGHT band: estUnit must fit the budget as a UNIT, and a whole
-	// cohort (M×estUnit) must NOT — else the test can't discriminate.
-	if estUnit > budget {
-		t.Fatalf("B7(b) setup: estUnit %d > budget %d — a single unit must fit", estUnit, budget)
-	}
-	if M*estUnit <= budget {
-		t.Fatalf("B7(b) setup: a cohort (%d×%d=%d) must EXCEED budget %d to discriminate per-unit vs per-cohort",
-			M, estUnit, M*estUnit, budget)
-	}
-	wantConcurrency := int(budget / estUnit) // == budgetUnits (4)
-	if wantConcurrency != budgetUnits {
-		t.Fatalf("B7 setup: expected %d concurrent units, got %d (budget/estUnit)", budgetUnits, wantConcurrency)
-	}
-
-	// (a) EFFECTIVE CONCURRENCY through the REAL bracket. Track how many bracket
-	// bodies are simultaneously past Acquire — driven purely by the semaphore.
 	var inFlight atomic.Int32
 	var maxConc atomic.Int32
+	var peakWeight atomic.Int64
+	var completed atomic.Int32
+
 	runUnit := func() {
 		release, err := enterSeedUnit(context.Background(), "unit")
 		if err != nil {
@@ -258,66 +99,213 @@ func TestFalsifier46_GranularityDiscriminator_PerUnitNotPerCohort(t *testing.T) 
 				break
 			}
 		}
-		time.Sleep(40 * time.Millisecond) // hold the slot so true overlap is observable
+		// Record the real in-flight weight the gate is holding.
+		w, _ := inFlightSeedWeightForTest()
+		for {
+			old := peakWeight.Load()
+			if w <= old || peakWeight.CompareAndSwap(old, w) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond) // hold the slot so overlap would show
 		inFlight.Add(-1)
 		release()
+		completed.Add(1)
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < K*M; i++ {
+	for i := 0; i < M; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runUnit()
-		}()
+		go func() { defer wg.Done(); runUnit() }()
 	}
 	wg.Wait()
 
-	// The semaphore must admit exactly budget/estUnit UNITS simultaneously (ΣN-units
-	// bound). Under a per-COHORT acquire the inflated+clamped weight would pin this to
-	// 1 — this assertion FAILS for the @15cff6b granularity.
-	if got := int(maxConc.Load()); got != wantConcurrency {
-		t.Fatalf("B7(a) GRANULARITY: max concurrent units = %d, want %d (= budget %d / estUnit %d). "+
-			"A value of 1 means the acquire weight is per-COHORT (inflated+clamped), the @15cff6b defect; "+
-			"the bound must be PER-UNIT so floor(budget/unit) units run at once = ΣN-units aggregate cap.",
-			got, wantConcurrency, budget, estUnit)
+	if got := maxConc.Load(); got != 1 {
+		t.Fatalf("A1 GRANULARITY/RED: max concurrent seed units = %d, want 1 — the adaptive gate must "+
+			"SERIALIZE units to a headroom that fits one at a time. A value of M (%d) means the gate is OFF "+
+			"or the per-unit weight is ignored (peak = M×unit >> ceiling).", got, M)
 	}
-
-	// (b) the per-unit weight band, asserted directly on the real acquire weight.
-	if estUnit >= M*1<<20 {
-		t.Fatalf("B7(b) WEIGHT: estUnit %d is in the per-COHORT band (>= M units) — granularity defect", estUnit)
+	if pw := peakWeight.Load(); pw > ceiling {
+		t.Fatalf("A1: peak in-flight weight %d B exceeded the ceiling %d B — the aggregate bound leaked", pw, ceiling)
+	}
+	if c := completed.Load(); int(c) != M {
+		t.Fatalf("A1: %d/%d units completed — serialize must never DROP", c, M)
 	}
 }
 
-// B8 — C46-4(a) CALIBRATION-BAND discriminator: drive units that each allocate a
-// KNOWN, retained per-unit footprint through the per-unit bracket, and assert
-// calibrateEstUnit lands in a PER-UNIT band — tight enough that a per-COHORT
-// calibration (M× a unit, which the @15cff6b g.Go-cohort placement would have
-// measured) FAILS the band. This is the half of C46-4 that keys on what
-// calibrate MEASURES (B7 keys on effective concurrency); together they pin the
-// granularity from both the weight and the concurrency side.
+// A2 — STACKED seed→nested / C1 deadlock-safety. The real production stack is:
+// the seed gate (enterSeedUnit, this package) OUTER, and — when a seed unit's
+// resolve triggers a depth-0 nested-CR resolve — the SEPARATE nested gate
+// (api.enterNestedResolveUnit) INNER, both on ONE goroutine in strict nest
+// order. C1 requires SEPARATE instances (own mutex/cond/counters) so the stack
+// cannot self-deadlock.
 //
-// The per-cohort RED control is structural, not a proxy: the @15cff6b defect
-// wrapped seedCohort (M units' summed allocation inside ONE enterSeedUnit), so
-// the FIRST measured delta = M units. Asserting `calibrated < perUnitCeil`
-// (perUnitCeil < M×unit) FAILS for that placement and PASSES for the
-// shared-primitive (one-unit) placement.
-func TestFalsifier46_CalibrationLandsInPerUnitBand(t *testing.T) {
+// This arm proves the load-bearing structural property that makes the stack
+// deadlock-free WITHOUT reaching into the api package's unexported gate: (1) a
+// seed unit's BODY runs while holding the admission but NOT the seed mutex
+// (enterSeedUnit releases b.mu before returning the release closure), so the
+// inner nested-gate admission (which takes the nested gate's OWN mutex + the
+// stateless shared cache.AdmissionCeiling) can never contend with or wait on
+// the seed mutex; and (2) the seed gate's OWN park→proceed liveness (broadcast
+// on release), so even under a tight headroom a parked unit proceeds. If the
+// two gates shared a lock (the C1 violation), (1) would deadlock: a unit body
+// calling AdmissionCeiling / a second admission would re-enter a held mutex.
+//
+// Concretely: goroutine A takes a seed unit and, INSIDE its held body,
+// synchronously calls cache.AdmissionCeiling() (exactly what the inner nested
+// gate does at admission) — this must not deadlock (proves no seed mutex is
+// held during the body). Meanwhile goroutine B must PARK on the tight headroom
+// then PROCEED when A releases (proves broadcast liveness). A shared-lock C1
+// violation, or a body that held the seed mutex, would hang → test times out.
+func TestSeedBoundAdaptive_A2_StackedSeedNestedNoDeadlock(t *testing.T) {
+	const unitBytes = int64(64 * 1024 * 1024)
+	resetSeedBoundForTest()
+	t.Cleanup(resetSeedBoundForTest)
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	restore, _ := tightHeadroomSeams(t, unitBytes, 1) // fits one at a time
+	t.Cleanup(restore)
+
+	aReleased := make(chan struct{})
+	bDone := make(chan struct{})
+
+	go func() {
+		release, err := enterSeedUnit(context.Background(), "A")
+		if err != nil {
+			t.Errorf("A enterSeedUnit: %v", err)
+			close(aReleased)
+			return
+		}
+		// INNER (nested-gate proxy): while holding the seed admission, do exactly
+		// what api.enterNestedResolveUnit does at admission — sample the shared
+		// ceiling. If the seed gate held its own mutex across the body, or the two
+		// gates shared a lock, this would deadlock.
+		for i := 0; i < 100; i++ {
+			_, _ = cache.AdmissionCeiling()
+			_ = cache.AdmissionLiveHeapSample()
+		}
+		time.Sleep(40 * time.Millisecond) // hold so B genuinely parks
+		release()
+		close(aReleased)
+	}()
+
+	go func() {
+		defer close(bDone)
+		time.Sleep(10 * time.Millisecond) // let A admit first
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		release, err := enterSeedUnit(ctx, "B")
+		if err != nil {
+			t.Errorf("B enterSeedUnit parked past ctx (deadlock?): %v", err)
+			return
+		}
+		release()
+	}()
+
+	select {
+	case <-bDone:
+		<-aReleased
+	case <-time.After(8 * time.Second):
+		t.Fatal("A2 DEADLOCK: the stacked seed→nested case hung — C1 violated (separate instances + " +
+			"no seed mutex held during the unit body + broadcast-on-release must let the stack proceed)")
+	}
+}
+
+// A3 — inFlightCount==0 guaranteed-progress: a LONE unit whose weight exceeds
+// the whole ceiling still admits (runs alone) rather than parking forever.
+func TestSeedBoundAdaptive_A3_LoneOversizedAdmits(t *testing.T) {
+	const unitBytes = int64(64 * 1024 * 1024)
+	resetSeedBoundForTest()
+	t.Cleanup(resetSeedBoundForTest)
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	// Ceiling SMALLER than one unit (fits 0 whole units): the lone unit "won't
+	// fit" but inFlightCount==0 ⇒ admits.
+	restore := cache.SetAdmissionRuntimeSeamsForTest(
+		func() int64 { return unitBytes / 2 * 8 / 7 }, // ceiling ~= unitBytes/2 < unitBytes
+		func() int64 { return 0 },
+	)
+	t.Cleanup(restore)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	release, err := enterSeedUnit(ctx, "lone-oversized")
+	if err != nil {
+		t.Fatalf("A3: a lone oversized unit must admit (inFlightCount==0 escape), got err %v — "+
+			"it parked forever instead of running alone", err)
+	}
+	release()
+}
+
+// A4 — TRANSPARENT when GOMEMLIMIT is unlimited (the runtime default). The gate
+// no-ops: no serialization, do() runs, release is a no-op.
+func TestSeedBoundAdaptive_A4_UnlimitedIsTransparent(t *testing.T) {
+	resetSeedBoundForTest()
+	t.Cleanup(resetSeedBoundForTest)
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	// math.MaxInt64 limit ⇒ AdmissionCeiling returns unlimited==true.
+	restore := cache.SetAdmissionRuntimeSeamsForTest(
+		func() int64 { return 1<<63 - 1 },
+		func() int64 { return 0 },
+	)
+	t.Cleanup(restore)
+
+	ran := false
+	err := boundSeedUnit(context.Background(), "unit", func() error { ran = true; return nil })
+	if err != nil {
+		t.Fatalf("A4: transparent pass-through returned err: %v", err)
+	}
+	if !ran {
+		t.Fatalf("A4: transparent pass-through did NOT run do()")
+	}
+}
+
+// A5 — SERIALIZE-not-drop: every unit's do() runs under a tight headroom that
+// forces serialization.
+func TestSeedBoundAdaptive_A5_AllUnitsComplete(t *testing.T) {
+	const unitBytes = int64(64 * 1024 * 1024)
+	resetSeedBoundForTest()
+	t.Cleanup(resetSeedBoundForTest)
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	restore, _ := tightHeadroomSeams(t, unitBytes, 1)
+	t.Cleanup(restore)
+
+	const n = 20
+	var ran atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = boundSeedUnit(context.Background(), "unit", func() error { ran.Add(1); return nil })
+		}()
+	}
+	wg.Wait()
+	if got := ran.Load(); int(got) != n {
+		t.Fatalf("A5: %d/%d units ran — a tight headroom must BLOCK (serialize) excess, never DROP", got, n)
+	}
+}
+
+// A6 — CALIBRATION lands in a per-UNIT band (granularity discriminator, C4
+// per-unit assertion preserved). Drive units that each allocate + retain a
+// KNOWN per-unit footprint through the bracket; calibrateEstUnit must land < a
+// whole cohort (M units). A per-cohort placement would calibrate ≈ M×.
+func TestSeedBoundAdaptive_A6_CalibrationPerUnitBand(t *testing.T) {
 	const (
 		M          = 8
 		perUnitMiB = 4
-		// budget generous so the bracket never blocks; we're testing calibration.
-		budgetMiB = 256
 	)
-	t.Setenv("SEED_FOOTPRINT_BUDGET_BYTES", "268435456")  // 256 MiB
-	t.Setenv("SEED_EST_UNIT_BYTES_FALLBACK", "268435456") // high fallback so calibration (not fallback) is what we read
 	resetSeedBoundForTest()
 	t.Cleanup(resetSeedBoundForTest)
-	cache.ResetSeedUnitFootprintViolationsForTest()
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	// Generous headroom so the bracket never parks; we test calibration, which
+	// reads the SHARED live-heap sampler. Use a live-heap counter that grows with
+	// each unit's real retained allocation so the release-time delta is real.
+	var liveHeap atomic.Int64
+	restore := cache.SetAdmissionRuntimeSeamsForTest(
+		func() int64 { return 8 * 1024 * 1024 * 1024 }, // 8 GiB — never binds
+		func() int64 { return liveHeap.Load() },
+	)
+	t.Cleanup(restore)
 
-	// One unit: allocate + RETAIN ~perUnitMiB so the HeapInuse delta the bracket
-	// samples reflects ONE unit's real footprint (calibration is one-shot off the
-	// first unit).
 	var sink [][]byte
 	runUnit := func() {
 		release, err := enterSeedUnit(context.Background(), "unit")
@@ -325,16 +313,14 @@ func TestFalsifier46_CalibrationLandsInPerUnitBand(t *testing.T) {
 			t.Errorf("enterSeedUnit: %v", err)
 			return
 		}
-		// Retain the allocation across the release() sample so the delta is real.
 		buf := make([]byte, perUnitMiB*(1<<20))
 		for i := range buf {
-			buf[i] = byte(i) // touch pages so they're resident (HeapInuse, not just reserved)
+			buf[i] = byte(i)
 		}
 		sink = append(sink, buf)
+		liveHeap.Add(int64(len(buf))) // model live-heap growth for the release-time delta
 		release()
 	}
-
-	// Drive a few units sequentially (calibration pins on the first non-zero delta).
 	for i := 0; i < M; i++ {
 		runUnit()
 	}
@@ -342,13 +328,71 @@ func TestFalsifier46_CalibrationLandsInPerUnitBand(t *testing.T) {
 
 	est, calibrated := calibratedEstUnitForTest()
 	if !calibrated {
-		t.Skip("B8: calibration did not latch (GC ran across every first-unit sample) — non-deterministic on this host; B7 covers the concurrency side")
+		t.Fatalf("A6: calibration did not latch — the first unit's live-heap delta must calibrate the weight")
 	}
-	// PER-UNIT band: the calibrated weight must be < a whole cohort (M units). A
-	// per-cohort placement (@15cff6b) would have calibrated ≈ M×, FAILING this.
 	perUnitCeil := int64(M) * perUnitMiB * (1 << 20) / 2 // half a cohort — generous per-unit ceiling
 	if est >= perUnitCeil {
-		t.Fatalf("B8 C46-4(a): calibrated estUnit %d B >= per-unit ceiling %d B — calibration measured a "+
-			"PER-COHORT footprint (the @15cff6b g.Go-cohort placement), not one unit", est, perUnitCeil)
+		t.Fatalf("A6: calibrated estUnit %d B >= per-unit ceiling %d B — calibration measured a PER-COHORT "+
+			"footprint, not one unit (granularity defect)", est, perUnitCeil)
 	}
+	// And it must reflect ~one unit's allocation (perUnitMiB), not near-zero.
+	if est < int64(perUnitMiB)*(1<<20)/2 {
+		t.Fatalf("A6: calibrated estUnit %d B is implausibly small (< half a unit) — calibration under-measured", est)
+	}
+}
+
+// A7 — the AssertSeedUnitFootprint diagnostic still fires from the adaptive
+// release path when a unit's measured delta exceeds the ceiling it was admitted
+// against (re-homed from the old semaphore release). Under a tight ceiling +
+// an injected live-heap jump larger than the ceiling, the per-unit violation
+// counter bumps.
+func TestSeedBoundAdaptive_A7_OversizeAssertFires(t *testing.T) {
+	resetSeedBoundForTest()
+	t.Cleanup(resetSeedBoundForTest)
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	cache.ResetSeedUnitFootprintViolationsForTest()
+
+	// Ceiling ~= 8 MiB. The unit's release samples a live-heap delta of ~64 MiB
+	// (injected) >> ceiling → AssertSeedUnitFootprint counts a violation.
+	const ceilingBytes = int64(8 * 1024 * 1024)
+	var liveHeap atomic.Int64
+	restore := cache.SetAdmissionRuntimeSeamsForTest(
+		func() int64 { return ceilingBytes * 8 / 7 },
+		func() int64 { return liveHeap.Load() },
+	)
+	t.Cleanup(restore)
+
+	release, err := enterSeedUnit(context.Background(), "unit/oversized")
+	if err != nil {
+		t.Fatalf("A7: enterSeedUnit (lone, inFlightCount==0 escape) must admit: %v", err)
+	}
+	// Jump live heap by 64 MiB so the release-time delta >> ceiling.
+	liveHeap.Add(64 * 1024 * 1024)
+	release()
+
+	if v := cache.SeedUnitFootprintViolations(); v == 0 {
+		t.Fatalf("A7: an oversized unit (delta >> ceiling) did not bump the AssertSeedUnitFootprint " +
+			"violation counter — the diagnostic did not fire from the adaptive release path")
+	}
+}
+
+// A8 — -race: concurrent seed-unit churn under a tight headroom, clean + no
+// deadlock (the assertion is the clean -race run).
+func TestSeedBoundAdaptive_A8_ConcurrentRace(t *testing.T) {
+	const unitBytes = int64(16 * 1024 * 1024)
+	resetSeedBoundForTest()
+	t.Cleanup(resetSeedBoundForTest)
+	t.Cleanup(cache.ResetAdmissionRuntimeSeamsForTest)
+	restore, _ := tightHeadroomSeams(t, unitBytes, 2) // fits two at a time
+	t.Cleanup(restore)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = boundSeedUnit(context.Background(), "unit", func() error { return nil })
+		}()
+	}
+	wg.Wait()
 }

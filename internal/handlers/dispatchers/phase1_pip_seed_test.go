@@ -128,39 +128,38 @@ func TestPhase1PIPSeedKey_RootWidgetUsesDispatcherDefaultTuple(t *testing.T) {
 	}
 }
 
-// TestSeedCohort_CtxCancelEmitsAbortLog is the Ship 0.30.191 Fix C
-// falsifier. It pins the contract that when seedCohort's per-cohort
-// context is already cancelled at loop entry, the deferred reporter
-// emits a single greppable `phase1.cohort.abort` log line carrying
-// the abort cause + phase + processed counts + elapsed_ms +
-// cohort_timeout_ms — the load-bearing fields the post-deploy
-// validation grep relies on.
+// TestSeedScopeYielding_CtxCancelEmitsAbortLog is the 0.30.191 Fix-C
+// abort-observability falsifier, RE-POINTED 2026-07-03 (docs/prewarm-engine-
+// implicit-on-cache-2026-07-03.md §4.3b) from the deleted legacy seedCohort to
+// the surviving ENGINE seed path (seedScopeYielding, prewarm_engine_boot.go).
 //
-// A regression that removes the deferred reporter (or fails to thread
-// the local counters into the loop) fails this test.
+// COVERAGE MIGRATION + NEW EMIT: the engine's ctx-cancel exits previously just
+// `return ctx.Err()` with no greppable line — a coverage GAP, not a duplicate.
+// This ship ADDS a `prewarm.seed.abort` emit to seedScopeYielding carrying the
+// Fix-C load-bearing fields (phase / cause / targets_processed / elapsed_ms) so
+// the post-deploy "seed finished or cut off?" grep survives on the engine path.
+// This test drives seedScopeYielding with a PRE-CANCELLED ctx (1 restaction ref,
+// 0 widgets): the restactions-loop ctx-check fires on the first iteration,
+// emits the abort line, and returns ctx.Err().
 //
-// SCOPE: this test drives the cancelled-ctx + restactions-phase path
-// (1 restaction ref, 0 widgets, parent ctx pre-cancelled). seedCohort
-// hits cctx.Err() != nil on the first loop iteration, sets
-// abortCause="ctx_err" + abortPhase="restactions", records cohort
-// status "failed", and returns. The deferred reporter then emits the
-// `phase1.cohort.abort` log line.
-func TestSeedCohort_CtxCancelEmitsAbortLog(t *testing.T) {
+// A regression that removes the emit (or fails to thread the phase/counters)
+// fails this test. RED against the pre-emit engine: seedScopeYielding returned
+// ctx.Err() with NO greppable abort line → the assertions below cannot hold.
+func TestSeedScopeYielding_CtxCancelEmitsAbortLog(t *testing.T) {
 	var buf bytes.Buffer
 	h := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
 	prevDefault := slog.Default()
 	slog.SetDefault(slog.New(h))
 	t.Cleanup(func() { slog.SetDefault(prevDefault) })
 
-	// Pre-cancelled parent ctx — seedCohort's cctx, derived via
-	// context.WithTimeout(ctx, ...), inherits the cancellation
-	// immediately.
+	// Pre-cancelled ctx — seedScopeYielding hits ctx.Err() != nil on the first
+	// restactions-loop iteration, emits the abort, and returns.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// 1 restaction ref — never resolved because the ctx-check at the
-	// top of the loop fires first and returns. The ref's content is
-	// irrelevant; the abort path runs before seedOneRestaction.
+	// 1 restaction ref — never resolved because the ctx-check at the top of the
+	// loop fires first. The ref's content is irrelevant; the abort path runs
+	// before any seed work.
 	refs := []templatesv1.ObjectReference{{
 		Reference: templatesv1.Reference{
 			Name:      "test-restaction",
@@ -170,25 +169,16 @@ func TestSeedCohort_CtxCancelEmitsAbortLog(t *testing.T) {
 		Resource:   "restactions",
 	}}
 
-	// Ship 0.30.242 H.c-layered Phase 2c — cache.Cohort replaced by local
-	// dispatcher-package seedTarget (Phase 2b, phase1_pip_seed.go).
-	cohort := seedTarget{
-		Username: "test-cohort",
-	}
-	// Zero-value endpoints + nil REST config — withCohortSeedContext
-	// just installs the fields on the ctx; they are never dereferenced
-	// because seedOneRestaction is never reached.
-	err := seedCohort(ctx, cohort, refs, nil /* widgets */, endpoints.Endpoint{}, nil /* rc */, "test-authn-ns")
+	// Zero-value endpoints + nil REST config — never dereferenced (the ctx-check
+	// returns before any target seed).
+	err := seedScopeYielding(ctx, refs, nil /* widgets */, endpoints.Endpoint{}, nil /* rc */, "test-authn-ns")
 	if err == nil {
-		t.Fatalf("Fix C: seedCohort with pre-cancelled ctx returned nil; want non-nil error so the errgroup sees the cohort failure")
+		t.Fatalf("Fix-C(engine): seedScopeYielding with pre-cancelled ctx returned nil; want the ctx error")
 	}
 
-	// Assert the deferred reporter emitted the phase1.cohort.abort
-	// line with the load-bearing fields the post-deploy grep relies
-	// on.
 	logText := buf.String()
-	if !strings.Contains(logText, "phase1.cohort.abort") {
-		t.Fatalf("Fix C: expected `phase1.cohort.abort` log line; got:\n%s", logText)
+	if !strings.Contains(logText, "prewarm.seed.abort") {
+		t.Fatalf("Fix-C(engine): expected `prewarm.seed.abort` log line; got:\n%s", logText)
 	}
 
 	// Decode the JSON record lines and find the abort line.
@@ -198,56 +188,30 @@ func TestSeedCohort_CtxCancelEmitsAbortLog(t *testing.T) {
 		if jerr := json.Unmarshal([]byte(line), &rec); jerr != nil {
 			continue
 		}
-		if msg, _ := rec["msg"].(string); msg == "phase1.cohort.abort" {
+		if msg, _ := rec["msg"].(string); msg == "prewarm.seed.abort" {
 			found = rec
 			break
 		}
 	}
 	if found == nil {
-		t.Fatalf("Fix C: could not decode phase1.cohort.abort record from:\n%s", logText)
+		t.Fatalf("Fix-C(engine): could not decode prewarm.seed.abort record from:\n%s", logText)
 	}
 
-	// Pin every load-bearing field.
-	mustString := func(k, want string) {
-		t.Helper()
-		got, _ := found[k].(string)
-		if got != want {
-			t.Errorf("Fix C: log field %q = %q; want %q (full record: %+v)", k, got, want, found)
-		}
+	// Pin the load-bearing fields the post-deploy grep relies on.
+	if phase, _ := found["phase"].(string); phase != "restactions" {
+		t.Errorf("Fix-C(engine): phase = %q; want %q (full record: %+v)", phase, "restactions", found)
 	}
-	mustString("cohort", "test-cohort")
-	mustString("phase", "restactions")
-	mustString("abort_cause", "ctx_err")
-	// ctx_err carries the underlying cancellation reason — non-empty
-	// is the contract; the exact string ("context canceled") is set by
-	// the stdlib.
-	if s, _ := found["ctx_err"].(string); s == "" {
-		t.Errorf("Fix C: log field ctx_err is empty; want non-empty cancellation reason")
+	// cause carries the underlying cancellation reason — non-empty is the
+	// contract; the exact string ("context canceled") is stdlib-set.
+	if s, _ := found["cause"].(string); s == "" {
+		t.Errorf("Fix-C(engine): cause is empty; want non-empty cancellation reason (full record: %+v)", found)
 	}
-
-	// Numeric fields are decoded as float64 by encoding/json.
-	mustNum := func(k string, want float64) {
-		t.Helper()
-		got, _ := found[k].(float64)
-		if got != want {
-			t.Errorf("Fix C: log field %q = %v; want %v (full record: %+v)", k, got, want, found)
-		}
+	// targets_processed decoded as float64 by encoding/json; 0 (aborted before
+	// the first target seed completed).
+	if tp, _ := found["targets_processed"].(float64); tp != 0 {
+		t.Errorf("Fix-C(engine): targets_processed = %v; want 0 (aborted on first iteration)", tp)
 	}
-	mustNum("restactions_total", 1)
-	mustNum("widgets_total", 0)
-	mustNum("restactions_processed", 0)
-	mustNum("widgets_processed", 0)
-	mustNum("cohort_timeout_ms", float64(pipCohortTimeout.Milliseconds()))
-
-	// elapsed_ms must be present and non-negative.
 	if _, ok := found["elapsed_ms"]; !ok {
-		t.Errorf("Fix C: log field elapsed_ms missing (full record: %+v)", found)
-	}
-
-	// Also verify the cohort was marked failed.
-	if v, ok := pipCohortSeedStatus.Load("test-cohort"); !ok {
-		t.Errorf("Fix C: cohort status not recorded; want %q", cohortStatusFailed)
-	} else if status, _ := v.(string); status != cohortStatusFailed {
-		t.Errorf("Fix C: cohort status = %q; want %q", status, cohortStatusFailed)
+		t.Errorf("Fix-C(engine): elapsed_ms missing (full record: %+v)", found)
 	}
 }

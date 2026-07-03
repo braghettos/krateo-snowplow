@@ -1,129 +1,115 @@
-// seed_bound.go — #46 Piece B: the prewarm-seed aggregate-footprint bound +
-// the Piece-A per-unit footprint sample, applied at the seed-unit choke point.
+// seed_bound.go — the prewarm seed-unit ADAPTIVE memory-admission bound,
+// applied at the shared seed-unit choke points (seedOneWidget / seedOneRestaction).
 //
 // THE #23 OOM CLASS: a prewarm seed unit (one (target, layer) resolve) can
 // materialize a multi-hundred-MB UNPAGINATED full-list envelope
-// (seedRAFullListForWidget). Running many such units CONCURRENTLY (the legacy
-// runPIPSeed errgroup at GOMAXPROCS) summed to the ~8 GiB #23 boot OOM. The
-// engine path (seedScopeYielding) is SERIAL today, so its present risk is a
-// single oversized unit; the legacy errgroup path — reachable via the
-// PREWARM_ENGINE_ENABLED=false back-out lever — is the live concurrent
-// aggregate. Both are wrapped here (C46-2: bound the path that runs AND the
-// reachable back-out path).
+// (seedRAFullListForWidget). The adaptive nested-resolve bound does NOT cover
+// this allocation — a RA's own data-stage LISTs are depth-0 non-CR paths that
+// Gate 4 of the nested-resolve seam rejects (docs/prewarm-engine-implicit-on-cache-2026-07-03.md §3.1).
+// So this seed-unit bound is the ONLY thing that bounds seedRAFullListForWidget.
 //
-// TWO mechanisms, ONE wrapper (boundSeedUnit):
-//   - Piece B (the BOUND): a process-wide semaphore.Weighted sized by
-//     SEED_FOOTPRINT_BUDGET_BYTES. Each unit Acquires its estimated weight
-//     before resolving and Releases after. Excess BLOCKS (never drops → the
-//     seed still completes, just serialized under memory pressure). On the
-//     serial engine path this is a no-op admission gate (one unit at a time);
-//     on the concurrent errgroup path it caps the aggregate in-flight
-//     footprint. Disabled (no-op) when the budget is 0.
-//   - Piece A (the ASSERT): sample HeapInuse delta around the resolve and call
-//     cache.AssertSeedUnitFootprint — panics in test / logs+counts in prod
-//     when a SINGLE unit exceeds the budget (the oversized-unit signal that
-//     fires on both postures).
+// ADAPTIVE, ZERO-KNOB (fold 2026-07-03, §3.2; SUPERSEDES the fixed
+// SEED_FOOTPRINT_BUDGET_BYTES semaphore, which defaulted 0/DISABLED — leaving
+// the seed's dominant allocation UNBOUNDED once the seed flags fold on).
+// Replaces the fixed byte budget with the SAME recompute-per-admission headroom
+// gate as the (c) nested-resolve bound, via the SHARED cache.AdmissionCeiling()
+// primitive: ceiling = (GOMEMLIMIT − liveHeap) − GOMEMLIMIT/8.
 //
-// C46-1 (EMPIRICAL estUnitBytes, NOT a design-time constant — the 1.5.1 180×
-// lesson): the per-unit Acquire weight is calibrated from the FIRST unit's
-// MEASURED HeapInuse delta (one-shot), then reused. Before calibration (and as
-// the conservative fallback) the weight is SEED_EST_UNIT_BYTES_FALLBACK, which
-// MUST be conservative-HIGH (over-reserve, never under) so we never admit more
-// aggregate than the budget on the strength of a too-small guess.
+// C1 (deadlock-safety, NON-NEGOTIABLE): this is a SEPARATE bound instance
+// (seedBound, its OWN mutex/cond/inFlightWeight/inFlightCount) from the nested
+// bound's theBound(). It SHARES ONLY the pure calc (cache.AdmissionCeiling) +
+// the live-heap sampler (cache.AdmissionLiveHeapSample) — NEVER the counter/cond.
+// The stacked seed→nested case (a seed unit whose resolve triggers a depth-0
+// nested-CR resolve) holds TWO independent admissions on the SAME goroutine in
+// strict nest order (seed outer, nested inner); two independent semaphores each
+// with an inFlightCount==0 unconditional escape cannot self-deadlock. The two
+// weights are over-reservation against the same headroom — conservative-safe
+// (admits LESS aggregate, never more; the 1.5.1 over-reserve-is-safe lesson).
 //
-// SEED-SCOPED (customer /call UNTOUCHED): boundSeedUnit is called ONLY from the
-// seed choke points (seedOneTarget engine + the legacy errgroup closure), both
-// AFTER the per-binding identity short-circuit. The customer dispatcher never
-// routes here (feedback_bounding_mechanism_discipline: after the cache-hit,
-// seed-scoped, cost-proportional).
+// SERIALIZE-not-503 (the seed is background, no browser deadline): admit the
+// (N+1)th seed unit iff inFlightWeight + estUnit <= ceiling; else PARK (block,
+// ctx-bounded by the seed's own ctx — the boot budget / pipCohortTimeout),
+// re-check on release. inFlightCount==0 ⇒ admit unconditionally (anti-deadlock:
+// a lone oversized unit runs ALONE rather than parking forever). On ctx
+// cancel/deadline return the ctx error (the unit is abandoned best-effort,
+// log-only). NEVER a hard failure, NEVER a customer-visible error path.
+//
+// SEED-SCOPED (customer /call UNTOUCHED): enterSeedUnit is called ONLY from the
+// shared seed primitives, AFTER the per-binding identity short-circuit. The
+// customer dispatcher never routes here (feedback_bounding_mechanism_discipline:
+// after the cache-hit, seed-scoped, cost-proportional).
+//
+// TRANSPARENT when GOMEMLIMIT is unset (math.MaxInt64 → cache.AdmissionCeiling
+// returns unlimited): admit immediately, release is a no-op — byte-identical to
+// no bound (project_caching_is_provisional: cleanly removable). The chart sets
+// GOMEMLIMIT (7GiB); with it unset there is no soft ceiling to protect.
 package dispatchers
 
 import (
 	"context"
-	"runtime"
 	"sync"
 
-	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"golang.org/x/sync/semaphore"
 )
 
 const (
-	// envSeedFootprintBudgetBytes caps the aggregate in-flight prewarm-seed
-	// HeapInuse. 0 (default) DISABLES the bound + the per-unit assert — the
-	// transparent posture (project_caching_is_provisional: cleanly
-	// removable). Operators set it from the empirical per-entry cost × safety
-	// (feedback_capacity_caps_empirical_per_entry_cost).
-	envSeedFootprintBudgetBytes = "SEED_FOOTPRINT_BUDGET_BYTES"
-
-	// envSeedEstUnitBytesFallback is the CONSERVATIVE-HIGH per-unit weight
-	// used before the one-shot empirical calibration lands (and when
-	// calibration is somehow unavailable). Over-reserve by design: a too-high
-	// fallback serializes a bit more aggressively (safe); a too-low one would
-	// admit too much aggregate (the 1.5.1 180× under-estimate failure mode).
-	// 256 MiB ≈ a large unpaginated full-list unit; never larger than the
-	// whole budget would allow (clamped at use).
-	envSeedEstUnitBytesFallback        = "SEED_EST_UNIT_BYTES_FALLBACK"
-	defaultSeedEstUnitBytesFallback    = 256 * 1024 * 1024 // 256 MiB, conservative-high
+	// defaultSeedEstUnitBytes is the CONSERVATIVE-HIGH per-seed-unit admission
+	// weight used before the one-shot empirical calibration lands. Over-reserve
+	// by design: a too-high fallback serializes a touch more (safe); a too-low
+	// one admits too much aggregate (the 1.5.1 180× under-estimate failure mode).
+	// 256 MiB ≈ a large unpaginated full-list unit. FOLDED 2026-07-03: was the
+	// SEED_EST_UNIT_BYTES_FALLBACK env (deleted, zero-knob); now a CODE CONSTANT,
+	// mirroring nested_resolve_bound.go's defaultNestedEstUnitBytes.
+	defaultSeedEstUnitBytes int64 = 256 * 1024 * 1024
 )
+
+// seedAdmissionBound is the seed-unit process-wide admission gate — a SEPARATE
+// instance from the nested bound's aggregateBound (C1). inFlightWeight is the
+// sum of the estUnit weights of currently-admitted seed units; cond wakes
+// parked units on each release so they re-check headroom.
+type seedAdmissionBound struct {
+	mu             sync.Mutex
+	cond           *sync.Cond
+	inFlightWeight int64
+	inFlightCount  int
+}
 
 var (
-	// seedBoundOnce lazily builds the semaphore from the budget on first use
-	// (env is populated before any seed runs). A plain mutex-guarded
-	// double-check (NOT sync.Once) so resetSeedBoundForTest can rebuild it.
-	seedBoundMu      sync.Mutex
-	seedBoundSem     *semaphore.Weighted
-	seedBoundBudget  int64
-	seedBoundBuilt   bool
+	seedBoundMu   sync.Mutex
+	seedBoundOnce *seedAdmissionBound
 
-	// estUnitBytes is the calibrated per-unit Acquire weight. Starts at the
-	// conservative-high fallback; replaced ONCE by the first unit's measured
-	// HeapInuse delta (C46-1). Guarded by estUnitMu.
-	estUnitMu       sync.Mutex
-	estUnitBytes    int64
-	estUnitCalibrated bool
+	// estUnit calibration (self-adapting, mirror nested_resolve_bound.go).
+	// Starts at the conservative-high fallback; replaced ONCE by the first
+	// unit's measured live-heap delta.
+	seedEstUnitMu         sync.Mutex
+	seedEstUnitBytes      int64
+	seedEstUnitCalibrated bool
 )
 
-// seedBudgetBytes reads SEED_FOOTPRINT_BUDGET_BYTES (0 = disabled).
-func seedBudgetBytes() int64 {
-	return int64(env.Int(envSeedFootprintBudgetBytes, 0))
-}
-
-// seedEstUnitFallback reads the conservative-high fallback per-unit weight.
-func seedEstUnitFallback() int64 {
-	return int64(env.Int(envSeedEstUnitBytesFallback, defaultSeedEstUnitBytesFallback))
-}
-
-// seedBound lazily builds (once) the process-wide seed semaphore from the
-// budget, returning (sem, budget). Returns (nil, 0) when the budget is 0
-// (disabled → boundSeedUnit is a transparent pass-through).
-func seedBound() (*semaphore.Weighted, int64) {
+func seedBound() *seedAdmissionBound {
 	seedBoundMu.Lock()
 	defer seedBoundMu.Unlock()
-	if !seedBoundBuilt {
-		seedBoundBudget = seedBudgetBytes()
-		if seedBoundBudget > 0 {
-			seedBoundSem = semaphore.NewWeighted(seedBoundBudget)
-		}
-		seedBoundBuilt = true
+	if seedBoundOnce == nil {
+		seedBoundOnce = &seedAdmissionBound{}
+		seedBoundOnce.cond = sync.NewCond(&seedBoundOnce.mu)
 	}
-	return seedBoundSem, seedBoundBudget
+	return seedBoundOnce
 }
 
-// currentEstUnit returns the current per-unit Acquire weight, clamped to the
-// budget (a single Acquire can never exceed the semaphore capacity, else it
-// would deadlock forever). Uses the calibrated value once available, else the
-// conservative-high fallback.
-func currentEstUnit(budget int64) int64 {
-	estUnitMu.Lock()
-	est := estUnitBytes
-	calibrated := estUnitCalibrated
-	estUnitMu.Unlock()
+// currentEstUnit returns the per-seed-unit admission weight: the calibrated
+// value once available, else the conservative-high code-constant fallback,
+// clamped to the current ceiling so a single unit larger than the whole
+// headroom runs ALONE rather than parking forever (guaranteed progress).
+func currentEstUnit(ceiling int64, unlimited bool) int64 {
+	seedEstUnitMu.Lock()
+	est := seedEstUnitBytes
+	calibrated := seedEstUnitCalibrated
+	seedEstUnitMu.Unlock()
 	if !calibrated || est <= 0 {
-		est = seedEstUnitFallback()
+		est = defaultSeedEstUnitBytes
 	}
-	if budget > 0 && est > budget {
-		est = budget // clamp: one unit may use up to the whole budget, never more
+	if !unlimited && ceiling > 0 && est > ceiling {
+		est = ceiling // clamp: one unit may use up to the whole ceiling, never more
 	}
 	if est < 1 {
 		est = 1
@@ -131,93 +117,154 @@ func currentEstUnit(budget int64) int64 {
 	return est
 }
 
-// calibrateEstUnit records the first unit's MEASURED HeapInuse delta as the
-// empirical per-unit weight (C46-1, one-shot). Subsequent units reuse it.
-// A measured delta of 0 (GC ran mid-unit, or a static no-op unit) is ignored
-// so we don't calibrate to an unrealistically small weight.
+// calibrateEstUnit records the first unit's MEASURED live-heap delta as the
+// empirical per-unit weight (one-shot). Subsequent units reuse it. A delta <= 0
+// (GC ran mid-unit, or a static no-op unit) is ignored so we don't calibrate to
+// an unrealistically small weight. Mirrors calibrateNestedEstUnit.
 func calibrateEstUnit(measuredDelta int64) {
 	if measuredDelta <= 0 {
 		return
 	}
-	estUnitMu.Lock()
-	if !estUnitCalibrated {
-		estUnitBytes = measuredDelta
-		estUnitCalibrated = true
+	seedEstUnitMu.Lock()
+	if !seedEstUnitCalibrated {
+		seedEstUnitBytes = measuredDelta
+		seedEstUnitCalibrated = true
 	}
-	estUnitMu.Unlock()
-}
-
-// heapInuse samples the current HeapInuse. ReadMemStats stops the world
-// briefly; called at most twice per seed unit on the seed goroutine — never
-// on the customer path.
-func heapInuse() uint64 {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	return m.HeapInuse
+	seedEstUnitMu.Unlock()
 }
 
 // calibratedEstUnitForTest returns (estUnitBytes, calibrated) so the
 // granularity-discriminating falsifier can assert calibration landed in a
 // per-UNIT band (not N× a whole cohort). Test-only.
 func calibratedEstUnitForTest() (int64, bool) {
-	estUnitMu.Lock()
-	defer estUnitMu.Unlock()
-	return estUnitBytes, estUnitCalibrated
+	seedEstUnitMu.Lock()
+	defer seedEstUnitMu.Unlock()
+	return seedEstUnitBytes, seedEstUnitCalibrated
 }
 
-// enterSeedUnit is the seed-unit footprint bound, applied as a lifecycle
-// bracket at the SHARED seed primitives (seedOneWidget / seedOneRestaction),
-// AFTER their identity short-circuit. Both the engine (serial) and the legacy
-// errgroup (concurrent) paths funnel through those primitives, so bracketing
-// there bounds BOTH aggregates with one insertion (feedback_no_special_cases —
-// bound the shared mechanism, not each caller).
+// waitForReleaseOrCtx blocks on b.cond until a release Broadcasts OR ctx is
+// done. b.mu is held on entry and on return. sync.Cond has no ctx integration,
+// so a one-shot watcher Broadcasts on ctx.Done() to wake the Wait; the caller's
+// loop then re-checks ctx.Err(). Mirrors nested_resolve_bound.go's helper.
+func (b *seedAdmissionBound) waitForReleaseOrCtx(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			b.mu.Lock()
+			b.cond.Broadcast()
+			b.mu.Unlock()
+		case <-stop:
+		}
+	}()
+	b.cond.Wait() // releases b.mu while blocked; re-acquires on wake
+	close(stop)
+	return nil
+}
+
+// enterSeedUnit is the seed-unit adaptive-admission bound, applied as a
+// lifecycle bracket at the SHARED seed primitives (seedOneWidget /
+// seedOneRestaction), AFTER their identity short-circuit. The engine seed path
+// (seedScopeYielding) funnels through those primitives, so bracketing there
+// bounds the whole seed with one insertion (feedback_no_special_cases — bound
+// the shared mechanism, not each caller).
 //
 // Usage at each primitive, right after `if handle==nil || key=="" { return }`:
 //
 //	release, err := enterSeedUnit(ctx, "widget/"+ns+"/"+name)
-//	if err != nil { return err }   // ctx cancelled while blocked on the bound
+//	if err != nil { return err }   // ctx cancelled while parked on the bound
 //	defer release()
 //
 // label is a short seed-unit descriptor (kind + identity) for the assert log —
 // never a per-name special-case (feedback_no_special_cases).
 //
-// When the budget is 0 it is a transparent pass-through: Acquire is skipped and
-// release() is a no-op (no semaphore, no assert). Otherwise: Acquire(estUnit)
-// [blocks if the aggregate in-flight weight would exceed the budget] + sample
-// HeapInuse on entry; release() samples HeapInuse again, asserts the delta is
-// within budget, calibrates estUnit (one-shot), and Releases the weight.
+// SERIALIZE-not-503 + anti-deadlock (§3.3):
+//   - unlimited GOMEMLIMIT ⇒ transparent: admit immediately, release is a no-op.
+//   - inFlightCount == 0 ⇒ admit unconditionally (a lone oversized unit runs
+//     ALONE rather than parking forever — guaranteed progress).
+//   - else admit iff inFlightWeight + estUnit <= ceiling; else PARK (ctx-bounded
+//     by the seed's own ctx) and re-check on release. On ctx cancel/deadline
+//     return the ctx error (the unit is abandoned best-effort, log-only — the
+//     seed yields; NEVER a hard failure).
 //
-// The Acquire weight is clamped to the budget (currentEstUnit) so a single unit
-// larger than the whole budget runs ALONE rather than blocking forever — the
-// guaranteed-progress / "bounded event still happens" property. Nesting is
-// deadlock-free: the legacy errgroup SetLimit(GOMAXPROCS) is the OUTER
-// semaphore (acquired at g.Go spawn), this is INNER (acquired in the
-// primitive) — strict outer→inner, no lock-order inversion.
+// On admission inFlightWeight += estUnit, inFlightCount++, and a live-heap
+// sample is taken; release() re-samples, calibrates the per-unit weight
+// (one-shot), runs the AssertSeedUnitFootprint diagnostic, decrements, and
+// broadcasts to wake parked units.
 func enterSeedUnit(ctx context.Context, label string) (release func(), err error) {
-	sem, budget := seedBound()
-	if sem == nil || budget == 0 {
-		return func() {}, nil // disabled — transparent pass-through.
+	b := seedBound()
+
+	b.mu.Lock()
+	var est int64
+	var admitCeiling int64 // the ceiling this unit was admitted against (for the release-time assert)
+	var admitUnlimited bool
+	for {
+		ceiling, unlimited := cache.AdmissionCeiling()
+		est = currentEstUnit(ceiling, unlimited)
+		fits := b.inFlightWeight+est <= ceiling
+		// The seed is BACKGROUND (no browser deadline); there is no customer on
+		// THIS gate (the customer /call path never routes here), so there is no
+		// C5 waiting-customer priority to honour — a simpler admit rule than the
+		// nested bound. Guaranteed progress via the inFlightCount==0 escape.
+		if unlimited || b.inFlightCount == 0 || fits {
+			admitCeiling = ceiling
+			admitUnlimited = unlimited
+			b.inFlightWeight += est
+			b.inFlightCount++
+			b.mu.Unlock()
+			break
+		}
+		if werr := b.waitForReleaseOrCtx(ctx); werr != nil {
+			b.mu.Unlock()
+			return nil, werr
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			b.mu.Unlock()
+			return nil, cerr
+		}
+		// woken (release or ctx) — loop re-checks ceiling + ctx.
 	}
 
-	est := currentEstUnit(budget)
-	if aerr := sem.Acquire(ctx, est); aerr != nil {
-		// ctx cancelled/expired while blocked on the bound — propagate (the
-		// seed unit is abandoned for this run; the seed yields).
-		return nil, aerr
-	}
-
-	before := heapInuse()
+	before := cache.AdmissionLiveHeapSample()
+	var released bool
 	return func() {
-		after := heapInuse()
-		// HeapInuse can shrink across a GC mid-unit; treat a negative delta as
-		// 0 (no measurable growth — a static/no-op unit).
+		b.mu.Lock()
+		if released {
+			b.mu.Unlock()
+			return
+		}
+		released = true
+		after := cache.AdmissionLiveHeapSample()
 		var delta int64
 		if after > before {
-			delta = int64(after - before)
+			delta = after - before
 		}
 		calibrateEstUnit(delta)
+		// Diagnostic: per-unit oversize signal (re-homed from the old semaphore
+		// release). An oversized unit is one whose MEASURED delta exceeded the
+		// headroom it was ADMITTED against — so the budget is the ceiling
+		// captured AT ADMISSION (admitCeiling), NOT a fresh sample (a fresh
+		// sample would already reflect this unit's own allocation, moving the
+		// goalpost). unlimited admission ⇒ budget 0 ⇒ AssertSeedUnitFootprint
+		// no-ops, preserving the transparent posture.
+		budget := admitCeiling
+		if admitUnlimited || budget < 0 {
+			budget = 0
+		}
 		cache.AssertSeedUnitFootprint(label, uint64(delta), uint64(budget))
-		sem.Release(est)
+		b.inFlightWeight -= est
+		if b.inFlightWeight < 0 {
+			b.inFlightWeight = 0
+		}
+		b.inFlightCount--
+		if b.inFlightCount < 0 {
+			b.inFlightCount = 0
+		}
+		b.cond.Broadcast()
+		b.mu.Unlock()
 	}, nil
 }
 
@@ -233,16 +280,26 @@ func boundSeedUnit(ctx context.Context, label string, do func() error) error {
 	return do()
 }
 
-// resetSeedBoundForTest rebuilds the lazy semaphore + clears the calibration
-// so a falsifier can drive a fresh budget via t.Setenv. Test-only.
+// inFlightSeedWeightForTest returns the current aggregate in-flight seed weight
+// + count. Test-only.
+func inFlightSeedWeightForTest() (int64, int) {
+	b := seedBound()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inFlightWeight, b.inFlightCount
+}
+
+// resetSeedBoundForTest clears the process-wide seed gate + calibration so a
+// falsifier can drive a fresh state. It does NOT touch the shared
+// cache.AdmissionCeiling seams — a test that injects headroom must do so via
+// cache.SetAdmissionRuntimeSeamsForTest / ResetAdmissionRuntimeSeamsForTest.
+// Test-only. Mirrors resetNestedResolveBoundForTest.
 func resetSeedBoundForTest() {
 	seedBoundMu.Lock()
-	seedBoundBuilt = false
-	seedBoundSem = nil
-	seedBoundBudget = 0
+	seedBoundOnce = nil
 	seedBoundMu.Unlock()
-	estUnitMu.Lock()
-	estUnitBytes = 0
-	estUnitCalibrated = false
-	estUnitMu.Unlock()
+	seedEstUnitMu.Lock()
+	seedEstUnitBytes = 0
+	seedEstUnitCalibrated = false
+	seedEstUnitMu.Unlock()
 }

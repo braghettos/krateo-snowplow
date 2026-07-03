@@ -184,25 +184,32 @@ func TestProactiveRASeed_UnionDedup(t *testing.T) {
 	}
 }
 
-// TestProactiveRASeed_F3_EngineGuardDefaults — F-3 (in-process portion of the
-// latent-hazard guard). The proactive seed rides the engine path; the
-// PRODUCTION posture (asserted by the on-cluster F-3 pprof probe) is engine
-// ON. Here we assert the Go-default opt-in posture for BOTH flags so the
-// hazard guard's preconditions are documented and stable:
-//   - ProactiveRASeedEnabled() defaults OFF (no auto-on).
-//   - PrewarmEngineEnabled() defaults OFF in code; production flips it ON via
-//     the helm overlay (main-chart-reconciliation). The dead errgroup
-//     runPIPSeed re-OOM hazard is gated on PREWARM_ENGINE_ENABLED=false, which
-//     production must never set.
-func TestProactiveRASeed_F3_EngineGuardDefaults(t *testing.T) {
-	if ProactiveRASeedEnabled() {
-		t.Fatal("F-3 FAILED: PROACTIVE_RA_SEED_ENABLED must default OFF")
-	}
-	// Production posture: engine ON. Assert the flag is readable + ON when set
-	// (the production contract the hazard guard depends on).
-	t.Setenv(envPrewarmEngineEnabled, "true")
+// TestProactiveRASeed_F3_EngineImplicitOnCache — F-3, REWORKED for the
+// 2026-07-03 family fold (docs/prewarm-engine-implicit-on-cache-2026-07-03.md).
+// PREWARM_ENGINE_ENABLED + PROACTIVE_RA_SEED_ENABLED are RETIRED; both helpers
+// are now IMPLICIT-ON-CACHE and the legacy errgroup runPIPSeed OOM-hazard path
+// is DELETED. So the F-3 posture is no longer "flags default OFF, production
+// flips ON" — it is "engine + proactive seed ON iff CACHE_ENABLED; off-switch
+// is CACHE_ENABLED=false." This is the installer-test regression guard: a
+// cache-on deployment with the flags forgotten now correctly runs the engine
+// (not the deleted OOM-hazard path).
+func TestProactiveRASeed_F3_EngineImplicitOnCache(t *testing.T) {
+	// Implicit-ON: cache on ⇒ both the engine and the proactive seed run,
+	// WITHOUT any PREWARM_ENGINE_ENABLED / PROACTIVE_RA_SEED_ENABLED env.
+	t.Setenv("CACHE_ENABLED", "true")
 	if !PrewarmEngineEnabled() {
-		t.Fatal("F-3 FAILED: PREWARM_ENGINE_ENABLED=true (production posture) not honoured — " +
-			"the engine path would not run and the dead errgroup runPIPSeed re-OOM hazard re-activates")
+		t.Fatal("F-3 FAILED: engine must be implicit-ON when CACHE_ENABLED=true (post-fold) — " +
+			"a cache-on deployment with the flag forgotten must run the engine, not the deleted legacy path")
+	}
+	if !ProactiveRASeedEnabled() {
+		t.Fatal("F-3 FAILED: proactive RA seed must be implicit-ON when CACHE_ENABLED=true (post-fold)")
+	}
+	// Off-switch: cache off ⇒ both OFF.
+	t.Setenv("CACHE_ENABLED", "false")
+	if PrewarmEngineEnabled() {
+		t.Fatal("F-3 FAILED: engine must be OFF when CACHE_ENABLED=false (the only off-switch post-fold)")
+	}
+	if ProactiveRASeedEnabled() {
+		t.Fatal("F-3 FAILED: proactive RA seed must be OFF when CACHE_ENABLED=false")
 	}
 }

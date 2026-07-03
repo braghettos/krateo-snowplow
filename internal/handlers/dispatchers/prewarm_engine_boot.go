@@ -187,39 +187,23 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 		return nil
 	}
 
-	// LATENT HAZARD (gate build-obligation #1). This engine boot seed runs
-	// the SERIAL single-worker loop (seedScopeYielding — a plain for-loop
-	// with one restactions.Resolve in flight at a time, yielding to
-	// customers via engineYieldCheckpoint). That serial shape is what
-	// memory-bounds the seed: warm-peak is bounded by a SINGLE resolve's
-	// weight, NOT a concurrent fan-out, so it CANNOT reproduce the
-	// concurrent-fan-out OOM that (a)/#46 fixed.
+	// MEMORY SHAPE (informational). This engine boot seed runs the SERIAL
+	// single-worker loop (seedScopeYielding — a plain for-loop with one
+	// restactions.Resolve in flight at a time, yielding to customers via
+	// engineYieldCheckpoint). That serial shape is what memory-bounds the
+	// seed: warm-peak is bounded by a SINGLE resolve's weight, NOT a
+	// concurrent fan-out. The seed's dominant allocation (seedRAFullListForWidget's
+	// unpaginated full-list) is additionally bounded by the ADAPTIVE seed-unit
+	// gate (enterSeedUnit, seed_bound.go — fold 2026-07-03 §3), which serializes
+	// units against live GOMEMLIMIT headroom.
 	//
-	// BUT: the DEAD errgroup seed path (runPIPSeed, phase1_pip_seed.go —
-	// GOMAXPROCS-bounded g.SetLimit(runtime.GOMAXPROCS(0)) concurrent
-	// cohort fan-out) RE-ACTIVATES if PREWARM_ENGINE_ENABLED=false
-	// (phase1_walk.go:409 picks runPIPSeed when the engine is off). That
-	// concurrent seed BYPASSES the (a) process-wide weighted memory budget
-	// (which is on the CUSTOMER resolve entry, not the legacy seed loop) →
-	// it can re-OOM on the seed. The proactive RA union here WIDENS the
-	// seed source, so a fallback to the concurrent path would fan out over
-	// MORE refs.
-	//
-	// GUARD: production MUST keep PREWARM_ENGINE_ENABLED=true (the helm
-	// overlay sets it true — main-chart-reconciliation). F-3 asserts the
-	// production-on posture. Deleting the dead errgroup path is a separate
-	// BACKLOG item (NOT this ship).
-	if !PrewarmEngineEnabled() {
-		// Defensive: rePrewarmBoot is only reached when the engine path is
-		// selected (phase1_walk.go:482), so this branch should be
-		// unreachable in production. Emit loudly if it ever fires.
-		log.Warn("prewarm.engine.boot.hazard_engine_disabled_but_boot_reached",
-			slog.String("subsystem", "cache"),
-			slog.String("effect", "rePrewarmBoot reached with PREWARM_ENGINE_ENABLED=false — the concurrent "+
-				"runPIPSeed errgroup path (which BYPASSES the (a) memory budget) may also be active; "+
-				"this is the documented latent re-OOM hazard — keep the engine enabled"),
-		)
-	}
+	// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md §4):
+	// the old latent hazard — the DEAD errgroup runPIPSeed path re-activating
+	// when PREWARM_ENGINE_ENABLED=false — is GONE. runPIPSeed is DELETED and
+	// PrewarmEngineEnabled() is implicit-on-cache, so the engine is the only
+	// seed path whenever prewarm runs. The defensive
+	// hazard_engine_disabled_but_boot_reached Warn that guarded that
+	// now-unreachable state is removed with it.
 
 	// ── (1) RE-WALK the nav roots AFTER the sync barrier. A FRESH walker
 	// per root (new visited map — reusing the boot pass's visited would
@@ -393,6 +377,29 @@ func seedScopeYielding(ctx context.Context,
 
 	log := slog.Default()
 
+	// CTX-CANCEL ABORT OBSERVABILITY (fold 2026-07-03, §4.3b — migrated from the
+	// deleted seedCohort's 0.30.191 Fix-C `phase1.cohort.abort` reporter). The
+	// engine seed's ctx-cancel exits (boot budget / pipCohortTimeout / process
+	// shutdown) previously just `return ctx.Err()` with no greppable line, so a
+	// post-deploy "did the seed finish or get cut off?" grep had nothing to key
+	// on. emitSeedAbort logs a single greppable `prewarm.seed.abort` line with
+	// the same load-bearing fields Fix-C carried: phase (which loop was cut),
+	// cause (the ctx error), targets_processed, elapsed_ms. Best-effort +
+	// log-only — the seed is background, an abort is never fatal.
+	start := time.Now()
+	targetsProcessed := 0
+	emitSeedAbort := func(phase string, cause error) {
+		log.Warn("prewarm.seed.abort",
+			slog.String("subsystem", "cache"),
+			slog.String("phase", phase),
+			slog.Any("cause", cause),
+			slog.Int("targets_processed", targetsProcessed),
+			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			slog.String("effect", "seed cut off by ctx cancel/deadline (boot budget / pipCohortTimeout / "+
+				"shutdown); background best-effort — remaining targets fall back to per-user resolve at /call time"),
+		)
+	}
+
 	// #158 (design §1.4 + §1.5 engine path) — classify per-target seed
 	// failures instead of swallowing them. RBAC-deny → Info + rbac_deny
 	// counter (NO re-enqueue). Operational → Warn + operational counter +
@@ -489,6 +496,7 @@ func seedScopeYielding(ctx context.Context,
 	// ── RESTActions seed — per-binding targets scoped on each RA's TARGET GVR.
 	for _, ref := range restactionRefs {
 		if ctx.Err() != nil {
+			emitSeedAbort("restactions", ctx.Err())
 			return ctx.Err()
 		}
 		engineYieldCheckpoint(ctx)
@@ -507,18 +515,21 @@ func seedScopeYielding(ctx context.Context,
 				return seedOneRestaction(cohortCtx, cohortLogLabel(c), ref, authnNS)
 			})
 			if err != nil && ctx.Err() != nil {
+				emitSeedAbort("restactions", ctx.Err())
 				return ctx.Err()
 			}
 			if err != nil {
 				// #158 — classify (was: blanket Warn, no counter).
 				classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
 			}
+			targetsProcessed++
 		}
 	}
 
 	// ── Widgets seed — per-binding targets scoped on each widget's GVR.
 	for _, e := range widgetEntries {
 		if ctx.Err() != nil {
+			emitSeedAbort("widgets", ctx.Err())
 			return ctx.Err()
 		}
 		engineYieldCheckpoint(ctx)
@@ -536,12 +547,14 @@ func seedScopeYielding(ctx context.Context,
 				return seedOneWidgetFn(cohortCtx, e, authnNS)
 			})
 			if err != nil && ctx.Err() != nil {
+				emitSeedAbort("widgets", ctx.Err())
 				return ctx.Err()
 			}
 			if err != nil {
 				// #158 — classify (was: blanket Warn, no counter).
 				classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
 			}
+			targetsProcessed++
 		}
 	}
 	return nil

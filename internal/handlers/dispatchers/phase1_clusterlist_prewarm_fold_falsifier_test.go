@@ -32,31 +32,34 @@ func foldClusterListWired() bool {
 	return cache.PrewarmEnabled() && PrewarmContentEnabled()
 }
 
-// TestFoldFAL5_ApistageAutoOn_DoesNotWireClusterListPrewarm proves the
-// fold's auto-enable of the api-stage L1 does NOT cause the Step-7.5
-// cluster_list boot populate hook to be wired when PREWARM_CONTENT is off.
-// With CACHE_ENABLED=true + RESOLVED_CACHE_ENABLED unset (apistage auto-on
-// per #57) but PREWARM_CONTENT_ENABLED unset, the harvester gate stays
-// closed → no hook → no un-semaphored boot cold-fill burst.
-func TestFoldFAL5_ApistageAutoOn_DoesNotWireClusterListPrewarm(t *testing.T) {
+// TestFoldFAL5_ClusterListHookTracksPrewarmEnabled — REWORKED 2026-07-03 for
+// the prewarm-family fold (docs/prewarm-engine-implicit-on-cache-2026-07-03.md).
+//
+// PRE-FOLD this asserted the cluster_list hook stays UNWIRED when
+// PREWARM_CONTENT_ENABLED is off (independent of the apistage auto-on). POST-FOLD
+// that premise is void: PrewarmContentEnabled() is now implicit-on-cache, so
+// content can no longer be independently off — foldClusterListWired() ==
+// cache.PrewarmEnabled(). The safety property (no un-semaphored boot cold-fill
+// burst) is now guaranteed by the ADAPTIVE seed bound (§3) + the cluster_list
+// prewarm's own bounding, NOT by a content-off gate. This test now pins the
+// post-fold truth: the hook is wired iff cache is on, off iff cache is off.
+func TestFoldFAL5_ClusterListHookTracksPrewarmEnabled(t *testing.T) {
+	// Cache off → prewarm family off → no hook.
+	t.Setenv("CACHE_ENABLED", "false")
+	if foldClusterListWired() {
+		t.Fatalf("F-FOLD-5: cluster_list pre-warm hook wired with CACHE_ENABLED=false — " +
+			"the whole prewarm family (incl. content) is off when cache is off")
+	}
+	// Cache on → content implicit-on → hook wired. (The boot-burst safety is the
+	// adaptive seed bound's job now, not a content-off gate.)
 	t.Setenv("CACHE_ENABLED", "true")
-	// RESOLVED_CACHE_APISTAGE_ENABLED deliberately left UNSET — the fold
-	// makes apistage on anyway.
+	if !foldClusterListWired() {
+		t.Fatalf("F-FOLD-5: cluster_list pre-warm hook must be wired when CACHE_ENABLED=true " +
+			"(content is implicit-on-cache post-fold)")
+	}
+	// The apistage fold precondition still holds (auto-on under cache).
 	if !cache.ApistageL1Enabled() {
 		t.Fatalf("precondition: fold should make apistage auto-on under CACHE_ENABLED")
-	}
-	// PREWARM_CONTENT_ENABLED unset (the previously-unset bs-test-ger-03
-	// posture).
-	t.Setenv("PREWARM_CONTENT_ENABLED", "")
-	if foldClusterListWired() {
-		t.Fatalf("F-FOLD-5: cluster_list pre-warm hook wired with PREWARM_CONTENT off — " +
-			"the fold's apistage auto-on must NOT trigger a boot populate burst")
-	}
-	// Even with PREWARM (startup) on, content-prewarm being off keeps the
-	// harvester nil → hook still not wired.
-	t.Setenv("PREWARM_ENABLED", "true")
-	if foldClusterListWired() {
-		t.Fatalf("F-FOLD-5: cluster_list pre-warm hook wired with PREWARM_CONTENT off (PREWARM on)")
 	}
 }
 
