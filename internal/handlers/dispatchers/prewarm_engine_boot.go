@@ -371,6 +371,37 @@ var enumeratePrewarmTargetsForGVRFn = cache.EnumeratePrewarmTargetsForGVR
 // enumeratePrewarmTargetsForGVRFn.
 var seedOneWidgetFn = seedOneWidget
 
+// restActionTargetGVRFn / seedOneRestactionFn are the restaction-loop
+// mirrors of the widget seams above — same 1-LOC `var fooFn = foo` pattern.
+// #42 introduces them so the first-nav ORDERING falsifier can drive BOTH
+// loops (a high-fan-out restaction + a nav widget) in ONE hermetic run
+// without a live apiserver: restActionTargetGVRFn stands in for the
+// objects.Get-backed restActionTargetGVR (no apiserver), seedOneRestactionFn
+// stands in for the per-target seed primitive. Production ALWAYS uses the
+// real functions.
+var restActionTargetGVRFn = restActionTargetGVR
+var seedOneRestactionFn = seedOneRestaction
+
+// seedClass names the two top-level seed loops. seedClassWidgets is the
+// dashboard-first-paint class (small per-binding target sets); seedClassRestactions
+// is the class that can carry the high-fan-out settings/admin tail.
+type seedClass int
+
+const (
+	seedClassWidgets seedClass = iota
+	seedClassRestactions
+)
+
+// seedClassOrderFn is the #42 ORDERING seam. Production ALWAYS binds it to
+// the first-nav-first order [widgets, restactions] — it is NOT a runtime
+// flag and production never varies it (identical `var fooFn = foo` pattern as
+// seedOneWidgetFn). Its ONLY caller that varies it is the ordering falsifier,
+// which flips it to [restactions, widgets] for the RED arm to prove the
+// reordering is what puts the widget cell in L1 before the budget expires.
+var seedClassOrderFn = func() []seedClass {
+	return []seedClass{seedClassWidgets, seedClassRestactions}
+}
+
 func seedScopeYielding(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
@@ -493,68 +524,137 @@ func seedScopeYielding(ctx context.Context,
 		return do(cohortCtx)
 	}
 
-	// ── RESTActions seed — per-binding targets scoped on each RA's TARGET GVR.
-	for _, ref := range restactionRefs {
-		if ctx.Err() != nil {
-			emitSeedAbort("restactions", ctx.Err())
-			return ctx.Err()
-		}
-		engineYieldCheckpoint(ctx)
-
-		targetGVR, haveTarget := restActionTargetGVR(ctx, ref)
-		targets, scoped := targetsFor(targetGVR, haveTarget)
-		log.Info("prewarm.engine.seed.restaction_targets",
-			slog.String("subsystem", "cache"),
-			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("target_gvr", targetGVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("targets", len(targets)),
-		)
-		for _, c := range targets {
-			err := seedOneTarget(c, func(cohortCtx context.Context) error {
-				return seedOneRestaction(cohortCtx, cohortLogLabel(c), ref, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
-				emitSeedAbort("restactions", ctx.Err())
-				return ctx.Err()
-			}
-			if err != nil {
-				// #158 — classify (was: blanket Warn, no counter).
-				classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
-			}
-			targetsProcessed++
-		}
-	}
-
-	// ── Widgets seed — per-binding targets scoped on each widget's GVR.
-	for _, e := range widgetEntries {
-		if ctx.Err() != nil {
-			emitSeedAbort("widgets", ctx.Err())
-			return ctx.Err()
-		}
-		engineYieldCheckpoint(ctx)
-
-		targets, scoped := targetsFor(e.GVR, true)
-		log.Info("prewarm.engine.seed.widget_targets",
-			slog.String("subsystem", "cache"),
-			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-			slog.String("gvr", e.GVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("targets", len(targets)),
-		)
-		for _, c := range targets {
-			err := seedOneTarget(c, func(cohortCtx context.Context) error {
-				return seedOneWidgetFn(cohortCtx, e, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
+	// ── Widgets seed loop — per-binding targets scoped on each widget's GVR.
+	// Returns ctx.Err() if the budget/cancel cut it off mid-loop (the caller
+	// stops there), else nil.
+	seedWidgets := func() error {
+		for _, e := range widgetEntries {
+			if ctx.Err() != nil {
 				emitSeedAbort("widgets", ctx.Err())
 				return ctx.Err()
 			}
-			if err != nil {
-				// #158 — classify (was: blanket Warn, no counter).
-				classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
+			engineYieldCheckpoint(ctx)
+
+			targets, scoped := targetsFor(e.GVR, true)
+			log.Info("prewarm.engine.seed.widget_targets",
+				slog.String("subsystem", "cache"),
+				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+				slog.String("gvr", e.GVR.String()),
+				slog.Bool("scoped", scoped),
+				slog.Int("targets", len(targets)),
+			)
+			for _, c := range targets {
+				err := seedOneTarget(c, func(cohortCtx context.Context) error {
+					return seedOneWidgetFn(cohortCtx, e, authnNS)
+				})
+				if err != nil && ctx.Err() != nil {
+					emitSeedAbort("widgets", ctx.Err())
+					return ctx.Err()
+				}
+				if err != nil {
+					// #158 — classify (was: blanket Warn, no counter).
+					classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
+				}
+				targetsProcessed++
 			}
-			targetsProcessed++
+		}
+		return nil
+	}
+
+	// ── RESTActions seed loop — per-binding targets scoped on each RA's TARGET GVR.
+	//
+	// #42 CHEAP-COHORT-FIRST: within the restactions loop, process refs in
+	// ASCENDING len(targets) order so the cheap first-nav RAs (small target
+	// sets) seed before the high-fan-out settings/admin RAs (e.g. the
+	// 10190-target apps/deployments tail). We resolve every RA's target set
+	// FIRST (one restActionTargetGVR + targetsFor per ref) into
+	// restactionSeed, sort by len(targets) ascending, THEN seed — the tail
+	// that would exhaust the budget always runs LAST. Stable, index-derived
+	// (targetsFor is 100% BindingsByGVR-scoped; no static/literal target
+	// list — feedback_no_special_cases). Ties break on ns/name for a
+	// deterministic order.
+	type restactionSeed struct {
+		ref       templatesv1.ObjectReference
+		targetGVR schema.GroupVersionResource
+		targets   []seedTarget
+		scoped    bool
+	}
+	seedRestactions := func() error {
+		restactionSeeds := make([]restactionSeed, 0, len(restactionRefs))
+		for _, ref := range restactionRefs {
+			if ctx.Err() != nil {
+				emitSeedAbort("restactions", ctx.Err())
+				return ctx.Err()
+			}
+			engineYieldCheckpoint(ctx)
+
+			targetGVR, haveTarget := restActionTargetGVRFn(ctx, ref)
+			targets, scoped := targetsFor(targetGVR, haveTarget)
+			restactionSeeds = append(restactionSeeds, restactionSeed{
+				ref: ref, targetGVR: targetGVR, targets: targets, scoped: scoped,
+			})
+		}
+		sort.SliceStable(restactionSeeds, func(i, j int) bool {
+			if len(restactionSeeds[i].targets) != len(restactionSeeds[j].targets) {
+				return len(restactionSeeds[i].targets) < len(restactionSeeds[j].targets)
+			}
+			ri, rj := restactionSeeds[i].ref, restactionSeeds[j].ref
+			return ri.Namespace+"/"+ri.Name < rj.Namespace+"/"+rj.Name
+		})
+		for _, rs := range restactionSeeds {
+			if ctx.Err() != nil {
+				emitSeedAbort("restactions", ctx.Err())
+				return ctx.Err()
+			}
+			engineYieldCheckpoint(ctx)
+
+			log.Info("prewarm.engine.seed.restaction_targets",
+				slog.String("subsystem", "cache"),
+				slog.String("restaction", rs.ref.Namespace+"/"+rs.ref.Name),
+				slog.String("target_gvr", rs.targetGVR.String()),
+				slog.Bool("scoped", rs.scoped),
+				slog.Int("targets", len(rs.targets)),
+			)
+			for _, c := range rs.targets {
+				ref := rs.ref
+				err := seedOneTarget(c, func(cohortCtx context.Context) error {
+					return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS)
+				})
+				if err != nil && ctx.Err() != nil {
+					emitSeedAbort("restactions", ctx.Err())
+					return ctx.Err()
+				}
+				if err != nil {
+					// #158 — classify (was: blanket Warn, no counter).
+					classifyEngineSeedErr("restaction", rs.ref.Namespace+"/"+rs.ref.Name, cohortLogLabel(c), err)
+				}
+				targetsProcessed++
+			}
+		}
+		return nil
+	}
+
+	// #42 FIRST-NAV-FIRST ORDERING: run the seed classes in the order the
+	// seam dictates. Production ALWAYS runs [widgets, restactions] (widgets
+	// first) — the dashboard first paint reads a WIDGET cell (dashboard-flex
+	// → flexes GVR), and widget GVRs carry only the widget-read bindings
+	// (single-digit to low-tens of targets), so seeding all harvested widgets
+	// FIRST costs a tiny fraction of the boot budget and puts the first-nav
+	// cell in L1 BEFORE any high-fan-out restaction tail (e.g. an RA scoping
+	// on apps/deployments = 10190 per-composition bindings at 50K) can
+	// exhaust the 8-min budget. Ordering only — same per-binding enumerate,
+	// same primitives, same enterSeedUnit per-unit footprint bound; the seed
+	// SET is unchanged, only the SEQUENCE.
+	for _, cls := range seedClassOrderFn() {
+		var err error
+		switch cls {
+		case seedClassWidgets:
+			err = seedWidgets()
+		case seedClassRestactions:
+			err = seedRestactions()
+		}
+		if err != nil {
+			return err
 		}
 	}
 	return nil
