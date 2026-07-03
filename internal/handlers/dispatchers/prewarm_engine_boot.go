@@ -226,6 +226,16 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 	// short-circuit every child and descend nothing). The SAME walk() so
 	// harvestApiRef + harvestNavWidget re-fire over the now-populated
 	// dynamic navmenu children.
+	// BOOT-RACE-TOLERANT (shape A §2.4 D3): mark the re-drive ctx as a
+	// background resolve so the self-heal re-walk YIELDS memory + the C5
+	// cold-fan-out admission race to live customer /call traffic (complements
+	// engineYieldCheckpoint's between-cohort yield). A config-vars-driven
+	// re-drive can fire long after Ready — while customers are actively
+	// navigating — so it must not contend with them at the aggregate OOM
+	// bound (the 1.5.28 adaptive aggregate). 1 line, ctx-only, no behaviour
+	// change to accounting (background differs only at admission). See
+	// cache.WithBackgroundResolve.
+	ctx = cache.WithBackgroundResolve(ctx)
 	rctx := withPhase1SAContext(ctx, deps.saEP, deps.saRC)
 	roots, listErr := deps.lister(rctx)
 	if listErr != nil {

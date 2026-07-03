@@ -102,6 +102,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -622,16 +623,36 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// widget CRs). No hardcoded GVR LIST.
 	roots, listErr := lister(ctx)
 	if listErr != nil {
+		// BOOT-RACE-TOLERANT (shape A, docs/prewarm-boot-race-tolerant-2026-07-03.md
+		// §2.2): SOFTENED — this branch no longer GIVES UP on warming. When
+		// the config-vars ConfigMap is absent at boot (snowplow booted before
+		// the frontend), the eager read finds nothing; we LOG + PROCEED, and
+		// the config-vars ConfigMap informer (StartConfigVarsWatch) is the
+		// authority that DRIVES a scopeKindBoot re-walk the instant the
+		// ConfigMap lands — before OR after the readiness backstop, with zero
+		// pod restart (§2.6 any-boot-order tolerance).
+		//
+		// HARD-2 — READINESS FLIP POINT PRESERVED. The prior branch had its
+		// OWN early WaitAllInformersSynced + MarkPhase1Done + return, a
+		// SEPARATE flip point that bypassed the Step 7.6 defer. Removing that
+		// early flip does NOT advance the flip; it makes the roots-absent path
+		// fall through to the SAME Step 7.6 defer-MarkPhase1Done (or the PIP-off
+		// else) that every other path uses. Steps 4-7 run over the (empty)
+		// roots set + the meta-query seeds exactly as before — the sync barrier
+		// (Step 7) and the flip (Step 7.6/8) are unchanged and byte-identical
+		// for the deps-present-at-boot path (this branch is not even entered
+		// then). project_readyz_gates_on_prewarm_complete is intact.
 		log.Warn("phase1.warmup.roots_list_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", listErr),
-			slog.String("effect", "no roots to walk; lazy register-on-navigation still covers GVRs on first request"),
+			slog.String("effect", "no roots to walk YET; the config-vars ConfigMap informer will drive a "+
+				"scopeKindBoot re-walk when the ConfigMap appears (self-heal, no restart); "+
+				"lazy register-on-navigation still covers GVRs on first request meanwhile"),
 		)
-		// No roots — still run the sync barrier over whatever the
-		// meta-query seeds + CRD-watch registered, then signal done.
-		_ = rw.WaitAllInformersSynced(ctx)
-		cache.MarkPhase1Done()
-		return listErr
+		// roots stays nil → Steps 4-6 are no-ops over an empty set; Step 7
+		// syncs the meta-query seeds; Step 7.6 flips readiness at the normal
+		// (unchanged) point. Do NOT early-return / early-flip here.
+		roots = nil
 	}
 
 	log.Info("phase1.warmup.roots_discovered",
@@ -1036,13 +1057,65 @@ func installSeedLoopbackToken(ctx context.Context) context.Context {
 	if fn == nil {
 		return ctx // authn not configured — token-less seed (pre-#57 behaviour)
 	}
-	tok, err := fn(ctx)
-	if err != nil || tok == "" {
+
+	// BOOT-RACE-TOLERANT (shape A §2.3): bounded exponential backoff on the
+	// seed→authn token exchange. On a fresh install snowplow can boot before
+	// authn is serving on :8082 (the rt8rv 06:08:53 race — one connection-
+	// refused, no retry, token-less for the pod lifetime). The backoff retries
+	// the exchange until authn answers.
+	//
+	// STRICTLY CTX-BOUNDED, NO NEW ENV. wait.ExponentialBackoffWithContext
+	// stops the instant ctx is Done — ctx here is the seed/p1 ctx, itself a
+	// child of PHASE1_TIMEOUT_SECONDS (p1Ctx) / pipGlobalTimeout (seedCtx). The
+	// Steps are a SHAPE parameter (large enough that ctx, not Steps, is the
+	// true bound — Steps caps only the pathological ctx-never-cancels case),
+	// NOT a policy timeout (regression watch §4 / the 0.30.220 boot-stall
+	// lesson: a backoff that ignored ctx would re-introduce a boot-blocking
+	// stall).
+	//
+	// DEGRADE-NOT-FAIL. On budget/step exhaustion (or ctx cancel) it keeps the
+	// existing posture: WARN + bump seedLoopbackTokenErrTotal + return ctx
+	// unchanged (token-less) — never fatal. Behavioral neutrality when authn is
+	// already up: the first condition call succeeds → the loop exits after one
+	// iteration (byte-identical to the fire-once path, plus the same token
+	// install).
+	backoff := wait.Backoff{
+		Duration: 250 * time.Millisecond,
+		Factor:   2.0,
+		Jitter:   0.1,
+		// Steps caps the exponential growth; ctx is the real bound. 30 steps
+		// with Factor 2 (capped) fills any realistic phase budget — the loop
+		// exits on the first success or on ctx.Done long before Steps runs out
+		// in any non-pathological case.
+		Steps: 30,
+		// Cap the per-attempt sleep so late steps do not overshoot a
+		// still-arriving authn by minutes.
+		Cap: 30 * time.Second,
+	}
+
+	var tok string
+	waitErr := wait.ExponentialBackoffWithContext(ctx, backoff, func(cctx context.Context) (bool, error) {
+		t, err := fn(cctx)
+		if err == nil && t != "" {
+			tok = t
+			return true, nil // acquired — install it
+		}
+		// Transient (connection refused / authn not up yet / empty token):
+		// keep retrying. NEVER return the error (that would abort the backoff
+		// and drop us into the degrade path prematurely) — let ctx bound it.
+		return false, nil
+	})
+
+	if waitErr != nil || tok == "" {
+		// ctx cancelled, budget/steps exhausted, or (defensively) empty token:
+		// degrade to token-less, exactly as the pre-shape-A fire-once path did.
 		seedLoopbackTokenErrTotal.Add(1)
 		slog.Warn("prewarm.seed_loopback_token_unavailable",
 			slog.String("subsystem", "cache"),
-			slog.Any("err", err),
-			slog.String("effect", "prewarm loopback ran token-less; a nested loopback /call RA is not warmed this boot (degraded, not fatal)"),
+			slog.Any("err", waitErr),
+			slog.String("effect", "prewarm loopback ran token-less after bounded retry; a nested loopback "+
+				"/call RA is not warmed this pass (degraded, not fatal — a config-vars re-drive re-attempts "+
+				"the token when authn is up)"),
 		)
 		return ctx
 	}

@@ -456,6 +456,26 @@ func main() {
 					// engineProcessCtx). Mirrors cache.StartRefresher's
 					// cacheCtx-as-process-lifetime pattern (line 320).
 					dispatchers.SetEngineProcessContext(cacheCtx)
+					// BOOT-RACE-TOLERANT prewarm (shape A,
+					// docs/prewarm-boot-race-tolerant-2026-07-03.md §2.2).
+					// Register the single-object config-vars ConfigMap
+					// informer on the PROCESS-LIFETIME cacheCtx (NOT p1Ctx),
+					// coherent with SetEngineProcessContext just above: its
+					// AddFunc/UpdateFunc enqueue a scopeKindBoot re-drive on
+					// the SAME engine singleton the boot seed starts, so a
+					// frontend that creates the *-config-vars ConfigMap AFTER
+					// snowplow booted (fresh install, inverted order) drives
+					// the prewarm walk the instant the ConfigMap lands —
+					// before OR after the readiness backstop, zero restart.
+					// enqueueScope is safe before the worker starts (it
+					// populates the bounded dedup queue; the worker drains it
+					// on StartPrewarmEngine inside Phase1Warmup's engineSeed).
+					// Gated on the engine posture (#341: PREWARM_ENGINE_ENABLED
+					// =true is the production posture) — the enqueue is
+					// meaningless without the engine that processes boot scopes.
+					if cache.PrewarmEnabled() && dispatchers.PrewarmEngineEnabled() {
+						dispatchers.StartConfigVarsWatch(cacheCtx, rc, *authnNS)
+					}
 					// Ship #98 / 0.30.215 — wire the customer-priority
 					// yield hook BEFORE StartRefresher so the worker pool
 					// sees a populated hook on its first processNext.
