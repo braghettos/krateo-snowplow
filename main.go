@@ -1050,6 +1050,16 @@ func main() {
 	}...)
 	defer stop()
 
+	// Track 2 (transport gzip) — wrap the mux with Accept-Encoding-gated gzip
+	// compression BEFORE otelhttp so gzip is the INNERMOST wrapper (closest to
+	// the mux): it compresses the handler's actual response bytes, and the
+	// otelhttp span still measures the full request incl. the compressed
+	// write. text/event-stream (GET /refreshes) is excluded so the SSE stream
+	// keeps its per-event incremental flush (middleware.Gzip / T2-2). Non-gzip
+	// clients + curl diagnostics are byte-identical (gzhttp only compresses on
+	// Accept-Encoding: gzip). See middleware/compression.go.
+	var muxHandler http.Handler = middleware.Gzip(mux)
+
 	// OTel HTTP server instrumentation (default-OFF gated). otelhttp wraps
 	// the mux to create a server span per request and EXTRACT inbound W3C
 	// traceparent/baggage (the global propagator installed by
@@ -1061,7 +1071,7 @@ func main() {
 	// the OPTIONS preflight before otelhttp ever runs (otelhttp would
 	// otherwise span the preflight; CORS must own it). WithFilter skips
 	// span creation for the high-frequency health/readiness/debug probes.
-	var rootHandler http.Handler = otelhttp.NewHandler(mux, serviceName,
+	var rootHandler http.Handler = otelhttp.NewHandler(muxHandler, serviceName,
 		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
 			return r.Method + " " + r.URL.Path
 		}),

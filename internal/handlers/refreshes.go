@@ -139,6 +139,19 @@ func Refreshes(signingKey string) http.HandlerFunc {
 		wri.Header().Set("Connection", "keep-alive")
 		wri.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering
 		wri.WriteHeader(http.StatusOK)
+		// Track 2 (gzip) C-1: emit a `: connected` SSE comment BEFORE the
+		// first flush so response headers commit at connect. Under the gzhttp
+		// wrapper (middleware.Gzip) WriteHeader only saves the status and a
+		// Flush with ZERO buffered body bytes returns without touching the
+		// underlying writer (the ExceptContentTypes exclusion engages at the
+		// FIRST body write). Without a body byte, an armed-but-quiet stream
+		// would withhold headers up to the 20s heartbeat, stranding EventSource
+		// in CONNECTING and tripping intermediary time-to-first-header
+		// timeouts. A `:`-prefixed comment line is a non-empty write (→ the
+		// content-type filter runs → startPlain → headers commit) yet is
+		// invisible to EventSource clients per the spec — byte-neutral to the
+		// consumer, unconditional so the fix holds with or without the wrapper.
+		fmt.Fprint(wri, ": connected\n\n")
 		_ = rc.Flush()
 
 		// (5) Subscribe + stream until the client disconnects.
@@ -210,6 +223,15 @@ func serveIdleSSE(wri http.ResponseWriter, req *http.Request) {
 	wri.Header().Set("Connection", "keep-alive")
 	wri.Header().Set("X-Accel-Buffering", "no")
 	wri.WriteHeader(http.StatusOK)
+	// Track 2 (gzip) C-1: emit a `: connected` SSE comment BEFORE the first
+	// flush so headers commit at connect under the gzhttp wrapper. This idle
+	// path is the more critical of the two sites — serveIdleSSE serves the
+	// disabled/cache-off fallback AND the #68 warmup window, both of which
+	// idle indefinitely with no event, so without the preamble headers would
+	// never commit until the first 20s heartbeat. See the armed-path comment
+	// in Refreshes for the full mechanism (gzhttp WriteHeader saves status,
+	// zero-byte Flush is a no-op; a comment byte forces startPlain).
+	fmt.Fprint(wri, ": connected\n\n")
 	_ = rc.Flush()
 
 	heartbeat := time.NewTicker(refreshHeartbeatInterval)
