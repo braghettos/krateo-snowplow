@@ -235,7 +235,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		perPage, page, keyExtras)
-	if cacheHandle != nil {
+	// #95 SECURITY (A4 serve side): a re-derived BindingUID of "" collapses the
+	// key to the shared empty-identity row — treat it as a CACHE MISS and fall
+	// through to a direct resolve under THIS request's identity; NEVER serve the
+	// shared "" cell to a different ""-deriving identity (cross-identity read of
+	// a cell resolved under someone else's narrowing). Sibling of FIX-C's
+	// populate-side skip; uniform predicate (serveFromCacheEligible, helpers.go).
+	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
@@ -384,7 +390,20 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 		)
-	} else if cacheHandle != nil && cacheKey != "" {
+	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
+		// #95 SECURITY (A4 populate side, customer path) — the single-mechanism
+		// closure. A re-derived BindingUID of "" collapses to the shared
+		// empty-identity cell; do NOT POPULATE it from a customer request. The
+		// request still resolved + served its own content above; it just never
+		// writes the shared cell. This is load-bearing (not "dead weight"): a ""
+		// BindingUID does NOT make cacheKey=="", so the refresher (refresher.go
+		// Get→re-resolve→re-Put) and SSE subscription arming
+		// (refresh_subscription.go) would READ/deliver a populated ""-cell — the
+		// serve-guard alone leaves those readers exposed. Gating the Put closes
+		// the population source once, uniformly (sibling of seed FIX-C's skip +
+		// the serve-side #95 guard). serveFromCacheEligible is the SAME predicate
+		// (helpers.go).
+		//
 		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback Put
 		// site's cache key + components so they can be diff'd against the
 		// dispatcher_get (above) and seed (phase1_pip_seed.go) emissions

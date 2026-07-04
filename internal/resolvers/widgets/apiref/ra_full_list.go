@@ -169,6 +169,23 @@ func raFullListServe(
 		Name:      name,
 	})
 
+	// #95 SECURITY arch C-1 (A4 read side, one layer down from the dispatcher
+	// serve/Put guards): a re-derived BindingUID of "" (EvaluateRBAC deny/err
+	// fail-closed) collapses raKey to the shared empty-identity RAFullList cell.
+	// On a known-sliceable verdict + cell hit below we would SERVE that shared
+	// ""-keyed slice to a DIFFERENT ""-deriving identity — the same A4
+	// cross-identity read leak, reachable via #95's own dispatcher fall-through
+	// (top-level "" → guarded MISS → direct resolve → resolveApiRef →
+	// raFullListServe re-derives "" here). Treat it EXACTLY like the no-identity
+	// precedent above: fall back to the page-keyed resolve under the request's
+	// OWN identity — always correct, never the shared cell. As a side effect
+	// this also kills the ""-key PutRAFullList + ""-key sliceability records
+	// (they never run on the fallback path), so nothing populates the ""-cell
+	// here either.
+	if bindingUID == "" {
+		return nil, false, nil
+	}
+
 	keyInputs := cache.RAFullListKeyInputs(gvr.Group, gvr.Version, gvr.Resource,
 		namespace, name, bindingUID, extras)
 	raKey := cache.ComputeKey(keyInputs)

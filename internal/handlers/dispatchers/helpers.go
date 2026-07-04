@@ -269,6 +269,25 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 	return cache.ComputeKey(inputs), c, &inputs
 }
 
+// serveFromCacheEligible is the #95 SECURITY serve-side guard (A4 read side;
+// the sibling of FIX-C's populate-side skip). When dispatchCacheLookupKey
+// re-derived a first-match BindingUID of "" (EvaluateRBAC deny/err fail-closed,
+// see the FAIL-CLOSED note above), the key collapses to the shared
+// empty-identity row — a cell FIX-C no longer seeds but that a broad identity
+// (one whose EvaluateRBAC ALSO fail-closed, or a pre-fix residue) could have
+// populated. Serving it to a DIFFERENT ""-deriving identity is a cross-identity
+// read of a shared cell resolved under someone else's (possibly broad)
+// narrowing — the A4 leak shape. So a "" BindingUID makes the serve path treat
+// the lookup as a CACHE MISS: fall through to a direct resolve under the
+// request's OWN identity (never serve-then-filter, never serve the shared ""
+// cell). A non-empty BindingUID is byte-unchanged (true → normal L1 Get).
+// handle==nil (cache off / no identity) is already handled by the caller's nil
+// check; this adds the ""-BindingUID condition. Uniform across widgets +
+// restactions (no per-handler special-case, feedback_no_special_cases).
+func serveFromCacheEligible(inputs *cache.ResolvedKeyInputs) bool {
+	return inputs != nil && inputs.BindingUID != ""
+}
+
 // unionForKey builds the body-dependency fingerprint the widget L1 key must
 // fold under inline-extras design P (§1, §4.3): the UNION of both
 // author-declared inline maps (apiRef.extras + resourcesRefsTemplateExtras)
