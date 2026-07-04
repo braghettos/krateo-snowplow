@@ -88,6 +88,16 @@ var (
 	// now the sole feeder.)
 	pipSeedRBACDenyTotal        atomic.Uint64
 	pipSeedOperationalFailTotal atomic.Uint64
+
+	// #102 GTTL-1 — pipSeedSkippedStageErrorTotal counts seed Puts the
+	// error-aware Put-gate (declineSeedPutOnError, phase1_pip_seed.go) declined
+	// because the seed re-resolve observed a swallowed stage error OR touched an
+	// external endpoint — the SAME backstop the refresher applies
+	// (resolve_populate.go). SEED-SCOPED and distinct from the refresher's
+	// refresherSkippedStageError so a keepwarm-sweep / boot-seed decline is
+	// attributable in /debug/vars (the falsifier keys on this DELTA, not the
+	// refresher's counter). Exposed as snowplow_phase1_seed_skipped_stage_error_total.
+	pipSeedSkippedStageErrorTotal atomic.Uint64
 )
 
 // Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
@@ -195,6 +205,13 @@ func registerPIPMetrics() {
 		}))
 		expvar.Publish("snowplow_phase1_seed_operational_fail_total", expvar.Func(func() any {
 			return pipSeedOperationalFailTotal.Load()
+		}))
+
+		// #102 GTTL-1 — seed Puts declined by the error-aware Put-gate (stage
+		// error / external touch). SEED-SCOPED; distinct from the refresher's
+		// refresherSkippedStageError so a keepwarm-sweep decline is attributable.
+		expvar.Publish("snowplow_phase1_seed_skipped_stage_error_total", expvar.Func(func() any {
+			return pipSeedSkippedStageErrorTotal.Load()
 		}))
 
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so

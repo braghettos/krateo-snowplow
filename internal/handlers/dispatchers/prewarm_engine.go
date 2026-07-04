@@ -166,6 +166,16 @@ const (
 	// S4 admin-path defect.
 	scopeKindGVRDiscovered prewarmScopeKind = "gvr-discovered"
 
+	// scopeKindKeepwarm — #102 c1 the TTL-cadenced quiet-page keep-warm sweep.
+	// Fired by keepwarmTicker at TTL×3/4 (a design ratio derived from
+	// RESOLVED_CACHE_TTL_SECONDS, no new env). Runs the SAME re-walk + seed core
+	// as boot (rePrewarmKeepwarm → rePrewarmBootScoped) but the per-identity
+	// seed is bounded to rank-1 (the 95%-mix cohort, ALL pages) so rank-1's
+	// cells are re-Put — resetting CreatedAt — before they lazy-expire at TTL.
+	// Coalesces on key()=="keepwarm": a tick arriving while a sweep still runs
+	// dedups to at most one pending sweep. Per-scope timeout = the boot budget.
+	scopeKindKeepwarm prewarmScopeKind = "keepwarm"
+
 	// Ship 2 (NOT wired this ship): scopeKindWidgetCR (a widget/RESTAction
 	// CR add/update/delete re-walks that object's subtree) and
 	// scopeKindRBACShift (an RBAC binding shift re-seeds the affected GVRs'

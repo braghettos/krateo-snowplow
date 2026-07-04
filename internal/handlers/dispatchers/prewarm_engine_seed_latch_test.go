@@ -196,7 +196,7 @@ func runSeedScopeYielding(t *testing.T,
 	// short-circuits before any of them is dereferenced for I/O.
 	if err := seedScopeYielding(context.Background(),
 		nil /* restactionRefs */, widgets,
-		endpoints.Endpoint{}, nil /* saRC */, "test-authn-ns"); err != nil {
+		endpoints.Endpoint{}, nil /* saRC */, "test-authn-ns", false /* rank1Only */); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil (per-target errors are non-fatal)", err)
 	}
 

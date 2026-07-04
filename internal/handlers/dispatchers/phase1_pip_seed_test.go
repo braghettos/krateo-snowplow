@@ -171,7 +171,7 @@ func TestSeedScopeYielding_CtxCancelEmitsAbortLog(t *testing.T) {
 
 	// Zero-value endpoints + nil REST config — never dereferenced (the ctx-check
 	// returns before any target seed).
-	err := seedScopeYielding(ctx, refs, nil /* widgets */, endpoints.Endpoint{}, nil /* rc */, "test-authn-ns")
+	err := seedScopeYielding(ctx, refs, nil /* widgets */, endpoints.Endpoint{}, nil /* rc */, "test-authn-ns", false /* rank1Only */)
 	if err == nil {
 		t.Fatalf("Fix-C(engine): seedScopeYielding with pre-cancelled ctx returned nil; want the ctx error")
 	}

@@ -79,6 +79,9 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 			return rePrewarmBoot(ctx, deps)
 		case scopeKindGVRDiscovered:
 			return rePrewarmGVRDiscovered(ctx, deps, s.gvr)
+		case scopeKindKeepwarm:
+			// #102 c1 — the TTL-cadenced rank-1 keep-warm sweep.
+			return rePrewarmKeepwarm(ctx, deps)
 		default:
 			// Ship 2 future scopes (scopeKindWidgetCR / scopeKindRBACShift)
 			// land here when unwired.
@@ -180,7 +183,27 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.
 // rePrewarmBoot runs the boot re-walk + per-target-GVR-scoped seed. The
 // SAME walk() is used (via the deps.lister + a fresh phase1Walker per
 // root); the harvesters are shared by reference with the boot pass.
+// rePrewarmBoot runs the full re-walk + index rebuild + per-identity seed. The
+// #102 c1 keepwarm sweep reuses this SAME core via rePrewarmKeepwarm (rank1Only
+// seed), so the sweep gets the boot's dedup, NavOrder, BindingsByGVR index, and
+// yield/memory bounds for free — it IS the seed, just rank-1-bounded.
 func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
+	return rePrewarmBootScoped(ctx, deps, false /*rank1Only*/)
+}
+
+// rePrewarmKeepwarm is the #102 c1 keepwarm-sweep handler: the SAME re-walk +
+// seed core as boot, but the seed is bounded to rank-1 (the 95%-mix cohort, all
+// pages). Fires on the TTL×3/4 cadence (keepwarmTicker) so rank-1's cells are
+// re-Put — resetting CreatedAt — before they lazy-expire at TTL. Re-resolving
+// (not TTL-extending) preserves the §1.6 staleness backstop by construction:
+// every sweep Put is FRESH bytes, and the GTTL-1 error-aware Put-gate in the
+// shared seed primitives declines a degraded re-resolve rather than overwrite a
+// good warm entry.
+func rePrewarmKeepwarm(ctx context.Context, deps rePrewarmDeps) error {
+	return rePrewarmBootScoped(ctx, deps, true /*rank1Only*/)
+}
+
+func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only bool) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -318,12 +341,14 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 	// propagates; withCohortSeedContext OVERRIDES identity per cohort for the
 	// actual seed, so the SA base is correct for both the derivation fetch
 	// and as the per-cohort seed base.
-	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS); err != nil {
+	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS, rank1Only); err != nil {
 		return err
 	}
 
 	log.Info("prewarm.engine.boot.complete",
 		slog.String("subsystem", "cache"),
+		slog.Bool("rank1_only", rank1Only),
+		slog.String("scope", map[bool]string{false: "boot", true: "keepwarm"}[rank1Only]),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 	return nil
@@ -395,9 +420,15 @@ var seedOneRestactionFn = seedOneRestaction
 // the regression journal). Deleting the seam also removes test-only prod code
 // (the #66 shadow class).
 
+// rank1Only, when true, bounds the seed to the rank-1 identity (ranked[0], the
+// highest-CollapsedBindings 95%-mix cohort) — the #102 c1 keepwarm sweep scope.
+// The boot seed passes false (all ranks). It is a pure LOOP BOUND on the
+// existing rank-major loop (ranked is sorted DESC by CollapsedBindings, so
+// ranked[0] IS rank-1); no new seam, no separate loop — the sweep re-runs the
+// identical per-identity seed the boot does, just for the one dominant cohort.
 func seedScopeYielding(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
-	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
+	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, rank1Only bool) error {
 
 	log := slog.Default()
 
@@ -759,6 +790,14 @@ func seedScopeYielding(ctx context.Context,
 	// KEPT unobscured — single rank-1 iteration, widgets-then-restactions, no
 	// interleaving of later ranks.
 	for ri := range ranked {
+		// #102 c1: the keepwarm sweep is bounded to rank-1 (ranked[0]) — the
+		// 95%-mix dominant cohort, on ALL pages. Stop after the first rank. This
+		// is the whole c1 scope: re-resolve rank-1's cell set on the TTL×3/4
+		// cadence so those cells never lazy-expire (each sweep Put resets
+		// CreatedAt). Boot passes rank1Only=false and sweeps every rank.
+		if rank1Only && ri > 0 {
+			break
+		}
 		rankKey := ranked[ri].key
 		for _, ws := range widgetSeeds {
 			e := ws.e

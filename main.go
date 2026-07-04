@@ -475,6 +475,14 @@ func main() {
 					// meaningless without the engine that processes boot scopes.
 					if cache.PrewarmEnabled() && dispatchers.PrewarmEngineEnabled() {
 						dispatchers.StartConfigVarsWatch(cacheCtx, rc, *authnNS)
+						// #102 c1 — the TTL-cadenced quiet-page keep-warm sweep.
+						// Anchored to the PROCESS-LIFETIME cacheCtx (same as the
+						// config-vars watch + engine worker) so the ticker fires
+						// for the pod lifetime. It enqueues a scopeKindKeepwarm on
+						// the SAME engine singleton at TTL×3/4, re-seeding rank-1's
+						// cells before they lazy-expire. Gated identically (the
+						// sweep is meaningless without the engine that processes it).
+						dispatchers.StartKeepwarmSweep(cacheCtx)
 					}
 					// Ship #98 / 0.30.215 — wire the customer-priority
 					// yield hook BEFORE StartRefresher so the worker pool

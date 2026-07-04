@@ -233,7 +233,7 @@ func TestFixE_RankMajorClassInterleaveFirstNavOrder(t *testing.T) {
 	}
 	t.Cleanup(func() { seedOneRestactionFn = prevR })
 
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns"); err != nil {
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 

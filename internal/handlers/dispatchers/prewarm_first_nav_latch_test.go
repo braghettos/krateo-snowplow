@@ -220,7 +220,7 @@ func TestFirstNavLatch_FiresBeforeTail_GreenAndMutationRed(t *testing.T) {
 		}
 
 		installLatchFireObserver(t, rec)
-		if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns"); err != nil {
+		if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
 			t.Fatalf("seedScopeYielding returned %v; want nil", err)
 		}
 		return rec.snapshot()
@@ -308,7 +308,7 @@ func TestFirstNavLatch_RootIndexGtZeroOnly_NoEarlySegmentFire(t *testing.T) {
 		})
 
 	installLatchFireObserver(t, rec)
-	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns"); err != nil {
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()
@@ -392,7 +392,7 @@ func TestFirstNavLatch_ConcurrentFireWait_RealSegmentPath_Race(t *testing.T) {
 	// SEED goroutine — the REAL production fire site closes the latch.
 	seedErr := make(chan error, 1)
 	go func() {
-		seedErr <- seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns")
+		seedErr <- seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false)
 	}()
 
 	if err := <-seedErr; err != nil {
@@ -480,7 +480,7 @@ func TestFirstNavLatch_MutationII_FireBeforeSegment_IsRedUnderGreenGuard(t *test
 	installLatchFireObserver(t, rec)
 	// MUTATION (ii): fire BEFORE the segment completes (before any seed).
 	latch.fire("mutation-ii-premature", 0, 0, 0)
-	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns"); err != nil {
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()

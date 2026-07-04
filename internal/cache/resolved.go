@@ -1502,6 +1502,22 @@ func CatalogUnservableTTL() time.Duration {
 	return time.Duration(s) * time.Second
 }
 
+// ResolvedCacheTTL returns the effective standard resolved-cache entry TTL —
+// the SAME value newResolvedCache is constructed with (RESOLVED_CACHE_TTL_SECONDS
+// env, default defaultResolvedCacheTTLSeconds=3600s). Exported so the #102 c1
+// keep-warm sweep can derive its cadence (TTL×3/4) from the SAME source that
+// governs expiry — no separate cadence knob (feedback_no_special_cases). A
+// non-positive env value falls back to the default (matching newResolvedCache's
+// own <=0 guard at :605), so the accessor never returns 0 and the sweep cadence
+// is always well-defined.
+func ResolvedCacheTTL() time.Duration {
+	s := intFromEnv(envResolvedCacheTTLSeconds, defaultResolvedCacheTTLSeconds)
+	if s <= 0 {
+		s = defaultResolvedCacheTTLSeconds
+	}
+	return time.Duration(s) * time.Second
+}
+
 func int64FromEnv(key string, def int64) int64 {
 	v := os.Getenv(key)
 	if v == "" {

@@ -552,6 +552,18 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// restactions.go:180-182.
 	resCtx := cache.WithL1KeyContext(ctx, key)
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
+	// #102 GTTL-1 (arch Option A, uniform): install the error-aware Put-gate
+	// sinks so the seed honors the SAME backstop the refresher does
+	// (resolve_populate.go:207-285). A swallowed/continueOnError'd STAGE error
+	// (resolve returns nil-overall with degraded bytes) or a genuine EXTERNAL
+	// endpoint touch (no dep edge to invalidate it) must NOT be Put — on the
+	// keepwarm sweep that would blind-overwrite a good warm entry with degraded
+	// bytes (the GTTL-1 defect); on boot it would serve under-populated content
+	// on first paint. The gate keys on error PRESENCE, never on result
+	// emptiness (a legitimately-empty result produces no stage error → sink==0
+	// → still Put). Uniform across boot + sweep (feedback_no_special_cases).
+	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
+	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
 
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
 		In: &cr,
@@ -571,6 +583,15 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	encoded, err := encodeResolvedJSON(res)
 	if err != nil {
 		return fmt.Errorf("encode RESTAction %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	// #102 GTTL-1: decline the Put (return nil, best-effort — NOT an error, so
+	// the engine seed loop's PROCESSED-not-SUCCEEDED latch decrement is
+	// unaffected and readyz never hangs) when the resolve observed a stage
+	// error or touched an external endpoint. Keeps the prior good entry (if
+	// any); TTL is the outer net.
+	if declineSeedPutOnError(ctx, "restactions", ref.Namespace+"/"+ref.Name, stageErrSink, extTouchedSink) {
+		return nil
 	}
 
 	// Put under the per-user key — exactly the shape restactions.go
@@ -736,6 +757,11 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 
 	resCtx := cache.WithL1KeyContext(ctx, key)
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
+	// #102 GTTL-1 (arch Option A, uniform) — see seedOneRestaction: the
+	// error-aware Put-gate sinks make the seed honor the refresher's backstop
+	// so the keepwarm sweep never blind-re-Puts degraded bytes over a warm cell.
+	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
+	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
 
 	res, err := widgets.Resolve(resCtx, widgets.ResolveOptions{
 		In: in,
@@ -755,6 +781,12 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	encoded, err := encodeResolvedJSON(res)
 	if err != nil {
 		return fmt.Errorf("encode widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), err)
+	}
+
+	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
+	// or external touch — keeps any prior good entry; TTL is the outer net.
+	if declineSeedPutOnError(ctx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), stageErrSink, extTouchedSink) {
+		return nil
 	}
 
 	handle.Put(key, &cache.ResolvedEntry{
@@ -913,6 +945,82 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 			slog.String("effect", "RAFullList prewarm skipped for this (widget,cohort); first /call cold-resolves + pins lazily"),
 		)
 	}
+}
+
+// declineSeedPutOnError is the #102 GTTL-1 error-aware Put-gate for the shared
+// seed primitives — the seed-side mirror of the refresher's gate
+// (resolve_populate.go:251-285). It returns true (decline the Put) when the
+// seed re-resolve observed a swallowed/continueOnError'd STAGE error or touched
+// a genuine EXTERNAL endpoint, in which case the caller MUST skip handle.Put
+// and return nil (best-effort — NOT an error, so the engine seed loop's
+// PROCESSED-not-SUCCEEDED latch decrement is unaffected and readyz never hangs).
+//
+// WHY (arch Option A, uniform across boot + keepwarm sweep): a stage-errored
+// resolve produces degraded/under-populated bytes; a Put would (on the keepwarm
+// sweep) blind-overwrite a good warm entry — the GTTL-1 defect — or (on boot)
+// serve under-served content on first paint. An external touch has no dep edge
+// to invalidate it. The prior good entry (if any) is kept; TTL is the outer net
+// (§1.6). The gate keys on error PRESENCE, never on result emptiness — a
+// legitimately-empty result produces no stage error (sink Count()==0) → NOT
+// declined → its empty bytes ARE stored (mirrors resolve_populate.go:248-250).
+//
+// The identity for the log is read from ctx (withCohortSeedContext installs
+// WithUserInfo) so both primitives share one helper without threading a label.
+func declineSeedPutOnError(ctx context.Context, class, target string,
+	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink) bool {
+
+	if stageErrSink.Count() > 0 {
+		pipSeedSkippedStageErrorTotal.Add(1)
+		// Back-compat parity with the refresher's process-wide counter so
+		// existing "how many degraded re-Puts were declined" dashboards see the
+		// seed declines too (the seed-scoped counter above disambiguates source).
+		cache.BumpRefresherSkippedStageError()
+		stage, sampleErr := stageErrSink.Sample()
+		slog.Default().Info("phase1.seed.skip.stage_error",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.Int64("stage_errors", stageErrSink.Count()),
+			slog.String("stage_err_stage", stage),
+			slog.String("stage_err_sample", sampleErr),
+			slog.String("effect", "seed re-resolve observed a swallowed stage error; declining the Put "+
+				"(keeps any prior good entry; TTL is the outer net) — GTTL-1 backstop, uniform with the refresher"),
+		)
+		return true
+	}
+	if extTouchedSink.Count() > 0 {
+		pipSeedSkippedStageErrorTotal.Add(1)
+		cache.BumpExternalSkippedPut()
+		slog.Default().Info("phase1.seed.skip.external_touch",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("effect", "seed re-resolve touched an external endpoint (no dep edge to invalidate); "+
+				"declining the Put — GTTL-1 backstop, uniform with the refresher"),
+		)
+		return true
+	}
+	return false
+}
+
+// seedIdentityLabelFromCtx renders the seeding identity from the cohort ctx
+// (withCohortSeedContext installs WithUserInfo). Username else first group else
+// "anonymous" — mirrors cohortLogLabel's domain for log parity.
+func seedIdentityLabelFromCtx(ctx context.Context) string {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return "anonymous"
+	}
+	if ui.Username != "" {
+		return ui.Username
+	}
+	if len(ui.Groups) > 0 {
+		return "group:" + ui.Groups[0]
+	}
+	return "anonymous"
 }
 
 // cohortLogLabel renders a cohort into a stable log/metric label. The
