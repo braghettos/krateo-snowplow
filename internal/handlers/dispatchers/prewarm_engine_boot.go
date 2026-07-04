@@ -527,7 +527,27 @@ func seedScopeYielding(ctx context.Context,
 	// ── Widgets seed loop — per-binding targets scoped on each widget's GVR.
 	// Returns ctx.Err() if the budget/cancel cut it off mid-loop (the caller
 	// stops there), else nil.
+	//
+	// #42 Fix A2 CHEAP-COHORT-FIRST (symmetric to the restactions loop below):
+	// process widgets in ASCENDING len(targets) order so the cheap first-nav
+	// widgets (e.g. dashboard-flex, ~single-digit targets) seed FIRST, before a
+	// high-fan-out widget grinds down the budget. On a per-composition-
+	// RoleBinding topology a single widget GVR can carry hundreds of targets
+	// (obs-by-kind-list = 457 targets: per-composition RoleBindings grant devs
+	// on widget GVRs) — unsorted, that widget can abort the whole widgets loop
+	// before dashboard-flex is reached (phase=widgets targets_processed=84/457
+	// → dashboard-flex never seeded → cold nav#1). We resolve every widget's
+	// target set FIRST (one targetsFor per widget), sort by len(targets)
+	// ascending (ties on ns/name), THEN seed — the high-fan-out widget runs
+	// LAST. Target set stays 100% BindingsByGVR-derived; no caps/skips/magic
+	// numbers (feedback_prewarm_walk_no_sampling_caps) — pure ordering.
+	type widgetSeed struct {
+		e       navWidgetEntry
+		targets []seedTarget
+		scoped  bool
+	}
 	seedWidgets := func() error {
+		widgetSeeds := make([]widgetSeed, 0, len(widgetEntries))
 		for _, e := range widgetEntries {
 			if ctx.Err() != nil {
 				emitSeedAbort("widgets", ctx.Err())
@@ -536,14 +556,33 @@ func seedScopeYielding(ctx context.Context,
 			engineYieldCheckpoint(ctx)
 
 			targets, scoped := targetsFor(e.GVR, true)
+			widgetSeeds = append(widgetSeeds, widgetSeed{e: e, targets: targets, scoped: scoped})
+		}
+		sort.SliceStable(widgetSeeds, func(i, j int) bool {
+			if len(widgetSeeds[i].targets) != len(widgetSeeds[j].targets) {
+				return len(widgetSeeds[i].targets) < len(widgetSeeds[j].targets)
+			}
+			ei, ej := widgetSeeds[i].e, widgetSeeds[j].e
+			li := ei.W.GetNamespace() + "/" + ei.W.GetName()
+			lj := ej.W.GetNamespace() + "/" + ej.W.GetName()
+			return li < lj
+		})
+		for _, ws := range widgetSeeds {
+			if ctx.Err() != nil {
+				emitSeedAbort("widgets", ctx.Err())
+				return ctx.Err()
+			}
+			engineYieldCheckpoint(ctx)
+
+			e := ws.e
 			log.Info("prewarm.engine.seed.widget_targets",
 				slog.String("subsystem", "cache"),
 				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
 				slog.String("gvr", e.GVR.String()),
-				slog.Bool("scoped", scoped),
-				slog.Int("targets", len(targets)),
+				slog.Bool("scoped", ws.scoped),
+				slog.Int("targets", len(ws.targets)),
 			)
-			for _, c := range targets {
+			for _, c := range ws.targets {
 				err := seedOneTarget(c, func(cohortCtx context.Context) error {
 					return seedOneWidgetFn(cohortCtx, e, authnNS)
 				})
