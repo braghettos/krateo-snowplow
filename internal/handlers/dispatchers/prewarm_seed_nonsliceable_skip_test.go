@@ -143,6 +143,88 @@ func fixBCtxUser() context.Context {
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "userU"}))
 }
 
+// divergentCtxUser — userD is a member of TWO groups, each bound by a DISTINCT
+// binding to a DISTINCT ClusterRole: devs-r's role grants the RESTAction GVR
+// (the RA-CR coordinate), devs-w's role grants the widget Panel GVR. So
+// EvaluateRBAC(restactions) first-matches binding-R while EvaluateRBAC(panels)
+// first-matches binding-W → different BindingUIDs → the RA-keyed (eg2) and the
+// widget-keyed (eg1) raKey derivations DIVERGE. This is the load-bearing G2-B
+// fixture: it makes the eg1 defect observable (a widget-keyed pre-check MISSES
+// the RA-CR-keyed record). No wildcard — narrow, first-match-deterministic.
+func divergentCtxUser() context.Context {
+	return xcontext.BuildContext(context.Background(),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "userD", Groups: []string{"devs-r", "devs-w"}}))
+}
+
+// buildDivergentBindingWatcher publishes a watcher serving the aggregation RAs
+// plus TWO distinct-UID ClusterRoleBindings for userD's groups: binding-R
+// (devs-r → role-r → restactions) and binding-W (devs-w → role-w → panels). The
+// two roles grant DIFFERENT GVRs so the first-match BindingUID for the RA-CR
+// coordinate (restactions) differs from the widget coordinate (panels).
+func buildDivergentBindingWatcher(t *testing.T, ras ...*unstructured.Unstructured) {
+	t.Helper()
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	cache.ResetResolvedCacheForTest()
+
+	crbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}
+	crGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
+	scheme := runtime.NewScheme()
+	_ = rbacv1.AddToScheme(scheme)
+	listKinds := map[schema.GroupVersionResource]string{
+		fixBRestGVR: "RESTActionList",
+		crbGVR:      "ClusterRoleBindingList",
+		crGVR:       "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}: "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:        "RoleList",
+	}
+	// role-r grants ONLY the RESTAction GVR; role-w grants ONLY the widget Panel GVR.
+	ruleRest := []rbacv1.PolicyRule{{Verbs: []string{"*"}, APIGroups: []string{"templates.krateo.io"}, Resources: []string{"restactions"}}}
+	ruleWidget := []rbacv1.PolicyRule{{Verbs: []string{"*"}, APIGroups: []string{"widgets.templates.krateo.io"}, Resources: []string{"panels"}}}
+	seed := []runtime.Object{
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "role-r"}, Rules: ruleRest},
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "role-w"}, Rules: ruleWidget},
+		&rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "d-bind-r", UID: types.UID("uid-d-r")},
+			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "devs-r"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "role-r"},
+		},
+		&rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "d-bind-w", UID: types.UID("uid-d-w")},
+			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "devs-w"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "role-w"},
+		},
+	}
+	for _, ra := range ras {
+		seed = append(seed, ra)
+	}
+
+	wctx, wcancel := context.WithCancel(context.Background())
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, seed...)
+	rw, err := cache.NewResourceWatcher(wctx, dyn)
+	if err != nil {
+		wcancel()
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	rw.EnsureResourceType(fixBRestGVR)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rw.WaitForCacheSync(ctx, 5*time.Second); err != nil {
+		rw.Stop()
+		wcancel()
+		t.Fatalf("WaitForCacheSync: %v", err)
+	}
+	cache.RebuildRBACSnapshotForTest(rw)
+	prev := cache.Global()
+	cache.SetGlobal(rw)
+	t.Cleanup(func() {
+		rw.Stop()
+		wcancel()
+		cache.SetGlobal(prev)
+		cache.PublishRBACSnapshotForTest(nil)
+	})
+}
+
 // recordShapeNegative primes the shape-negative set for the RA's sliceShape
 // through apiref.RecordSeedFullListShapeNegativeForTest — which derives the
 // shape via the SAME unexported seedFullListShape() that both raFullListServe
@@ -186,6 +268,8 @@ func TestFixB_SeedSkipsKnownNonSliceable(t *testing.T) {
 	// BEFORE apiref.Resolve — the discarded resolve #3 is eliminated. ---
 	buf.Reset()
 	widgetKnown := fixBWidget("panel-known", "agg-known")
+	// FIX-B is the identity-free SHAPE-negative skip; FIX-G's per-key path finds
+	// no per-key verdict here, so this arm isolates FIX-B.
 	seedRAFullListForWidget(ctx, widgetKnown, "authn-ns", "krateo-system", "panel-known")
 	if !bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
 		t.Fatalf("FIX-B GREEN: expected the skip_nonsliceable log for a known-non-sliceable widget "+
@@ -200,5 +284,106 @@ func TestFixB_SeedSkipsKnownNonSliceable(t *testing.T) {
 	seedRAFullListForWidget(ctx, widgetUnknown, "authn-ns", "krateo-system", "panel-unknown")
 	if bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
 		t.Fatalf("FIX-B CONTROL: an UNKNOWN-shape widget must NOT skip (no shape-negative recorded for agg-unknown); logs:\n%s", buf.String())
+	}
+}
+
+// TestFixG_SeedSkipsPerKeyNonPermanentNegative — the #42 FIX-G G2-B falsifier
+// (the eg2 UNMASKING arm). DIVERGENT-BINDING fixture: the RA-CR first-match
+// (binding-R, grants restactions) differs from the widget first-match
+// (binding-W, grants the widget GVR) — different UIDs. The verdict is primed AND
+// consulted through the SHARED seedFullListRAKey (RA-CR coordinates), so:
+//   - eg2 (RA-keyed, current code): the pre-check keys off binding-R → HITS the
+//     record → SKIP fires (GREEN).
+//   - eg1 (widget-keyed, the defect): the pre-check would key off binding-W →
+//     MISS → skip never fires (G inert). Demonstrated RED by the temporary
+//     source mutation (widget-coordinate derivation) run attached to the diff
+//     report — a real divergence IS hermetically constructible here, so this is
+//     the primary G proof (not a constructed-same-key arm).
+//
+// The per-key negative is NON-permanent → FIX-A's permanent-only shape set does
+// NOT cover it → FIX-B alone would not skip (the G-vs-B discriminator). CONSULT
+// arm (labeled, G2-C): a granted-but-not-recorded identity does NOT skip.
+// Mutation (neuter SeedFullListPerKeyKnownNonSliceable) → GREEN loses the skip
+// → RED — PM re-runs it on the divergent fixture.
+func TestFixG_SeedSkipsPerKeyNonPermanentNegative(t *testing.T) {
+	perKeyRA := fixBAggRA("perkey-ra")
+	unrecRA := fixBAggRA("perkey-unrec")
+	buildDivergentBindingWatcher(t, perKeyRA, unrecRA)
+	ctx := divergentCtxUser() // userD: RA-CR first-match ≠ widget first-match
+
+	var buf bytes.Buffer
+	prevDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+
+	var typed templatesv1.RESTAction
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(perKeyRA.Object, &typed); err != nil {
+		t.Fatalf("convert perkey-ra: %v", err)
+	}
+
+	// G2-B PRE-HASH raKey FIELD-EQUALITY: the record derives raKey via the
+	// SHARED seedFullListRAKey off the RA-CR coordinates (no hand-fed constant);
+	// so does the pre-check. Prime the NON-permanent negative through that shared
+	// derivation. ok=true asserts a real RA-CR first-match exists under ctx.
+	if !apiref.RecordSeedFullListPerKeyNonPermanentNegativeForTest(
+		ctx, fixBRestGVR, "krateo-system", "perkey-ra", &typed, nil) {
+		t.Fatalf("G2-B setup: no RA-CR first-match under userD — divergent-binding fixture is wrong")
+	}
+
+	// G2-B PRE-HASH FIELD-EQUALITY (feedback_key_parity_golden_real_inputs_prehash_diff):
+	// assert the record derivation and the pre-check derivation fold the SAME
+	// ResolvedKeyInputs (same BindingUID) — codifying the G2-A single-source
+	// invariant at the FIELD level, not the digest. Both go through the RA-CR
+	// coordinates via the SHARED seedFullListRAKey.
+	recInputs, okRec := apiref.SeedFullListRAKeyInputsForTest(ctx, fixBRestGVR, "krateo-system", "perkey-ra", nil)
+	preInputs, okPre := apiref.SeedFullListRAKeyInputsForTest(ctx, fixBRestGVR, "krateo-system", "perkey-ra", nil)
+	if !okRec || !okPre {
+		t.Fatalf("G2-B: RA-CR key-input derivation returned ok=false (rec=%v pre=%v)", okRec, okPre)
+	}
+	// Compare the KEY-material fields explicitly (RepresentativeGroups/Extras are
+	// non-comparable slices/maps and are EXCLUDED FROM COMPUTEKEY anyway — the
+	// key identity is CacheEntryClass+GVR+ns+name+BindingUID, the divergence axis).
+	if recInputs.CacheEntryClass != preInputs.CacheEntryClass ||
+		recInputs.Group != preInputs.Group || recInputs.Version != preInputs.Version ||
+		recInputs.Resource != preInputs.Resource || recInputs.Namespace != preInputs.Namespace ||
+		recInputs.Name != preInputs.Name || recInputs.BindingUID != preInputs.BindingUID {
+		t.Fatalf("G2-B pre-hash field-equality FAILED: record vs pre-check RA-CR key-inputs diverge\n rec=%+v\n pre=%+v", recInputs, preInputs)
+	}
+	// And prove the fixture is GENUINELY divergent (not a degenerate same-key
+	// arm): a WIDGET-coordinate derivation folds a DIFFERENT BindingUID (binding-W)
+	// than the RA-CR derivation (binding-R). If these matched, the eg1 defect
+	// would be masked (see feedback_falsifier_shape_must_discriminate).
+	widgetGVR := schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels"}
+	wInputs, okW := apiref.SeedFullListRAKeyInputsForTest(ctx, widgetGVR, "krateo-system", "panel-perkey", nil)
+	if !okW {
+		t.Fatalf("G2-B: widget-coordinate derivation returned ok=false — fixture should grant the widget GVR too")
+	}
+	if wInputs.BindingUID == recInputs.BindingUID {
+		t.Fatalf("G2-B fixture NOT divergent: widget BindingUID (%q) == RA-CR BindingUID (%q); the eg1 defect would be masked",
+			wInputs.BindingUID, recInputs.BindingUID)
+	}
+
+	widget := fixBWidget("panel-perkey", "perkey-ra")
+
+	// --- GREEN: seedRAFullListForWidget (RA-CR derivation) HITS the record →
+	// skip fires attributed to the PER-KEY negative. Under the DIVERGENT fixture
+	// a widget-coordinate derivation (eg1) would key off binding-W and MISS. ---
+	buf.Reset()
+	seedRAFullListForWidget(ctx, widget, "authn-ns", "krateo-system", "panel-perkey")
+	if !bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
+		t.Fatalf("FIX-G G2-B GREEN: expected the per-key skip under the RA-CR derivation on the DIVERGENT-binding "+
+			"fixture (eg2). A miss here is the eg1 defect (pre-check keyed off the widget binding); logs:\n%s", buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("\"per_key_negative\":true")) {
+		t.Fatalf("FIX-G: the skip must be attributed to the PER-KEY negative (per_key_negative:true), not shape; logs:\n%s", buf.String())
+	}
+
+	// --- CONSULT arm (G2-C, labeled — NOT key-correctness): perkey-unrec has NO
+	// recorded verdict → does NOT skip (proves the skip is gated on a present
+	// per-key verdict, not unconditional). ---
+	buf.Reset()
+	seedRAFullListForWidget(ctx, fixBWidget("panel-unrec", "perkey-unrec"), "authn-ns", "krateo-system", "panel-unrec")
+	if bytes.Contains(buf.Bytes(), []byte("phase1.seed.rafulllist.skip_nonsliceable")) {
+		t.Fatalf("FIX-G CONSULT: an identity with NO recorded per-key verdict must NOT skip; logs:\n%s", buf.String())
 	}
 }

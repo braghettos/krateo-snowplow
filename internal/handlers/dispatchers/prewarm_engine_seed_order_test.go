@@ -1,53 +1,49 @@
-// prewarm_engine_seed_order_test.go — #42: the FIRST-NAV-FIRST ordering
-// falsifier for seedScopeYielding.
+// prewarm_engine_seed_order_test.go — #42 FIX-E: the rank-major, class-
+// interleaved, first-nav-ordered seed falsifier.
 //
-// ROOT CAUSE (docs/prewarm-first-nav-seed-trace-2026-07-03.md): the boot seed
-// ran RESTActions FIRST, and a single high-fan-out RA (settings-krateo-status
-// → apps/deployments = 10190 per-composition bindings at 50K) drowned the
-// 8-minute boot budget, so the WIDGETS loop never ran → the dashboard's
-// dashboard-flex widget cell (flexes GVR, single-digit targets) was never
-// per-user-seeded → 750ms cold first-nav.
+// ── FALSIFIER-SET MIGRATION (2026-07-04, TL-approved delete-with-migration) ──
+// FIX-E replaced the class-major seedScopeYielding (whole-widgets-class then
+// whole-restactions-class, dispatched by the seedClassOrderFn seam) with a
+// UNIFIED rank-major, class-INTERLEAVED, first-nav-ordered loop (per identity
+// rank r → widgets(r) in NavOrder → restactions(r)). The seedClassOrderFn seam
+// was removed. THREE falsifiers that guarded the superseded model were DELETED;
+// their properties are re-covered as follows (PM property-coverage map):
 //
-// THE FIX (prewarm_engine_boot.go): run the WIDGETS loop before the
-// RESTActions loop (seedClassOrderFn), and process RESTActions in ascending
-// len(targets) order. The discriminating property: when the budget deadline
-// fires inside the expensive restaction fan-out, the cheap WIDGET cell is
-// STILL seeded first.
+//   (a) TestSeedScopeYielding_FirstNavFirst_OrderingFalsifier
+//       GUARDED: "widgets seed before restactions (restactions not starved by
+//       widget work)". SUPERSEDED by per-rank interleave — restactions now seed
+//       WITHIN each rank right after that rank's widgets, not after ALL widget
+//       ranks. The underlying #42 property ("restactions must not be starved")
+//       is now guarded by THIS file's rank-major assert (a lower-rank seed
+//       before rank-1 completes → RED) + the revert-interleave mutation.
+//   (b) TestSeedScopeYielding_CheapCohortFirst_SortFalsifier
+//       GUARDED: "restactions in ascending len(targets) order (cheap RA before
+//       the fan-out tail)". RETAINED — the RA within-rank ascending-len tiebreak
+//       survives FIX-E; asserted EXPLICITLY here (property (b) block).
+//   (c) TestSeedScopeYielding_CheapCohortFirst_WidgetsSortFalsifier
+//       GUARDED: "cheap/critical widgets not starved by a whale (A2 widget
+//       len-sort)". SUPERSEDED by NavOrder (count≠cost, proven twice — A2 seeded
+//       a cheap late-nav widget before the dashboard's own widgets). The "cheap/
+//       critical widget seeds first" property is now guarded by first-nav
+//       (NavOrder) order + the sequence assert here.
 //
-// HARNESS SHAPE (feedback_falsifier_shape_must_discriminate): K>1 cohorts ×
-// M>1 targets, ONE high-fan-out restaction (large target set whose per-target
-// seed consumes the budget) + one dashboard-flex-class widget (small target
-// set). The seed primitives (via the seams) record an ordered event log and
-// consume wall-clock so the budget expires mid-fan-out. The budget is a real
-// context deadline.
+// Condition 3: the E fixture derives NavOrder via the REAL harvest-stamping
+// (newNavWidgetHarvester + harvestNavWidget in walk order), NOT hand-assigned —
+// so it fails if the harvest-order stamping breaks, not only the seed loop.
 //
-//   - GREEN arm  = production order [widgets, restactions]: the widget Put is
-//     recorded BEFORE the context deadline fires.
-//   - RED arm    = reverted order [restactions, widgets] (via the
-//     seedClassOrderFn seam): the restaction fan-out eats the budget FIRST,
-//     the loop aborts on ctx.Err() before the widgets loop runs, so the
-//     widget Put is NEVER recorded. This is the RED arm that proves the
-//     ordering — not incidental luck — is what warms the first-nav cell.
-//
-// SEAMS USED: enumeratePrewarmTargetsForGVRFn (per-GVR target sets),
-// restActionTargetGVRFn (RA → its target GVR, no apiserver), seedOneWidgetFn /
-// seedOneRestactionFn (per-target primitives that record + consume budget),
-// seedClassOrderFn (the #42 order seam, flipped for the RED arm). Production
-// ALWAYS binds seedClassOrderFn to [widgets, restactions].
-//
-// Pure unit: no cluster, no informer, no apiserver, -race clean. Does NOT
-// touch ./internal/rbac/... (destructive TestMain).
+// Hermetic, -race, seams only (no cluster). TestFixD_IdentityRankMajorSeedOrder
+// (rank-major skeleton) stays GREEN unmodified in its own file.
 
 package dispatchers
 
 import (
 	"context"
 	"log/slog"
-	"strconv"
+	"strings"
 	"sync"
 	"testing"
-	"time"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -56,584 +52,252 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 )
 
-// orderSeedGVRs — the widget GVR (cheap: few targets) and the high-fan-out
-// restaction's TARGET GVR (expensive: many targets). Distinct so the seam
-// enumerator returns different-sized target sets per class.
+// ── recorder: ordered (class,label,identity) seed events ────────────────────
+type eSeedEvent struct {
+	class    string // "widget" | "restaction"
+	label    string // ns/name
+	identity string // "user:<u>" | "group:<g>" | "anon"
+}
+
+type eSeedRecorder struct {
+	mu     sync.Mutex
+	events []eSeedEvent
+}
+
+func (r *eSeedRecorder) record(class, label, identity string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, eSeedEvent{class: class, label: label, identity: identity})
+}
+
+func (r *eSeedRecorder) snapshot() []eSeedEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]eSeedEvent(nil), r.events...)
+}
+
+// eIdentityLabel renders the seeding identity from the cohort ctx the seam runs
+// under (withCohortSeedContext installs WithUserInfo). Mirrors the rank key
+// domain (Username, else first group).
+func eIdentityLabel(ctx context.Context) string {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return "anon"
+	}
+	if ui.Username != "" {
+		return "user:" + ui.Username
+	}
+	if len(ui.Groups) > 0 {
+		return "group:" + ui.Groups[0]
+	}
+	return "anon"
+}
+
+// quietLoggingE silences seed info logging for a run (assert on the recorder).
+func quietLoggingE(t *testing.T) {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(eDiscard{}, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+}
+
+type eDiscard struct{}
+
+func (eDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+// ── E fixture GVRs ──────────────────────────────────────────────────────────
+// Each widget has its OWN GVR so the enumerator seam can give it a distinct
+// identity set; the two RA target GVRs get distinct-sized sets for the RA
+// ascending-len tiebreak assert (property (b)).
+func eWidgetGVR(res string) schema.GroupVersionResource {
+	return schema.GroupVersionResource{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: res}
+}
+
 var (
-	orderWidgetGVR = schema.GroupVersionResource{
-		Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "flexes",
-	}
-	orderFanoutGVR = schema.GroupVersionResource{
-		Group: "apps", Version: "v1", Resource: "deployments",
-	}
-	// orderCheapRAGVR — a SECOND restaction's target GVR with a SMALL target
-	// set (the cheap first-nav RA). Used by the C-SORT arm to give the
-	// ascending-len(targets) sort two genuinely different-sized RA target sets
-	// to order (the sort is a no-op with a single RA).
-	orderCheapRAGVR = schema.GroupVersionResource{
-		Group: "core.krateo.io", Version: "v1", Resource: "cheaps",
-	}
+	eCheapRAGVR  = schema.GroupVersionResource{Group: "core.krateo.io", Version: "v1", Resource: "cheaps"}
+	eFanoutRAGVR = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
 )
 
-// orderSeedEvent records one seed Put in call order.
-type orderSeedEvent struct {
-	class      string // "widget" | "restaction"
-	label      string // ns/name
-	beforeDone bool   // was the seed context still live (budget not yet expired) when this Put ran?
+type eID struct {
+	name      string
+	group     bool
+	collapsed int
 }
 
-// orderSeedRecorder is the shared, mutex-guarded ordered event log the seam
-// primitives append to. It also holds the outer budget context so each Put can
-// record whether the budget was still live at the moment it ran.
-type orderSeedRecorder struct {
-	mu           sync.Mutex
-	events       []orderSeedEvent
-	budgetCtx    context.Context
-	perTargetDur time.Duration // wall-clock each restaction target consumes
+func (e eID) subject() cache.SubjectIdentity {
+	if e.group {
+		return cache.SubjectIdentity{Groups: []string{e.name}}
+	}
+	return cache.SubjectIdentity{Username: e.name}
 }
 
-func (r *orderSeedRecorder) record(class, label string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.events = append(r.events, orderSeedEvent{
-		class:      class,
-		label:      label,
-		beforeDone: r.budgetCtx.Err() == nil,
-	})
-}
-
-// widgetPutBeforeBudget reports whether a widget Put was recorded while the
-// budget was still live.
-func (r *orderSeedRecorder) widgetPutBeforeBudget() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, e := range r.events {
-		if e.class == "widget" && e.beforeDone {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *orderSeedRecorder) counts() (widgets, restactions int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, e := range r.events {
-		switch e.class {
-		case "widget":
-			widgets++
-		case "restaction":
-			restactions++
-		}
-	}
-	return
-}
-
-// firstIndex returns the index of the FIRST recorded Put with the given
-// class+label (ns/name), or -1 if none. Used by C-SORT to assert relative
-// ordering (cheap RA Put recorded before expensive RA Put).
-func (r *orderSeedRecorder) firstIndex(class, label string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i, e := range r.events {
-		if e.class == class && e.label == label {
-			return i
-		}
-	}
-	return -1
-}
-
-// putBeforeBudget reports whether a Put with class+label was recorded while
-// the budget was still live.
-func (r *orderSeedRecorder) putBeforeBudget(class, label string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, e := range r.events {
-		if e.class == class && e.label == label && e.beforeDone {
-			return true
-		}
-	}
-	return false
-}
-
-// installOrderSeams wires all four production seams for one ordering run.
-//
-//   - enumeratePrewarmTargetsForGVRFn returns gvrCount[gvr] targets for the
-//     GVR (widget GVR + one distinct target GVR per RA); unknown GVRs → nil.
-//   - restActionTargetGVRFn maps each RA ref (by ns/name) to its target GVR
-//     via raGVR, so the restaction loop's ascending-len(targets) SORT sees
-//     genuinely different-sized target sets per RA (the C-SORT discriminator).
-//   - seedOneWidgetFn / seedOneRestactionFn record the Put (class+label) and
-//     consume rec.perTargetDur of wall-clock so the budget can expire
-//     mid-sequence.
-//
-// No new seam: this reuses the exact seams the production code exposes.
-func installOrderSeams(t *testing.T, rec *orderSeedRecorder,
-	gvrCount map[schema.GroupVersionResource]int,
-	raGVR map[string]schema.GroupVersionResource) {
-	t.Helper()
-
-	prevEnum := enumeratePrewarmTargetsForGVRFn
-	enumeratePrewarmTargetsForGVRFn = func(gvr schema.GroupVersionResource, verb string) []cache.PrewarmTarget {
-		return makeGVRTargets(gvr, gvrCount[gvr])
-	}
-	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
-
-	prevTargetGVR := restActionTargetGVRFn
-	restActionTargetGVRFn = func(_ context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
-		gvr, ok := raGVR[ref.Namespace+"/"+ref.Name]
-		return gvr, ok
-	}
-	t.Cleanup(func() { restActionTargetGVRFn = prevTargetGVR })
-
-	prevWidgetSeed := seedOneWidgetFn
-	seedOneWidgetFn = func(_ context.Context, e navWidgetEntry, _ string) error {
-		rec.record("widget", e.W.GetNamespace()+"/"+e.W.GetName())
-		return nil
-	}
-	t.Cleanup(func() { seedOneWidgetFn = prevWidgetSeed })
-
-	prevRASeed := seedOneRestactionFn
-	seedOneRestactionFn = func(_ context.Context, _ string, ref templatesv1.ObjectReference, _ string) error {
-		// Each target consumes wall-clock so the budget can expire mid-sequence
-		// (the class-order RED) or mid-fan-out (the sort RED).
-		time.Sleep(rec.perTargetDur)
-		rec.record("restaction", ref.Namespace+"/"+ref.Name)
-		return nil
-	}
-	t.Cleanup(func() { seedOneRestactionFn = prevRASeed })
-}
-
-// makeGVRTargets builds n distinct per-binding targets for a GVR.
-func makeGVRTargets(gvr schema.GroupVersionResource, n int) []cache.PrewarmTarget {
-	out := make([]cache.PrewarmTarget, 0, n)
-	for i := 0; i < n; i++ {
+// eIdentityTargets builds one PrewarmTarget per identity for a GVR; the
+// CollapsedBindings count drives the rank.
+func eIdentityTargets(gvr schema.GroupVersionResource, ids ...eID) []cache.PrewarmTarget {
+	out := make([]cache.PrewarmTarget, 0, len(ids))
+	for _, id := range ids {
 		out = append(out, cache.PrewarmTarget{
-			BindingUID: gvr.Resource + "-uid-" + strconv.Itoa(i),
-			Subject:    cache.SubjectIdentity{Username: gvr.Resource + "-user-" + strconv.Itoa(i)},
-			GVR:        gvr,
-			Verb:       "list",
+			BindingUID:        "uid-" + id.name,
+			Subject:           id.subject(),
+			GVR:               gvr,
+			Verb:              "list",
+			CollapsedBindings: id.collapsed,
 		})
 	}
 	return out
 }
 
-// makeOrderWidget / makeOrderRA build the sole cheap widget and the sole
-// high-fan-out RA ref for the run.
-func makeOrderWidget(ns, name string) navWidgetEntry {
+// eHarvestWidget stamps a widget through the REAL harvester (condition 3) so
+// NavOrder comes from harvest sequence, not a hand-assigned value.
+func eHarvestWidget(h *navWidgetHarvester, name string, gvr schema.GroupVersionResource) {
 	w := &unstructured.Unstructured{}
-	w.SetNamespace(ns)
+	w.SetNamespace("krateo-system")
 	w.SetName(name)
-	w.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: orderWidgetGVR.Group, Version: orderWidgetGVR.Version, Kind: "Flex",
-	})
-	return navWidgetEntry{W: w, GVR: orderWidgetGVR}
+	w.SetGroupVersionKind(schema.GroupVersionKind{Group: gvr.Group, Version: gvr.Version, Kind: "W"})
+	h.harvestNavWidget(w, gvr, -1, 1, -1, -1)
 }
 
-func makeOrderRA(ns, name string) templatesv1.ObjectReference {
+func eRA(name string) templatesv1.ObjectReference {
 	return templatesv1.ObjectReference{
-		Reference:  templatesv1.Reference{Name: name, Namespace: ns},
+		Reference:  templatesv1.Reference{Name: name, Namespace: "krateo-system"},
 		APIVersion: restActionGVR.Group + "/" + restActionGVR.Version,
 		Resource:   restActionGVR.Resource,
 	}
 }
 
-// makeOrderWidgetGVR builds a navWidgetEntry with an explicit GVR so the
-// enumerator seam can give it a distinct target count — the C-SORT widgets arm
-// needs ≥2 widgets with UNEQUAL target counts to exercise the widgets-loop
-// sort.
-func makeOrderWidgetGVR(ns, name string, gvr schema.GroupVersionResource) navWidgetEntry {
-	w := &unstructured.Unstructured{}
-	w.SetNamespace(ns)
-	w.SetName(name)
-	w.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: gvr.Group, Version: gvr.Version, Kind: "W",
-	})
-	return navWidgetEntry{W: w, GVR: gvr}
-}
-
-// quietLogging silences the seed's info logging for a run; we assert on the
-// recorder, not logs.
-func quietLogging(t *testing.T) {
-	t.Helper()
-	prevDefault := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(discardWriter{}, &slog.HandlerOptions{Level: slog.LevelError})))
-	t.Cleanup(func() { slog.SetDefault(prevDefault) })
-}
-
-// runOrderArm runs seedScopeYielding once under a budget context for the
-// CLASS-order falsifier: one cheap widget (few cohorts) + one high-fan-out RA
-// (many targets whose per-target sleep is sized so the budget expires well
-// inside the fan-out).
-func runOrderArm(t *testing.T, order []seedClass, budget time.Duration, few, many int, perTarget time.Duration) *orderSeedRecorder {
-	t.Helper()
-
-	quietLogging(t)
-	// customerInFlight must be 0 so engineYieldCheckpoint is a no-op.
-	zeroCustomerInFlight()
-
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
-
-	rec := &orderSeedRecorder{budgetCtx: ctx, perTargetDur: perTarget}
-	ra := makeOrderRA("krateo-system", "settings-krateo-status")
-	installOrderSeams(t, rec,
-		map[schema.GroupVersionResource]int{orderWidgetGVR: few, orderFanoutGVR: many},
-		map[string]schema.GroupVersionResource{ra.Namespace + "/" + ra.Name: orderFanoutGVR})
-
-	prevOrder := seedClassOrderFn
-	seedClassOrderFn = func() []seedClass { return order }
-	t.Cleanup(func() { seedClassOrderFn = prevOrder })
-
-	widgets := []navWidgetEntry{makeOrderWidget("krateo-system", "dashboard-flex")}
-	ras := []templatesv1.ObjectReference{ra}
-
-	// seedScopeYielding returns ctx.Err() when the budget cuts it off — that
-	// is EXPECTED in the RED arm; both arms are non-fatal here.
-	_ = seedScopeYielding(ctx, ras, widgets, endpoints.Endpoint{}, nil, "test-authn-ns")
-	return rec
-}
-
-type discardWriter struct{}
-
-func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
-
-// ── THE FALSIFIER ────────────────────────────────────────────────────────
+// TestFixE_RankMajorClassInterleaveFirstNavOrder — the #42 FIX-E falsifier.
 //
-// Both arms share the SAME inputs (K=2 cohorts on the cheap widget, M=200
-// targets on the fan-out RA), the SAME budget, and the SAME per-target sleep
-// sized so the fan-out alone (200 × 2ms = 400ms) FAR overruns the 60ms budget.
-// The ONLY difference is the class order the seam dictates.
-
-func TestSeedScopeYielding_FirstNavFirst_OrderingFalsifier(t *testing.T) {
-	engineLatchTestMu.Lock() // shares customerInFlightCount + package seams
-	defer engineLatchTestMu.Unlock()
-
-	const (
-		fewWidgetTargets  = 2                     // K>1 cohorts on the widget class
-		manyFanoutTargets = 200                   // M>1 high fan-out (the 10190-analogue)
-		perTargetSleep    = 2 * time.Millisecond  // 200×2ms = 400ms fan-out >> budget
-		budget            = 60 * time.Millisecond // expires deep inside the fan-out
-	)
-
-	t.Run("GREEN_widgets_first_seeds_widget_before_budget", func(t *testing.T) {
-		rec := runOrderArm(t,
-			[]seedClass{seedClassWidgets, seedClassRestactions},
-			budget, fewWidgetTargets, manyFanoutTargets, perTargetSleep)
-
-		w, _ := rec.counts()
-		if w == 0 {
-			t.Fatalf("widgets-first: NO widget Put recorded at all (want %d); events=%+v", fewWidgetTargets, rec.events)
-		}
-		if !rec.widgetPutBeforeBudget() {
-			t.Fatalf("widgets-first: widget Put was NOT recorded before the budget expired — "+
-				"the fix must seed the first-nav widget cell before any high-fan-out tail; events=%+v", rec.events)
-		}
-		t.Logf("GREEN: widget Put recorded before budget (widgets=%d); ordering fix warms first-nav cell", w)
-	})
-
-	t.Run("RED_restactions_first_starves_widget", func(t *testing.T) {
-		rec := runOrderArm(t,
-			[]seedClass{seedClassRestactions, seedClassWidgets}, // reverted order
-			budget, fewWidgetTargets, manyFanoutTargets, perTargetSleep)
-
-		// The restaction fan-out must have started (it eats the budget) and the
-		// widget Put must NOT have been recorded before the budget expired — the
-		// pre-fix 750ms cold-first-nav condition.
-		_, ra := rec.counts()
-		if ra == 0 {
-			t.Fatalf("restactions-first: expected the fan-out to run (and eat the budget) but 0 restaction Puts recorded; events=%+v", rec.events)
-		}
-		if rec.widgetPutBeforeBudget() {
-			t.Fatalf("RED arm FAILED TO GO RED: a widget Put was recorded before the budget expired even with "+
-				"restactions-first — the harness does not discriminate ordering (fan-out sleep too small / budget too large); events=%+v", rec.events)
-		}
-		t.Logf("RED: restactions-first ate the budget (restactionPuts=%d), widget cell NOT warmed before budget — matches pre-fix cold first-nav", ra)
-	})
-}
-
-// ── C-SORT: the within-restaction ascending-len(targets) SORT falsifier ────
-//
-// The class-order falsifier above proves widgets-first, but with a SINGLE
-// restaction the ascending-len(targets) sort orders nothing — an inverted or
-// removed comparator would go undetected (the #46 masking pattern). C-SORT
-// gives the sort ≥2 restactions with genuinely different-sized target sets
-// (cheap=few, expensive=many) and a budget that fits the cheap RA's targets
-// but NOT the expensive one's, then asserts the CHEAP RA is seeded FIRST and
-// lands before the budget — REGARDLESS of the input ref order.
-//
-// The discriminator (no comparator seam needed): run the SAME inputs in BOTH
-// ref orders — ascending [cheap, expensive] and descending [expensive, cheap]
-// — and require the SAME outcome (cheap-first, cheap-before-budget). Only a
-// correct ascending sort satisfies BOTH arms: a removed sort would follow
-// input order (descending arm → expensive first → cheap starved), and an
-// inverted (descending) comparator would starve the cheap RA in BOTH. The
-// masked-arm guard below proves the descending-INPUT arm genuinely depends on
-// the sort (it fails the cheap-first assertion when we simulate an unsorted
-// iteration over the same input).
-
-// runSortArm runs seedScopeYielding with widgets DISABLED (class order =
-// [restactions] only) and the given RA ref order, under a budget that fits the
-// cheap RA (fewTargets) but not the expensive RA (manyTargets). Returns the
-// recorder plus the ns/name labels of the cheap and expensive RAs.
-func runSortArm(t *testing.T, refOrder []templatesv1.ObjectReference,
-	few, many int, perTarget time.Duration, budget time.Duration) *orderSeedRecorder {
-	t.Helper()
-
-	quietLogging(t)
-	zeroCustomerInFlight()
-
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
-
-	rec := &orderSeedRecorder{budgetCtx: ctx, perTargetDur: perTarget}
-	installOrderSeams(t, rec,
-		map[schema.GroupVersionResource]int{orderCheapRAGVR: few, orderFanoutGVR: many},
-		map[string]schema.GroupVersionResource{
-			"krateo-system/dashboard-data":         orderCheapRAGVR, // cheap first-nav RA
-			"krateo-system/settings-krateo-status": orderFanoutGVR,  // expensive tail
-		})
-
-	// widgets DISABLED — isolate the restaction sort.
-	prevOrder := seedClassOrderFn
-	seedClassOrderFn = func() []seedClass { return []seedClass{seedClassRestactions} }
-	t.Cleanup(func() { seedClassOrderFn = prevOrder })
-
-	_ = seedScopeYielding(ctx, refOrder, nil, endpoints.Endpoint{}, nil, "test-authn-ns")
-	return rec
-}
-
-func TestSeedScopeYielding_CheapCohortFirst_SortFalsifier(t *testing.T) {
+// Fixture: 2 identity ranks (devs collapsed=442 = rank 1; ops collapsed=5 =
+// rank 2), 3 widgets harvested in a deliberate NAV ORDER (dashboard-flex first,
+// then obs-panel, then settings-card), each widget carrying BOTH identities; 2
+// restactions (cheap 1-target, fanout 3-target) each carrying devs.
+func TestFixE_RankMajorClassInterleaveFirstNavOrder(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
-
-	const (
-		fewCheapTargets   = 3                     // cheap RA — fits the budget
-		manyFanoutTargets = 200                   // expensive RA — overruns the budget
-		perTargetSleep    = 2 * time.Millisecond  // per-target wall-clock
-		budget            = 60 * time.Millisecond // fits 3×2ms=6ms cheap, not 200×2ms=400ms expensive
-	)
-	cheap := makeOrderRA("krateo-system", "dashboard-data")
-	expensive := makeOrderRA("krateo-system", "settings-krateo-status")
-	cheapLabel := cheap.Namespace + "/" + cheap.Name
-	expensiveLabel := expensive.Namespace + "/" + expensive.Name
-
-	// assertCheapFirst is the shared GREEN assertion: the cheap RA must be
-	// seeded FIRST and land before the budget; the expensive RA is the one
-	// starved (0 or truncated Puts after the budget).
-	assertCheapFirst := func(t *testing.T, rec *orderSeedRecorder, arm string) {
-		t.Helper()
-		ci := rec.firstIndex("restaction", cheapLabel)
-		ei := rec.firstIndex("restaction", expensiveLabel)
-		if ci < 0 {
-			t.Fatalf("%s: cheap RA %q never seeded (want first); events=%+v", arm, cheapLabel, rec.events)
-		}
-		if !rec.putBeforeBudget("restaction", cheapLabel) {
-			t.Fatalf("%s: cheap RA %q Put did NOT land before the budget — the ascending sort must seed the "+
-				"cheap first-nav RA before the expensive tail; events=%+v", arm, cheapLabel, rec.events)
-		}
-		if ei >= 0 && ei < ci {
-			t.Fatalf("%s: expensive RA %q (idx %d) was seeded BEFORE cheap RA %q (idx %d) — ascending "+
-				"len(targets) sort violated; events=%+v", arm, expensiveLabel, ei, cheapLabel, ci, rec.events)
-		}
-		t.Logf("%s: cheap RA seeded first (idx %d, before budget); expensive tail starved (firstIdx %d) — ascending sort load-bearing", arm, ci, ei)
-	}
-
-	// GREEN 1 — input already ascending [cheap, expensive]. Trivially the sort
-	// keeps cheap first.
-	t.Run("GREEN_input_ascending", func(t *testing.T) {
-		rec := runSortArm(t, []templatesv1.ObjectReference{cheap, expensive},
-			fewCheapTargets, manyFanoutTargets, perTargetSleep, budget)
-		assertCheapFirst(t, rec, "ascending-input")
-	})
-
-	// GREEN 2 — input DESCENDING [expensive, cheap]. This is the arm the sort
-	// actually earns: without the ascending sort, the expensive RA would run
-	// first (input order) and starve the cheap RA. Same asserted outcome as
-	// GREEN 1 proves the outcome depends on the SORT, not the input order.
-	t.Run("GREEN_input_descending_sort_reorders", func(t *testing.T) {
-		rec := runSortArm(t, []templatesv1.ObjectReference{expensive, cheap},
-			fewCheapTargets, manyFanoutTargets, perTargetSleep, budget)
-		assertCheapFirst(t, rec, "descending-input")
-	})
-
-	// MASKED-ARM GUARD — prove the descending-input arm genuinely discriminates
-	// the sort: simulate an UNSORTED iteration over the SAME descending input
-	// (expensive first) under the SAME budget, and assert it would STARVE the
-	// cheap RA (cheap Put NOT before budget). If this "no-sort" simulation
-	// still landed cheap-before-budget, the GREEN_descending arm would be
-	// non-discriminating (budget too large / fan-out too small). This mirrors
-	// the class-falsifier's RED-arm guard.
-	t.Run("MASKED_no_sort_would_starve_cheap", func(t *testing.T) {
-		quietLogging(t)
-		zeroCustomerInFlight()
-
-		ctx, cancel := context.WithTimeout(context.Background(), budget)
-		defer cancel()
-		rec := &orderSeedRecorder{budgetCtx: ctx, perTargetDur: perTargetSleep}
-
-		// Directly replay the per-target primitive in UNSORTED descending input
-		// order (expensive's manyTargets first, then cheap's fewTargets) — the
-		// exact sequence the loop would run if the ascending sort were removed.
-		replay := func(ref templatesv1.ObjectReference, n int) {
-			for i := 0; i < n; i++ {
-				if ctx.Err() != nil {
-					return
-				}
-				time.Sleep(rec.perTargetDur)
-				rec.record("restaction", ref.Namespace+"/"+ref.Name)
-			}
-		}
-		replay(expensive, manyFanoutTargets) // unsorted: expensive first
-		replay(cheap, fewCheapTargets)       // cheap starved behind the tail
-
-		if rec.putBeforeBudget("restaction", cheapLabel) {
-			t.Fatalf("MASKED guard failed: an UNSORTED descending replay still landed the cheap RA before the "+
-				"budget — the GREEN_descending arm does NOT discriminate the sort (budget too large / fan-out too "+
-				"small); events=%+v", rec.events)
-		}
-		t.Logf("MASKED: unsorted descending replay STARVES cheap RA (as expected) — so GREEN_descending's cheap-first result is EARNED by the ascending sort")
-	})
-}
-
-// ── C-SORT WIDGETS ARM: the WIDGETS-loop ascending-len(targets) sort (Fix A2) ─
-//
-// SYMMETRIC to the restactions sort arm above, for the WIDGETS loop. Fix A
-// sorted restactions cheap-first but left the widgets loop UNSORTED — a single
-// high-fan-out widget GVR (obs-by-kind-list = 457 targets on a
-// per-composition-RoleBinding topology) grinds down the budget at the HEAD of
-// the loop, aborting it (phase=widgets targets_processed=84/457) before the
-// cheap dashboard-flex widget (~single-digit targets) is reached → cold nav#1.
-// Fix A2 applies the SAME ascending len(targets) sort.SliceStable to the
-// widgets loop. This arm proves it (GREEN in both input orders) and
-// mutation-proves it (invert the comparator → RED).
-
-// two distinct widget GVRs so the enumerator seam gives them unequal target
-// counts (the widgets sort needs unequal sizes to order anything).
-var (
-	orderCheapWidgetGVR = schema.GroupVersionResource{
-		Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "cheapws",
-	}
-	orderFanoutWidgetGVR = schema.GroupVersionResource{
-		Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "fanoutws",
-	}
-)
-
-// runWidgetSortArm runs seedScopeYielding with RESTACTIONS disabled (class
-// order = [widgets] only) and the given widget entry order, under a budget that
-// fits the cheap widget (fewTargets) but not the expensive widget
-// (manyTargets).
-func runWidgetSortArm(t *testing.T, widgetOrder []navWidgetEntry,
-	few, many int, perTarget time.Duration, budget time.Duration) *orderSeedRecorder {
-	t.Helper()
-
-	quietLogging(t)
 	zeroCustomerInFlight()
+	quietLoggingE(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
+	devs := eID{name: "devs", group: true, collapsed: 442}
+	ops := eID{name: "ops", group: true, collapsed: 5}
 
-	rec := &orderSeedRecorder{budgetCtx: ctx, perTargetDur: perTarget}
-	installOrderSeams(t, rec,
-		map[schema.GroupVersionResource]int{orderCheapWidgetGVR: few, orderFanoutWidgetGVR: many},
-		nil /* no RAs */)
+	// REAL harvest-stamping (condition 3): NavOrder = harvest sequence.
+	h := newNavWidgetHarvester()
+	dashGVR, obsGVR, setGVR := eWidgetGVR("flexes"), eWidgetGVR("obs"), eWidgetGVR("cards")
+	eHarvestWidget(h, "dashboard-flex", dashGVR) // NavOrder 0 — first-nav
+	eHarvestWidget(h, "obs-panel", obsGVR)       // NavOrder 1
+	eHarvestWidget(h, "settings-card", setGVR)   // NavOrder 2
+	widgets := h.snapshot()
+	if len(widgets) != 3 {
+		t.Fatalf("harvest setup: want 3 widgets, got %d", len(widgets))
+	}
 
-	// The widgets seam records + consumes budget per target, mirroring the
-	// restaction seam, so a high-fan-out widget can starve the loop.
-	prevWidgetSeed := seedOneWidgetFn
-	seedOneWidgetFn = func(_ context.Context, e navWidgetEntry, _ string) error {
-		time.Sleep(rec.perTargetDur)
-		rec.record("widget", e.W.GetNamespace()+"/"+e.W.GetName())
+	cheapRA, fanoutRA := eRA("cheap-ra"), eRA("fanout-ra")
+	ras := []templatesv1.ObjectReference{fanoutRA, cheapRA} // hostile input order (fanout first)
+
+	rec := &eSeedRecorder{}
+
+	prevEnum := enumeratePrewarmTargetsForGVRFn
+	enumeratePrewarmTargetsForGVRFn = func(gvr schema.GroupVersionResource, _ string) []cache.PrewarmTarget {
+		switch gvr {
+		case dashGVR, obsGVR, setGVR:
+			return eIdentityTargets(gvr, devs, ops)
+		case eCheapRAGVR:
+			return eIdentityTargets(eCheapRAGVR, devs) // 1 target
+		case eFanoutRAGVR:
+			return eIdentityTargets(eFanoutRAGVR, devs, ops, eID{name: "filler", collapsed: 1}) // 3 targets
+		}
 		return nil
 	}
-	t.Cleanup(func() { seedOneWidgetFn = prevWidgetSeed })
+	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
 
-	// restactions DISABLED — isolate the widgets sort.
-	prevOrder := seedClassOrderFn
-	seedClassOrderFn = func() []seedClass { return []seedClass{seedClassWidgets} }
-	t.Cleanup(func() { seedClassOrderFn = prevOrder })
-
-	_ = seedScopeYielding(ctx, nil, widgetOrder, endpoints.Endpoint{}, nil, "test-authn-ns")
-	return rec
-}
-
-func TestSeedScopeYielding_CheapCohortFirst_WidgetsSortFalsifier(t *testing.T) {
-	engineLatchTestMu.Lock()
-	defer engineLatchTestMu.Unlock()
-
-	const (
-		fewCheapTargets   = 3                     // cheap widget — fits the budget
-		manyFanoutTargets = 200                   // expensive widget (obs-by-kind-list analogue) — overruns
-		perTargetSleep    = 2 * time.Millisecond  // per-target wall-clock
-		budget            = 60 * time.Millisecond // fits 3×2ms=6ms cheap, not 200×2ms=400ms expensive
-	)
-	cheap := makeOrderWidgetGVR("krateo-system", "dashboard-flex", orderCheapWidgetGVR)
-	expensive := makeOrderWidgetGVR("krateo-system", "obs-by-kind-list", orderFanoutWidgetGVR)
-	cheapLabel := "krateo-system/dashboard-flex"
-	expensiveLabel := "krateo-system/obs-by-kind-list"
-
-	assertCheapFirst := func(t *testing.T, rec *orderSeedRecorder, arm string) {
-		t.Helper()
-		ci := rec.firstIndex("widget", cheapLabel)
-		ei := rec.firstIndex("widget", expensiveLabel)
-		if ci < 0 {
-			t.Fatalf("%s: cheap widget %q never seeded (want first); events=%+v", arm, cheapLabel, rec.events)
+	prevTGVR := restActionTargetGVRFn
+	restActionTargetGVRFn = func(_ context.Context, ref templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+		if ref.Name == "cheap-ra" {
+			return eCheapRAGVR, true
 		}
-		if !rec.putBeforeBudget("widget", cheapLabel) {
-			t.Fatalf("%s: cheap widget %q Put did NOT land before the budget — the ascending sort must seed the "+
-				"cheap first-nav widget (dashboard-flex) before the high-fan-out widget (obs-by-kind-list); events=%+v",
-				arm, cheapLabel, rec.events)
-		}
-		if ei >= 0 && ei < ci {
-			t.Fatalf("%s: expensive widget %q (idx %d) was seeded BEFORE cheap widget %q (idx %d) — ascending "+
-				"len(targets) sort violated in the widgets loop; events=%+v", arm, expensiveLabel, ei, cheapLabel, ci, rec.events)
-		}
-		t.Logf("%s: cheap widget seeded first (idx %d, before budget); high-fan-out widget starved (firstIdx %d) — widgets-loop ascending sort load-bearing", arm, ci, ei)
+		return eFanoutRAGVR, true
+	}
+	t.Cleanup(func() { restActionTargetGVRFn = prevTGVR })
+
+	prevW := seedOneWidgetFn
+	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string) error {
+		rec.record("widget", e.W.GetName(), eIdentityLabel(ctx))
+		return nil
+	}
+	t.Cleanup(func() { seedOneWidgetFn = prevW })
+
+	prevR := seedOneRestactionFn
+	seedOneRestactionFn = func(ctx context.Context, _ string, ref templatesv1.ObjectReference, _ string) error {
+		rec.record("restaction", ref.Name, eIdentityLabel(ctx))
+		return nil
+	}
+	t.Cleanup(func() { seedOneRestactionFn = prevR })
+
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns"); err != nil {
+		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 
-	// GREEN 1 — input already ascending [cheap, expensive].
-	t.Run("GREEN_input_ascending", func(t *testing.T) {
-		rec := runWidgetSortArm(t, []navWidgetEntry{cheap, expensive},
-			fewCheapTargets, manyFanoutTargets, perTargetSleep, budget)
-		assertCheapFirst(t, rec, "ascending-input")
-	})
+	assertFixESequence(t, rec.snapshot())
+}
 
-	// GREEN 2 — input DESCENDING [expensive, cheap]. Without the widgets-loop
-	// sort the expensive widget would run first (input order) and starve the
-	// cheap dashboard-flex — the exact 84/457 abort. Same asserted outcome as
-	// GREEN 1 proves the outcome depends on the SORT, not input order.
-	t.Run("GREEN_input_descending_sort_reorders", func(t *testing.T) {
-		rec := runWidgetSortArm(t, []navWidgetEntry{expensive, cheap},
-			fewCheapTargets, manyFanoutTargets, perTargetSleep, budget)
-		assertCheapFirst(t, rec, "descending-input")
-	})
+// assertFixESequence verifies rank-major / class-interleave / nav-order /
+// RA-tiebreak on the recorded event sequence.
+func assertFixESequence(t *testing.T, ev []eSeedEvent) {
+	t.Helper()
 
-	// MASKED-ARM GUARD — unsorted descending replay must STARVE the cheap
-	// widget, proving GREEN_descending genuinely discriminates the widgets sort.
-	t.Run("MASKED_no_sort_would_starve_cheap", func(t *testing.T) {
-		quietLogging(t)
-		zeroCustomerInFlight()
-
-		ctx, cancel := context.WithTimeout(context.Background(), budget)
-		defer cancel()
-		rec := &orderSeedRecorder{budgetCtx: ctx, perTargetDur: perTargetSleep}
-
-		replay := func(label string, n int) {
-			for i := 0; i < n; i++ {
-				if ctx.Err() != nil {
-					return
-				}
-				time.Sleep(rec.perTargetDur)
-				rec.record("widget", label)
+	// (a) RANK-MAJOR + INTERLEAVE: last rank-1 (devs) event < first rank-2 (ops)
+	// event, across BOTH classes.
+	lastDevs, firstOps := -1, len(ev)
+	for i, e := range ev {
+		switch e.identity {
+		case "group:devs":
+			lastDevs = i
+		case "group:ops":
+			if i < firstOps {
+				firstOps = i
 			}
 		}
-		replay(expensiveLabel, manyFanoutTargets) // unsorted: expensive first
-		replay(cheapLabel, fewCheapTargets)       // cheap starved behind the tail
+	}
+	if lastDevs < 0 || firstOps == len(ev) {
+		t.Fatalf("FIX-E: expected both devs (rank1) and ops (rank2) seeds; events=%+v", ev)
+	}
+	if lastDevs >= firstOps {
+		t.Fatalf("FIX-E rank-major VIOLATED: a rank-2 (ops) seed at idx %d ran BEFORE the last rank-1 (devs) seed at idx %d — "+
+			"a lower rank must not interleave before rank-1 completes; events=%+v", firstOps, lastDevs, ev)
+	}
 
-		if rec.putBeforeBudget("widget", cheapLabel) {
-			t.Fatalf("MASKED guard failed: an UNSORTED descending widget replay still landed the cheap widget before "+
-				"the budget — GREEN_descending does NOT discriminate the widgets sort; events=%+v", rec.events)
+	// Within rank-1 (devs): (c) widgets in NavOrder; widgets-before-restactions
+	// (per-rank + FIX-F segment shape); (b) RAs ascending-len tiebreak.
+	var r1widgets, r1ras []string
+	for _, e := range ev {
+		if e.identity != "group:devs" {
+			continue
 		}
-		t.Logf("MASKED: unsorted descending widget replay STARVES cheap widget (as expected) — GREEN_descending's cheap-first result is EARNED by the widgets-loop sort")
-	})
+		if e.class == "widget" {
+			if len(r1ras) > 0 {
+				t.Fatalf("FIX-E: rank-1 widget %q seeded AFTER a rank-1 restaction — per-rank shape is widgets-then-restactions; events=%+v", e.label, ev)
+			}
+			r1widgets = append(r1widgets, e.label)
+		} else {
+			r1ras = append(r1ras, e.label)
+		}
+	}
+	// (c) NavOrder: dashboard-flex(0) → obs-panel(1) → settings-card(2).
+	if got, want := strings.Join(r1widgets, ","), "dashboard-flex,obs-panel,settings-card"; got != want {
+		t.Fatalf("FIX-E property (c) NavOrder VIOLATED: rank-1 widget order = %q; want first-nav %q "+
+			"(harvest-stamped NavOrder, NOT A2 count-sort)", got, want)
+	}
+	// (b) RA ascending-len tiebreak: cheap-ra (1 target) before fanout-ra (3).
+	seenCheap := false
+	for _, ra := range r1ras {
+		if ra == "fanout-ra" && !seenCheap {
+			t.Fatalf("FIX-E property (b) RA ascending-len tiebreak VIOLATED: fanout-ra (3 targets) seeded before cheap-ra (1 target); rank-1 RA order=%v", r1ras)
+		}
+		if ra == "cheap-ra" {
+			seenCheap = true
+		}
+	}
+	if !seenCheap {
+		t.Fatalf("FIX-E: cheap-ra was not seeded under rank-1; RA order=%v events=%+v", r1ras, ev)
+	}
 }

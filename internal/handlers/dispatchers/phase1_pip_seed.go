@@ -178,6 +178,29 @@ type navWidgetEntry struct {
 	// perPage) when the Path carries them. See deriveSeedKeyTuple.
 	KeyPerPage int
 	KeyPage    int
+
+	// #42 FIX-E — FIRST-NAV WALK ORDER. A monotonic sequence number
+	// assigned at harvest time. The Phase-1 walk visits nav roots in
+	// config.json order (default-route/dashboard subtree first —
+	// phase1_roots.go) and descends each depth-first, so harvest order IS
+	// the frontend's first-nav priority order. The seed uses this as the
+	// WITHIN-RANK widget order (replacing the A2 count-sort: count≠cost —
+	// A2 seeded a cheap-but-late widget before the dashboard's own
+	// widgets). 100% walk-derived — zero static name lists, no depth/route
+	// literal (the ORDERING is the signal, not any hardcoded name).
+	NavOrder int
+
+	// #42 FIX-F seam (STAMP-ONLY — no consumer here). RootIndex is the
+	// zero-based index of the config-root subtree this widget was FIRST
+	// harvested under (BeginRoot increments it as the walk moves to the next
+	// root). Roots iterate in config.json order (phase1_roots.go), so
+	// RootIndex==0 is the default-route/dashboard subtree — the rank-1
+	// first-nav SEGMENT. FIX-F's readyz latch will consume this to flip ready
+	// once the RootIndex==0 segment is seeded (segment-scoped, NOT rank-scoped
+	// — PM condition F-C2). This field is written and never read in this
+	// change; the latch is built in the FIX-F ship (#99). Walk-derived, no
+	// literal — the INDEX is the signal.
+	RootIndex int
 }
 
 // navWidgetHarvester accumulates the deduplicated navigation widget
@@ -195,11 +218,36 @@ type navWidgetEntry struct {
 type navWidgetHarvester struct {
 	mu      sync.Mutex
 	entries map[string]navWidgetEntry
+	// #42 FIX-E — monotonic harvest-order counter. Incremented under mu on
+	// each FIRST harvest of a distinct widget so NavOrder captures the walk's
+	// first-nav priority sequence (roots in config.json order, depth-first).
+	navSeq int
+	// #42 FIX-F seam — zero-based current config-root index. BeginRoot()
+	// increments it as the walk advances to the next root (roots resolve
+	// sequentially — phase1WarmupWith). curRoot starts at -1 so the first
+	// BeginRoot() sets it to 0 (the default-route/dashboard subtree). Stamped
+	// into RootIndex on first harvest; no consumer here (FIX-F builds the latch).
+	curRoot int
 }
 
 // newNavWidgetHarvester returns an empty harvester.
 func newNavWidgetHarvester() *navWidgetHarvester {
-	return &navWidgetHarvester{entries: map[string]navWidgetEntry{}}
+	// curRoot starts at -1 so the first BeginRoot() sets RootIndex 0.
+	return &navWidgetHarvester{entries: map[string]navWidgetEntry{}, curRoot: -1}
+}
+
+// BeginRoot advances the current config-root index (#42 FIX-F seam, STAMP-ONLY).
+// The phase-1 walk calls this before descending each root; roots resolve
+// sequentially so the increment is deterministic — RootIndex 0 is the first
+// (default-route/dashboard) subtree. Nil-safe (flag-off Phase 1 passes no
+// harvester). No consumer here; FIX-F's readyz latch reads RootIndex.
+func (h *navWidgetHarvester) BeginRoot() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.curRoot++
+	h.mu.Unlock()
 }
 
 // harvestNavWidget records a navigation widget CR plus the GVR +
@@ -242,6 +290,18 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 	// cohort against the CR; concurrent cohort resolves MUST NOT share
 	// a single *unstructured. The DeepCopy is bounded by the widget CR
 	// size (small) and runs once per distinct widget.
+	// #42 FIX-E — stamp the first-nav sequence number at first harvest. The
+	// walk reaches widgets in nav order (roots in config.json order,
+	// depth-first descent), so navSeq IS the frontend first-nav priority.
+	seq := h.navSeq
+	h.navSeq++
+	// #42 FIX-F seam — stamp the config-root index (STAMP-ONLY, no consumer
+	// here). curRoot is -1 only if a harvest somehow precedes the first
+	// BeginRoot(); clamp to 0 (the first-nav segment) defensively.
+	rootIdx := h.curRoot
+	if rootIdx < 0 {
+		rootIdx = 0
+	}
 	h.entries[key] = navWidgetEntry{
 		W:          w.DeepCopy(),
 		GVR:        gvr,
@@ -249,6 +309,8 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 		Page:       resolvePage,
 		KeyPerPage: keyPerPage,
 		KeyPage:    keyPage,
+		NavOrder:   seq,
+		RootIndex:  rootIdx,
 	}
 }
 
@@ -718,6 +780,11 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	// effort: a prewarm error is log-only and never fails the widget seed
 	// (the cohort's per-user widget cell above already seeded; RAFullList is
 	// an accelerator). NON-FATAL by design.
+	// #42 FIX-G: seedRAFullListForWidget consults the caller's OWN per-key
+	// sliceability verdict via the RA-CR-coordinate derivation (shared with
+	// raFullListServe — G2-A), reading the cohort identity from resCtx. No
+	// bindingUID is threaded (the eg1 defect was threading the WIDGET-coordinate
+	// bindingUID, which key-diverged from the RA-CR verdict → G inert).
 	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName())
 	return nil
 }
@@ -748,36 +815,6 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		return
 	}
 
-	// #42 FIX-B — SKIP the whole prewarm resolve when this apiRef→RESTAction
-	// sliceShape has ALREADY been proven structurally non-sliceable under ANY
-	// identity (cache FIX-A shape-level negative set). On a not-sliceable
-	// aggregation RA, apiref.Resolve's raFullListServe returns served=false and
-	// Resolve falls through to a page-keyed resolve whose result THIS function
-	// discards — pure waste (design §A1 resolve #3; ~4.7s/identity on
-	// estate-graph). One objects.Get to derive the shape is cheap vs that
-	// triple resolve. The FIRST identity (shape unknown) still runs the full
-	// first-sight that RECORDS the verdict, so nothing is under-seeded; only
-	// identities #2..N (shape now known-negative) skip. Drift-free: the shape
-	// is derived by apiref.SeedFullListShapeKnownNonSliceable with the SAME
-	// const+inputs raFullListServe uses (single source of truth).
-	if cache.ResolvedCacheEnabled() {
-		if got := objects.Get(ctx, apiRef); got.Err == nil && got.Unstructured != nil {
-			var ra templatesv1.RESTAction
-			if cerr := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(
-				got.Unstructured.Object, &ra); cerr == nil {
-				if apiref.SeedFullListShapeKnownNonSliceable(got.GVR, apiRef.Namespace, apiRef.Name, &ra) {
-					slog.Default().Info("phase1.seed.rafulllist.skip_nonsliceable",
-						slog.String("subsystem", "cache"),
-						slog.String("widget", ns+"/"+name),
-						slog.String("apiref", apiRef.Namespace+"/"+apiRef.Name),
-						slog.String("effect", "sliceShape known structurally non-sliceable (FIX-A shape set); "+
-							"skipping the discarded fallback resolve (design §A1 resolve #3 elimination)"),
-					)
-					return
-				}
-			}
-		}
-	}
 	// inline-extras design P §5 / MUST-FIX #1 — PIP-seed key parity at the
 	// RAFullList sub-cell. The dispatcher's apiRef path keys this sub-cell on
 	// the apiRef-EFFECTIVE map (merge(apiRefInline, request)) via
@@ -789,7 +826,57 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 	// The resourcesRefsTemplateExtras map is correctly NOT folded here — it
 	// does not affect the apiRef fetch (§1). Absent ⇒ {} ⇒ byte-identical to
 	// the pre-inline-extras nil Extras (extrasMinusSlice({}) → nil → no fold).
+	// Computed BEFORE the pre-check so FIX-G's per-key raKey folds the SAME
+	// extras the RAFullList cell keys on (raKey parity).
 	apiRefInline := widgets.GetApiRefExtras(w.Object)
+
+	// #42 FIX-B (shape-level) + FIX-G (per-key) — SKIP the whole prewarm resolve
+	// when this apiRef→RESTAction is already known NOT sliceable, so the
+	// discarded resolve #3 (design §A1; ~4.7s/identity on estate-graph, ~140s/
+	// rank across the un-skipped heavy list widgets) never runs. On a
+	// not-sliceable RA, apiref.Resolve's raFullListServe returns served=false and
+	// Resolve falls through to a page-keyed resolve whose result THIS function
+	// discards — pure waste. One objects.Get to derive the RA is cheap vs that
+	// resolve. TWO checks, both drift-free (derived by the apiref helpers that
+	// share raFullListServe's exact key+shape derivation):
+	//   FIX-B: SHAPE-level negative — structurally non-sliceable under ANY
+	//     identity (permanent-only, FIX-A shape set). Covers identities #2..N
+	//     once the FIRST identity's first-sight records the permanent verdict.
+	//   FIX-G: THIS identity's OWN PER-KEY verdict (permanent OR NOT) — recorded
+	//     by the widgets.Resolve first-sight moments ago in THIS seedOneWidget
+	//     call. Catches the NON-permanent list-shaped negatives FIX-B's
+	//     permanent-only shape set does not, per-identity. G2-A: the per-key
+	//     raKey is derived by SeedFullListPerKeyKnownNonSliceable off the RA-CR
+	//     COORDINATES (via the shared seedFullListRAKey, reading identity from
+	//     ctx) — the SAME derivation raFullListServe records under, so no
+	//     producer/consumer key divergence (the eg1 defect was keying off the
+	//     WIDGET's coordinate bindingUID). ctx carries the cohort identity.
+	// The FIRST identity (both unknown) still runs the full first-sight that
+	// RECORDS the verdict → nothing under-seeded; only later work skips.
+	if got := objects.Get(ctx, apiRef); got.Err == nil && got.Unstructured != nil {
+		var ra templatesv1.RESTAction
+		if cerr := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(
+			got.Unstructured.Object, &ra); cerr == nil {
+			shapeNeg := apiref.SeedFullListShapeKnownNonSliceable(got.GVR, apiRef.Namespace, apiRef.Name, &ra)
+			perKeyNeg := apiref.SeedFullListPerKeyKnownNonSliceable(ctx, got.GVR, apiRef.Namespace, apiRef.Name, &ra, apiRefInline)
+			if shapeNeg || perKeyNeg {
+				reason := "shape-negative (FIX-A/B, structurally non-sliceable under any identity)"
+				if !shapeNeg {
+					reason = "per-key negative (FIX-G, this identity's own first-sight verdict — non-permanent list shape)"
+				}
+				slog.Default().Info("phase1.seed.rafulllist.skip_nonsliceable",
+					slog.String("subsystem", "cache"),
+					slog.String("widget", ns+"/"+name),
+					slog.String("apiref", apiRef.Namespace+"/"+apiRef.Name),
+					slog.Bool("shape_negative", shapeNeg),
+					slog.Bool("per_key_negative", perKeyNeg),
+					slog.String("effect", "known non-sliceable ("+reason+"); "+
+						"skipping the discarded fallback resolve (design §A1 resolve #3 elimination)"),
+				)
+				return
+			}
+		}
+	}
 	// Resolve at a paginated tuple so raFullListServe engages (it requires
 	// perPage>0 && page>0). page 1 + prewarmPageLimit is sufficient: the
 	// byte-verify + pin are per-(RA × shape), NOT per-page, so this single

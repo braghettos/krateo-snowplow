@@ -395,6 +395,10 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	}
 
 	resolver := func(rctx context.Context, root navigationRoot) error {
+		// #42 FIX-F seam — advance the config-root index before descending this
+		// root so harvested widgets stamp the correct RootIndex (roots resolve
+		// sequentially). Nil-safe when navHarvester is nil (prewarm off).
+		navHarvester.BeginRoot()
 		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester, navHarvester, pagCollector)
 	}
 

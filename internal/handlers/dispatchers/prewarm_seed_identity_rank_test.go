@@ -118,10 +118,10 @@ func TestFixD_IdentityRankMajorSeedOrder(t *testing.T) {
 	}
 	t.Cleanup(func() { seedOneWidgetFn = prevSeed })
 
-	prevOrder := seedClassOrderFn
-	seedClassOrderFn = func() []seedClass { return []seedClass{seedClassWidgets} }
-	t.Cleanup(func() { seedClassOrderFn = prevOrder })
-
+	// #42 FIX-E: the seedClassOrderFn=[widgets] seam-set (formerly here) was
+	// removed — the seam is deleted; widgets-only isolation is carried by the
+	// nil restactions arg below (always was; the seam-set was redundant).
+	// Assertions unchanged. See prewarm_engine_seed_order_test.go migration map.
 	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns"); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}

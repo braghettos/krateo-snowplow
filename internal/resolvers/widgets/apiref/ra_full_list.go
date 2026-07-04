@@ -89,6 +89,89 @@ func seedFullListShape(gvr schema.GroupVersionResource, namespace, name string, 
 		gvr.Resource, namespace, name, sliceJQ)
 }
 
+// SeedFullListPerKeyKnownNonSliceable is the #42 FIX-G seed pre-check — the
+// PER-KEY (caller's-own-identity) sibling of the FIX-B SHAPE-level pre-check.
+// It reports whether THIS identity's (raKey × sliceShape) verdict is already
+// known-and-NOT-sliceable — PERMANENT OR NOT. The caller's widgets.Resolve
+// first-sight (which ran moments earlier in the SAME seedOneWidget call, BEFORE
+// seedRAFullListForWidget) records that per-key verdict synchronously; so at
+// this point THIS identity's own verdict is available and, if it's a plain
+// (non-permanent) false, FIX-B's shape-negative set does NOT cover it (FIX-B
+// keys off permanent-only per the C-1 safety ruling). Consulting the per-key
+// verdict skips the discarded resolve #3 for those non-permanent negatives too
+// — the ~140s/rank the trace attributed to un-skipped heavy list-shaped RAs.
+//
+// SAFE: a known&&!sliceable verdict (permanent or not) means raFullListServe
+// would return served=false and apiref.Resolve would fall through to a
+// page-keyed resolve whose result seedRAFullListForWidget DISCARDS — so
+// skipping it changes NOTHING except eliminating the waste (same discarded-
+// result argument as FIX-B; TRACED side-effect-free). Lever-A per-key retry is
+// UNTOUCHED — the verdict entry exists regardless; we only read it.
+//
+// INVARIANT (must NEVER drift from raFullListServe): the raKey is derived by
+// the SHARED seedFullListRAKey — the SINGLE derivation over the FULL INPUT
+// TUPLE (EvaluateRBAC on the RA-CR coordinates → first-match bindingUID →
+// RAFullListKeyInputs → ComputeKey) that raFullListServe itself calls. G2-A
+// (the eg2 defect fix): the earlier eg1 impl folded a bindingUID threaded out
+// of seedOneWidget — derived by EvaluateRBAC on the WIDGET's coordinates, a
+// DIFFERENT candidate set → likely a different first-match → lookup miss → skip
+// never fired → G inert (the feedback_key_parity_golden_real_inputs_prehash_diff
+// class). The fix is single-source over the WHOLE derivation, not just the hash
+// function: pre-check + serve compute the raKey the SAME way, off the RA-CR
+// coordinates, so a divergence is structurally impossible. extras is the
+// apiRef-inline effective map (same the seed passes to apiref.Resolve). "" from
+// the fail-closed EvaluateRBAC disables the per-key check (raKey would be the
+// shared empty-identity cell — never consult it, #95 semantics). The FIX-G G2-B
+// falsifier drives BOTH the record and this pre-check through the REAL RA-CR
+// derivation with a DIVERGENT widget-vs-RA first-match, so the eg1 widget-keyed
+// variant goes RED (skip doesn't fire) while eg2 goes GREEN.
+func SeedFullListPerKeyKnownNonSliceable(ctx context.Context, gvr schema.GroupVersionResource,
+	namespace, name string, ra *templatesv1.RESTAction, extras map[string]any) bool {
+	if ra == nil {
+		return false
+	}
+	_, raKey, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)
+	if !ok {
+		return false // no identity / fail-closed "" → don't consult the shared cell
+	}
+	shape := seedFullListShape(gvr, namespace, name, ra)
+	sliceable, known := cache.SliceabilityLookup(raKey, shape)
+	return known && !sliceable
+}
+
+// seedFullListRAKey is the SINGLE SOURCE OF TRUTH for the RAFullList cell key
+// (G2-A). It runs EvaluateRBAC on the RA-CR COORDINATES (gvr, ns, name — the
+// resource the RAFullList cell is keyed on), folds the first-match bindingUID +
+// extras into RAFullListKeyInputs, and returns BOTH the keyInputs and the
+// ComputeKey'd raKey. raFullListServe (the producer — records the verdict + Puts
+// the cell under this key) AND the FIX-G pre-check (the consumer — looks the
+// verdict up) both call THIS, so producer/consumer can never key-diverge (the
+// eg1 defect was the pre-check keying off a WIDGET-coordinate bindingUID). ok=false
+// when there is no identity on ctx OR EvaluateRBAC fail-closes to "" (the shared
+// empty-identity cell — #95: never serve/populate/consult it).
+func seedFullListRAKey(ctx context.Context, gvr schema.GroupVersionResource,
+	namespace, name string, extras map[string]any) (cache.ResolvedKeyInputs, string, bool) {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return cache.ResolvedKeyInputs{}, "", false
+	}
+	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username:  ui.Username,
+		Groups:    ui.Groups,
+		Verb:      "get",
+		Group:     gvr.Group,
+		Resource:  gvr.Resource,
+		Namespace: namespace,
+		Name:      name,
+	})
+	if bindingUID == "" {
+		return cache.ResolvedKeyInputs{}, "", false
+	}
+	keyInputs := cache.RAFullListKeyInputs(gvr.Group, gvr.Version, gvr.Resource,
+		namespace, name, bindingUID, extras)
+	return keyInputs, cache.ComputeKey(keyInputs), true
+}
+
 // RecordSeedFullListShapeNegativeForTest records the given RA's sliceShape as
 // structurally non-sliceable (Class C false+permanent) — TEST-ONLY, mirroring
 // the established cache.RecordSliceability...ForTest / PublishRBACSnapshotForTest
@@ -107,6 +190,44 @@ func RecordSeedFullListShapeNegativeForTest(gvr schema.GroupVersionResource,
 	// identity-free shape alone); a stable placeholder keeps the per-key entry
 	// well-formed. permanent=true = Class C, the promotion condition.
 	cache.RecordSliceabilityClassified("seed-test-rakey/"+shape, shape, false, true, cache.SliceabilityLabels{})
+}
+
+// RecordSeedFullListPerKeyNonPermanentNegativeForTest records a NON-permanent
+// (permanent=false) false per-key verdict for the RA under ctx's identity — the
+// FIX-G trigger. G2-B: the raKey is derived via the SHARED seedFullListRAKey
+// (RA-CR coordinates → real EvaluateRBAC first-match), the SAME derivation
+// raFullListServe (producer) and SeedFullListPerKeyKnownNonSliceable (consumer)
+// use — NO hand-fed bindingUID constant. So the record lands under the raKey
+// the RA-CR first-match produces; if the pre-check keyed off a DIFFERENT
+// (widget-coordinate) first-match — the eg1 defect — the lookup would MISS this
+// record and the skip would not fire (the falsifier's divergent-binding arm
+// goes RED on the eg1 variant). permanent=false → FIX-A's shape-negative set
+// does NOT get it (FIX-A is permanent-only) → FIX-B alone would NOT skip; only
+// FIX-G's per-key consult catches it (the G-vs-B discriminator). TEST-ONLY.
+// Returns ok=false if there's no RA-CR first-match under ctx (setup error).
+func RecordSeedFullListPerKeyNonPermanentNegativeForTest(ctx context.Context, gvr schema.GroupVersionResource,
+	namespace, name string, ra *templatesv1.RESTAction, extras map[string]any) bool {
+	_, raKey, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)
+	if !ok {
+		return false
+	}
+	shape := seedFullListShape(gvr, namespace, name, ra)
+	cache.RecordSliceabilityClassified(raKey, shape, false /*sliceable*/, false /*permanent — the FIX-G discriminator*/, cache.SliceabilityLabels{})
+	return true
+}
+
+// SeedFullListRAKeyInputsForTest exposes the PRE-HASH ResolvedKeyInputs that the
+// SHARED seedFullListRAKey derives for the given RA-CR coordinates under ctx —
+// so the G2-B falsifier can assert PRE-HASH INPUT FIELD-EQUALITY (not just the
+// ComputeKey digest) between the record derivation and the pre-check derivation,
+// per feedback_key_parity_golden_real_inputs_prehash_diff. Both the record
+// helper and the pre-check call the SAME seedFullListRAKey, so this returns the
+// exact keyInputs both sides fold into their raKey. ok=false when no RA-CR
+// first-match under ctx. TEST-ONLY.
+func SeedFullListRAKeyInputsForTest(ctx context.Context, gvr schema.GroupVersionResource,
+	namespace, name string, extras map[string]any) (cache.ResolvedKeyInputs, bool) {
+	ki, _, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)
+	return ki, ok
 }
 
 // raFullListServe implements the Ship 4a page-independent serve at the
@@ -139,56 +260,24 @@ func raFullListServe(
 		return nil, false, nil // cache off — fall back
 	}
 
-	ui, err := xcontext.UserInfo(ctx)
-	if err != nil {
-		// No identity — cannot key the per-binding cell safely. Fall back to
-		// the page-keyed resolve (which itself runs under the request
-		// identity). NEVER serve a binding-keyed cell without an identity.
-		return nil, false, nil
-	}
-
-	// Ship 0.30.242 H.c-layered Phase 2b — design §3.3 raFullList row.
-	// The cell folds the WIDGET's GET-permit BindingUID (the same
-	// BindingUID the widgets-class cell would key on). Path B: derive
-	// it via a direct rbac.EvaluateRBAC call rather than threading the
-	// per-request memo. The per-request memo plumbing is a Phase 3
-	// follow-up (Diego ratified 2026-06-03 R3); F3 falsifier validates
-	// that direct calls preserve correctness.
+	// Ship 0.30.242 H.c-layered Phase 2b (§3.3 raFullList row) + #42 G2-A: the
+	// RAFullList cell keys on the RA-CR's GET-permit first-match BindingUID,
+	// derived via seedFullListRAKey — the SINGLE SOURCE OF TRUTH shared with the
+	// FIX-G pre-check (SeedFullListPerKeyKnownNonSliceable), so the verdict this
+	// path RECORDS is looked up under the IDENTICAL raKey the seed pre-check
+	// computes (the eg1 defect was the pre-check keying off a widget-coordinate
+	// bindingUID → miss → G inert).
 	//
-	// allowed=false / err yields bindingUID="" (the cell folds the empty
-	// identity — equivalent to the cache=off transparent-fallback row).
-	// Same fail-closed semantics as the pre-ship BindingSetHash path
-	// (which returned 0 on snap=nil — equivalent collapse).
-	_, bindingUID, _ := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
-		Username:  ui.Username,
-		Groups:    ui.Groups,
-		Verb:      "get",
-		Group:     gvr.Group,
-		Resource:  gvr.Resource,
-		Namespace: namespace,
-		Name:      name,
-	})
-
-	// #95 SECURITY arch C-1 (A4 read side, one layer down from the dispatcher
-	// serve/Put guards): a re-derived BindingUID of "" (EvaluateRBAC deny/err
-	// fail-closed) collapses raKey to the shared empty-identity RAFullList cell.
-	// On a known-sliceable verdict + cell hit below we would SERVE that shared
-	// ""-keyed slice to a DIFFERENT ""-deriving identity — the same A4
-	// cross-identity read leak, reachable via #95's own dispatcher fall-through
-	// (top-level "" → guarded MISS → direct resolve → resolveApiRef →
-	// raFullListServe re-derives "" here). Treat it EXACTLY like the no-identity
-	// precedent above: fall back to the page-keyed resolve under the request's
-	// OWN identity — always correct, never the shared cell. As a side effect
-	// this also kills the ""-key PutRAFullList + ""-key sliceability records
-	// (they never run on the fallback path), so nothing populates the ""-cell
-	// here either.
-	if bindingUID == "" {
+	// ok=false covers BOTH the no-identity case (never serve a binding-keyed
+	// cell without an identity) AND #95 arch C-1: a fail-closed EvaluateRBAC
+	// "" collapses to the shared empty-identity cell — serving/populating it
+	// cross-identity is the A4 leak (reachable via #95's own dispatcher
+	// fall-through), so fall back to the page-keyed resolve under the request's
+	// OWN identity (also kills the ""-key PutRAFullList + sliceability records).
+	keyInputs, raKey, ok := seedFullListRAKey(ctx, gvr, namespace, name, extras)
+	if !ok {
 		return nil, false, nil
 	}
-
-	keyInputs := cache.RAFullListKeyInputs(gvr.Group, gvr.Version, gvr.Resource,
-		namespace, name, bindingUID, extras)
-	raKey := cache.ComputeKey(keyInputs)
 
 	// fullCtx scopes the UNPAGINATED resolves' inner-call dep edges to the
 	// RAFullList key, so an informer event on any object the RA reads
