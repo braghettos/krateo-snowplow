@@ -700,13 +700,64 @@ func seedScopeYielding(ctx context.Context,
 		return false
 	}
 
+	// ── #99 FIX-F: FIRST-NAV LATCH ARMING (segment-scoped, F-C2). ──
+	// The readyz gate flips when the rank-1 (ri==0) identity's RootIndex==0
+	// (default-route/dashboard) WIDGET segment has seeded — NOT the whole
+	// rank-1 pass, NOT the full seed (prewarm_first_nav_latch.go). We count
+	// the rank-1 × RootIndex==0 widget-target PAIRS up front so we can fire
+	// the latch the instant the LAST one seeds (mid-rank-1, before the
+	// RootIndex>0 widgets and before ANY rank-1 restaction — the heavy
+	// NON-first-nav tail is still mid-seed, ARM-TAIL). RootIndex is stamped on
+	// widgets only (phase1_pip_seed.go BeginRoot/RootIndex); restactions carry
+	// no first-nav marker, so the segment is the widget subset — the RA cells
+	// warm through FIX-E's ascending-len ordering (cheap dashboard RAs before
+	// the fanout whale) as background tail after the flip. The latch is nil
+	// under the pure-unit seed tests that call seedScopeYielding directly (no
+	// engineSeed wrapper built it) → all fire() calls are nil-safe no-ops, so
+	// those tests are unchanged.
+	latch := currentFirstNavLatch()
+	latchStart := time.Now()
+	firstNavRemaining := 0
+	firstNavWidgets := 0
+	if latch != nil && len(ranked) > 0 {
+		rank1 := ranked[0].key
+		for _, ws := range widgetSeeds {
+			if ws.e.RootIndex != 0 {
+				continue
+			}
+			hasRank1Target := false
+			for _, c := range ws.targets {
+				if identityKey(c) == rank1 {
+					firstNavRemaining++
+					hasRank1Target = true
+				}
+			}
+			if hasRank1Target {
+				firstNavWidgets++
+			}
+		}
+	}
+	// firstNavTotal is the segment target count; firstNavRemaining decrements
+	// toward zero as each first-nav target seeds. Captured before the loop so
+	// the fire-log reports the count actually waited on.
+	firstNavTotal := firstNavRemaining
+	// fireFirstNav closes the latch once the segment is complete. reason
+	// discriminates the segment-complete path from the provably-zero path.
+	// segSeeded = the first-nav targets seeded by fire time (= total minus
+	// whatever remains; the zero-targets path reports 0). Nil-safe.
+	fireFirstNav := func(reason string) {
+		if latch != nil {
+			latch.fire(reason, firstNavWidgets, firstNavTotal-firstNavRemaining, time.Since(latchStart))
+		}
+	}
+
 	// (4) RANK-MAJOR, CLASS-INTERLEAVED seed: per rank → widgets(r) in NavOrder,
 	// then restactions(r). FIX-F SEAM (F-C1): the rank-1 first-nav segment
-	// boundary — the moment rank-1's widgets AND restactions have all been
-	// seeded — is a clean, well-defined point. FIX-F (task #99) will close a
-	// firstNavDone latch HERE; this cut only KEEPS the boundary unobscured
-	// (single rank-1 iteration, widgets-then-restactions, no interleaving of
-	// later ranks into it). Do NOT build the latch in this cut.
+	// boundary is a clean, well-defined point; the latch fires the instant the
+	// rank-1 RootIndex==0 widget count reaches zero (below), NOT at the rank-1
+	// boundary (which would pull the RA tail into the readyz gate). The seam is
+	// KEPT unobscured — single rank-1 iteration, widgets-then-restactions, no
+	// interleaving of later ranks.
 	for ri := range ranked {
 		rankKey := ranked[ri].key
 		for _, ws := range widgetSeeds {
@@ -717,6 +768,28 @@ func seedScopeYielding(ctx context.Context,
 				}
 				if seedWidgetTarget(e, c) {
 					return ctx.Err()
+				}
+				// F-C2: fire the latch the instant the LAST rank-1
+				// RootIndex==0 widget target has been PROCESSED (mid-rank-1).
+				// Only the rank-1 first-nav segment decrements; RootIndex>0
+				// widgets and lower ranks never touch firstNavRemaining, so this
+				// cannot fire early on a RootIndex>0-only seed (F-C3).
+				//
+				// PROCESSED, NOT SUCCEEDED (deliberate, C2 liveness). We reach
+				// this line whenever seedWidgetTarget did not abort on ctx-cancel;
+				// a per-target seed FAILURE is classified + swallowed inside
+				// seedWidgetTarget (classifyEngineSeedErr), so the count still
+				// decrements. This is intentional: a permanently-failing dashboard
+				// target must NOT hang /readyz to the PHASE1_TIMEOUT backstop
+				// (that is the exact cold-cell degeneration FIX-F removes). The
+				// real guard that the dashboard is genuinely warm is the
+				// on-cluster post-Ready /dashboard nav#1 l1:HIT content check, not
+				// this counter.
+				if latch != nil && ri == 0 && e.RootIndex == 0 && identityKey(c) == rankKey {
+					firstNavRemaining--
+					if firstNavRemaining == 0 {
+						fireFirstNav("segment-complete")
+					}
 				}
 			}
 		}
@@ -731,7 +804,23 @@ func seedScopeYielding(ctx context.Context,
 				}
 			}
 		}
-		// ── FIX-F SEAM: rank-1 (ri==0) first-nav segment complete here. ──
+		// ── FIX-F SEAM: rank-1 (ri==0) segment boundary. If the rank-1
+		// first-nav segment had ZERO widget targets (no RootIndex==0 widget
+		// authorised for the rank-1 identity — e.g. an all-tail topology, or
+		// prewarm reached no dashboard widget), there is provably nothing to
+		// warm on the first-nav path → fire here so the latch never hangs
+		// (the PHASE1_TIMEOUT backstop would otherwise be the only escape).
+		// firstNavTotal==0 is the "no first-nav segment exists" case; a
+		// non-zero total already fired above. ──
+		if latch != nil && ri == 0 && firstNavTotal == 0 {
+			fireFirstNav("zero-first-nav-targets")
+		}
+	}
+	// Defensive: if ranked was empty (no identities enumerated at all — nothing
+	// to seed), fire so readyz does not wait on the backstop for a genuinely
+	// empty seed. Nil-safe.
+	if latch != nil && len(ranked) == 0 {
+		fireFirstNav("zero-first-nav-targets")
 	}
 	return nil
 }

@@ -436,6 +436,17 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			var bootErr error
 			var closeOnce sync.Once
 
+			// #99 FIX-F: build the process first-nav latch BEFORE enqueuing the
+			// boot scope so seedScopeYielding (deep inside the engine worker)
+			// can reach the SAME latch this select awaits. The latch fires the
+			// instant the rank-1 RootIndex==0 first-nav segment seeds (or
+			// provably has none); this select waits on it instead of the whole
+			// boot scope, so /readyz flips WITH the dashboard warm (§F.1) rather
+			// than at the PHASE1_TIMEOUT backstop with cold cells. bootDone and
+			// the scopeDone callback are UNTOUCHED — the boot scope keeps
+			// seeding the tail in background after the flip.
+			firstNav := ensureFirstNavLatch()
+
 			// Fix v2 / 0.30.248: the engine worker MUST use a process-
 			// lifetime ctx, NOT pctx. pctx is the boot-seed orchestration
 			// goroutine's bounded ctx; the outer `defer seedCancel()` at
@@ -477,7 +488,23 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			// for the process lifetime. The engine genuinely "keeps
 			// running for any future Ship 2 enqueues" — under the new
 			// SetEngineProcessContext mechanism wired at main.go.
+			// #99 FIX-F: unblock readiness on the FIRST of:
+			//   - firstNav fired — the rank-1 first-nav segment is warm (or
+			//     provably empty). This is the happy path: return nil so the
+			//     deferred MarkPhase1Done flips Ready WITH the dashboard warm
+			//     while the boot scope seeds the tail in background.
+			//   - bootDone — the boot scope finished (or failed) BEFORE the
+			//     latch could fire. This happens when the seed aborts early
+			//     (roots_list_failed / re-walk error → seedScopeYielding never
+			//     runs → latch never fires); return bootErr so a genuine boot
+			//     failure still surfaces (and MarkPhase1Done fires the C2
+			//     Ready-degraded backstop via the caller's defer).
+			//   - pctx.Done() — the PHASE1_TIMEOUT parent / pipGlobalTimeout
+			//     child backstop (§F.0/C2). UNCHANGED: readiness is never
+			//     withheld forever; on backstop the pod goes Ready-degraded.
 			select {
+			case <-firstNav.wait():
+				return nil
 			case <-bootDone:
 				return bootErr
 			case <-pctx.Done():
