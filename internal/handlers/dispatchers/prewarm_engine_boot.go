@@ -40,6 +40,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -492,9 +493,10 @@ func seedScopeYielding(ctx context.Context,
 		out := make([]seedTarget, 0, len(raw))
 		for _, t := range raw {
 			out = append(out, seedTarget{
-				BindingUID: t.BindingUID,
-				Username:   t.Subject.Username,
-				Groups:     append([]string(nil), t.Subject.Groups...),
+				BindingUID:        t.BindingUID,
+				Username:          t.Subject.Username,
+				Groups:            append([]string(nil), t.Subject.Groups...),
+				CollapsedBindings: t.CollapsedBindings,
 			})
 		}
 		return out, true
@@ -558,6 +560,10 @@ func seedScopeYielding(ctx context.Context,
 			targets, scoped := targetsFor(e.GVR, true)
 			widgetSeeds = append(widgetSeeds, widgetSeed{e: e, targets: targets, scoped: scoped})
 		}
+		// A2 within-rank tiebreak: ascending len(targets), ties on ns/name — kept
+		// as the deterministic WIDGET order INSIDE each identity rank (FIX-D
+		// interaction (b); arch composition note). widgetSeeds stays in this
+		// order and the rank loop below iterates it as-is per identity.
 		sort.SliceStable(widgetSeeds, func(i, j int) bool {
 			if len(widgetSeeds[i].targets) != len(widgetSeeds[j].targets) {
 				return len(widgetSeeds[i].targets) < len(widgetSeeds[j].targets)
@@ -567,34 +573,96 @@ func seedScopeYielding(ctx context.Context,
 			lj := ej.W.GetNamespace() + "/" + ej.W.GetName()
 			return li < lj
 		})
-		for _, ws := range widgetSeeds {
-			if ctx.Err() != nil {
-				emitSeedAbort("widgets", ctx.Err())
-				return ctx.Err()
-			}
-			engineYieldCheckpoint(ctx)
 
-			e := ws.e
+		// #42 FIX-D IDENTITY-RANK-MAJOR seed order. The A2 count-sort put the
+		// cheap WIDGET first, but on this topology counts are near-uniform (~15
+		// per widget) so count≠cost and a heavy widget's tail can still abort
+		// before the dashboard cohort is warm across ALL widgets. FIX-D instead
+		// ranks IDENTITIES by their dedup collapsed-binding count DESCENDING
+		// (Group/devs≈the whole user population = rank 1; installer SAs =
+		// singletons, last) and seeds RANK-MAJOR: pass 1 = every widget under
+		// rank-1 identity, pass 2 = rank-2, …. So the 95%-mix cohort's dashboard
+		// cells are ALL warm within the first pass regardless of a heavy-widget
+		// tail. DATA-DERIVED: the rank key is the identity tuple, the rank metric
+		// is CollapsedBindings from the dedup — NO static list / name literal
+		// (feedback_no_special_cases). PURE ORDERING: the (widget×identity) seed
+		// SET is unchanged (union over widgetSeeds' targets = the same set the
+		// old widget-major loop covered); only the SEQUENCE changes.
+		//
+		// identityKey mirrors the dedup key (Username + US + sorted Groups) so an
+		// identity is the SAME rank unit across every widget.
+		identityKey := func(c seedTarget) string {
+			g := append([]string(nil), c.Groups...)
+			sort.Strings(g)
+			return c.Username + "\x1f" + strings.Join(g, "\x1f")
+		}
+		type rankedIdentity struct {
+			key       string
+			collapsed int
+		}
+		rankOf := map[string]rankedIdentity{}
+		for _, ws := range widgetSeeds {
+			for _, c := range ws.targets {
+				k := identityKey(c)
+				if _, ok := rankOf[k]; !ok {
+					rankOf[k] = rankedIdentity{key: k, collapsed: c.CollapsedBindings}
+				}
+			}
+		}
+		ranked := make([]rankedIdentity, 0, len(rankOf))
+		for _, ri := range rankOf {
+			ranked = append(ranked, ri)
+		}
+		// Rank DESCENDING by collapsed count; ties break on the identity key for
+		// a deterministic, starvation-free order (D-2 equal-rank tiebreak).
+		sort.SliceStable(ranked, func(i, j int) bool {
+			if ranked[i].collapsed != ranked[j].collapsed {
+				return ranked[i].collapsed > ranked[j].collapsed
+			}
+			return ranked[i].key < ranked[j].key
+		})
+
+		// Emit the per-widget target-count telemetry ONCE up front (the seed loop
+		// below is identity-major, so the widget_targets line no longer pairs 1:1
+		// with a contiguous per-widget block).
+		for _, ws := range widgetSeeds {
 			log.Info("prewarm.engine.seed.widget_targets",
 				slog.String("subsystem", "cache"),
-				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-				slog.String("gvr", e.GVR.String()),
+				slog.String("widget", ws.e.W.GetNamespace()+"/"+ws.e.W.GetName()),
+				slog.String("gvr", ws.e.GVR.String()),
 				slog.Bool("scoped", ws.scoped),
 				slog.Int("targets", len(ws.targets)),
 			)
-			for _, c := range ws.targets {
-				err := seedOneTarget(c, func(cohortCtx context.Context) error {
-					return seedOneWidgetFn(cohortCtx, e, authnNS)
-				})
-				if err != nil && ctx.Err() != nil {
-					emitSeedAbort("widgets", ctx.Err())
-					return ctx.Err()
+		}
+
+		// RANK-MAJOR passes: for each identity in descending-rank order, seed
+		// every widget (A2 order) that has a target for that identity.
+		for ri := range ranked {
+			rankKey := ranked[ri].key
+			for _, ws := range widgetSeeds {
+				e := ws.e
+				for _, c := range ws.targets {
+					if identityKey(c) != rankKey {
+						continue
+					}
+					if ctx.Err() != nil {
+						emitSeedAbort("widgets", ctx.Err())
+						return ctx.Err()
+					}
+					engineYieldCheckpoint(ctx)
+					err := seedOneTarget(c, func(cohortCtx context.Context) error {
+						return seedOneWidgetFn(cohortCtx, e, authnNS)
+					})
+					if err != nil && ctx.Err() != nil {
+						emitSeedAbort("widgets", ctx.Err())
+						return ctx.Err()
+					}
+					if err != nil {
+						// #158 — classify (was: blanket Warn, no counter).
+						classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
+					}
+					targetsProcessed++
 				}
-				if err != nil {
-					// #158 — classify (was: blanket Warn, no counter).
-					classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
-				}
-				targetsProcessed++
 			}
 		}
 		return nil

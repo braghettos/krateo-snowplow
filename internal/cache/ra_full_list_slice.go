@@ -364,6 +364,21 @@ type sliceabilityMemo struct {
 	count    int64    // approximate entry count (atomic via mu)
 	mu       sync.Mutex
 	cap      int
+
+	// #42 FIX-A — SHAPE-LEVEL negative-permanent set. When a
+	// (raKey × sliceShape) verdict is recorded false AND permanent (Class C
+	// structurally non-sliceable), the sliceShape is ALSO recorded here.
+	// sliceShape is IDENTITY-FREE (sliceShapeHash folds caller class/gvr/ns/
+	// name + the RA slice-jq — NO BindingUID, no per-user dimension), so a
+	// structurally-non-sliceable shape proven under identity #1 is proven for
+	// EVERY identity. lookup() consults it when the per-key verdict is UNKNOWN
+	// → returns (false, true) → the always-correct page-keyed fallback (never
+	// a wrong result — a shared NEGATIVE can only route to fallback; positives
+	// stay strictly per-key, never shared). This is what collapses the 3
+	// resolves/identity to 1 on aggregation RAs (design §A5 FIX-A). Keyed on
+	// sliceShape alone (no memoKey/raKey) so it hits across the per-BindingUID
+	// raKeys that never share today.
+	shapeNegative sync.Map // sliceShape(string) -> struct{}
 }
 
 var raSliceabilityMemo = &sliceabilityMemo{cap: defaultSliceabilityMemoCap}
@@ -519,6 +534,18 @@ func memoKey(raFullListKey, sliceShape string) string {
 func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, known bool) {
 	v, ok := m.verdicts.Load(memoKey(raFullListKey, sliceShape))
 	if !ok {
+		// #42 FIX-A — no PER-KEY verdict for this (raKey × shape) yet. Before
+		// returning unknown (which forces first-sight = the expensive triple
+		// resolve), consult the SHAPE-LEVEL negative set: if this sliceShape was
+		// proven structurally non-sliceable under ANY raKey (identity), it is
+		// non-sliceable for THIS raKey too (the shape is identity-free). Return
+		// (false, true) → the caller takes the always-correct page-keyed
+		// fallback — NEVER a wrong result (a shared negative can only route to
+		// fallback; positives are never shared). This collapses identities
+		// #2..N on a structurally-non-sliceable RA from 3 resolves to 1.
+		if _, neg := m.shapeNegative.Load(sliceShape); neg {
+			return false, true
+		}
 		return false, false
 	}
 	e, ok := v.(*sliceabilityMemoEntry)
@@ -568,6 +595,16 @@ func (m *sliceabilityMemo) lookup(raFullListKey, sliceShape string) (sliceable, 
 // Labels and raKey/sliceShape are preserved across refresh-in-place (a
 // refresh-without-labels never overwrites real labels with empty).
 func (m *sliceabilityMemo) record(raFullListKey, sliceShape string, sliceable, permanent bool, labels SliceabilityLabels) {
+	// #42 FIX-A — record the SHAPE-LEVEL negative when this verdict is
+	// structurally-non-sliceable (false + permanent). Monotonic: once a shape
+	// is proven structurally non-sliceable it stays so for the pod's life
+	// (Class C is permanent by construction — same monotonicity as the
+	// per-entry permanent flag below). A later positive verdict on a DIFFERENT
+	// raKey of the same shape is impossible (structural shape doesn't flip),
+	// so we never need to un-record.
+	if !sliceable && permanent {
+		m.shapeNegative.Store(sliceShape, struct{}{})
+	}
 	mk := memoKey(raFullListKey, sliceShape)
 	now := currentNowUnix()
 	if prev, exists := m.verdicts.Load(mk); exists {
@@ -662,6 +699,16 @@ func (m *sliceabilityMemo) invalidate(raFullListKey string) int {
 			return true
 		}
 		m.verdicts.Delete(k)
+		// #42 FIX-A arch C-1: a per-key invalidation must ALSO clear the
+		// shape-level negative it fed, or the shape set would pin a permanent
+		// false that SliceabilityLookup keeps returning known=false for even
+		// after the underlying shape may have changed — defeating the Lever-C
+		// dep-event self-heal for the shared-negative path. The entry carries
+		// its sliceShape, so we clear it here at the same delete point (the
+		// rate-floor above already bounds churn). Next lookup on this shape then
+		// returns known=false → first-sight re-verify restores the correct
+		// verdict.
+		m.shapeNegative.Delete(e.sliceShape)
 		m.mu.Lock()
 		if m.count > 0 {
 			m.count--
@@ -685,6 +732,17 @@ func InvalidateSliceabilityForKey(raFullListKey string) int {
 // SliceabilityLookup is the package-level lookup against the process memo.
 func SliceabilityLookup(raFullListKey, sliceShape string) (sliceable, known bool) {
 	return raSliceabilityMemo.lookup(raFullListKey, sliceShape)
+}
+
+// SliceabilityShapeKnownNegative reports whether the given sliceShape has been
+// recorded structurally non-sliceable (Class C, false+permanent) under ANY
+// raKey — the #42 FIX-A shape-level negative set. Identity-free by
+// construction (sliceShape folds no BindingUID). FIX-B (seedRAFullListForWidget)
+// consults it to SKIP the discarded fallback resolve on a known-non-sliceable
+// widget without needing the per-BindingUID raKey.
+func SliceabilityShapeKnownNegative(sliceShape string) bool {
+	_, neg := raSliceabilityMemo.shapeNegative.Load(sliceShape)
+	return neg
 }
 
 // RecordSliceability records a byte-verify verdict in the process memo with
@@ -744,13 +802,13 @@ type SliceabilityMemoEntry struct {
 	// (IsStructurallyNonSliceable) fired; gates retry cap to 1. Ship #91.
 	Permanent bool `json:"permanent"`
 	// RetryCount — number of record() refreshes for this entry. Ship #91.
-	RetryCount int8 `json:"retryCount"`
-	CallerClass              string `json:"callerClass,omitempty"`
-	CallerGroup              string `json:"callerGroup,omitempty"`
-	CallerVersion            string `json:"callerVersion,omitempty"`
-	CallerResource           string `json:"callerResource,omitempty"`
-	CallerNamespace          string `json:"callerNamespace,omitempty"`
-	CallerName               string `json:"callerName,omitempty"`
+	RetryCount      int8   `json:"retryCount"`
+	CallerClass     string `json:"callerClass,omitempty"`
+	CallerGroup     string `json:"callerGroup,omitempty"`
+	CallerVersion   string `json:"callerVersion,omitempty"`
+	CallerResource  string `json:"callerResource,omitempty"`
+	CallerNamespace string `json:"callerNamespace,omitempty"`
+	CallerName      string `json:"callerName,omitempty"`
 }
 
 // SliceabilityMemoSnapshot returns a flat list of every recorded entry in the

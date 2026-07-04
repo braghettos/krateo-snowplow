@@ -90,6 +90,15 @@ type PrewarmTarget struct {
 	Subject    SubjectIdentity
 	GVR        schema.GroupVersionResource
 	Verb       string
+	// CollapsedBindings — #42 FIX-D: how many raw bindings this GVR bucket
+	// collapsed into this one representative identity (≥1). DATA-DERIVED from
+	// the dedup itself (NOT a static list / name literal — feedback_no_special_cases):
+	// a broadly-granted identity like Group/devs collapses the ~N-per-composition
+	// RoleBindings (devs≈the user population), while an installer SA stays a
+	// singleton (1). The identity-rank-major seed order (FIX-D) ranks identities
+	// by this count DESCENDING so the highest-population cohort (the 95% mix)
+	// warms first across ALL widgets, regardless of heavy-widget tails.
+	CollapsedBindings int
 }
 
 // EnumeratePrewarmTargetsForGVR returns the per-binding prewarm targets
@@ -182,18 +191,20 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 
 		if prev, seen := byIdentity[key]; seen {
 			// Keep the lexicographically-smallest bindingID as the stable
-			// diagnostic representative.
+			// diagnostic representative; count this collapsed binding (FIX-D).
+			prev.CollapsedBindings++
 			if string(id) < prev.BindingUID {
 				prev.BindingUID = string(id)
-				byIdentity[key] = prev
 			}
+			byIdentity[key] = prev
 			continue
 		}
 		byIdentity[key] = PrewarmTarget{
-			BindingUID: string(id),
-			Subject:    rep,
-			GVR:        gvr,
-			Verb:       verb,
+			BindingUID:        string(id),
+			Subject:           rep,
+			GVR:               gvr,
+			Verb:              verb,
+			CollapsedBindings: 1, // this identity's first (and maybe only) binding
 		}
 	}
 	rawBindings := len(ids)

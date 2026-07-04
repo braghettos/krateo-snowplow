@@ -322,6 +322,11 @@ type seedTarget struct {
 	BindingUID string
 	Username   string
 	Groups     []string
+	// CollapsedBindings — #42 FIX-D: the dedup's collapsed-binding count for
+	// this representative identity (≥1), carried from cache.PrewarmTarget. Used
+	// ONLY to rank identities for the identity-rank-major seed order; NOT part
+	// of the seed dispatch or the cell key.
+	CollapsedBindings int
 }
 
 // withCohortSeedContext builds the per-cohort seed context. Mirrors
@@ -406,6 +411,26 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		// cohort ctx ALWAYS installs WithUserInfo, so an empty key here
 		// is a configuration bug (PREWARM_PIP_ENABLED on while
 		// CACHE_ENABLED off); log + skip.
+		return nil
+	}
+	// #42 FIX-C (A4 security finding, populate side): the cohort's identity
+	// re-derived a first-match BindingUID of "" — EvaluateRBAC denied or
+	// errored at lookup and fail-closed (helpers.go). Every "" identity folds
+	// the SAME shared empty-identity cell, resolved under a cohort (e.g.
+	// system:kube-controller-manager) whose serve-time narrowing can be broad;
+	// any real request that also derives "" would HIT it. Do NOT Put that cell
+	// from the seed — skip with one log line (non-empty identities still
+	// seeded). The serve-side treatment of a re-derived "" as a MISS is the
+	// separate task #95 gate.
+	if inputs != nil && inputs.BindingUID == "" {
+		slog.Default().Info("phase1.seed.skip.empty_binding",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "restactions"),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.String("cohort", cohortLabel),
+			slog.String("effect", "cohort re-derived first-match BindingUID=\"\" (RBAC deny/err fail-closed); "+
+				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
+		)
 		return nil
 	}
 
@@ -574,6 +599,24 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		// seedOneRestaction.
 		return nil
 	}
+	// #42 FIX-C (A4 security finding, populate side) — mirror of
+	// seedOneRestaction: skip the shared empty-identity cell Put when the
+	// cohort re-derived a first-match BindingUID of "" (EvaluateRBAC deny/err
+	// fail-closed). See seedOneRestaction for the full rationale; serve-side
+	// treatment is task #95.
+	if inputs != nil && inputs.BindingUID == "" {
+		// The cohort identity is on ctx (WithUserInfo) and is emitted by the
+		// emitDispatchCacheKeyDiag "seed" line just above; this skip line keys
+		// on the widget + class (the diag line pairs the identity to it).
+		slog.Default().Info("phase1.seed.skip.empty_binding",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "widgets"),
+			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+			slog.String("effect", "cohort re-derived first-match BindingUID=\"\" (RBAC deny/err fail-closed); "+
+				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
+		)
+		return nil
+	}
 
 	// #46: bound this seed unit's footprint (semaphore admission + per-unit
 	// HeapInuse assert), AFTER the identity short-circuit so the customer
@@ -691,6 +734,37 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 	if err != nil || apiRef.Name == "" || apiRef.Namespace == "" {
 		// No apiRef (static widget) or unparseable — nothing to prewarm.
 		return
+	}
+
+	// #42 FIX-B — SKIP the whole prewarm resolve when this apiRef→RESTAction
+	// sliceShape has ALREADY been proven structurally non-sliceable under ANY
+	// identity (cache FIX-A shape-level negative set). On a not-sliceable
+	// aggregation RA, apiref.Resolve's raFullListServe returns served=false and
+	// Resolve falls through to a page-keyed resolve whose result THIS function
+	// discards — pure waste (design §A1 resolve #3; ~4.7s/identity on
+	// estate-graph). One objects.Get to derive the shape is cheap vs that
+	// triple resolve. The FIRST identity (shape unknown) still runs the full
+	// first-sight that RECORDS the verdict, so nothing is under-seeded; only
+	// identities #2..N (shape now known-negative) skip. Drift-free: the shape
+	// is derived by apiref.SeedFullListShapeKnownNonSliceable with the SAME
+	// const+inputs raFullListServe uses (single source of truth).
+	if cache.ResolvedCacheEnabled() {
+		if got := objects.Get(ctx, apiRef); got.Err == nil && got.Unstructured != nil {
+			var ra templatesv1.RESTAction
+			if cerr := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(
+				got.Unstructured.Object, &ra); cerr == nil {
+				if apiref.SeedFullListShapeKnownNonSliceable(got.GVR, apiRef.Namespace, apiRef.Name, &ra) {
+					slog.Default().Info("phase1.seed.rafulllist.skip_nonsliceable",
+						slog.String("subsystem", "cache"),
+						slog.String("widget", ns+"/"+name),
+						slog.String("apiref", apiRef.Namespace+"/"+apiRef.Name),
+						slog.String("effect", "sliceShape known structurally non-sliceable (FIX-A shape set); "+
+							"skipping the discarded fallback resolve (design §A1 resolve #3 elimination)"),
+					)
+					return
+				}
+			}
+		}
 	}
 	// inline-extras design P §5 / MUST-FIX #1 — PIP-seed key parity at the
 	// RAFullList sub-cell. The dispatcher's apiRef path keys this sub-cell on

@@ -46,6 +46,69 @@ import (
 // byte-verify must be independent (design §3 "different sliceShape").
 const raFullListCallerClass = "apiref"
 
+// SeedFullListShapeKnownNonSliceable is the #42 FIX-B seed pre-check. It
+// reports whether the apiRef→RESTAction sliceShape has ALREADY been proven
+// structurally non-sliceable (Class C, false+permanent) under ANY identity —
+// via the identity-free shape-level negative set (cache FIX-A). When true, the
+// seed's fallback resolve in seedRAFullListForWidget is pure waste (its result
+// is discarded — raFullListServe would return served=false and apiref.Resolve
+// would fall through to a page-keyed resolve whose output the seed throws
+// away), so the caller SKIPS the whole resolve.
+//
+// INVARIANT (load-bearing — must NEVER diverge from raFullListServe): this
+// derives the sliceShape with the SAME const (raFullListCallerClass) and the
+// SAME inputs (gvr.{G,V,R}, namespace, name, ptr.Deref(ra.Spec.Filter)) that
+// raFullListServe uses at line ~121. Co-located in THIS file with the const +
+// the serve path precisely so the two cannot drift. If they ever diverge the
+// pre-check either OVER-skips (a genuinely-seedable shape is skipped → a
+// missed seed) or UNDER-skips (a non-sliceable shape still runs the wasted
+// resolve #3). The FIX-B falsifier exercises this THROUGH seedRAFullListForWidget
+// (the real path), NOT by calling this helper directly, so a drift surfaces as
+// a test failure rather than only a comment violation.
+//
+// gvr/namespace/name identify the RESTAction CR (res.GVR + the apiRef); ra is
+// the typed RESTAction (Spec.Filter is the slice-jq). Mirrors raFullListServe's
+// shape derivation exactly.
+func SeedFullListShapeKnownNonSliceable(gvr schema.GroupVersionResource,
+	namespace, name string, ra *templatesv1.RESTAction) bool {
+	if ra == nil {
+		return false
+	}
+	return cache.SliceabilityShapeKnownNegative(seedFullListShape(gvr, namespace, name, ra))
+}
+
+// seedFullListShape is the ONE shape-derivation both the pre-check and the
+// serve path (raFullListServe) express — the SINGLE SOURCE OF TRUTH for the
+// sliceShape (raFullListCallerClass + gvr + ns/name + slice-jq). Keeping it a
+// function (not two inline expressions) makes the invariant enforceable: the
+// FIX-B falsifier records the negative through this SAME derivation, so a drift
+// would surface as the skip not firing.
+func seedFullListShape(gvr schema.GroupVersionResource, namespace, name string, ra *templatesv1.RESTAction) string {
+	sliceJQ := ptr.Deref(ra.Spec.Filter, "")
+	return cache.SliceShapeHash(raFullListCallerClass, gvr.Group, gvr.Version,
+		gvr.Resource, namespace, name, sliceJQ)
+}
+
+// RecordSeedFullListShapeNegativeForTest records the given RA's sliceShape as
+// structurally non-sliceable (Class C false+permanent) — TEST-ONLY, mirroring
+// the established cache.RecordSliceability...ForTest / PublishRBACSnapshotForTest
+// convention. It exists so the cross-package FIX-B falsifier (in the
+// dispatchers package, which cannot reach the unexported seedFullListShape) can
+// prime the shape-negative set through the SAME derivation the serve path uses
+// — driving the negative-record and the seed-side pre-check through ONE
+// function, so a shape-derivation drift surfaces as the falsifier's skip not
+// firing. This is exactly what raFullListServe records on a first-sight
+// byte-verify of a structurally-non-sliceable shape; the helper avoids standing
+// up the full SA-transport resolve just to observe that record.
+func RecordSeedFullListShapeNegativeForTest(gvr schema.GroupVersionResource,
+	namespace, name string, ra *templatesv1.RESTAction) {
+	shape := seedFullListShape(gvr, namespace, name, ra)
+	// raKey is irrelevant to the SHAPE-negative set (FIX-A keys it on the
+	// identity-free shape alone); a stable placeholder keeps the per-key entry
+	// well-formed. permanent=true = Class C, the promotion condition.
+	cache.RecordSliceabilityClassified("seed-test-rakey/"+shape, shape, false, true, cache.SliceabilityLabels{})
+}
+
 // raFullListServe implements the Ship 4a page-independent serve at the
 // apiRef chokepoint. It is called ONLY when cache is on AND the request is
 // paginated (perPage>0 && page>0) — the unpaginated path keeps today's
@@ -117,9 +180,10 @@ func raFullListServe(
 	// with the widget cell's own deps recorded under the request ctx.
 	fullCtx := cache.WithL1KeyContext(ctx, raKey)
 
-	sliceJQ := ptr.Deref(ra.Spec.Filter, "")
-	shape := cache.SliceShapeHash(raFullListCallerClass, gvr.Group, gvr.Version,
-		gvr.Resource, namespace, name, sliceJQ)
+	// Single source of truth for the sliceShape — the SAME derivation the #42
+	// FIX-B pre-check (SeedFullListShapeKnownNonSliceable) uses, so the seed
+	// skip can never diverge from what this serve path records.
+	shape := seedFullListShape(gvr, namespace, name, ra)
 
 	offset := (page - 1) * perPage
 
