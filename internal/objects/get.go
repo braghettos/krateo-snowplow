@@ -55,6 +55,16 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	// pivot's serve rate, and cache-disabled is "pivot inactive", not a
 	// pivot fallthrough.
 	if cache.Disabled() {
+		// #101: an informer-only ctx (cache.WithInformerOnlyReads — the
+		// /refreshes arming path) must NOT reach the apiserver even when the
+		// cache subsystem is off: there is no informer to serve from, so the
+		// correct informer-only answer is a NotFound-shaped miss, never the
+		// endpoint-less-ctx apiserver ERROR. This is the reachable cache-off
+		// site (the flag-off branch below is structurally dead — useInformer()
+		// folds to !cache.Disabled(), #57).
+		if cache.InformerOnlyReadsFromContext(ctx) {
+			return informerOnlyMiss(ctx, ref)
+		}
 		return getFromAPIServer(ctx, ref)
 	}
 
@@ -149,6 +159,17 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 				//     token and returns the authoritative 403.
 			}
 		}
+		// #101: informer-only reads. On an endpoint-less internal route (the
+		// /refreshes arming path, cache.WithInformerOnlyReads) the apiserver
+		// fallthrough is unreachable-by-design — getFromAPIServer dies at the
+		// UserConfig read with a noisy 401-shaped ERROR and the coord is
+		// fail-closed-skipped anyway. Return the NotFound-shaped Err the caller
+		// already handles, quietly, WITHOUT attempting the doomed apiserver GET.
+		// Placed AFTER the informer-serve attempt so a genuine informer HIT still
+		// serves; only the fallthrough is short-circuited (serve set unchanged).
+		if cache.InformerOnlyReadsFromContext(ctx) {
+			return informerOnlyMiss(ctx, ref)
+		}
 		// Any fall-through inside the routed branch — parse failure,
 		// nil/passthrough/metadata-only watcher, not-synced, GET-miss,
 		// RBAC-denied GET — is an apiserver-served call under the active
@@ -159,7 +180,32 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 
 	// Flag off: pivot inactive. Take the apiserver branch unchanged from
 	// pre-0.30.96. No counter increment — see the cache.Disabled() note.
+	// #101: the informer-only guard for the cache-off case lives at the
+	// cache.Disabled() early-return above (the reachable site); this branch is
+	// structurally dead (useInformer() == !cache.Disabled(), #57), so no guard
+	// is needed here.
 	return getFromAPIServer(ctx, ref)
+}
+
+// informerOnlyMiss returns the NotFound-shaped Result an informer-only ctx
+// (#101, cache.WithInformerOnlyReads) yields on a routed-branch fallthrough,
+// WITHOUT touching the apiserver. It fills res.GVR (best-effort parse) so the
+// caller's telemetry keeps the coordinate, and a NotFound-coded res.Err so the
+// existing fail-closed skip (subscriptionKeyExtras: got.Err != nil → skip)
+// applies unchanged. Logged at Debug only — this is the expected quiet path on
+// an endpoint-less route, NOT the "unable to get user endpoint" ERROR it
+// replaces.
+func informerOnlyMiss(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
+	if gv, err := schema.ParseGroupVersion(ref.APIVersion); err == nil {
+		res.GVR = gv.WithResource(ref.Resource)
+	}
+	xcontext.Logger(ctx).Debug("objects.Get: informer-only ctx, apiserver fallthrough suppressed",
+		slog.String("gvr", res.GVR.String()),
+		slog.String("ns", ref.Namespace),
+		slog.String("name", ref.Name))
+	res.Err = response.New(http.StatusNotFound,
+		apierrors.NewNotFound(res.GVR.GroupResource(), ref.Name))
+	return res
 }
 
 func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {

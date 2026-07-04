@@ -285,9 +285,17 @@ func validateSubscription(req *http.Request) (map[string]struct{}, error) {
 		return nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
 	}
 
+	// #101: the /refreshes arming reads MUST be informer-only. The route is
+	// authed by middleware.RefreshAuth (UserInfo but DELIBERATELY no UserConfig),
+	// so subscriptionKeyExtras's per-coord objects.Get cannot reach the apiserver
+	// fall-through without dying at the endpoint read (378-error storm). The
+	// marker makes an informer GET-miss a quiet NotFound-shaped skip instead.
+	armCtx := cache.WithInformerOnlyReads(req.Context())
+
 	armed := make(map[string]struct{}, len(reqs))
+	var skippedInformerMiss, skippedOther int
 	for _, s := range reqs {
-		key, ok := dispatchers.DeriveSubscriptionKey(req.Context(), dispatchers.SubscriptionCoordinates{
+		key, ok, reason := dispatchers.DeriveSubscriptionKeyWithReason(armCtx, dispatchers.SubscriptionCoordinates{
 			Class:     s.Class,
 			Group:     s.Group,
 			Version:   s.Version,
@@ -299,9 +307,30 @@ func validateSubscription(req *http.Request) (map[string]struct{}, error) {
 			Extras:    s.Extras,
 		})
 		if !ok {
-			continue // fail-closed: skip keys this identity can't produce
+			// fail-closed: skip keys this identity can't produce.
+			switch reason {
+			case dispatchers.SubscriptionSkipInformerMiss:
+				skippedInformerMiss++
+			default:
+				skippedOther++
+			}
+			continue
 		}
 		armed[key] = struct{}{}
 	}
+
+	// #101 ARM condition: per-subscription INFO summary REPLACING the per-coord
+	// ERROR storm. ONE line per /refreshes connection with the armed count and
+	// the skip breakdown — so a "did admin's dashboard arm?" question is
+	// answerable from a single grep, and the informer-miss coords (the transient
+	// post-storm state) are visible as a count, not 378 ERROR lines. INFO, not
+	// ERROR: an informer-miss skip is expected/self-healing, not a fault.
+	xcontext.Logger(req.Context()).Info("refreshes.subscription.summary",
+		slog.String("subsystem", "cache"),
+		slog.Int("requested", len(reqs)),
+		slog.Int("armed", len(armed)),
+		slog.Int("skipped_informer_miss", skippedInformerMiss),
+		slog.Int("skipped_other", skippedOther),
+	)
 	return armed, nil
 }

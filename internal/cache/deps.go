@@ -304,6 +304,52 @@ func BackgroundResolveFromContext(ctx context.Context) bool {
 	return v
 }
 
+// ctxKeyInformerOnlyReadsType is the typed context key marking a ctx whose
+// objects.Get reads MUST be informer-only — the apiserver fallthrough is
+// unreachable-by-design and must not be attempted (#101).
+type ctxKeyInformerOnlyReadsType struct{}
+
+var ctxKeyInformerOnlyReads = ctxKeyInformerOnlyReadsType{}
+
+// WithInformerOnlyReads marks ctx so objects.Get serves ONLY from the
+// in-process informer cache: on any routed-branch fallthrough (GET-miss,
+// not-servable, RBAC-denied, parse failure) it returns a NotFound-shaped Err
+// INSTEAD of calling getFromAPIServer.
+//
+// THE DEFECT IT KILLS (#101, docs/refreshes-arming-endpoint-storm-trace-2026-07-04.md).
+// The GET /refreshes arming path is authed by middleware.RefreshAuth, which
+// attaches UserInfo but DELIBERATELY NO UserConfig (the route "needs no
+// <user>-clientconfig Secret lookup", main.go). subscriptionKeyExtras calls
+// objects.Get per widget/widgetContent coord to reconstruct the inline-extras
+// union; on an informer GET-miss coord the routed branch falls through to
+// getFromAPIServer, which dies INSTANTLY at the endpoint read (xcontext.UserConfig
+// → "unable to get user endpoint" ERROR + 401-shaped Err) — no I/O, just noise.
+// The coord is then fail-closed-skipped anyway. This marker makes the doomed
+// fallthrough a quiet NotFound so the skip stays silent; the SERVE SET IS
+// UNCHANGED (the fallthrough never succeeded on this endpoint-less route).
+//
+// It is a GENERIC capability like WithInternalRESTConfig — a ctx-scoped read
+// mode, NOT a per-route/resource/user special-case in objects.Get
+// (feedback_no_special_cases). Any endpoint-less internal driver that must not
+// touch the apiserver can set it.
+func WithInformerOnlyReads(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyInformerOnlyReads, true)
+}
+
+// InformerOnlyReadsFromContext reports whether ctx was marked by
+// WithInformerOnlyReads — i.e. whether objects.Get must skip the apiserver
+// fallthrough and return a NotFound-shaped Err instead.
+func InformerOnlyReadsFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyInformerOnlyReads).(bool)
+	return v
+}
+
 // ctxKeyRefreshTriggerGVRType is the typed context key for the R1 Layer 1
 // refresh-trigger-GVR marker.
 type ctxKeyRefreshTriggerGVRType struct{}
