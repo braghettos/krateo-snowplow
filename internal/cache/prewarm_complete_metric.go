@@ -8,8 +8,7 @@
 //
 // VALUE SHAPE: a map (expvar.Func → map[string]int64) under that single
 // name, mirroring the established map-valued expvars in this codebase
-// (snowplow_crd_discovery in crd_discovery_expvar.go;
-// snowplow_phase1_cohort_seed_status in phase1_pip_metrics.go):
+// (snowplow_crd_discovery in crd_discovery_expvar.go):
 //
 //	"done":       0 before the Phase1Done flip, 1 after. THE boundary the
 //	             bench gates on (== 1 means /readyz has flipped to 200).

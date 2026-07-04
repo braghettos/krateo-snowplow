@@ -517,6 +517,14 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		RawJSON: encoded,
 		Inputs:  inputs,
 	})
+	// counters-hygiene 2026-07-04: this success Put is a seed UNIT resolved +
+	// written to per-user L1 — the real meaning of
+	// snowplow_phase1_bindingset_seed_resolves_total. Its only historical
+	// incrementer (runPIPSeed) was deleted in the prewarm-family fold, leaving
+	// the counter dead-at-0 (which made a 287-real-seed boot look like "seed
+	// didn't run"). Wired here + at seedOneWidget's success Put so the counter
+	// again means "seed units resolved+Put".
+	pipBindingSetSeedResolvesTotal.Add(1)
 
 	// Record the self-dep + ensure the informer for the RESTAction GVR
 	// is wired (AC-PIP.5 — without this the refresher never wakes for
@@ -691,6 +699,10 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		RawJSON: encoded,
 		Inputs:  inputs,
 	})
+	// counters-hygiene 2026-07-04 — see seedOneRestaction: this success Put is
+	// a seed UNIT resolved+written; wired so snowplow_phase1_bindingset_seed_resolves_total
+	// again means "seed units resolved+Put" (was dead-at-0 post-fold).
+	pipBindingSetSeedResolvesTotal.Add(1)
 
 	// Record widget deps — self + apiRef + render-eligible
 	// resourcesRefs. Matches widgets.go:230. recordWidgetDeps ensures

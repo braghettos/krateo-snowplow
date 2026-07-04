@@ -503,6 +503,12 @@ func iterateApiRefPages(
 		// see phase1_walk_pagination_metrics.go).
 		bumpPrewarmApiRefPagesTotal()
 		bumpPrewarmUnitsPlanned(1)
+		// NB (counters-hygiene 2026-07-04): bumpPrewarmUnitsSeeded increments
+		// snowplow_phase1_units_seeded, which counts apiRef CONTENT-PAGINATION
+		// page cells (here) — NOT top-level per-identity seed units (that's
+		// snowplow_phase1_bindingset_seed_resolves_total). Name reads "seed
+		// units"; semantics are content-pagination cells. See the declaration
+		// doc in phase1_walk_pagination_metrics.go.
 		bumpPrewarmUnitsSeeded()
 
 		// Put this page's envelope under the matching content L1 key.

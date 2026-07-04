@@ -69,6 +69,17 @@ var (
 	// prewarmUnitsSeeded — one per page cell handed to populateWidgetContentL1
 	// with a non-nil resolved envelope (lower bound on actual L1 writes; see
 	// the file header for the relationship to the skip counters).
+	//
+	// NAME-vs-SEMANTIC WARNING (counters-hygiene 2026-07-04): despite the
+	// published expvar key `snowplow_phase1_units_seeded` reading like "seed
+	// units", this counts apiRef CONTENT-PAGINATION page cells (the
+	// widgetContent walk), NOT the top-level per-identity restactions/widgets
+	// SEED units. The per-identity seed-unit signal is
+	// snowplow_phase1_bindingset_seed_resolves_total (phase1_pip_metrics.go).
+	// The expvar KEY is deliberately NOT renamed — breaking a published
+	// observability key to fix a naming nit is the wrong trade (a 50K debugger
+	// keys dashboards/greps on the string); this comment + the increment-site
+	// comment kill the red-herring risk instead.
 	prewarmUnitsSeeded atomic.Uint64
 
 	// prewarmApiRefPagesTotal — one per EXTRA apiRef page (page 2..N) the

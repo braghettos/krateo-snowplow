@@ -92,13 +92,12 @@ Defined in `internal/handlers/dispatchers/phase1_pip_metrics.go`.
 
 | expvar | meaning | healthy range |
 |---|---|---|
-| `snowplow_phase1_bindingset_seed_resolves_total` (`:181`) | `uint64` — per-binding-target seed resolves | climbs during seed |
+| `snowplow_phase1_bindingset_seed_resolves_total` (`:181`) | `uint64` — seed UNITS resolved + written to per-user L1 (one per successful `handle.Put` in seedOneRestaction/seedOneWidget) | climbs during seed; `0` after boot means no seed unit was written (wired 2026-07-04 — was dead-at-0 before) |
 | `snowplow_phase1_bindingset_seed_failures_total` (`:184`) | `uint64` — grand-total seed failures (= rbac_deny + operational; back-compat) | interpret via the split below |
 | `snowplow_phase1_seed_rbac_deny_total` (`:192`) | `uint64` — EXPECTED narrow-RBAC denies (403/401); cohort genuinely can't read the target | non-zero is **normal**; these need no L1 entry, not re-enqueued |
 | `snowplow_phase1_seed_operational_fail_total` (`:195`) | `uint64` — UNEXPECTED failures (ctx timeout/cancel, 5xx, transport, panic) | **0**. Non-zero = a real hole; these ARE re-enqueued |
 | `snowplow_phase1_widget_seed_failure_total` (`:203`) | `map["cohort\|name\|gvr"→uint64]` — which widget broke which cohort | pinpoints a per-widget per-cohort seed failure |
 | `snowplow_phase1_restaction_seed_failure_total` (`:211`) | `map["cohort\|namespace/name"→uint64]` — same for RESTActions | pinpoints a per-RESTAction per-cohort seed failure |
-| `snowplow_phase1_cohort_seed_status` (`:220`) | `map[cohort→"success"\|"partial"\|"failed"]` | all `success` on a clean boot; `partial`/`failed` flags the affected cohort |
 
 ### Refresher — background re-resolve worker pool
 Defined in `internal/cache/refresher_metrics.go`.
