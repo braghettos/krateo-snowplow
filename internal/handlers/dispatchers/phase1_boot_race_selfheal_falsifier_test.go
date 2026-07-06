@@ -219,10 +219,8 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 	}
 	// The singleton must have a pending boot scope (coalesced on the boot key).
 	e := prewarmEngineSingleton()
-	e.mu.Lock()
-	_, hasBoot := e.pending[prewarmScope{kind: scopeKindBoot}.key()]
-	pendingLen := len(e.pending)
-	e.mu.Unlock()
+	hasBoot := e.pendingHasBootForTest()
+	pendingLen := e.pendingLenForTest()
 	if !hasBoot {
 		t.Fatalf("SELF-HEAL FAIL: no scopeKindBoot pending on the engine after the ConfigMap AddFunc")
 	}
@@ -233,7 +231,7 @@ func TestBootRace_ConfigVarsInformerDrivesReWalk(t *testing.T) {
 		ConfigVarsEnqueuedTotal())
 
 	// Drive the re-walk (what the worker would do): dequeue + run the handler.
-	scope, ok := e.dequeueScope()
+	scope, ok := e.drainScopeForTest()
 	if !ok || scope.kind != scopeKindBoot {
 		t.Fatalf("expected a boot scope dequeued for the re-walk")
 	}
@@ -322,9 +320,7 @@ func TestBootRace_RED_OneShotGivesUpWithoutTrigger(t *testing.T) {
 	}
 	// Confirm no boot scope is pending on the singleton (nothing re-drove).
 	e := prewarmEngineSingleton()
-	e.mu.Lock()
-	_, hasBoot := e.pending[prewarmScope{kind: scopeKindBoot}.key()]
-	e.mu.Unlock()
+	hasBoot := e.pendingHasBootForTest()
 	if hasBoot {
 		t.Fatalf("RED arm: a boot scope was re-enqueued with no informer — impossible on HEAD")
 	}

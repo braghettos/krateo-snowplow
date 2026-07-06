@@ -17,18 +17,17 @@ package dispatchers
 
 // PrewarmEngineSnapshot returns the prewarm-engine worker counters,
 // mirroring snowplow_prewarm_engine_{enqueued,processed,yield}_total and
-// snowplow_prewarm_engine_pending_depth. pendingDepth is read under the
-// engine mutex (race-free against enqueue/dequeue). Safe before the engine
-// has started: prewarmEngineSingleton() lazily constructs the engine, so a
-// pre-start read returns zeros from the freshly-allocated struct.
+// snowplow_prewarm_engine_pending_depth. pendingDepth is the workqueue's own
+// Len() (F.4 / R1 — internally synchronized, race-free against Add/Get).
+// Safe before the engine has started: prewarmEngineSingleton() lazily
+// constructs the engine (queue included), so a pre-start read returns zeros
+// from the freshly-allocated queue.
 func PrewarmEngineSnapshot() (enqueued, processed, yield uint64, pendingDepth int64) {
 	e := prewarmEngineSingleton()
 	if e == nil {
 		return 0, 0, 0, 0
 	}
-	e.mu.Lock()
-	pendingDepth = int64(len(e.pending))
-	e.mu.Unlock()
+	pendingDepth = int64(e.queue.Len())
 	return e.enqueuedTotal.Load(), e.processedTotal.Load(), e.yieldTotal.Load(), pendingDepth
 }
 

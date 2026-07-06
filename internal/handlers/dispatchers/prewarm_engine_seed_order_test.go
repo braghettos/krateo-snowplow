@@ -220,20 +220,20 @@ func TestFixE_RankMajorClassInterleaveFirstNavOrder(t *testing.T) {
 	t.Cleanup(func() { restActionTargetGVRFn = prevTGVR })
 
 	prevW := seedOneWidgetFn
-	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string) error {
+	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string, _ bool) error {
 		rec.record("widget", e.W.GetName(), eIdentityLabel(ctx))
 		return nil
 	}
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 
 	prevR := seedOneRestactionFn
-	seedOneRestactionFn = func(ctx context.Context, _ string, ref templatesv1.ObjectReference, _ string) error {
+	seedOneRestactionFn = func(ctx context.Context, _ string, ref templatesv1.ObjectReference, _ string, _ bool) error {
 		rec.record("restaction", ref.Name, eIdentityLabel(ctx))
 		return nil
 	}
 	t.Cleanup(func() { seedOneRestactionFn = prevR })
 
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 

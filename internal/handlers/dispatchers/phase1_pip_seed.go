@@ -457,7 +457,7 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 //   - restactions.Resolve same entrypoint at restactions.go:183-189.
 //   - encodeResolvedJSON + cacheHandle.Put + ensureWatcherInformerForGVR
 //   - cache.Deps().Record — same Put shape as restactions.go:212-230.
-func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string) error {
+func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string, bootScoped bool) error {
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
 		// #158 (design §1.3): preserve the typed status error so the call
@@ -515,6 +515,39 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
 		)
 		return nil
+	}
+
+	// F.4 boot-only fresh-skip (design §3.2). When this is the genuine boot
+	// scope (bootScoped) and the production cell key already holds a LIVE
+	// (non-expired) entry, the target is already warm — count it as processed
+	// and skip the resolve + Put, so a deadline-cut boot chunk's continuation
+	// re-pays only the cold remainder (cost-proportional resume). Gated on
+	// bootScoped ONLY: keepwarm must re-Put (reset CreatedAt) and gvr-discovered
+	// must re-resolve (record the new-GVR dep edge), so both pass bootScoped=false
+	// and fall through to the normal resolve (F4-C3 boundary).
+	//
+	// F4-C2a: freshness is the store's OWN TTL-expiry check — handle.Get returns
+	// (entry, true) iff the entry exists AND is non-expired per the exact
+	// effectiveTTL logic the serve path uses (resolved.go Get). No "TTL-remaining
+	// ≥ X" literal, no put-since bookkeeping. The lookup consumes `key` — the
+	// SAME key derived above by dispatchCacheLookupKey that the Put below uses —
+	// so skip-key correctness cannot drift from Put-key correctness (single
+	// derivation site, feedback_consultation_mutation_is_not_key_correctness).
+	// Placed BEFORE enterSeedUnit so a skipped target never consumes the #46
+	// memory admission (the bound composes trivially — strictly fewer admissions).
+	if bootScoped {
+		if _, live := handle.Get(key); live {
+			pipSeedFreshSkipTotal.Add(1)
+			slog.Default().Debug("phase1.seed.fresh_skip",
+				slog.String("subsystem", "cache"),
+				slog.String("class", "restactions"),
+				slog.String("restaction", ref.Namespace+"/"+ref.Name),
+				slog.String("cohort", cohortLabel),
+				slog.String("effect", "boot-scope fresh-skip: live L1 cell under the production key; "+
+					"resolve+Put skipped, target counted as processed (F.4 cost-proportional resume)"),
+			)
+			return nil
+		}
 	}
 
 	// #46 / fold 2026-07-03: bound this seed unit's footprint via the ADAPTIVE
@@ -663,7 +696,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 //     matches widgets.go:215-231 (recordWidgetDeps calls
 //     ensureWatcherInformerForGVR for the widget GVR + apiRef GVR +
 //     each resourcesRefs GVR, satisfying AC-PIP.5 for widgets).
-func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error {
+func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, bootScoped bool) error {
 	if e.W == nil {
 		return nil
 	}
@@ -728,6 +761,32 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
 		)
 		return nil
+	}
+
+	// F.4 boot-only fresh-skip (design §3.2) — mirror of seedOneRestaction. On
+	// the genuine boot scope, if the production widget cell key already holds a
+	// LIVE (non-expired) entry, count it processed and skip resolve+Put so a
+	// deadline-cut boot chunk's continuation is cost-proportional. Gated on
+	// bootScoped ONLY (keepwarm re-Puts, gvr-discovered re-resolves; both pass
+	// false — F4-C3 boundary). Freshness = handle.Get's own TTL-expiry check
+	// (F4-C2a), consuming the SAME `key` derived above (single derivation site,
+	// F4-C2a). BEFORE enterSeedUnit so a skip never consumes the #46 admission.
+	// The unpaginated seedRAFullListForWidget accelerator is skipped along with
+	// the widget resolve — correct, because a live widget cell implies its
+	// first paginated /call already found (or will lazily rebuild) the pinned
+	// full-list; the boot chunk's job is done for this warm target.
+	if bootScoped {
+		if _, live := handle.Get(key); live {
+			pipSeedFreshSkipTotal.Add(1)
+			slog.Default().Debug("phase1.seed.fresh_skip",
+				slog.String("subsystem", "cache"),
+				slog.String("class", "widgets"),
+				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+				slog.String("effect", "boot-scope fresh-skip: live L1 cell under the production key; "+
+					"resolve+Put skipped, target counted as processed (F.4 cost-proportional resume)"),
+			)
+			return nil
+		}
 	}
 
 	// #46: bound this seed unit's footprint (semaphore admission + per-unit
