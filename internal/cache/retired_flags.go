@@ -74,6 +74,30 @@ var retiredFlags = []retiredFlag{
 		name:     "RESOLVED_CACHE_APISTAGE_ENABLED",
 		behavior: "the api-stage L1 is now on iff the resolved cache is on; set RESOLVED_CACHE_ENABLED=false (or CACHE_ENABLED=false) to disable",
 	},
+	// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md):
+	// the prewarm FAMILY is now implicit-on-cache. These four on/off gates each
+	// stopped reading their own env and return cache.PrewarmEnabled(). The
+	// severity split makes any of them =false a loud Warn (the installer-test
+	// footgun: an operator asked a stage OFF and now gets it ON). The seed
+	// sizing knobs SEED_FOOTPRINT_BUDGET_BYTES / SEED_EST_UNIT_BYTES_FALLBACK
+	// are NOT here — they were inert default-off CAPACITY knobs replaced by the
+	// adaptive bound (no silent behavior change to warn about; §3.5).
+	{
+		name:     "PREWARM_CONTENT_ENABLED",
+		behavior: "the Phase-1 content pass is now implicit-on-cache; set CACHE_ENABLED=false to disable",
+	},
+	{
+		name:     "PREWARM_PIP_ENABLED",
+		behavior: "the per-identity prewarm seed is now implicit-on-cache; set CACHE_ENABLED=false to disable",
+	},
+	{
+		name:     "PREWARM_ENGINE_ENABLED",
+		behavior: "the prewarm engine is now implicit-on-cache; set CACHE_ENABLED=false to disable",
+	},
+	{
+		name:     "PROACTIVE_RA_SEED_ENABLED",
+		behavior: "the proactive RESTAction seed is now implicit-on-cache; set CACHE_ENABLED=false to disable",
+	},
 }
 
 // retiredFlagAuditedOnce guards warn-once-per-flag-per-process. Keyed by

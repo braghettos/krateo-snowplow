@@ -128,7 +128,11 @@ func subscriptionKeyExtras(ctx context.Context, c SubscriptionCoordinates) (map[
 		Resource:   c.Resource,
 	})
 	if got.Err != nil || got.Unstructured == nil {
-		// Fail-closed: skip the coord (no request-only fallback).
+		// Fail-closed: skip the coord (no request-only fallback). On the
+		// /refreshes arming path the ctx carries cache.WithInformerOnlyReads
+		// (#101), so an informer GET-miss returns a quiet NotFound-shaped Err
+		// here instead of a noisy apiserver-endpoint ERROR — the skip is the
+		// same, the log noise is gone.
 		return nil, false
 	}
 	return unionForKey(
@@ -138,9 +142,41 @@ func subscriptionKeyExtras(ctx context.Context, c SubscriptionCoordinates) (map[
 	), true
 }
 
+// SubscriptionSkipReason classifies WHY a coordinate did not arm — for the
+// #101 per-subscription INFO summary the /refreshes handler emits. The only
+// distinction the summary needs is informer-miss (the coord's widget CR was
+// absent from the informer store — the transient post-storm GET-miss the fix
+// silences) vs any other fail-closed skip (unknown class / missing identity /
+// empty key). Not an error taxonomy — a telemetry bucket.
+type SubscriptionSkipReason int
+
+const (
+	// SubscriptionArmed — a real key was derived (not a skip).
+	SubscriptionArmed SubscriptionSkipReason = iota
+	// SubscriptionSkipInformerMiss — the widget/widgetContent coord's CR was
+	// not GET-able from the informer (subscriptionKeyExtras fail-closed). This
+	// is the bucket the #101 storm coords land in.
+	SubscriptionSkipInformerMiss
+	// SubscriptionSkipOther — unknown class, missing identity, or empty key
+	// (the identity-bound classes' dispatchCacheLookupKey returned empty).
+	SubscriptionSkipOther
+)
+
 func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) (string, bool) {
 	key, _, ok := deriveSubscription(ctx, coords)
 	return key, ok
+}
+
+// DeriveSubscriptionKeyWithReason is DeriveSubscriptionKey plus the #101 skip
+// classification: on !ok it reports WHY the coord did not arm
+// (SubscriptionSkipInformerMiss vs SubscriptionSkipOther) so the /refreshes
+// handler can emit the per-subscription {armed, skipped_informer_miss} INFO
+// summary. On ok the reason is SubscriptionArmed. Shares the SINGLE
+// deriveSubscription body — no parallel derivation copy (the #66 anti-drift
+// discipline).
+func DeriveSubscriptionKeyWithReason(ctx context.Context, coords SubscriptionCoordinates) (string, bool, SubscriptionSkipReason) {
+	key, _, ok, reason := deriveSubscriptionWithReason(ctx, coords)
+	return key, ok, reason
 }
 
 // deriveSubscription is the SINGLE key-derivation body for /refreshes. It
@@ -163,6 +199,15 @@ func DeriveSubscriptionKey(ctx context.Context, coords SubscriptionCoordinates) 
 // one paginationInfo calls — extracted, not re-implemented, so the two sides
 // cannot drift) to ALL classes BEFORE the per-class derivation below.
 func deriveSubscription(ctx context.Context, coords SubscriptionCoordinates) (string, *cache.ResolvedKeyInputs, bool) {
+	key, inputs, ok, _ := deriveSubscriptionWithReason(ctx, coords)
+	return key, inputs, ok
+}
+
+// deriveSubscriptionWithReason is the SINGLE derivation body; deriveSubscription
+// is a thin wrapper that drops the #101 skip reason. The reason distinguishes
+// an informer-miss skip (subscriptionKeyExtras fail-closed — the #101 storm
+// coord) from any other fail-closed skip, for the handler's INFO summary.
+func deriveSubscriptionWithReason(ctx context.Context, coords SubscriptionCoordinates) (string, *cache.ResolvedKeyInputs, bool, SubscriptionSkipReason) {
 	coords.PerPage, coords.Page = normalizePagination(coords.PerPage, coords.Page)
 
 	switch coords.Class {
@@ -178,15 +223,16 @@ func deriveSubscription(ctx context.Context, coords SubscriptionCoordinates) (st
 		// in place of the request-only coords.Extras.
 		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
 		if !ok {
-			return "", nil, false
+			// #101: the CR was not informer-GET-able (the storm coord).
+			return "", nil, false, SubscriptionSkipInformerMiss
 		}
 		key, handle, inputs := dispatchWidgetContentKey(ctx,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
 		if handle == nil || key == "" {
-			return "", nil, false
+			return "", nil, false, SubscriptionSkipOther
 		}
-		return key, inputs, true
+		return key, inputs, true, SubscriptionArmed
 
 	case classWidgets:
 		// Identity-bound widget. #64: same inline-extras union as widgetContent
@@ -195,15 +241,16 @@ func deriveSubscription(ctx context.Context, coords SubscriptionCoordinates) (st
 		// armed key never matches the published one for an inline-extras widget.
 		keyExtras, ok := subscriptionKeyExtras(ctx, coords)
 		if !ok {
-			return "", nil, false
+			// #101: the CR was not informer-GET-able (the storm coord).
+			return "", nil, false, SubscriptionSkipInformerMiss
 		}
 		key, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, keyExtras)
 		if handle == nil || key == "" {
-			return "", nil, false
+			return "", nil, false, SubscriptionSkipOther
 		}
-		return key, inputs, true
+		return key, inputs, true, SubscriptionArmed
 
 	case classRestActions,
 		cache.CacheEntryClassApistage,
@@ -215,18 +262,20 @@ func deriveSubscription(ctx context.Context, coords SubscriptionCoordinates) (st
 		// #64: these classes carry NO inline-extras blocks (they are not
 		// widgets — a RESTAction/apistage/raFullList cell's emit key folds only
 		// the request extras), so raw coords.Extras is request-only parity on
-		// BOTH sides. UNCHANGED.
+		// BOTH sides. UNCHANGED. These arms issue NO objects.Get (only
+		// dispatchCacheLookupKey → in-process rbac.EvaluateRBAC), so an empty
+		// key here is never an informer-miss — SubscriptionSkipOther.
 		key, handle, inputs := dispatchCacheLookupKey(ctx, coords.Class,
 			coords.Group, coords.Version, coords.Resource,
 			coords.Namespace, coords.Name, coords.PerPage, coords.Page, coords.Extras)
 		if handle == nil || key == "" {
-			return "", nil, false
+			return "", nil, false, SubscriptionSkipOther
 		}
-		return key, inputs, true
+		return key, inputs, true, SubscriptionArmed
 
 	default:
 		// Unknown class — fail closed.
-		return "", nil, false
+		return "", nil, false, SubscriptionSkipOther
 	}
 }
 

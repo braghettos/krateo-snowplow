@@ -178,7 +178,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 		perPage, page, extras)
-	if cacheHandle != nil {
+	// #95 SECURITY (A4 serve side) — sibling of FIX-C's populate-side skip,
+	// uniform with widgets.go: a re-derived BindingUID of "" collapses the key
+	// to the shared empty-identity row → treat as a CACHE MISS, fall through to
+	// a direct resolve under THIS request's identity; never serve the shared ""
+	// cell to a different ""-deriving identity. See serveFromCacheEligible.
+	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "restactions", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
@@ -360,7 +365,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 		)
-	} else if cacheHandle != nil && cacheKey != "" {
+	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
+		// #95 SECURITY (A4 populate side, customer path) — sibling of the
+		// widgets.go Put-gate + seed FIX-C: a re-derived BindingUID of "" must
+		// NOT POPULATE the shared empty-identity cell (the refresher + SSE
+		// subscription readers would otherwise deliver it — a "" BindingUID does
+		// NOT make cacheKey==""). The request still served its own content; it
+		// just never writes the shared cell. serveFromCacheEligible (helpers.go).
+		//
 		// Ship 0.30.188 — diagnostic slog: emit the per-user-fallback
 		// Put site's cache key + components symmetrically with widgets.go.
 		emitDispatchCacheKeyDiag(log, "per_user_fallback_put", req.Context(),

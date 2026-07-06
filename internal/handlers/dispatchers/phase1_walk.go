@@ -102,6 +102,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -359,25 +360,23 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	}
 
 	// Ship PIP (0.30.173): the per-identity prewarm seed harvester.
-	// Sibling of the content-prewarm harvester. When PIP is on the
-	// discovery walk harvests every resolved navigation widget CR + its
-	// (GVR, perPage, page) tuple into this set (Step 7.6a); the pipSeed
-	// callback below drains it together with the apiRef set to seed the
-	// top-level per-user resolved-output L1 for every enumerated RBAC
-	// cohort BEFORE phase1Done flips. Flag-off (PIP_ENABLED=false or
-	// PREWARM_CONTENT_ENABLED=false) the harvester stays nil — startup
-	// is byte-identical to 0.30.172.
+	// Sibling of the content-prewarm harvester. The discovery walk harvests
+	// every resolved navigation widget CR + its (GVR, perPage, page) tuple
+	// into this set (Step 7.6a); the ENGINE boot seed (rePrewarmBoot →
+	// seedScopeYielding) drains it together with the apiRef set to seed the
+	// top-level per-user resolved-output L1 for every per-binding target
+	// BEFORE phase1Done flips. Harvester stays nil when prewarm is off —
+	// startup byte-identical to the no-prewarm baseline.
 	//
-	// PIP rides the content-prewarm gate (it depends on the same
-	// apiRefHarvester for the restactions seed loop). A future ship may
-	// split the gates if the OOM profile justifies it.
+	// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md):
+	// all three gates below are now implicit-on-cache (each returns
+	// cache.PrewarmEnabled()), so this conjunction collapses to
+	// cache.PrewarmEnabled(). The legacy runPIPSeed errgroup drain that used
+	// to consume this harvester is DELETED; the engine boot seed is the ONLY
+	// consumer (navHarvester shared by reference with it).
 	var navHarvester *navWidgetHarvester
-	var pipSeed pipSeedFn
 	if cache.PrewarmEnabled() && PrewarmContentEnabled() && PrewarmPIPEnabled() {
 		navHarvester = newNavWidgetHarvester()
-		pipSeed = func(pctx context.Context) error {
-			return runPIPSeed(pctx, harvester, navHarvester, *saEP, rc, authnNS)
-		}
 	}
 
 	// Path 3.2.2.b (0.30.221) — the deferred apiRef pagination collector.
@@ -396,16 +395,28 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 	}
 
 	resolver := func(rctx context.Context, root navigationRoot) error {
+		// #42 FIX-F seam — advance the config-root index before descending this
+		// root so harvested widgets stamp the correct RootIndex (roots resolve
+		// sequentially). Nil-safe when navHarvester is nil (prewarm off).
+		navHarvester.BeginRoot()
 		return resolveNavigationRoot(rctx, root.Root, root.GVR, *saEP, rc, authnNS, harvester, navHarvester, pagCollector)
 	}
 
-	// Ship 1 — the unified dynamic cohort-prewarm engine. When ON (and the
-	// PIP harvesters exist — the engine shares them), the background seed
-	// goroutine routes through the engine: it runs the post-sync re-walk
-	// (the boot-race fix), builds the BindingsByGVR index over the
-	// navigated GVRs, and seeds per-target-GVR-scoped cohorts — instead of
-	// the legacy global runPIPSeed. engineSeed is the background callback
-	// phase1WarmupWith invokes at Step 7.6 in place of pipSeed when set.
+	// The unified dynamic cohort-prewarm engine. When prewarm is on (and the
+	// PIP harvesters exist — the engine shares them), the seed goroutine
+	// routes through the engine: it runs the post-sync re-walk (the boot-race
+	// fix), builds the BindingsByGVR index over the navigated GVRs, and seeds
+	// per-target-GVR-scoped cohorts. engineSeed is the callback
+	// phase1WarmupWith invokes at Step 7.6.
+	//
+	// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md):
+	// PrewarmEngineEnabled() is now implicit-on-cache (== cache.PrewarmEnabled()),
+	// and navHarvester != nil iff cache.PrewarmEnabled() && PrewarmContentEnabled()
+	// && PrewarmPIPEnabled() (all three now implicit-on-cache). So when
+	// navHarvester != nil the engine gate is necessarily true — the engine is
+	// the ONLY seed path. The legacy runPIPSeed errgroup fallback is DELETED
+	// (its only reachable state, engine-off-cache-on, is now unreachable).
+	// Back-out = CACHE_ENABLED=false.
 	var engineSeed pipSeedFn
 	if PrewarmEngineEnabled() && navHarvester != nil {
 		deps := rePrewarmDeps{
@@ -424,6 +435,17 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			bootDone := make(chan struct{})
 			var bootErr error
 			var closeOnce sync.Once
+
+			// #99 FIX-F: build the process first-nav latch BEFORE enqueuing the
+			// boot scope so seedScopeYielding (deep inside the engine worker)
+			// can reach the SAME latch this select awaits. The latch fires the
+			// instant the rank-1 RootIndex==0 first-nav segment seeds (or
+			// provably has none); this select waits on it instead of the whole
+			// boot scope, so /readyz flips WITH the dashboard warm (§F.1) rather
+			// than at the PHASE1_TIMEOUT backstop with cold cells. bootDone and
+			// the scopeDone callback are UNTOUCHED — the boot scope keeps
+			// seeding the tail in background after the flip.
+			firstNav := ensureFirstNavLatch()
 
 			// Fix v2 / 0.30.248: the engine worker MUST use a process-
 			// lifetime ctx, NOT pctx. pctx is the boot-seed orchestration
@@ -466,7 +488,23 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			// for the process lifetime. The engine genuinely "keeps
 			// running for any future Ship 2 enqueues" — under the new
 			// SetEngineProcessContext mechanism wired at main.go.
+			// #99 FIX-F: unblock readiness on the FIRST of:
+			//   - firstNav fired — the rank-1 first-nav segment is warm (or
+			//     provably empty). This is the happy path: return nil so the
+			//     deferred MarkPhase1Done flips Ready WITH the dashboard warm
+			//     while the boot scope seeds the tail in background.
+			//   - bootDone — the boot scope finished (or failed) BEFORE the
+			//     latch could fire. This happens when the seed aborts early
+			//     (roots_list_failed / re-walk error → seedScopeYielding never
+			//     runs → latch never fires); return bootErr so a genuine boot
+			//     failure still surfaces (and MarkPhase1Done fires the C2
+			//     Ready-degraded backstop via the caller's defer).
+			//   - pctx.Done() — the PHASE1_TIMEOUT parent / pipGlobalTimeout
+			//     child backstop (§F.0/C2). UNCHANGED: readiness is never
+			//     withheld forever; on backstop the pod goes Ready-degraded.
 			select {
+			case <-firstNav.wait():
+				return nil
 			case <-bootDone:
 				return bootErr
 			case <-pctx.Done():
@@ -475,14 +513,12 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		}
 	}
 
-	// Prefer the engine when enabled; else the legacy PIP seed — the
-	// engine's documented back-out lever (#341 ruling 2026-06-12):
-	// PREWARM_ENGINE_ENABLED=false flips production back to runPIPSeed/
-	// seedCohort in one helm --set. See seedCohort's header.
-	seedFn := pipSeed
-	if engineSeed != nil {
-		seedFn = engineSeed
-	}
+	// The engine is the single seed path (implicit-on-cache, fold 2026-07-03).
+	// engineSeed is nil only when the harvesters are absent (cache/prewarm
+	// off — no prewarm at all); phase1WarmupWith treats a nil seedFn as "flip
+	// Ready right after the sync barrier" (Step 8 else branch), the correct
+	// byte-identical no-seed behaviour for the cache-off case.
+	seedFn := engineSeed
 
 	// Path 3.2 / 0.30.218 — Step 7.5 cluster_list cell pre-warm. Runs
 	// BEFORE MarkPhase1Done (the cells must be warm by the time
@@ -622,16 +658,36 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// widget CRs). No hardcoded GVR LIST.
 	roots, listErr := lister(ctx)
 	if listErr != nil {
+		// BOOT-RACE-TOLERANT (shape A, docs/prewarm-boot-race-tolerant-2026-07-03.md
+		// §2.2): SOFTENED — this branch no longer GIVES UP on warming. When
+		// the config-vars ConfigMap is absent at boot (snowplow booted before
+		// the frontend), the eager read finds nothing; we LOG + PROCEED, and
+		// the config-vars ConfigMap informer (StartConfigVarsWatch) is the
+		// authority that DRIVES a scopeKindBoot re-walk the instant the
+		// ConfigMap lands — before OR after the readiness backstop, with zero
+		// pod restart (§2.6 any-boot-order tolerance).
+		//
+		// HARD-2 — READINESS FLIP POINT PRESERVED. The prior branch had its
+		// OWN early WaitAllInformersSynced + MarkPhase1Done + return, a
+		// SEPARATE flip point that bypassed the Step 7.6 defer. Removing that
+		// early flip does NOT advance the flip; it makes the roots-absent path
+		// fall through to the SAME Step 7.6 defer-MarkPhase1Done (or the PIP-off
+		// else) that every other path uses. Steps 4-7 run over the (empty)
+		// roots set + the meta-query seeds exactly as before — the sync barrier
+		// (Step 7) and the flip (Step 7.6/8) are unchanged and byte-identical
+		// for the deps-present-at-boot path (this branch is not even entered
+		// then). project_readyz_gates_on_prewarm_complete is intact.
 		log.Warn("phase1.warmup.roots_list_failed",
 			slog.String("subsystem", "cache"),
 			slog.Any("err", listErr),
-			slog.String("effect", "no roots to walk; lazy register-on-navigation still covers GVRs on first request"),
+			slog.String("effect", "no roots to walk YET; the config-vars ConfigMap informer will drive a "+
+				"scopeKindBoot re-walk when the ConfigMap appears (self-heal, no restart); "+
+				"lazy register-on-navigation still covers GVRs on first request meanwhile"),
 		)
-		// No roots — still run the sync barrier over whatever the
-		// meta-query seeds + CRD-watch registered, then signal done.
-		_ = rw.WaitAllInformersSynced(ctx)
-		cache.MarkPhase1Done()
-		return listErr
+		// roots stays nil → Steps 4-6 are no-ops over an empty set; Step 7
+		// syncs the meta-query seeds; Step 7.6 flips readiness at the normal
+		// (unchanged) point. Do NOT early-return / early-flip here.
+		roots = nil
 	}
 
 	log.Info("phase1.warmup.roots_discovered",
@@ -1036,13 +1092,65 @@ func installSeedLoopbackToken(ctx context.Context) context.Context {
 	if fn == nil {
 		return ctx // authn not configured — token-less seed (pre-#57 behaviour)
 	}
-	tok, err := fn(ctx)
-	if err != nil || tok == "" {
+
+	// BOOT-RACE-TOLERANT (shape A §2.3): bounded exponential backoff on the
+	// seed→authn token exchange. On a fresh install snowplow can boot before
+	// authn is serving on :8082 (the rt8rv 06:08:53 race — one connection-
+	// refused, no retry, token-less for the pod lifetime). The backoff retries
+	// the exchange until authn answers.
+	//
+	// STRICTLY CTX-BOUNDED, NO NEW ENV. wait.ExponentialBackoffWithContext
+	// stops the instant ctx is Done — ctx here is the seed/p1 ctx, itself a
+	// child of PHASE1_TIMEOUT_SECONDS (p1Ctx) / pipGlobalTimeout (seedCtx). The
+	// Steps are a SHAPE parameter (large enough that ctx, not Steps, is the
+	// true bound — Steps caps only the pathological ctx-never-cancels case),
+	// NOT a policy timeout (regression watch §4 / the 0.30.220 boot-stall
+	// lesson: a backoff that ignored ctx would re-introduce a boot-blocking
+	// stall).
+	//
+	// DEGRADE-NOT-FAIL. On budget/step exhaustion (or ctx cancel) it keeps the
+	// existing posture: WARN + bump seedLoopbackTokenErrTotal + return ctx
+	// unchanged (token-less) — never fatal. Behavioral neutrality when authn is
+	// already up: the first condition call succeeds → the loop exits after one
+	// iteration (byte-identical to the fire-once path, plus the same token
+	// install).
+	backoff := wait.Backoff{
+		Duration: 250 * time.Millisecond,
+		Factor:   2.0,
+		Jitter:   0.1,
+		// Steps caps the exponential growth; ctx is the real bound. 30 steps
+		// with Factor 2 (capped) fills any realistic phase budget — the loop
+		// exits on the first success or on ctx.Done long before Steps runs out
+		// in any non-pathological case.
+		Steps: 30,
+		// Cap the per-attempt sleep so late steps do not overshoot a
+		// still-arriving authn by minutes.
+		Cap: 30 * time.Second,
+	}
+
+	var tok string
+	waitErr := wait.ExponentialBackoffWithContext(ctx, backoff, func(cctx context.Context) (bool, error) {
+		t, err := fn(cctx)
+		if err == nil && t != "" {
+			tok = t
+			return true, nil // acquired — install it
+		}
+		// Transient (connection refused / authn not up yet / empty token):
+		// keep retrying. NEVER return the error (that would abort the backoff
+		// and drop us into the degrade path prematurely) — let ctx bound it.
+		return false, nil
+	})
+
+	if waitErr != nil || tok == "" {
+		// ctx cancelled, budget/steps exhausted, or (defensively) empty token:
+		// degrade to token-less, exactly as the pre-shape-A fire-once path did.
 		seedLoopbackTokenErrTotal.Add(1)
 		slog.Warn("prewarm.seed_loopback_token_unavailable",
 			slog.String("subsystem", "cache"),
-			slog.Any("err", err),
-			slog.String("effect", "prewarm loopback ran token-less; a nested loopback /call RA is not warmed this boot (degraded, not fatal)"),
+			slog.Any("err", waitErr),
+			slog.String("effect", "prewarm loopback ran token-less after bounded retry; a nested loopback "+
+				"/call RA is not warmed this pass (degraded, not fatal — a config-vars re-drive re-attempts "+
+				"the token when authn is up)"),
 		)
 		return ctx
 	}

@@ -60,47 +60,42 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// envPrewarmEngineEnabled is the Ship 1 opt-in for the unified dynamic
-// cohort-prewarm engine. When ON, the background seed goroutine routes
-// through the engine (post-sync re-walk + per-target-GVR-scoped seed +
-// the BindingsByGVR index) instead of the legacy global runPIPSeed.
-// Default false: flag-off the engine is inert and the legacy PIP seed
-// path runs byte-identically. The engine additionally requires
-// prewarm-on (#57: implicit-on-cache) + PREWARM_CONTENT_ENABLED +
-// PREWARM_PIP_ENABLED (it shares the same harvesters); when any is off
-// it stays inert.
-const envPrewarmEngineEnabled = "PREWARM_ENGINE_ENABLED"
-
-// PrewarmEngineEnabled reports whether the Ship 1 unified engine is opted
-// in. Defaults false (opt-in), mirroring the PIP gate's introduction
-// posture so a regression can be ruled out by flipping one knob.
+// PrewarmEngineEnabled reports whether the unified dynamic cohort-prewarm
+// engine runs. FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-
+// 2026-07-03.md): the standalone PREWARM_ENGINE_ENABLED env read is RETIRED
+// (registered in cache.retiredFlags). The engine is now IMPLICIT-ON-CACHE — it
+// runs exactly when prewarm runs, mirroring #57's PREWARM_ENABLED /
+// RESOLVER_USE_INFORMER fold.
+//
+// Gate on cache.PrewarmEnabled() (== !cache.Disabled(), phase1.go:74-76), NOT a
+// raw CACHE_ENABLED read: behaviorally identical today, but it keeps the engine
+// bound to the PREWARM master gate so a future prewarm/cache split follows
+// automatically. Reads as intent: "engine on iff prewarm on."
+//
+// The legacy runPIPSeed errgroup back-out (engine-off-cache-on) is DELETED and
+// unreachable; the back-out lever is now CACHE_ENABLED=false.
 func PrewarmEngineEnabled() bool {
-	return env.String(envPrewarmEngineEnabled, "false") == "true"
+	return cache.PrewarmEnabled() // implicit-on-cache (#57); was env "PREWARM_ENGINE_ENABLED"=="true"
 }
 
-// envProactiveRASeedEnabled is the opt-in for the proactive
-// composition-page RESTAction seed source (Option A). When ON, the engine
-// boot seed UNIONS the RBAC-reachable RESTAction refs
-// (cache.RBACReachableRestActionRefs) into the nav-walk harvester snapshot
-// so the per-composition click-through detail RESTActions (never reached
-// by the nav walk) get warmed at boot. Default false: flag-off the seed
-// source is byte-identical to the harvester-only snapshot (F-6 — the
-// served content is unchanged; this flag only widens WHICH refs the seed
-// loop iterates, never the per-request authz boundary).
+// ProactiveRASeedEnabled reports whether the proactive composition-page
+// RESTAction seed source (Option A) is on. When on, the engine boot seed UNIONS
+// the RBAC-reachable RESTAction refs (cache.RBACReachableRestActionRefs) into
+// the nav-walk harvester snapshot so per-composition click-through detail
+// RESTActions (never reached by the nav walk) get warmed at boot. This widens
+// only WHICH refs the seed loop iterates, never the per-request authz boundary.
 //
-// It rides the engine gate: it is a no-op unless PrewarmEnabled()
-// (implicit-on-cache, #57) AND the engine boot seed runs
-// (PrewarmEngineEnabled()). The legacy runPIPSeed path does NOT consult it.
-const envProactiveRASeedEnabled = "PROACTIVE_RA_SEED_ENABLED"
-
-// ProactiveRASeedEnabled reports whether the proactive RESTAction seed
-// source is opted in. Defaults false (opt-in).
+// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md §2):
+// the standalone PROACTIVE_RA_SEED_ENABLED env read is RETIRED (registered in
+// cache.retiredFlags). It is now IMPLICIT-ON-CACHE — the proactive union runs
+// whenever prewarm runs. Safe to fold ON given the adaptive seed bound (§3)
+// now bounds the (widened) seed's dominant allocation.
 func ProactiveRASeedEnabled() bool {
-	return env.String(envProactiveRASeedEnabled, "false") == "true"
+	return cache.PrewarmEnabled() // implicit-on-cache (#57); was env "PROACTIVE_RA_SEED_ENABLED"=="true"
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -170,6 +165,16 @@ const (
 	// OnAdd→onChange→dirty-mark→refresher path. Closes the canonical
 	// S4 admin-path defect.
 	scopeKindGVRDiscovered prewarmScopeKind = "gvr-discovered"
+
+	// scopeKindKeepwarm — #102 c1 the TTL-cadenced quiet-page keep-warm sweep.
+	// Fired by keepwarmTicker at TTL×3/4 (a design ratio derived from
+	// RESOLVED_CACHE_TTL_SECONDS, no new env). Runs the SAME re-walk + seed core
+	// as boot (rePrewarmKeepwarm → rePrewarmBootScoped) but the per-identity
+	// seed is bounded to rank-1 (the 95%-mix cohort, ALL pages) so rank-1's
+	// cells are re-Put — resetting CreatedAt — before they lazy-expire at TTL.
+	// Coalesces on key()=="keepwarm": a tick arriving while a sweep still runs
+	// dedups to at most one pending sweep. Per-scope timeout = the boot budget.
+	scopeKindKeepwarm prewarmScopeKind = "keepwarm"
 
 	// Ship 2 (NOT wired this ship): scopeKindWidgetCR (a widget/RESTAction
 	// CR add/update/delete re-walks that object's subtree) and

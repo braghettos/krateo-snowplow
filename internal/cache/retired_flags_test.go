@@ -142,6 +142,43 @@ func TestAuditRetiredFlags_ApistageFalseLogsWarn(t *testing.T) {
 	}
 }
 
+// TestAuditRetiredFlags_PrewarmFamilyFalseLogsWarn — the 2026-07-03 family
+// fold: each of the four prewarm gates set to "false" is a silent
+// behavior-change (operator asked a prewarm stage OFF, now gets it ON under
+// CACHE_ENABLED) and MUST audit at Warn. This is the installer-test footgun the
+// fold closes.
+func TestAuditRetiredFlags_PrewarmFamilyFalseLogsWarn(t *testing.T) {
+	for _, flag := range []string{
+		"PREWARM_CONTENT_ENABLED",
+		"PREWARM_PIP_ENABLED",
+		"PREWARM_ENGINE_ENABLED",
+		"PROACTIVE_RA_SEED_ENABLED",
+	} {
+		t.Run(flag, func(t *testing.T) {
+			cache.ResetRetiredFlagAuditForTest()
+			t.Cleanup(cache.ResetRetiredFlagAuditForTest)
+			t.Setenv(flag, "false")
+
+			log, recs := newCaptureLogger()
+			cache.AuditRetiredFlags(log)
+
+			got := findAuditRecords(*recs, flag)
+			if len(got) != 1 {
+				t.Fatalf("%s=false: want exactly 1 audit line; got %d (%+v)", flag, len(got), *recs)
+			}
+			if got[0].level != slog.LevelWarn {
+				t.Fatalf("%s=false: want slog.Warn (silent behavior change); got %v", flag, got[0].level)
+			}
+			if got[0].attrs["status"] != "ignored" {
+				t.Fatalf("%s=false: audit line must report status=ignored; attrs=%v", flag, got[0].attrs)
+			}
+			if got[0].attrs["remediation"] == "" {
+				t.Fatalf("%s=false: WARN audit line must carry a remediation hint; attrs=%v", flag, got[0].attrs)
+			}
+		})
+	}
+}
+
 // TestAuditRetiredFlags_TrueLogsInfo — C2: a retired flag set to "true"
 // (or anything other than "false") is a harmless no-op and logs at
 // slog.Info, NOT Warn.

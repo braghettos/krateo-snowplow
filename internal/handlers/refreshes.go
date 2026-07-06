@@ -139,6 +139,19 @@ func Refreshes(signingKey string) http.HandlerFunc {
 		wri.Header().Set("Connection", "keep-alive")
 		wri.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering
 		wri.WriteHeader(http.StatusOK)
+		// Track 2 (gzip) C-1: emit a `: connected` SSE comment BEFORE the
+		// first flush so response headers commit at connect. Under the gzhttp
+		// wrapper (middleware.Gzip) WriteHeader only saves the status and a
+		// Flush with ZERO buffered body bytes returns without touching the
+		// underlying writer (the ExceptContentTypes exclusion engages at the
+		// FIRST body write). Without a body byte, an armed-but-quiet stream
+		// would withhold headers up to the 20s heartbeat, stranding EventSource
+		// in CONNECTING and tripping intermediary time-to-first-header
+		// timeouts. A `:`-prefixed comment line is a non-empty write (→ the
+		// content-type filter runs → startPlain → headers commit) yet is
+		// invisible to EventSource clients per the spec — byte-neutral to the
+		// consumer, unconditional so the fix holds with or without the wrapper.
+		fmt.Fprint(wri, ": connected\n\n")
 		_ = rc.Flush()
 
 		// (5) Subscribe + stream until the client disconnects.
@@ -210,6 +223,15 @@ func serveIdleSSE(wri http.ResponseWriter, req *http.Request) {
 	wri.Header().Set("Connection", "keep-alive")
 	wri.Header().Set("X-Accel-Buffering", "no")
 	wri.WriteHeader(http.StatusOK)
+	// Track 2 (gzip) C-1: emit a `: connected` SSE comment BEFORE the first
+	// flush so headers commit at connect under the gzhttp wrapper. This idle
+	// path is the more critical of the two sites — serveIdleSSE serves the
+	// disabled/cache-off fallback AND the #68 warmup window, both of which
+	// idle indefinitely with no event, so without the preamble headers would
+	// never commit until the first 20s heartbeat. See the armed-path comment
+	// in Refreshes for the full mechanism (gzhttp WriteHeader saves status,
+	// zero-byte Flush is a no-op; a comment byte forces startPlain).
+	fmt.Fprint(wri, ": connected\n\n")
 	_ = rc.Flush()
 
 	heartbeat := time.NewTicker(refreshHeartbeatInterval)
@@ -263,9 +285,17 @@ func validateSubscription(req *http.Request) (map[string]struct{}, error) {
 		return nil, fmt.Errorf("too many subscription entries (%d; max %d)", len(reqs), refreshSubMaxEntries)
 	}
 
+	// #101: the /refreshes arming reads MUST be informer-only. The route is
+	// authed by middleware.RefreshAuth (UserInfo but DELIBERATELY no UserConfig),
+	// so subscriptionKeyExtras's per-coord objects.Get cannot reach the apiserver
+	// fall-through without dying at the endpoint read (378-error storm). The
+	// marker makes an informer GET-miss a quiet NotFound-shaped skip instead.
+	armCtx := cache.WithInformerOnlyReads(req.Context())
+
 	armed := make(map[string]struct{}, len(reqs))
+	var skippedInformerMiss, skippedOther int
 	for _, s := range reqs {
-		key, ok := dispatchers.DeriveSubscriptionKey(req.Context(), dispatchers.SubscriptionCoordinates{
+		key, ok, reason := dispatchers.DeriveSubscriptionKeyWithReason(armCtx, dispatchers.SubscriptionCoordinates{
 			Class:     s.Class,
 			Group:     s.Group,
 			Version:   s.Version,
@@ -277,9 +307,30 @@ func validateSubscription(req *http.Request) (map[string]struct{}, error) {
 			Extras:    s.Extras,
 		})
 		if !ok {
-			continue // fail-closed: skip keys this identity can't produce
+			// fail-closed: skip keys this identity can't produce.
+			switch reason {
+			case dispatchers.SubscriptionSkipInformerMiss:
+				skippedInformerMiss++
+			default:
+				skippedOther++
+			}
+			continue
 		}
 		armed[key] = struct{}{}
 	}
+
+	// #101 ARM condition: per-subscription INFO summary REPLACING the per-coord
+	// ERROR storm. ONE line per /refreshes connection with the armed count and
+	// the skip breakdown — so a "did admin's dashboard arm?" question is
+	// answerable from a single grep, and the informer-miss coords (the transient
+	// post-storm state) are visible as a count, not 378 ERROR lines. INFO, not
+	// ERROR: an informer-miss skip is expected/self-healing, not a fault.
+	xcontext.Logger(req.Context()).Info("refreshes.subscription.summary",
+		slog.String("subsystem", "cache"),
+		slog.Int("requested", len(reqs)),
+		slog.Int("armed", len(armed)),
+		slog.Int("skipped_informer_miss", skippedInformerMiss),
+		slog.Int("skipped_other", skippedOther),
+	)
 	return armed, nil
 }

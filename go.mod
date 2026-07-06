@@ -8,6 +8,7 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/google/go-cmp v0.7.0
 	github.com/itchyny/gojq v0.12.17
+	github.com/klauspost/compress v1.18.0
 	github.com/krateoplatformops/plumbing v0.9.3
 	github.com/stretchr/testify v1.11.1
 	github.com/swaggo/http-swagger v1.3.4

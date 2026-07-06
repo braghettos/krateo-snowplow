@@ -30,12 +30,11 @@
 //       Bumped at every seedOneWidget error.
 //   - snowplow_phase1_restaction_seed_failure_total
 //       Symmetric counter for restaction failures (same defect class).
-//   - snowplow_phase1_cohort_seed_status
-//       expvar.Func returning map["cohort"] -> "success"|"partial"|"failed"
-//       Set per cohort goroutine: "success" iff every restaction+widget
-//       Put completed; "partial" iff any per-(restaction/widget) error
-//       was recorded; "failed" iff the cohort timed out or errored
-//       fatally before reaching any target.
+//
+// (snowplow_phase1_cohort_seed_status was DELETED in the 2026-07-04
+// counters-hygiene pass — its backing map had zero writers post the
+// 2026-07-03 prewarm-family fold and published {} forever; see the deletion
+// note at the var block below.)
 
 package dispatchers
 
@@ -49,12 +48,21 @@ import (
 
 // Grand totals across all cohorts.
 var (
-	// Ship A.3 / 0.30.179 — binding-set enumeration counters. The first
-	// two are the seed-loop's grand totals (restactions + widgets across
-	// every enumerated class); the third is the failure counter per
-	// AC-178 §"Three expvar counters". The bindingset-class count itself
-	// + the powerset-skipped counter are exposed via accessors on
-	// internal/cache (single source of truth).
+	// Ship A.3 / 0.30.179 — binding-set enumeration counters.
+	//
+	// INCREMENTED-BY (audited 2026-07-04, counters-hygiene pass — the next
+	// 50K debugger reads these cold):
+	//   - pipBindingSetSeedResolvesTotal: incremented once per successful seed
+	//     UNIT Put — the handle.Put success path in seedOneRestaction +
+	//     seedOneWidget (phase1_pip_seed.go). Means "seed units resolved +
+	//     written to per-user L1". (Its only historical incrementer, runPIPSeed,
+	//     was DELETED in the 2026-07-03 prewarm-family fold, leaving it
+	//     dead-at-0 — which made a 287-real-seed boot read as "seed didn't run";
+	//     re-wired in the 2026-07-04 counters-hygiene pass.)
+	//   - pipBindingSetSeedFailuresTotal: the back-compat grand total (=
+	//     rbac_deny + operational). Incremented ONLY from classifyEngineSeedErr
+	//     (prewarm_engine_boot.go:450) — the engine seed loop's per-target
+	//     failure path. (runPIPSeed, the other historical feeder, is deleted.)
 	pipBindingSetSeedResolvesTotal atomic.Uint64
 	pipBindingSetSeedFailuresTotal atomic.Uint64
 
@@ -73,10 +81,23 @@ var (
 	//     hole the operator can act on; these ARE re-enqueued (legacy:
 	//     bounded retry; engine: coalesced boot re-walk).
 	//
-	// Both call sites (runPIPSeed + seedScopeYielding) feed these via
-	// classifySeedErr — see phase1_seed_classify.go.
+	// INCREMENTED-BY: classifyEngineSeedErr (prewarm_engine_boot.go:452/463)
+	// via classifySeedErr (phase1_seed_classify.go) — the engine seed loop's
+	// per-target failure classifier. (The historical runPIPSeed feeder was
+	// deleted in the 2026-07-03 prewarm-family fold; the engine seed loop is
+	// now the sole feeder.)
 	pipSeedRBACDenyTotal        atomic.Uint64
 	pipSeedOperationalFailTotal atomic.Uint64
+
+	// #102 GTTL-1 — pipSeedSkippedStageErrorTotal counts seed Puts the
+	// error-aware Put-gate (declineSeedPutOnError, phase1_pip_seed.go) declined
+	// because the seed re-resolve observed a swallowed stage error OR touched an
+	// external endpoint — the SAME backstop the refresher applies
+	// (resolve_populate.go). SEED-SCOPED and distinct from the refresher's
+	// refresherSkippedStageError so a keepwarm-sweep / boot-seed decline is
+	// attributable in /debug/vars (the falsifier keys on this DELTA, not the
+	// refresher's counter). Exposed as snowplow_phase1_seed_skipped_stage_error_total.
+	pipSeedSkippedStageErrorTotal atomic.Uint64
 )
 
 // Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
@@ -84,23 +105,23 @@ var (
 // value is *atomic.Uint64. The composite key keeps the per-cohort and
 // per-target dimensions independent: an operator inspecting
 // /debug/vars sees the exact widget that broke the exact cohort.
-//
-// Per-cohort seed status. Keyed by cohort label; value is a *atomic.Pointer[string]
-// holding "success", "partial", or "failed". A pointer to an interned
-// string keeps the load/store atomic.
 var (
 	pipWidgetSeedFailureByKey     sync.Map
 	pipRestactionSeedFailureByKey sync.Map
-	pipCohortSeedStatus           sync.Map
 )
 
-// cohort seed status constants. Kept as package-level strings so the
-// expvar Func returns stable values (no per-call allocation).
-const (
-	cohortStatusSuccess = "success"
-	cohortStatusPartial = "partial"
-	cohortStatusFailed  = "failed"
-)
+// counters-hygiene 2026-07-04: DELETED the orphaned pipCohortSeedStatus map +
+// its recordCohortSeedStatus writer + cohortStatus{Success,Partial,Failed}
+// constants + the snowplow_phase1_cohort_seed_status expvar publish. The map
+// had ZERO writers (its only caller was the runPIPSeed errgroup task, deleted
+// in the 2026-07-03 prewarm-family fold) → the expvar published {} forever =
+// the same always-empty red-herring observability this pass is killing
+// (it read `phase1_cohort_seed_status:{}` and looked like "no cohort seed
+// ran"). A sensible per-cohort success/partial/failed status would need the
+// engine seed LOOP (prewarm_engine_boot.go) to aggregate per-cohort outcome —
+// that file is FROZEN for arch Track 1, and wiring it there is out of this
+// pass's scope — so DELETE (not wire) is the honest choice. observability.md +
+// the two design-doc references updated in the same change.
 
 // incFailureCounter bumps the per-(cohort, target) failure counter. Lazy
 // allocation on first observation via the LoadOrStore + Add pattern (same
@@ -117,19 +138,6 @@ func incFailureCounter(m *sync.Map, compositeKey string) {
 		return
 	}
 	fresh.Add(1)
-}
-
-// recordCohortSeedStatus writes the per-cohort seed status. Idempotent:
-// "partial" overrides "success" only; "failed" overrides any prior
-// status. The recorder is called from a single goroutine per cohort
-// (the runPIPSeed errgroup task) so no cross-goroutine race exists, but
-// the sync.Map keeps the published view consistent for the expvar
-// reader.
-func recordCohortSeedStatus(cohortLabel, status string) {
-	// Last-write-wins is acceptable here: per cohort there's exactly one
-	// writer (the errgroup goroutine). The architect's intent is that
-	// the FINAL status set by that goroutine is the published status.
-	pipCohortSeedStatus.Store(cohortLabel, status)
 }
 
 // pipMetricsOnce guards the expvar.Publish calls — same pattern as
@@ -163,8 +171,11 @@ func registerPIPMetrics() {
 		// (confirmed live: 0/0/{}/{} while prewarm_engine_processed_total>0).
 		// Always-zero expvars are misleading observability. The LIVE seed
 		// signals — the failure-classification family (rbac_deny /
-		// operational_fail / per-(cohort,target) maps / cohort_seed_status)
-		// published below — are populated on BOTH paths and stay.
+		// operational_fail / per-(cohort,target) maps) + the now-wired
+		// bindingset_seed_resolves total (counters-hygiene 2026-07-04) —
+		// published below are populated by the engine seed path and stay.
+		// (cohort_seed_status was ALSO deleted in that pass — same always-{}
+		// class; its writer was runPIPSeed. See the var-block note.)
 
 		// Ship 0.30.242 H.c-layered Phase 2b — binding-set classes /
 		// powerset-skipped counters DELETED. The underlying functions
@@ -196,6 +207,13 @@ func registerPIPMetrics() {
 			return pipSeedOperationalFailTotal.Load()
 		}))
 
+		// #102 GTTL-1 — seed Puts declined by the error-aware Put-gate (stage
+		// error / external touch). SEED-SCOPED; distinct from the refresher's
+		// refresherSkippedStageError so a keepwarm-sweep decline is attributable.
+		expvar.Publish("snowplow_phase1_seed_skipped_stage_error_total", expvar.Func(func() any {
+			return pipSeedSkippedStageErrorTotal.Load()
+		}))
+
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so
 		// operators see WHICH widget/restaction broke WHICH cohort.
 		// Composite key shape: "cohort|name|gvr" (widgets) /
@@ -216,14 +234,8 @@ func registerPIPMetrics() {
 			})
 			return out
 		}))
-		// Per-cohort seed status: "success" | "partial" | "failed".
-		expvar.Publish("snowplow_phase1_cohort_seed_status", expvar.Func(func() any {
-			out := map[string]string{}
-			pipCohortSeedStatus.Range(func(k, v any) bool {
-				out[k.(string)] = v.(string)
-				return true
-			})
-			return out
-		}))
+		// counters-hygiene 2026-07-04: snowplow_phase1_cohort_seed_status
+		// DELETED — its backing map had zero writers post prewarm-family fold
+		// (published {} forever). See the deletion note at the var block above.
 	})
 }

@@ -456,6 +456,34 @@ func main() {
 					// engineProcessCtx). Mirrors cache.StartRefresher's
 					// cacheCtx-as-process-lifetime pattern (line 320).
 					dispatchers.SetEngineProcessContext(cacheCtx)
+					// BOOT-RACE-TOLERANT prewarm (shape A,
+					// docs/prewarm-boot-race-tolerant-2026-07-03.md §2.2).
+					// Register the single-object config-vars ConfigMap
+					// informer on the PROCESS-LIFETIME cacheCtx (NOT p1Ctx),
+					// coherent with SetEngineProcessContext just above: its
+					// AddFunc/UpdateFunc enqueue a scopeKindBoot re-drive on
+					// the SAME engine singleton the boot seed starts, so a
+					// frontend that creates the *-config-vars ConfigMap AFTER
+					// snowplow booted (fresh install, inverted order) drives
+					// the prewarm walk the instant the ConfigMap lands —
+					// before OR after the readiness backstop, zero restart.
+					// enqueueScope is safe before the worker starts (it
+					// populates the bounded dedup queue; the worker drains it
+					// on StartPrewarmEngine inside Phase1Warmup's engineSeed).
+					// Gated on the engine posture (#341: PREWARM_ENGINE_ENABLED
+					// =true is the production posture) — the enqueue is
+					// meaningless without the engine that processes boot scopes.
+					if cache.PrewarmEnabled() && dispatchers.PrewarmEngineEnabled() {
+						dispatchers.StartConfigVarsWatch(cacheCtx, rc, *authnNS)
+						// #102 c1 — the TTL-cadenced quiet-page keep-warm sweep.
+						// Anchored to the PROCESS-LIFETIME cacheCtx (same as the
+						// config-vars watch + engine worker) so the ticker fires
+						// for the pod lifetime. It enqueues a scopeKindKeepwarm on
+						// the SAME engine singleton at TTL×3/4, re-seeding rank-1's
+						// cells before they lazy-expire. Gated identically (the
+						// sweep is meaningless without the engine that processes it).
+						dispatchers.StartKeepwarmSweep(cacheCtx)
+					}
 					// Ship #98 / 0.30.215 — wire the customer-priority
 					// yield hook BEFORE StartRefresher so the worker pool
 					// sees a populated hook on its first processNext.
@@ -1030,6 +1058,16 @@ func main() {
 	}...)
 	defer stop()
 
+	// Track 2 (transport gzip) — wrap the mux with Accept-Encoding-gated gzip
+	// compression BEFORE otelhttp so gzip is the INNERMOST wrapper (closest to
+	// the mux): it compresses the handler's actual response bytes, and the
+	// otelhttp span still measures the full request incl. the compressed
+	// write. text/event-stream (GET /refreshes) is excluded so the SSE stream
+	// keeps its per-event incremental flush (middleware.Gzip / T2-2). Non-gzip
+	// clients + curl diagnostics are byte-identical (gzhttp only compresses on
+	// Accept-Encoding: gzip). See middleware/compression.go.
+	var muxHandler http.Handler = middleware.Gzip(mux)
+
 	// OTel HTTP server instrumentation (default-OFF gated). otelhttp wraps
 	// the mux to create a server span per request and EXTRACT inbound W3C
 	// traceparent/baggage (the global propagator installed by
@@ -1041,7 +1079,7 @@ func main() {
 	// the OPTIONS preflight before otelhttp ever runs (otelhttp would
 	// otherwise span the preflight; CORS must own it). WithFilter skips
 	// span creation for the high-frequency health/readiness/debug probes.
-	var rootHandler http.Handler = otelhttp.NewHandler(mux, serviceName,
+	var rootHandler http.Handler = otelhttp.NewHandler(muxHandler, serviceName,
 		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
 			return r.Method + " " + r.URL.Path
 		}),

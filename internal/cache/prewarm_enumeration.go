@@ -4,20 +4,34 @@
 // EnumerateBindingSetClasses + bindings_by_gvr.go's
 // EnumerateResourceCohorts.
 //
-// PURPOSE (design §7.1 + §7.2)
+// PURPOSE (design §7.1 + §7.2; #42 dedup design 2026-07-04)
 //
-// The prewarm engine seeds one L1 cell per layer per per-layer first-
-// match binding. Under H.c-layered the cell key folds BindingUID (the
-// matched binding's stable identity), so the prewarm enumeration
-// returns PER-BINDING TARGETS rather than per-cohort tuples.
+// The prewarm engine seeds one L1 cell per layer per distinct
+// REPRESENTATIVE IDENTITY. For each navigated GVR × verb, look up the
+// bindings in BindingsByGVR (the existing reverse index —
+// bindings_by_gvr.go), project each binding's Subjects to a
+// representative SubjectIdentity, and emit ONE PrewarmTarget per DISTINCT
+// (Username, sorted-Groups) tuple.
 //
-// For each navigated GVR × verb, look up the bindings in BindingsByGVR
-// (the existing reverse index — bindings_by_gvr.go). For each binding,
-// emit ONE PrewarmTarget. The representative SubjectIdentity for each
-// target is drawn from the binding's Subjects (the prewarm dispatch
-// runs under THIS identity; the cell it populates is shared with every
-// real-user request whose first-match for the same (verb, gvr, ns) is
-// the same binding).
+// WHY per-identity, not per-binding (#42): the enumerated BindingUID is
+// carried on PrewarmTarget for diagnostics but is NEVER consumed by the
+// seed dispatch — the cell key's BindingUID is RE-DERIVED at populate
+// time from a FIRST-MATCH EvaluateRBAC over the representative identity
+// (Path B: dispatchCacheLookupKey → EvaluateRBAC → matchedBindingUID →
+// ComputeKey; Username/Groups themselves are never hashed). So two
+// bindings with the same representative tuple produce BYTE-IDENTICAL seed
+// dispatches populating the SAME cell. On a per-composition-RoleBinding
+// topology one widget GVR carries hundreds of bindings that all project
+// to Group/devs → one identity → 456 redundant full resolves for ONE
+// cell (live: 81 obs-by-kind-list resolves × p50 4.45s = 396s → ONE hash,
+// aborting the widgets loop before dashboard-flex). Deduping by
+// representative identity is LOSSLESS (the seeded CELL SET is proven
+// unchanged, design §1 correctness proof) and leak-free (distinct tuples
+// still dispatch separately; L1 stays per-first-match-binding keyed —
+// feedback_l1_per_user_keyed_never_cohort intact; this is DISPATCH dedup,
+// not key cohorting). It is dedup of provably-identical work, NOT sampling
+// (feedback_dynamic_cohort_prewarm_no_static_no_cold_fill — no caps, no
+// static lists).
 //
 // COMPARISON TO V3
 //
@@ -37,31 +51,54 @@
 package cache
 
 import (
+	"log/slog"
+	"sort"
+	"strings"
+
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // PrewarmTarget is one prewarm dispatch's input. Each target represents
-// a per-(binding, layer) cell that the prewarm engine should populate.
+// ONE DISTINCT REPRESENTATIVE IDENTITY (post-#42-dedup) that the prewarm
+// engine should dispatch a seed resolve as.
 //
 // FIELDS:
-//   - BindingUID: the cell-key identity dimension (matched binding's
-//     UID, as produced by cache.BindingUIDFromCRB / FromRB).
-//   - Subject: the SubjectIdentity to dispatch the prewarm call as.
-//     Derived from the binding's Subjects via pickRepresentativeFromSubjects.
+//   - BindingUID: DIAGNOSTIC ONLY. The lexicographically-smallest binding
+//     UID among the bindings that projected to this target's identity —
+//     retained for log/telemetry (cohortLogLabel) and a stable tie-break.
+//     It is NOT the cell-key identity dimension: the cell key's BindingUID
+//     is RE-DERIVED at populate time from a first-match EvaluateRBAC over
+//     Subject (Path B — dispatchCacheLookupKey; the enumerated BindingUID
+//     never reaches ComputeKey). See the package header.
+//   - Subject: the SubjectIdentity to dispatch the prewarm call as
+//     (the dedup key domain: Username + sorted Groups). Derived from a
+//     binding's Subjects via pickRepresentativeFromSubjects.
 //   - GVR: the layer's resource (the cell-key gvr dimension).
 //   - Verb: the layer's authz verb (typically "get" for widgets /
 //     restactions; "list" for apistage; depends on layer).
 //
-// CONTRACT: two real-user requests whose first-match for (verb, gvr,
-// ns, name) is the SAME binding observe the SAME BindingUID and thus
-// SHARE the prewarm-populated cell. This is the per-binding sharing
-// invariant — design §1.2.
+// CONTRACT (#42): the enumerator returns ONE target per distinct
+// representative identity. Two real-user requests whose first-match for
+// (verb, gvr, ns, name) is the SAME binding still observe the SAME
+// re-derived BindingUID and SHARE the prewarm-populated cell (per-binding
+// sharing invariant, design §1.2). Deduping identical-tuple dispatches
+// does not change which cells are seeded — only how many redundant
+// resolves run to seed them (design §1 lossless/leak-free proof).
 type PrewarmTarget struct {
 	BindingUID string
 	Subject    SubjectIdentity
 	GVR        schema.GroupVersionResource
 	Verb       string
+	// CollapsedBindings — #42 FIX-D: how many raw bindings this GVR bucket
+	// collapsed into this one representative identity (≥1). DATA-DERIVED from
+	// the dedup itself (NOT a static list / name literal — feedback_no_special_cases):
+	// a broadly-granted identity like Group/devs collapses the ~N-per-composition
+	// RoleBindings (devs≈the user population), while an installer SA stays a
+	// singleton (1). The identity-rank-major seed order (FIX-D) ranks identities
+	// by this count DESCENDING so the highest-population cohort (the 95% mix)
+	// warms first across ALL widgets, regardless of heavy-widget tails.
+	CollapsedBindings int
 }
 
 // EnumeratePrewarmTargetsForGVR returns the per-binding prewarm targets
@@ -109,7 +146,21 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 		ids[id] = struct{}{}
 	}
 
-	out := make([]PrewarmTarget, 0, len(ids))
+	// #42 DEDUP BY REPRESENTATIVE IDENTITY (design §2). Two bindings that
+	// project to the same representative (Username, sorted-Groups) tuple
+	// produce byte-identical seed dispatches populating the SAME cell (Path B
+	// re-derives the cell-key BindingUID from the identity, not the enumerated
+	// one — see the package header). We therefore emit ONE PrewarmTarget per
+	// distinct tuple. Deterministic: keep the lexicographically-smallest
+	// bindingID among a tuple's bindings as the DIAGNOSTIC BindingUID (the
+	// field is diagnostic-only). This is dedup of provably-identical work —
+	// NOT sampling: the seeded CELL SET is unchanged (no caps, no static
+	// lists; feedback_dynamic_cohort_prewarm_no_static_no_cold_fill,
+	// feedback_no_special_cases). Placing it in the enumerator covers the
+	// engine's widgets AND restactions loops (and proactive_ra_seed's
+	// len()==0 gate — dedup never turns a non-empty set empty) with ONE
+	// insertion; the boot.go seam signature is unchanged.
+	byIdentity := make(map[string]PrewarmTarget, len(ids))
 	for id := range ids {
 		entry, ok := idx.entries[id]
 		if !ok {
@@ -126,14 +177,57 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 		// without re-walking the typed snapshot here.
 		rep := pickRepresentativeFromSubjectKeys(entry.subjects)
 
-		out = append(out, PrewarmTarget{
-			BindingUID: string(id),
-			Subject:    rep,
-			GVR:        gvr,
-			Verb:       verb,
-		})
+		// Dedup key = Username + US + join(SORTED Groups, US). Today a
+		// representative carries ≤1 group, but sorting future-proofs the key
+		// against EvaluateRBAC's set-semantics over Groups (the SEP US=\x1f
+		// can't collide with an RFC-1123 subject name or a group string). The
+		// binding-namespace is deliberately NOT in the key: the seed dispatch
+		// evaluates at the WIDGET's (gvr, ns, name), so two same-subject
+		// RoleBindings in different namespaces are one identical dispatch
+		// (design §1 namespace nuance).
+		groups := append([]string(nil), rep.Groups...)
+		sort.Strings(groups)
+		key := rep.Username + "\x1f" + strings.Join(groups, "\x1f")
+
+		if prev, seen := byIdentity[key]; seen {
+			// Keep the lexicographically-smallest bindingID as the stable
+			// diagnostic representative; count this collapsed binding (FIX-D).
+			prev.CollapsedBindings++
+			if string(id) < prev.BindingUID {
+				prev.BindingUID = string(id)
+			}
+			byIdentity[key] = prev
+			continue
+		}
+		byIdentity[key] = PrewarmTarget{
+			BindingUID:        string(id),
+			Subject:           rep,
+			GVR:               gvr,
+			Verb:              verb,
+			CollapsedBindings: 1, // this identity's first (and maybe only) binding
+		}
 	}
+	rawBindings := len(ids)
 	idx.mu.RUnlock()
+
+	out := make([]PrewarmTarget, 0, len(byIdentity))
+	for _, t := range byIdentity {
+		out = append(out, t)
+	}
+
+	// AC-D4: one greppable line per call — {gvr, bindings(raw), identities(deduped)}
+	// preserves the post-deploy "how much redundancy collapsed?" story now that
+	// the engine's `targets` field reports the deduped count. Info-level (arch
+	// C-1): the default slog handler is Info, so at Debug the OC-1 live evidence
+	// would never emit on a standard deploy; one line per GVR per walk is cheap
+	// and matches the sibling widget_targets/restaction_targets Info lines.
+	slog.Info("prewarm.enumerate.dedup",
+		slog.String("subsystem", "cache"),
+		slog.String("gvr", gvr.String()),
+		slog.String("verb", verb),
+		slog.Int("bindings", rawBindings),
+		slog.Int("identities", len(out)),
+	)
 
 	return out
 }

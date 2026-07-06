@@ -1,42 +1,37 @@
 // phase1_pip_seed.go — Ship PIP (0.30.173): the per-identity prewarm
 // seed of restactions + widgets top-level L1.
 //
-// THE NORTH-STAR DEFECT THIS SHIPS AGAINST. After phase1Done=true at
-// 0.30.172, admin's first compositions-list /call is l1_hit:"miss" and
-// takes ~13.8 s — the per-USER resolved-output L1 (top-level
-// restactions / widgets cache classes) is cold for every cohort. F2
-// (Ship F2 / 0.30.125) populates only the IDENTITY-FREE apistage
-// content L1; the per-user envelope above it is still resolved on the
-// first hot path. PIP fills that gap: BEFORE phase1Done flips, seed the
-// top-level L1 once per (RBAC cohort, restaction) AND once per (RBAC
-// cohort, widget) reached by the Phase-1 walker. The first /call by
-// every cohort then returns dispatcher.call.complete l1_hit:"hit" with
-// zero resolve.
+// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md §4):
+// the LEGACY orchestration in this file — runPIPSeed (the GOMAXPROCS errgroup
+// cohort fan-out), seedCohort, seedCohortFn, enumerateAggregatePrewarmTargets
+// (+Fn) — is DELETED. The prewarm engine is now implicit-on-cache and its
+// engine seed (prewarm_engine_boot.go seedScopeYielding) is the ONLY seed path;
+// the errgroup back-out lever (PREWARM_ENGINE_ENABLED=false) that kept the
+// legacy path alive is retired. This file is now the SHARED SEED-PRIMITIVE
+// LIBRARY: seedOneRestaction / seedOneWidget / seedRAFullListForWidget /
+// withCohortSeedContext / cohortLogLabel + the navWidgetHarvester type — all
+// called by the engine boot seed. The seedTarget type + PrewarmPIPEnabled gate
+// also live here.
 //
-// COHORT ENUMERATION. The cohort set is derived from
-// cache.EnumerateBindingSetClasses() — see
-// internal/cache/binding_set_enumeration.go for the canonical-dedupe
-// contract (two identities are the same cohort iff their union of matched
-// binding-pointer-sets is equal).
+// THE NORTH-STAR DEFECT THIS SHIPS AGAINST (unchanged rationale). After
+// phase1Done=true at 0.30.172, admin's first compositions-list /call was
+// l1_hit:"miss" (~13.8 s) — the per-USER resolved-output L1 (top-level
+// restactions / widgets cache classes) was cold for every cohort. The seed
+// primitives here fill that gap: BEFORE phase1Done flips, the engine seed warms
+// the top-level L1 once per (per-binding target, restaction) AND once per
+// (target, widget) reached by the Phase-1 walker, so the first /call returns
+// l1_hit:"hit" with zero resolve.
 //
-// Ship 2 / 0.30.196 — COHORT-COUNT-INDEPENDENT. The old cohort cap (50)
-// + the cohort_cap_exceeded fail-closed branch are DELETED. The product
-// owner's invariant: the cache architecture must NOT depend on cohort
-// count — a future customer with per-user User-kind bindings could push
-// cohort count to O(users), and that must never wedge the pod. Each
-// cohort × (N_restactions+N_widgets) is still an L1 entry, but the seed
-// is now a BACKGROUND best-effort warm: a large cohort set simply takes
-// longer to warm in the background; it never withholds readiness.
+// PER-BINDING TARGETS. The seed target set is derived from the BindingsByGVR
+// reverse index via cache.EnumeratePrewarmTargetsForGVR (per navigated GVR),
+// built by the engine boot re-walk — see prewarm_engine_boot.go.
 //
-// BACKGROUND + BEST-EFFORT (Ship 2 / 0.30.196 — supersedes the prior
-// FOREGROUND + FAIL-CLOSED contract). phase1WarmupWith launches runPIPSeed
-// as Step 7.6 on a bounded background goroutine AFTER MarkPhase1Done
-// (Step 8) — readiness is already 200. Any cohort-level error is log-only;
-// it NEVER withholds readiness and NEVER fail-closes. The background seed
-// is bounded by pipGlobalTimeout and dies with the process. The first
-// /call by a not-yet-seeded cohort falls back to a per-user resolve — the
-// correct degraded posture, since the architecture gate proved the cold
-// nav is served from the informer substrate regardless of the seed.
+// MEMORY BOUND (fold 2026-07-03). Each seed unit funnels through the ADAPTIVE
+// seed-unit gate (enterSeedUnit, seed_bound.go) — serialize against live
+// GOMEMLIMIT headroom, per-unit calibration, AssertSeedUnitFootprint diagnostic.
+// This is the ONLY thing bounding seedRAFullListForWidget's unpaginated
+// full-list (the #23 dominant allocation); the adaptive nested-resolve bound
+// does NOT cover it (§3.1).
 //
 // CONCURRENCY (architect's design §3). The cohort loop runs under a
 // bounded errgroup with limit = runtime.GOMAXPROCS(0) — matches the F2
@@ -85,13 +80,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"sync"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/snowplow/apis"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
@@ -101,7 +94,6 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/apiref"
-	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -109,15 +101,6 @@ import (
 )
 
 const (
-	// envPrewarmPIPEnabled is the Ship PIP (0.30.173) opt-in gate.
-	// Chart default is true (active by default for this ship); operators
-	// may set "false" to disable the seed if a regression is observed.
-	// PIP additionally requires prewarm-on (#57: implicit-on-cache, i.e.
-	// the cache subsystem is on) + PREWARM_CONTENT_ENABLED (the
-	// apiRefHarvester depends on the content-prewarm path) — when either
-	// is off, PIP stays inert regardless of this knob.
-	envPrewarmPIPEnabled = "PREWARM_PIP_ENABLED"
-
 	// Ship 2 / 0.30.196 — the PER-COHORT CAP IS DELETED. pipCohortCapDefault
 	// (50), envPrewarmPIPCohortCap ("PREWARM_PIP_COHORT_CAP"), and
 	// pipCohortCap() are GONE. The cap was the not-Ready-forever landmine:
@@ -158,12 +141,14 @@ const (
 	pipGlobalTimeout = 8 * time.Minute
 )
 
-// PrewarmPIPEnabled reports whether the Ship PIP per-identity prewarm
-// seed is opted in. Defaults FALSE as of 0.30.176 (Phase A.1): the
-// PIP seed is opt-in via PREWARM_PIP_ENABLED=true.
+// PrewarmPIPEnabled reports whether the Ship PIP per-identity prewarm seed
+// runs. FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md):
+// the standalone PREWARM_PIP_ENABLED env read is RETIRED (registered in
+// cache.retiredFlags). It is now IMPLICIT-ON-CACHE — the PIP seed runs whenever
+// prewarm runs, mirroring #57. (PIP still shares the content-prewarm harvester;
+// both gates now derive from cache.PrewarmEnabled().)
 func PrewarmPIPEnabled() bool {
-	v := env.String(envPrewarmPIPEnabled, "false")
-	return v == "true"
+	return cache.PrewarmEnabled() // implicit-on-cache (#57); was env "PREWARM_PIP_ENABLED"=="true"
 }
 
 // navWidgetEntry is one navigation widget CR captured during the
@@ -193,6 +178,29 @@ type navWidgetEntry struct {
 	// perPage) when the Path carries them. See deriveSeedKeyTuple.
 	KeyPerPage int
 	KeyPage    int
+
+	// #42 FIX-E — FIRST-NAV WALK ORDER. A monotonic sequence number
+	// assigned at harvest time. The Phase-1 walk visits nav roots in
+	// config.json order (default-route/dashboard subtree first —
+	// phase1_roots.go) and descends each depth-first, so harvest order IS
+	// the frontend's first-nav priority order. The seed uses this as the
+	// WITHIN-RANK widget order (replacing the A2 count-sort: count≠cost —
+	// A2 seeded a cheap-but-late widget before the dashboard's own
+	// widgets). 100% walk-derived — zero static name lists, no depth/route
+	// literal (the ORDERING is the signal, not any hardcoded name).
+	NavOrder int
+
+	// #42 FIX-F seam (STAMP-ONLY — no consumer here). RootIndex is the
+	// zero-based index of the config-root subtree this widget was FIRST
+	// harvested under (BeginRoot increments it as the walk moves to the next
+	// root). Roots iterate in config.json order (phase1_roots.go), so
+	// RootIndex==0 is the default-route/dashboard subtree — the rank-1
+	// first-nav SEGMENT. FIX-F's readyz latch will consume this to flip ready
+	// once the RootIndex==0 segment is seeded (segment-scoped, NOT rank-scoped
+	// — PM condition F-C2). This field is written and never read in this
+	// change; the latch is built in the FIX-F ship (#99). Walk-derived, no
+	// literal — the INDEX is the signal.
+	RootIndex int
 }
 
 // navWidgetHarvester accumulates the deduplicated navigation widget
@@ -210,11 +218,36 @@ type navWidgetEntry struct {
 type navWidgetHarvester struct {
 	mu      sync.Mutex
 	entries map[string]navWidgetEntry
+	// #42 FIX-E — monotonic harvest-order counter. Incremented under mu on
+	// each FIRST harvest of a distinct widget so NavOrder captures the walk's
+	// first-nav priority sequence (roots in config.json order, depth-first).
+	navSeq int
+	// #42 FIX-F seam — zero-based current config-root index. BeginRoot()
+	// increments it as the walk advances to the next root (roots resolve
+	// sequentially — phase1WarmupWith). curRoot starts at -1 so the first
+	// BeginRoot() sets it to 0 (the default-route/dashboard subtree). Stamped
+	// into RootIndex on first harvest; no consumer here (FIX-F builds the latch).
+	curRoot int
 }
 
 // newNavWidgetHarvester returns an empty harvester.
 func newNavWidgetHarvester() *navWidgetHarvester {
-	return &navWidgetHarvester{entries: map[string]navWidgetEntry{}}
+	// curRoot starts at -1 so the first BeginRoot() sets RootIndex 0.
+	return &navWidgetHarvester{entries: map[string]navWidgetEntry{}, curRoot: -1}
+}
+
+// BeginRoot advances the current config-root index (#42 FIX-F seam, STAMP-ONLY).
+// The phase-1 walk calls this before descending each root; roots resolve
+// sequentially so the increment is deterministic — RootIndex 0 is the first
+// (default-route/dashboard) subtree. Nil-safe (flag-off Phase 1 passes no
+// harvester). No consumer here; FIX-F's readyz latch reads RootIndex.
+func (h *navWidgetHarvester) BeginRoot() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.curRoot++
+	h.mu.Unlock()
 }
 
 // harvestNavWidget records a navigation widget CR plus the GVR +
@@ -257,6 +290,18 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 	// cohort against the CR; concurrent cohort resolves MUST NOT share
 	// a single *unstructured. The DeepCopy is bounded by the widget CR
 	// size (small) and runs once per distinct widget.
+	// #42 FIX-E — stamp the first-nav sequence number at first harvest. The
+	// walk reaches widgets in nav order (roots in config.json order,
+	// depth-first descent), so navSeq IS the frontend first-nav priority.
+	seq := h.navSeq
+	h.navSeq++
+	// #42 FIX-F seam — stamp the config-root index (STAMP-ONLY, no consumer
+	// here). curRoot is -1 only if a harvest somehow precedes the first
+	// BeginRoot(); clamp to 0 (the first-nav segment) defensively.
+	rootIdx := h.curRoot
+	if rootIdx < 0 {
+		rootIdx = 0
+	}
 	h.entries[key] = navWidgetEntry{
 		W:          w.DeepCopy(),
 		GVR:        gvr,
@@ -264,6 +309,8 @@ func (h *navWidgetHarvester) harvestNavWidget(w *unstructured.Unstructured, gvr 
 		Page:       resolvePage,
 		KeyPerPage: keyPerPage,
 		KeyPage:    keyPage,
+		NavOrder:   seq,
+		RootIndex:  rootIdx,
 	}
 }
 
@@ -337,556 +384,11 @@ type seedTarget struct {
 	BindingUID string
 	Username   string
 	Groups     []string
-}
-
-// enumerateAggregatePrewarmTargets unions per-GVR prewarm targets across
-// every registered GVR + dedupes by (BindingUID, Username, Groups[0]).
-// One seed dispatch per unique target; each dispatch resolves whatever
-// restactions/widgets its identity authorises (the per-layer BindingUID
-// is derived at populate time, design §7.2 + Path B).
-//
-// Returns nil when the resource watcher is not wired (cache=off / pre-
-// readiness) or when no binding authorises any navigated GVR. The seed
-// loop treats nil as a clean no-op (logs phase1.seed.skipped).
-func enumerateAggregatePrewarmTargets() []seedTarget {
-	rw := cache.Global()
-	if rw == nil {
-		return nil
-	}
-	gvrs := rw.RegisteredGVRs()
-	if len(gvrs) == 0 {
-		return nil
-	}
-	// Dedupe by (BindingUID, Username, first Group) — the seed dispatch's
-	// identity dimensions. Two GVRs sharing the same authorising binding +
-	// representative identity produce ONE seed dispatch.
-	type dedupeKey struct {
-		BindingUID string
-		Username   string
-		Group      string
-	}
-	seen := make(map[dedupeKey]struct{}, 32)
-	out := make([]seedTarget, 0, 32)
-	for _, gvr := range gvrs {
-		// Verb "list" — restactions/widgets nav LIST is the dominant
-		// authz question; matches the BindingsByGVR index's enrolment
-		// criterion (rulesGrantGetList covers both get+list).
-		targets := cache.EnumeratePrewarmTargetsForGVR(gvr, "list")
-		for _, t := range targets {
-			var firstGroup string
-			if len(t.Subject.Groups) > 0 {
-				firstGroup = t.Subject.Groups[0]
-			}
-			k := dedupeKey{
-				BindingUID: t.BindingUID,
-				Username:   t.Subject.Username,
-				Group:      firstGroup,
-			}
-			if _, ok := seen[k]; ok {
-				continue
-			}
-			seen[k] = struct{}{}
-			out = append(out, seedTarget{
-				BindingUID: t.BindingUID,
-				Username:   t.Subject.Username,
-				Groups:     append([]string(nil), t.Subject.Groups...),
-			})
-		}
-	}
-	return out
-}
-
-// enumerateAggregatePrewarmTargetsFn is a test seam over
-// enumerateAggregatePrewarmTargets — same pattern as seedCohortFn /
-// phase1MaxApiRefPagesForTest. The #158 discrimination falsifier swaps it
-// to inject a fixed cohort list so runPIPSeed's classification + retry
-// branches can be driven end-to-end without a live cache/RBAC snapshot.
-// Production always uses the real enumerator.
-var enumerateAggregatePrewarmTargetsFn = enumerateAggregatePrewarmTargets
-
-// runPIPSeed is the Ship PIP Step 7.6 entry point invoked by
-// phase1WarmupWith. Enumerates per-binding targets and seeds the
-// resolved-output L1 (restactions + widgets) for every target.
-//
-// Ship 2 / 0.30.196 — runPIPSeed is invoked on a BACKGROUND goroutine
-// AFTER MarkPhase1Done; its return value is log-only. There is no longer
-// a cohort cap and no fail-closed path: per-cohort errors are swallowed
-// (each cohort goroutine returns nil), so a non-nil return here is now
-// vacuously rare. Readiness is NEVER affected by this function's outcome.
-//
-// h is the F2 content-prewarm harvester (apiRefHarvester) — drained
-// for the restactions seed loop. nh is the new navWidgetHarvester —
-// drained for the widgets seed loop. Both are pre-populated by the
-// walk and stable by the time runPIPSeed runs.
-func runPIPSeed(ctx context.Context, h *contentPrewarmHarvester, nh *navWidgetHarvester,
-	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
-
-	log := slog.Default()
-	start := time.Now()
-
-	// Ship 0.30.242 H.c-layered Phase 2b — per-binding seed enumeration.
-	// The PIP seed drives one entry per per-binding target (a binding
-	// authorising get/list on a navigated GVR) derived from the
-	// BindingsByGVR reverse index via cache.EnumeratePrewarmTargetsForGVR.
-	// Replaces the pre-ship EnumerateBindingSetClasses cohort enumerator
-	// (deleted in commit 1d93d02). Cell sharing is now per-binding —
-	// design §7.2.
-	//
-	// Aggregation across GVRs: enumerate targets per navigated GVR, then
-	// dedupe by (BindingUID, Username, Groups[0]) so a binding that
-	// grants multiple GVRs produces ONE seed dispatch (the dispatch
-	// resolves widgets+restactions covering whatever cells its identity
-	// authorises). Path B (Phase 2b deferral): seed dispatch derives its
-	// own per-layer BindingUID at populate time via direct rbac.EvaluateRBAC.
-	targets := enumerateAggregatePrewarmTargetsFn()
-	if len(targets) == 0 {
-		log.Info("phase1.seed.skipped",
-			slog.String("subsystem", "cache"),
-			slog.String("reason", "EnumeratePrewarmTargetsForGVR returned no targets across registered GVRs — RBAC snapshot empty or unpublished, or no bindings authorise the navigated GVRs"),
-		)
-		return nil
-	}
-	// Adapt targets to the legacy cohort dispatch surface. cohorts type
-	// is preserved at the loop level for minimum-churn migration in 2b;
-	// per-binding KEY semantics now flow through the cell-key BindingUID
-	// derived at populate time (helpers.go:dispatchCacheLookupKey via
-	// direct rbac.EvaluateRBAC — Path B).
-	cohorts := targets
-
-	// Ship 2 / 0.30.196 — the cohort cap check is DELETED. There is no
-	// fail-closed-on-cohort-count branch: runPIPSeed runs as a background
-	// best-effort warm (phase1_walk.go Step 7.6) AFTER readiness is already
-	// 200, so a high cohort count can never withhold readiness. An
-	// O(users)-cohort topology simply takes longer to warm in the
-	// background, bounded by pipGlobalTimeout — it never wedges the pod.
-
-	restactionRefs := h.snapshot()
-	widgetEntries := nh.snapshot()
-
-	log.Info("phase1.seed.started",
-		slog.String("subsystem", "cache"),
-		slog.Int("cohorts", len(cohorts)),
-		slog.Int("restactions", len(restactionRefs)),
-		slog.Int("widgets", len(widgetEntries)),
-	)
-
-	// Step 7.6 global budget — phase1WarmupWith already passes a ctx
-	// bound by PHASE1_TIMEOUT_SECONDS; layer the PIP-specific 40 s
-	// ceiling on top so a stuck cohort cannot eat the whole Phase 1
-	// budget.
-	pctx, pcancel := context.WithTimeout(ctx, pipGlobalTimeout)
-	defer pcancel()
-
-	g, gctx := errgroup.WithContext(pctx)
-	limit := runtime.GOMAXPROCS(0)
-	if limit < 1 {
-		limit = 1
-	}
-	g.SetLimit(limit)
-
-	// #158 (design §1.5) — legacy-path bounded re-enqueue. Operational
-	// failures (NOT RBAC denies) are collected here during the errgroup,
-	// then drained ONCE after g.Wait() with a per-retry customer-priority
-	// yield (engineYieldCheckpoint — the SAME customerInFlight() predicate
-	// the engine uses; NOT a private busy loop, NOT a shared budget). Bound:
-	// ≤1 retry per cohort per run — a cohort that fails operationally TWICE
-	// is logged + dropped (the customer's first /call lazily warms it). The
-	// engine path (PrewarmEngineEnabled()==true) does NOT reach runPIPSeed;
-	// it re-enqueues a coalesced scopeKindBoot instead (seedScopeYielding).
-	var (
-		retryMu      sync.Mutex
-		retryCohorts []seedTarget
-	)
-
-	for _, c := range cohorts {
-		cohort := c // pin loop variable
-		g.Go(func() error {
-			// Ship A.3 / 0.30.179 — count every per-class seed resolve
-			// (one cohort goroutine = one resolve unit). Failures bump
-			// the dedicated failure counter so the operator sees a
-			// non-zero `snowplow_phase1_bindingset_seed_failures_total`
-			// when the seed loop drops a class.
-			//
-			// PER-COHORT ERRORS ARE NON-FATAL — Ship A.3 / 0.30.180
-			// followup. Binding-set enumeration produces cohort classes
-			// for EVERY (user, group-subset) binding-set, including
-			// narrow ServiceAccount identities that genuinely cannot
-			// read RESTActions/widgets (their bindings permit only
-			// scoped resources). A per-cohort RBAC denial during seed
-			// is EXPECTED for narrow cohorts: those cohorts don't need
-			// a seeded L1 entry — their first /call would deny anyway.
-			// Log + count + return nil so the global seed loop completes
-			// and phase1Done flips. The cluster-wide PIP mechanism stays
-			// FOREGROUND (still gates phase1Done) but per-cohort
-			// failures no longer FAIL-CLOSE the whole pod.
-			pipBindingSetSeedResolvesTotal.Add(1)
-			// #46: NO bound wrap here — the footprint bound lives in the SHARED
-			// primitives seedOneWidget/seedOneRestaction (which this errgroup's
-			// seedCohortFn funnels through), so the aggregate is bounded at the
-			// shared mechanism, NOT per-caller. The errgroup's SetLimit
-			// (GOMAXPROCS) is the OUTER semaphore; Piece-B's is INNER (in the
-			// primitive) — strict outer→inner ordering, deadlock-free.
-			if err := seedCohortFn(gctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
-				// #158 — classify the failure instead of blanket-labelling
-				// it "expected RBAC." pipBindingSetSeedFailuresTotal is kept
-				// as the back-compat grand total (= rbac_deny + operational).
-				pipBindingSetSeedFailuresTotal.Add(1)
-				switch classifySeedErr(err) {
-				case seedFailRBACDeny:
-					// EXPECTED: a narrow cohort that genuinely cannot read the
-					// seed target. Info, not Warn; NOT re-enqueued (it would
-					// deny again — nothing to retry).
-					pipSeedRBACDenyTotal.Add(1)
-					slog.Info("phase1.seed.cohort.expected_deny",
-						slog.String("subsystem", "cache"),
-						slog.String("cohort", cohortLogLabel(cohort)),
-						slog.Any("err", err),
-						slog.String("effect", "cohort skipped; phase1Done not blocked — this cohort's "+
-							"identity is forbidden from the seed target (403/401), which is the expected "+
-							"narrow-RBAC posture and needs no L1 entry"),
-					)
-				default:
-					// OPERATIONAL (incl. the fail-loud default): ctx
-					// timeout/cancel, 5xx, transport, panic, or any
-					// unclassified error. Warn + dedicated counter + queue
-					// for a bounded single retry after g.Wait().
-					pipSeedOperationalFailTotal.Add(1)
-					slog.Warn("phase1.seed.cohort.operational_failure",
-						slog.String("subsystem", "cache"),
-						slog.String("cohort", cohortLogLabel(cohort)),
-						slog.Any("err", err),
-						slog.String("effect", "cohort seed failed operationally (NOT an RBAC deny); queued "+
-							"for one bounded re-attempt after the seed loop — see "+
-							"snowplow_phase1_seed_operational_fail_total at /debug/vars"),
-					)
-					retryMu.Lock()
-					retryCohorts = append(retryCohorts, cohort)
-					retryMu.Unlock()
-				}
-				// Non-fatal — return nil so the global seed loop completes.
-				return nil
-			}
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		// g.Wait error should never fire now (per-cohort errors are swallowed
-		// above), but keep the failure-path log + counter intact so any future
-		// genuinely-fatal error mode is surfaced.
-		log.Error("phase1.seed.failed",
-			slog.String("subsystem", "cache"),
-			slog.Any("err", err),
-			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
-		)
-		return err
-	}
-
-	// #158 (design §1.5) — drain the operational-failure retry slice ONCE,
-	// serially, with a customer-priority yield before each re-attempt. This
-	// is the legacy path's bounded re-enqueue (no engine queue exists when
-	// PrewarmEngineEnabled()==false). ≤1 retry per cohort: a cohort that
-	// fails operationally AGAIN here is logged + dropped (the customer's
-	// first /call lazily warms it — the documented degraded posture). The
-	// yield reuses engineYieldCheckpoint (the SAME customerInFlight()
-	// predicate the engine uses) so a customer burst arriving mid-retry
-	// defers the remaining retries — never a private busy loop, never a
-	// shared budget.
-	retryMu.Lock()
-	pending := retryCohorts
-	retryMu.Unlock()
-	if len(pending) > 0 {
-		log.Info("phase1.seed.retry.started",
-			slog.String("subsystem", "cache"),
-			slog.Int("operational_failed_cohorts", len(pending)),
-		)
-		retried := 0
-		for _, cohort := range pending {
-			if err := pctx.Err(); err != nil {
-				// Step 7.6 budget exhausted — stop retrying; remaining
-				// cohorts warm lazily on first /call.
-				break
-			}
-			engineYieldCheckpoint(pctx)
-			if err := seedCohortFn(pctx, cohort, restactionRefs, widgetEntries, saEP, saRC, authnNS); err != nil {
-				// Second operational failure → drop (bound = ≤1 retry).
-				slog.Warn("phase1.seed.cohort.retry_exhausted",
-					slog.String("subsystem", "cache"),
-					slog.String("cohort", cohortLogLabel(cohort)),
-					slog.Any("err", err),
-					slog.String("effect", "cohort still failing after one bounded re-attempt; dropped — "+
-						"the cohort's first /call cold-resolves + warms lazily"),
-				)
-				continue
-			}
-			retried++
-		}
-		log.Info("phase1.seed.retry.completed",
-			slog.String("subsystem", "cache"),
-			slog.Int("operational_failed_cohorts", len(pending)),
-			slog.Int("retry_succeeded", retried),
-		)
-	}
-
-	log.Info("phase1.seed.completed",
-		slog.String("subsystem", "cache"),
-		slog.Int("cohorts", len(cohorts)),
-		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
-	)
-	return nil
-}
-
-// seedCohortFn is a test seam over seedCohort — same pattern as
-// phase1MaxApiRefPagesForTest (phase1_walk_pagination.go:124). The
-// #158 discrimination falsifier (phase1_seed_classify_test.go) swaps this
-// to inject a fake seedCohort returning a controlled error class without a
-// live cluster, then asserts the call site's branch (counter + log + the
-// re-enqueue delta). Production always uses the real seedCohort.
-var seedCohortFn = seedCohort
-
-// seedCohort seeds one cohort's per-user restactions + widgets L1
-// entries. Per-cohort timeout + per-cohort error containment.
-//
-// Ship 0.30.187 D1: per-target errors are NON-FATAL — they bump the
-// per-(cohort, target) failure counter (visible at /debug/vars) and
-// mark the cohort status as "partial", but the loop continues so the
-// remaining seed targets land. The cohort's final status (success /
-// partial / failed) is published via recordCohortSeedStatus. A
-// timeout / outer-ctx cancel still returns an error (the cohort status
-// is "failed") so the caller can surface that mode separately.
-//
-// RATIONALE for non-fatal per-target errors: pre-0.30.187 the FIRST
-// widget-seed error for a cohort returned immediately. cyberjoker is in
-// group:devs; that cohort's restactions seeded but widgets seed
-// errored on widget #1 (likely RBAC denial on a narrow nav widget),
-// and seedCohort returned after the first widget so the remaining 16
-// widgets of group:devs were never seeded — the 14/17 first-nav cold
-// miss on the 0.30.186 cyberjoker run. With per-target containment a
-// single bad widget broke ONE cell, not 16.
-//
-// Ship 0.30.191 Fix C — abort-cause instrumentation. Every path that
-// flips cohort status to "failed" now also emits a single greppable
-// log line `phase1.cohort.abort` carrying which phase fired the abort
-// (restactions / widgets / panic / pre-flight), the abort cause
-// (ctx_err with the underlying ctx.Err string, panic with the recovered
-// value, etc.), how many targets the cohort had processed by then, the
-// elapsed wall-clock, and the per-cohort timeout in milliseconds. The
-// log line is emitted by a deferred reporter so a panic mid-loop is
-// also captured (a recover() in the same defer prevents the goroutine
-// from crashing the errgroup). All instrumentation fields are uniform
-// across cohorts (feedback_no_special_cases): no per-cohort branching.
-//
-// LEGACY SEED PATH (#341 ruling 2026-06-12): reached ONLY when
-// PREWARM_ENGINE_ENABLED=false — the documented single-knob back-out
-// lever for the unified prewarm engine (0.30.247/248); prod runs =true.
-// Kept per the #57 lever framework; deliberately NOT unified with the
-// engine's seedScopeYielding (independent by design, so the lever stays
-// a clean revert). Do not refactor or delete while the lever stands.
-func seedCohort(ctx context.Context, cohort seedTarget,
-	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
-	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
-
-	log := slog.Default()
-	cohortLabel := cohortLogLabel(cohort)
-	start := time.Now()
-
-	// Ship 0.30.191 Fix C — local counters threaded through the loops.
-	// Updated INSIDE the for-bodies (goroutine-scoped, no concurrency).
-	// The deferred reporter reads them after the function body exits.
-	var (
-		abortPhase           string // "init" / "restactions" / "widgets" / "panic"
-		abortCause           string // free-form short tag — ctx_err / panic / none
-		ctxErrString         string // ctx.Err().Error() at abort site, or ""
-		processedRestactions int
-		processedWidgets     int
-		emittedFinalAbortLog bool
-		recoveredPanic       any
-	)
-	abortPhase = "init"
-
-	log.Info("phase1.seed.cohort.start",
-		slog.String("subsystem", "cache"),
-		slog.String("cohort", cohortLabel),
-		slog.Int("restactions", len(restactionRefs)),
-		slog.Int("widgets", len(widgetEntries)),
-	)
-
-	// Per-cohort hard ceiling. A stuck cohort cannot wedge Step 7.6
-	// past its global budget. Fixed 120s (0.30.179 value); the
-	// 0.30.190 proportional-timeout model was REVERTED at 0.30.191 per
-	// the SCOPE CORRECTION — we instrument first, then fix.
-	cctx, ccancel := context.WithTimeout(ctx, pipCohortTimeout)
-	defer ccancel()
-
-	// Ship 0.30.191 Fix C — deferred abort-cause reporter. Runs whether
-	// the body returns normally, returns an error, or panics. Emits one
-	// `phase1.cohort.abort` log line when the cohort's status is
-	// "failed" (timeout, ctx cancel, panic). Pure observational —
-	// returns no value, mutates no shared state.
-	//
-	// The recover() catches a downstream panic in seedOneRestaction /
-	// seedOneWidget — pre-0.30.191 such a panic crashed the cohort
-	// goroutine + (potentially) the pod via the errgroup propagation.
-	// Now the panic is logged + the cohort is marked failed + the
-	// error is returned up the errgroup; the caller's runPIPSeed loop
-	// already treats per-cohort errors as non-fatal (0.30.180), so a
-	// panic in one cohort no longer wedges all of Phase 1.
-	defer func() {
-		if r := recover(); r != nil {
-			recoveredPanic = r
-			abortPhase = "panic"
-			abortCause = "panic"
-			ctxErrString = ""
-			// We're recovering INSIDE the deferred closure — emit the
-			// abort log line below and mark cohort failed. The caller
-			// (errgroup) will not see an error because we're swallowing
-			// the panic here, but recordCohortSeedStatus and the abort
-			// log line make the failure visible.
-			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
-		}
-		// Only emit the abort log line for cohorts that ACTUALLY failed
-		// (the inline abort branches set abortCause non-empty before
-		// returning; success / partial paths leave it ""). This avoids
-		// log spam for the success path.
-		if abortCause == "" {
-			return
-		}
-		if emittedFinalAbortLog {
-			return
-		}
-		emittedFinalAbortLog = true
-		fields := []any{
-			slog.String("subsystem", "cache"),
-			slog.String("cohort", cohortLabel),
-			slog.String("phase", abortPhase),
-			slog.String("abort_cause", abortCause),
-			slog.String("ctx_err", ctxErrString),
-			slog.Int("restactions_total", len(restactionRefs)),
-			slog.Int("widgets_total", len(widgetEntries)),
-			slog.Int("restactions_processed", processedRestactions),
-			slog.Int("widgets_processed", processedWidgets),
-			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
-			slog.Int64("cohort_timeout_ms", pipCohortTimeout.Milliseconds()),
-		}
-		if recoveredPanic != nil {
-			fields = append(fields, slog.Any("panic", recoveredPanic))
-		}
-		log.Info("phase1.cohort.abort", fields...)
-	}()
-
-	// Build the per-cohort ctx: SA transport seam preserved (so the
-	// resolver dispatches via the SA-credentialed inner-call path that
-	// 0.30.166/167/168 wired) but identity OVERRIDDEN via
-	// xcontext.WithUserInfo so dispatchCacheLookupKey hashes the cohort
-	// into the L1 key and EvaluateRBAC fires against the cohort's
-	// bindings.
-	cohortCtx := withCohortSeedContext(cctx, cohort, saEP, saRC)
-
-	// Track whether ANY per-target Put errored — if so the cohort
-	// status is "partial"; if not it's "success". A timeout / ctx
-	// cancel below sets "failed" and short-circuits.
-	hadFailure := false
-
-	// Restactions seed loop — drain the harvester, one Put per
-	// (cohort, restaction).
-	abortPhase = "restactions"
-	for _, ref := range restactionRefs {
-		if err := cctx.Err(); err != nil {
-			abortCause = "ctx_err"
-			ctxErrString = err.Error()
-			log.Error("phase1.seed.cohort.timeout",
-				slog.String("subsystem", "cache"),
-				slog.String("cohort", cohortLabel),
-				slog.String("phase", "restactions"),
-				slog.Any("err", err),
-				slog.Int("restactions_processed", processedRestactions),
-				slog.Int("widgets_processed", processedWidgets),
-				slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
-				slog.Int64("cohort_timeout_ms", pipCohortTimeout.Milliseconds()),
-			)
-			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
-			return fmt.Errorf("cohort %q restactions seed: %w", cohortLabel, err)
-		}
-		if err := seedOneRestaction(cohortCtx, cohortLabel, ref, authnNS); err != nil {
-			// Ship 0.30.187 D1: per-target containment. Bump the
-			// per-(cohort, target) failure counter and continue with
-			// the next restaction so a single bad target does not
-			// abort the cohort.
-			hadFailure = true
-			incFailureCounter(&pipRestactionSeedFailureByKey,
-				cohortLabel+"|"+ref.Namespace+"/"+ref.Name)
-			log.Warn("phase1.seed.cohort.target_skipped",
-				slog.String("subsystem", "cache"),
-				slog.String("cohort", cohortLabel),
-				slog.String("phase", "restactions"),
-				slog.String("restaction", ref.Namespace+"/"+ref.Name),
-				slog.Any("err", err),
-				slog.String("effect", "this target skipped; cohort continues — see "+
-					"snowplow_phase1_restaction_seed_failure_total at /debug/vars"),
-			)
-			continue
-		}
-		processedRestactions++
-	}
-
-	// Widgets seed loop — drain the harvested widget entries, one Put
-	// per (cohort, widget).
-	abortPhase = "widgets"
-	for _, e := range widgetEntries {
-		if err := cctx.Err(); err != nil {
-			abortCause = "ctx_err"
-			ctxErrString = err.Error()
-			log.Error("phase1.seed.cohort.timeout",
-				slog.String("subsystem", "cache"),
-				slog.String("cohort", cohortLabel),
-				slog.String("phase", "widgets"),
-				slog.Any("err", err),
-				slog.Int("restactions_processed", processedRestactions),
-				slog.Int("widgets_processed", processedWidgets),
-				slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
-				slog.Int64("cohort_timeout_ms", pipCohortTimeout.Milliseconds()),
-			)
-			recordCohortSeedStatus(cohortLabel, cohortStatusFailed)
-			return fmt.Errorf("cohort %q widgets seed: %w", cohortLabel, err)
-		}
-		if err := seedOneWidget(cohortCtx, e, authnNS); err != nil {
-			// Ship 0.30.187 D1: per-target containment for widget
-			// seeds — see the restactions block above. Composite key:
-			// "cohort|widget_name|gvr".
-			hadFailure = true
-			incFailureCounter(&pipWidgetSeedFailureByKey,
-				cohortLabel+"|"+e.W.GetNamespace()+"/"+e.W.GetName()+"|"+e.GVR.String())
-			log.Warn("phase1.seed.cohort.target_skipped",
-				slog.String("subsystem", "cache"),
-				slog.String("cohort", cohortLabel),
-				slog.String("phase", "widgets"),
-				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-				slog.String("gvr", e.GVR.String()),
-				slog.Any("err", err),
-				slog.String("effect", "this widget skipped for this cohort; loop continues — "+
-					"see snowplow_phase1_widget_seed_failure_total at /debug/vars"),
-			)
-			continue
-		}
-		processedWidgets++
-	}
-
-	// Publish the cohort's final status.
-	if hadFailure {
-		recordCohortSeedStatus(cohortLabel, cohortStatusPartial)
-	} else {
-		recordCohortSeedStatus(cohortLabel, cohortStatusSuccess)
-	}
-
-	log.Info("phase1.seed.cohort.complete",
-		slog.String("subsystem", "cache"),
-		slog.String("cohort", cohortLabel),
-		slog.Bool("had_per_target_failure", hadFailure),
-		slog.Int("restactions_processed", processedRestactions),
-		slog.Int("widgets_processed", processedWidgets),
-		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
-	)
-	return nil
+	// CollapsedBindings — #42 FIX-D: the dedup's collapsed-binding count for
+	// this representative identity (≥1), carried from cache.PrewarmTarget. Used
+	// ONLY to rank identities for the identity-rank-major seed order; NOT part
+	// of the seed dispatch or the cell key.
+	CollapsedBindings int
 }
 
 // withCohortSeedContext builds the per-cohort seed context. Mirrors
@@ -973,13 +475,33 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		// CACHE_ENABLED off); log + skip.
 		return nil
 	}
+	// #42 FIX-C (A4 security finding, populate side): the cohort's identity
+	// re-derived a first-match BindingUID of "" — EvaluateRBAC denied or
+	// errored at lookup and fail-closed (helpers.go). Every "" identity folds
+	// the SAME shared empty-identity cell, resolved under a cohort (e.g.
+	// system:kube-controller-manager) whose serve-time narrowing can be broad;
+	// any real request that also derives "" would HIT it. Do NOT Put that cell
+	// from the seed — skip with one log line (non-empty identities still
+	// seeded). The serve-side treatment of a re-derived "" as a MISS is the
+	// separate task #95 gate.
+	if inputs != nil && inputs.BindingUID == "" {
+		slog.Default().Info("phase1.seed.skip.empty_binding",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "restactions"),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.String("cohort", cohortLabel),
+			slog.String("effect", "cohort re-derived first-match BindingUID=\"\" (RBAC deny/err fail-closed); "+
+				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
+		)
+		return nil
+	}
 
-	// #46: bound this seed unit's footprint (semaphore admission + per-unit
-	// HeapInuse assert), AFTER the identity short-circuit so the customer
-	// /call path is untouched. seedOneRestaction is a SHARED primitive — both
-	// the engine (serial) and legacy errgroup (concurrent) seed paths funnel
-	// here, so this one bracket bounds BOTH aggregates. Transparent when
-	// SEED_FOOTPRINT_BUDGET_BYTES==0.
+	// #46 / fold 2026-07-03: bound this seed unit's footprint via the ADAPTIVE
+	// seed-unit gate (enterSeedUnit — serialize against live GOMEMLIMIT
+	// headroom + per-unit calibration + AssertSeedUnitFootprint), AFTER the
+	// identity short-circuit so the customer /call path is untouched.
+	// seedOneRestaction is the engine seed's shared primitive. Transparent when
+	// GOMEMLIMIT is unset (unlimited headroom).
 	seedRelease, seedErr := enterSeedUnit(ctx, "restaction/"+ref.Namespace+"/"+ref.Name)
 	if seedErr != nil {
 		return seedErr // ctx cancelled while blocked on the bound
@@ -1030,6 +552,18 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// restactions.go:180-182.
 	resCtx := cache.WithL1KeyContext(ctx, key)
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
+	// #102 GTTL-1 (arch Option A, uniform): install the error-aware Put-gate
+	// sinks so the seed honors the SAME backstop the refresher does
+	// (resolve_populate.go:207-285). A swallowed/continueOnError'd STAGE error
+	// (resolve returns nil-overall with degraded bytes) or a genuine EXTERNAL
+	// endpoint touch (no dep edge to invalidate it) must NOT be Put — on the
+	// keepwarm sweep that would blind-overwrite a good warm entry with degraded
+	// bytes (the GTTL-1 defect); on boot it would serve under-populated content
+	// on first paint. The gate keys on error PRESENCE, never on result
+	// emptiness (a legitimately-empty result produces no stage error → sink==0
+	// → still Put). Uniform across boot + sweep (feedback_no_special_cases).
+	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
+	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
 
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
 		In: &cr,
@@ -1051,12 +585,29 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		return fmt.Errorf("encode RESTAction %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 
+	// #102 GTTL-1: decline the Put (return nil, best-effort — NOT an error, so
+	// the engine seed loop's PROCESSED-not-SUCCEEDED latch decrement is
+	// unaffected and readyz never hangs) when the resolve observed a stage
+	// error or touched an external endpoint. Keeps the prior good entry (if
+	// any); TTL is the outer net.
+	if declineSeedPutOnError(ctx, "restactions", ref.Namespace+"/"+ref.Name, stageErrSink, extTouchedSink) {
+		return nil
+	}
+
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
 	handle.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
 	})
+	// counters-hygiene 2026-07-04: this success Put is a seed UNIT resolved +
+	// written to per-user L1 — the real meaning of
+	// snowplow_phase1_bindingset_seed_resolves_total. Its only historical
+	// incrementer (runPIPSeed) was deleted in the prewarm-family fold, leaving
+	// the counter dead-at-0 (which made a 287-real-seed boot look like "seed
+	// didn't run"). Wired here + at seedOneWidget's success Put so the counter
+	// again means "seed units resolved+Put".
+	pipBindingSetSeedResolvesTotal.Add(1)
 
 	// Record the self-dep + ensure the informer for the RESTAction GVR
 	// is wired (AC-PIP.5 — without this the refresher never wakes for
@@ -1139,13 +690,32 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		// seedOneRestaction.
 		return nil
 	}
+	// #42 FIX-C (A4 security finding, populate side) — mirror of
+	// seedOneRestaction: skip the shared empty-identity cell Put when the
+	// cohort re-derived a first-match BindingUID of "" (EvaluateRBAC deny/err
+	// fail-closed). See seedOneRestaction for the full rationale; serve-side
+	// treatment is task #95.
+	if inputs != nil && inputs.BindingUID == "" {
+		// The cohort identity is on ctx (WithUserInfo) and is emitted by the
+		// emitDispatchCacheKeyDiag "seed" line just above; this skip line keys
+		// on the widget + class (the diag line pairs the identity to it).
+		slog.Default().Info("phase1.seed.skip.empty_binding",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "widgets"),
+			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+			slog.String("effect", "cohort re-derived first-match BindingUID=\"\" (RBAC deny/err fail-closed); "+
+				"skipping the shared empty-identity cell Put (A4 populate-side guard)"),
+		)
+		return nil
+	}
 
 	// #46: bound this seed unit's footprint (semaphore admission + per-unit
 	// HeapInuse assert), AFTER the identity short-circuit so the customer
-	// /call path is untouched. seedOneWidget is a SHARED primitive — both the
-	// engine (serial) and legacy errgroup (concurrent) seed paths funnel here,
-	// so this one bracket bounds BOTH aggregates. Transparent when
-	// SEED_FOOTPRINT_BUDGET_BYTES==0.
+	// /call path is untouched. fold 2026-07-03: enterSeedUnit is now the
+	// ADAPTIVE gate (serialize against live GOMEMLIMIT headroom). seedOneWidget
+	// is the engine seed's shared primitive; this bracket covers both
+	// widgets.Resolve AND seedRAFullListForWidget (the unpaginated full-list —
+	// the seed's dominant allocation). Transparent when GOMEMLIMIT is unset.
 	seedRelease, seedErr := enterSeedUnit(ctx, "widget/"+e.W.GetNamespace()+"/"+e.W.GetName())
 	if seedErr != nil {
 		return seedErr // ctx cancelled while blocked on the bound
@@ -1187,6 +757,11 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 
 	resCtx := cache.WithL1KeyContext(ctx, key)
 	resCtx = cache.WithPIPStageTimingSink(resCtx, stageTimingSink)
+	// #102 GTTL-1 (arch Option A, uniform) — see seedOneRestaction: the
+	// error-aware Put-gate sinks make the seed honor the refresher's backstop
+	// so the keepwarm sweep never blind-re-Puts degraded bytes over a warm cell.
+	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
+	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
 
 	res, err := widgets.Resolve(resCtx, widgets.ResolveOptions{
 		In: in,
@@ -1208,10 +783,20 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 		return fmt.Errorf("encode widget %s/%s: %w", e.W.GetNamespace(), e.W.GetName(), err)
 	}
 
+	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
+	// or external touch — keeps any prior good entry; TTL is the outer net.
+	if declineSeedPutOnError(ctx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), stageErrSink, extTouchedSink) {
+		return nil
+	}
+
 	handle.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
 	})
+	// counters-hygiene 2026-07-04 — see seedOneRestaction: this success Put is
+	// a seed UNIT resolved+written; wired so snowplow_phase1_bindingset_seed_resolves_total
+	// again means "seed units resolved+Put" (was dead-at-0 post-fold).
+	pipBindingSetSeedResolvesTotal.Add(1)
 
 	// Record widget deps — self + apiRef + render-eligible
 	// resourcesRefs. Matches widgets.go:230. recordWidgetDeps ensures
@@ -1227,6 +812,11 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string) error 
 	// effort: a prewarm error is log-only and never fails the widget seed
 	// (the cohort's per-user widget cell above already seeded; RAFullList is
 	// an accelerator). NON-FATAL by design.
+	// #42 FIX-G: seedRAFullListForWidget consults the caller's OWN per-key
+	// sliceability verdict via the RA-CR-coordinate derivation (shared with
+	// raFullListServe — G2-A), reading the cohort identity from resCtx. No
+	// bindingUID is threaded (the eg1 defect was threading the WIDGET-coordinate
+	// bindingUID, which key-diverged from the RA-CR verdict → G inert).
 	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName())
 	return nil
 }
@@ -1256,6 +846,7 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 		// No apiRef (static widget) or unparseable — nothing to prewarm.
 		return
 	}
+
 	// inline-extras design P §5 / MUST-FIX #1 — PIP-seed key parity at the
 	// RAFullList sub-cell. The dispatcher's apiRef path keys this sub-cell on
 	// the apiRef-EFFECTIVE map (merge(apiRefInline, request)) via
@@ -1267,7 +858,57 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 	// The resourcesRefsTemplateExtras map is correctly NOT folded here — it
 	// does not affect the apiRef fetch (§1). Absent ⇒ {} ⇒ byte-identical to
 	// the pre-inline-extras nil Extras (extrasMinusSlice({}) → nil → no fold).
+	// Computed BEFORE the pre-check so FIX-G's per-key raKey folds the SAME
+	// extras the RAFullList cell keys on (raKey parity).
 	apiRefInline := widgets.GetApiRefExtras(w.Object)
+
+	// #42 FIX-B (shape-level) + FIX-G (per-key) — SKIP the whole prewarm resolve
+	// when this apiRef→RESTAction is already known NOT sliceable, so the
+	// discarded resolve #3 (design §A1; ~4.7s/identity on estate-graph, ~140s/
+	// rank across the un-skipped heavy list widgets) never runs. On a
+	// not-sliceable RA, apiref.Resolve's raFullListServe returns served=false and
+	// Resolve falls through to a page-keyed resolve whose result THIS function
+	// discards — pure waste. One objects.Get to derive the RA is cheap vs that
+	// resolve. TWO checks, both drift-free (derived by the apiref helpers that
+	// share raFullListServe's exact key+shape derivation):
+	//   FIX-B: SHAPE-level negative — structurally non-sliceable under ANY
+	//     identity (permanent-only, FIX-A shape set). Covers identities #2..N
+	//     once the FIRST identity's first-sight records the permanent verdict.
+	//   FIX-G: THIS identity's OWN PER-KEY verdict (permanent OR NOT) — recorded
+	//     by the widgets.Resolve first-sight moments ago in THIS seedOneWidget
+	//     call. Catches the NON-permanent list-shaped negatives FIX-B's
+	//     permanent-only shape set does not, per-identity. G2-A: the per-key
+	//     raKey is derived by SeedFullListPerKeyKnownNonSliceable off the RA-CR
+	//     COORDINATES (via the shared seedFullListRAKey, reading identity from
+	//     ctx) — the SAME derivation raFullListServe records under, so no
+	//     producer/consumer key divergence (the eg1 defect was keying off the
+	//     WIDGET's coordinate bindingUID). ctx carries the cohort identity.
+	// The FIRST identity (both unknown) still runs the full first-sight that
+	// RECORDS the verdict → nothing under-seeded; only later work skips.
+	if got := objects.Get(ctx, apiRef); got.Err == nil && got.Unstructured != nil {
+		var ra templatesv1.RESTAction
+		if cerr := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(
+			got.Unstructured.Object, &ra); cerr == nil {
+			shapeNeg := apiref.SeedFullListShapeKnownNonSliceable(got.GVR, apiRef.Namespace, apiRef.Name, &ra)
+			perKeyNeg := apiref.SeedFullListPerKeyKnownNonSliceable(ctx, got.GVR, apiRef.Namespace, apiRef.Name, &ra, apiRefInline)
+			if shapeNeg || perKeyNeg {
+				reason := "shape-negative (FIX-A/B, structurally non-sliceable under any identity)"
+				if !shapeNeg {
+					reason = "per-key negative (FIX-G, this identity's own first-sight verdict — non-permanent list shape)"
+				}
+				slog.Default().Info("phase1.seed.rafulllist.skip_nonsliceable",
+					slog.String("subsystem", "cache"),
+					slog.String("widget", ns+"/"+name),
+					slog.String("apiref", apiRef.Namespace+"/"+apiRef.Name),
+					slog.Bool("shape_negative", shapeNeg),
+					slog.Bool("per_key_negative", perKeyNeg),
+					slog.String("effect", "known non-sliceable ("+reason+"); "+
+						"skipping the discarded fallback resolve (design §A1 resolve #3 elimination)"),
+				)
+				return
+			}
+		}
+	}
 	// Resolve at a paginated tuple so raFullListServe engages (it requires
 	// perPage>0 && page>0). page 1 + prewarmPageLimit is sufficient: the
 	// byte-verify + pin are per-(RA × shape), NOT per-page, so this single
@@ -1304,6 +945,82 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 			slog.String("effect", "RAFullList prewarm skipped for this (widget,cohort); first /call cold-resolves + pins lazily"),
 		)
 	}
+}
+
+// declineSeedPutOnError is the #102 GTTL-1 error-aware Put-gate for the shared
+// seed primitives — the seed-side mirror of the refresher's gate
+// (resolve_populate.go:251-285). It returns true (decline the Put) when the
+// seed re-resolve observed a swallowed/continueOnError'd STAGE error or touched
+// a genuine EXTERNAL endpoint, in which case the caller MUST skip handle.Put
+// and return nil (best-effort — NOT an error, so the engine seed loop's
+// PROCESSED-not-SUCCEEDED latch decrement is unaffected and readyz never hangs).
+//
+// WHY (arch Option A, uniform across boot + keepwarm sweep): a stage-errored
+// resolve produces degraded/under-populated bytes; a Put would (on the keepwarm
+// sweep) blind-overwrite a good warm entry — the GTTL-1 defect — or (on boot)
+// serve under-served content on first paint. An external touch has no dep edge
+// to invalidate it. The prior good entry (if any) is kept; TTL is the outer net
+// (§1.6). The gate keys on error PRESENCE, never on result emptiness — a
+// legitimately-empty result produces no stage error (sink Count()==0) → NOT
+// declined → its empty bytes ARE stored (mirrors resolve_populate.go:248-250).
+//
+// The identity for the log is read from ctx (withCohortSeedContext installs
+// WithUserInfo) so both primitives share one helper without threading a label.
+func declineSeedPutOnError(ctx context.Context, class, target string,
+	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink) bool {
+
+	if stageErrSink.Count() > 0 {
+		pipSeedSkippedStageErrorTotal.Add(1)
+		// Back-compat parity with the refresher's process-wide counter so
+		// existing "how many degraded re-Puts were declined" dashboards see the
+		// seed declines too (the seed-scoped counter above disambiguates source).
+		cache.BumpRefresherSkippedStageError()
+		stage, sampleErr := stageErrSink.Sample()
+		slog.Default().Info("phase1.seed.skip.stage_error",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.Int64("stage_errors", stageErrSink.Count()),
+			slog.String("stage_err_stage", stage),
+			slog.String("stage_err_sample", sampleErr),
+			slog.String("effect", "seed re-resolve observed a swallowed stage error; declining the Put "+
+				"(keeps any prior good entry; TTL is the outer net) — GTTL-1 backstop, uniform with the refresher"),
+		)
+		return true
+	}
+	if extTouchedSink.Count() > 0 {
+		pipSeedSkippedStageErrorTotal.Add(1)
+		cache.BumpExternalSkippedPut()
+		slog.Default().Info("phase1.seed.skip.external_touch",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("identity", seedIdentityLabelFromCtx(ctx)),
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("effect", "seed re-resolve touched an external endpoint (no dep edge to invalidate); "+
+				"declining the Put — GTTL-1 backstop, uniform with the refresher"),
+		)
+		return true
+	}
+	return false
+}
+
+// seedIdentityLabelFromCtx renders the seeding identity from the cohort ctx
+// (withCohortSeedContext installs WithUserInfo). Username else first group else
+// "anonymous" — mirrors cohortLogLabel's domain for log parity.
+func seedIdentityLabelFromCtx(ctx context.Context) string {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return "anonymous"
+	}
+	if ui.Username != "" {
+		return ui.Username
+	}
+	if len(ui.Groups) > 0 {
+		return "group:" + ui.Groups[0]
+	}
+	return "anonymous"
 }
 
 // cohortLogLabel renders a cohort into a stable log/metric label. The

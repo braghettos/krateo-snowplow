@@ -40,6 +40,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -78,6 +79,9 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 			return rePrewarmBoot(ctx, deps)
 		case scopeKindGVRDiscovered:
 			return rePrewarmGVRDiscovered(ctx, deps, s.gvr)
+		case scopeKindKeepwarm:
+			// #102 c1 — the TTL-cadenced rank-1 keep-warm sweep.
+			return rePrewarmKeepwarm(ctx, deps)
 		default:
 			// Ship 2 future scopes (scopeKindWidgetCR / scopeKindRBACShift)
 			// land here when unwired.
@@ -179,7 +183,27 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.
 // rePrewarmBoot runs the boot re-walk + per-target-GVR-scoped seed. The
 // SAME walk() is used (via the deps.lister + a fresh phase1Walker per
 // root); the harvesters are shared by reference with the boot pass.
+// rePrewarmBoot runs the full re-walk + index rebuild + per-identity seed. The
+// #102 c1 keepwarm sweep reuses this SAME core via rePrewarmKeepwarm (rank1Only
+// seed), so the sweep gets the boot's dedup, NavOrder, BindingsByGVR index, and
+// yield/memory bounds for free — it IS the seed, just rank-1-bounded.
 func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
+	return rePrewarmBootScoped(ctx, deps, false /*rank1Only*/)
+}
+
+// rePrewarmKeepwarm is the #102 c1 keepwarm-sweep handler: the SAME re-walk +
+// seed core as boot, but the seed is bounded to rank-1 (the 95%-mix cohort, all
+// pages). Fires on the TTL×3/4 cadence (keepwarmTicker) so rank-1's cells are
+// re-Put — resetting CreatedAt — before they lazy-expire at TTL. Re-resolving
+// (not TTL-extending) preserves the §1.6 staleness backstop by construction:
+// every sweep Put is FRESH bytes, and the GTTL-1 error-aware Put-gate in the
+// shared seed primitives declines a degraded re-resolve rather than overwrite a
+// good warm entry.
+func rePrewarmKeepwarm(ctx context.Context, deps rePrewarmDeps) error {
+	return rePrewarmBootScoped(ctx, deps, true /*rank1Only*/)
+}
+
+func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only bool) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -187,45 +211,39 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 		return nil
 	}
 
-	// LATENT HAZARD (gate build-obligation #1). This engine boot seed runs
-	// the SERIAL single-worker loop (seedScopeYielding — a plain for-loop
-	// with one restactions.Resolve in flight at a time, yielding to
-	// customers via engineYieldCheckpoint). That serial shape is what
-	// memory-bounds the seed: warm-peak is bounded by a SINGLE resolve's
-	// weight, NOT a concurrent fan-out, so it CANNOT reproduce the
-	// concurrent-fan-out OOM that (a)/#46 fixed.
+	// MEMORY SHAPE (informational). This engine boot seed runs the SERIAL
+	// single-worker loop (seedScopeYielding — a plain for-loop with one
+	// restactions.Resolve in flight at a time, yielding to customers via
+	// engineYieldCheckpoint). That serial shape is what memory-bounds the
+	// seed: warm-peak is bounded by a SINGLE resolve's weight, NOT a
+	// concurrent fan-out. The seed's dominant allocation (seedRAFullListForWidget's
+	// unpaginated full-list) is additionally bounded by the ADAPTIVE seed-unit
+	// gate (enterSeedUnit, seed_bound.go — fold 2026-07-03 §3), which serializes
+	// units against live GOMEMLIMIT headroom.
 	//
-	// BUT: the DEAD errgroup seed path (runPIPSeed, phase1_pip_seed.go —
-	// GOMAXPROCS-bounded g.SetLimit(runtime.GOMAXPROCS(0)) concurrent
-	// cohort fan-out) RE-ACTIVATES if PREWARM_ENGINE_ENABLED=false
-	// (phase1_walk.go:409 picks runPIPSeed when the engine is off). That
-	// concurrent seed BYPASSES the (a) process-wide weighted memory budget
-	// (which is on the CUSTOMER resolve entry, not the legacy seed loop) →
-	// it can re-OOM on the seed. The proactive RA union here WIDENS the
-	// seed source, so a fallback to the concurrent path would fan out over
-	// MORE refs.
-	//
-	// GUARD: production MUST keep PREWARM_ENGINE_ENABLED=true (the helm
-	// overlay sets it true — main-chart-reconciliation). F-3 asserts the
-	// production-on posture. Deleting the dead errgroup path is a separate
-	// BACKLOG item (NOT this ship).
-	if !PrewarmEngineEnabled() {
-		// Defensive: rePrewarmBoot is only reached when the engine path is
-		// selected (phase1_walk.go:482), so this branch should be
-		// unreachable in production. Emit loudly if it ever fires.
-		log.Warn("prewarm.engine.boot.hazard_engine_disabled_but_boot_reached",
-			slog.String("subsystem", "cache"),
-			slog.String("effect", "rePrewarmBoot reached with PREWARM_ENGINE_ENABLED=false — the concurrent "+
-				"runPIPSeed errgroup path (which BYPASSES the (a) memory budget) may also be active; "+
-				"this is the documented latent re-OOM hazard — keep the engine enabled"),
-		)
-	}
+	// FOLDED 2026-07-03 (docs/prewarm-engine-implicit-on-cache-2026-07-03.md §4):
+	// the old latent hazard — the DEAD errgroup runPIPSeed path re-activating
+	// when PREWARM_ENGINE_ENABLED=false — is GONE. runPIPSeed is DELETED and
+	// PrewarmEngineEnabled() is implicit-on-cache, so the engine is the only
+	// seed path whenever prewarm runs. The defensive
+	// hazard_engine_disabled_but_boot_reached Warn that guarded that
+	// now-unreachable state is removed with it.
 
 	// ── (1) RE-WALK the nav roots AFTER the sync barrier. A FRESH walker
 	// per root (new visited map — reusing the boot pass's visited would
 	// short-circuit every child and descend nothing). The SAME walk() so
 	// harvestApiRef + harvestNavWidget re-fire over the now-populated
 	// dynamic navmenu children.
+	// BOOT-RACE-TOLERANT (shape A §2.4 D3): mark the re-drive ctx as a
+	// background resolve so the self-heal re-walk YIELDS memory + the C5
+	// cold-fan-out admission race to live customer /call traffic (complements
+	// engineYieldCheckpoint's between-cohort yield). A config-vars-driven
+	// re-drive can fire long after Ready — while customers are actively
+	// navigating — so it must not contend with them at the aggregate OOM
+	// bound (the 1.5.28 adaptive aggregate). 1 line, ctx-only, no behaviour
+	// change to accounting (background differs only at admission). See
+	// cache.WithBackgroundResolve.
+	ctx = cache.WithBackgroundResolve(ctx)
 	rctx := withPhase1SAContext(ctx, deps.saEP, deps.saRC)
 	roots, listErr := deps.lister(rctx)
 	if listErr != nil {
@@ -323,12 +341,14 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 	// propagates; withCohortSeedContext OVERRIDES identity per cohort for the
 	// actual seed, so the SA base is correct for both the derivation fetch
 	// and as the per-cohort seed base.
-	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS); err != nil {
+	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS, rank1Only); err != nil {
 		return err
 	}
 
 	log.Info("prewarm.engine.boot.complete",
 		slog.String("subsystem", "cache"),
+		slog.Bool("rank1_only", rank1Only),
+		slog.String("scope", map[bool]string{false: "boot", true: "keepwarm"}[rank1Only]),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 	return nil
@@ -377,11 +397,63 @@ var enumeratePrewarmTargetsForGVRFn = cache.EnumeratePrewarmTargetsForGVR
 // enumeratePrewarmTargetsForGVRFn.
 var seedOneWidgetFn = seedOneWidget
 
+// restActionTargetGVRFn / seedOneRestactionFn are the restaction-loop
+// mirrors of the widget seams above — same 1-LOC `var fooFn = foo` pattern.
+// #42 introduces them so the first-nav ORDERING falsifier can drive BOTH
+// loops (a high-fan-out restaction + a nav widget) in ONE hermetic run
+// without a live apiserver: restActionTargetGVRFn stands in for the
+// objects.Get-backed restActionTargetGVR (no apiserver), seedOneRestactionFn
+// stands in for the per-target seed primitive. Production ALWAYS uses the
+// real functions.
+var restActionTargetGVRFn = restActionTargetGVR
+var seedOneRestactionFn = seedOneRestaction
+
+// #42 FIX-E: the seedClass / seedClassOrderFn class-ORDER seam (whole-widgets-
+// class-then-whole-restactions-class dispatch) was REMOVED here. FIX-E replaced
+// the class-major model with a rank-major, class-INTERLEAVED loop
+// (seedScopeYielding below: per identity rank → widgets(r) in NavOrder →
+// restactions(r)), so there is no longer a "class order" to vary — the classes
+// interleave per rank. The 3 falsifiers that drove seedClassOrderFn
+// (FirstNavFirst / CheapCohortFirst restactions-sort / widgets-sort) were
+// deleted-with-migration; their guarded properties are re-covered by the FIX-E
+// interleave falsifier (see prewarm_engine_seed_order_test.go migration note +
+// the regression journal). Deleting the seam also removes test-only prod code
+// (the #66 shadow class).
+
+// rank1Only, when true, bounds the seed to the rank-1 identity (ranked[0], the
+// highest-CollapsedBindings 95%-mix cohort) — the #102 c1 keepwarm sweep scope.
+// The boot seed passes false (all ranks). It is a pure LOOP BOUND on the
+// existing rank-major loop (ranked is sorted DESC by CollapsedBindings, so
+// ranked[0] IS rank-1); no new seam, no separate loop — the sweep re-runs the
+// identical per-identity seed the boot does, just for the one dominant cohort.
 func seedScopeYielding(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
-	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
+	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, rank1Only bool) error {
 
 	log := slog.Default()
+
+	// CTX-CANCEL ABORT OBSERVABILITY (fold 2026-07-03, §4.3b — migrated from the
+	// deleted seedCohort's 0.30.191 Fix-C `phase1.cohort.abort` reporter). The
+	// engine seed's ctx-cancel exits (boot budget / pipCohortTimeout / process
+	// shutdown) previously just `return ctx.Err()` with no greppable line, so a
+	// post-deploy "did the seed finish or get cut off?" grep had nothing to key
+	// on. emitSeedAbort logs a single greppable `prewarm.seed.abort` line with
+	// the same load-bearing fields Fix-C carried: phase (which loop was cut),
+	// cause (the ctx error), targets_processed, elapsed_ms. Best-effort +
+	// log-only — the seed is background, an abort is never fatal.
+	start := time.Now()
+	targetsProcessed := 0
+	emitSeedAbort := func(phase string, cause error) {
+		log.Warn("prewarm.seed.abort",
+			slog.String("subsystem", "cache"),
+			slog.String("phase", phase),
+			slog.Any("cause", cause),
+			slog.Int("targets_processed", targetsProcessed),
+			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
+			slog.String("effect", "seed cut off by ctx cancel/deadline (boot budget / pipCohortTimeout / "+
+				"shutdown); background best-effort — remaining targets fall back to per-user resolve at /call time"),
+		)
+	}
 
 	// #158 (design §1.4 + §1.5 engine path) — classify per-target seed
 	// failures instead of swallowing them. RBAC-deny → Info + rbac_deny
@@ -444,9 +516,10 @@ func seedScopeYielding(ctx context.Context,
 		out := make([]seedTarget, 0, len(raw))
 		for _, t := range raw {
 			out = append(out, seedTarget{
-				BindingUID: t.BindingUID,
-				Username:   t.Subject.Username,
-				Groups:     append([]string(nil), t.Subject.Groups...),
+				BindingUID:        t.BindingUID,
+				Username:          t.Subject.Username,
+				Groups:            append([]string(nil), t.Subject.Groups...),
+				CollapsedBindings: t.CollapsedBindings,
 			})
 		}
 		return out, true
@@ -476,63 +549,317 @@ func seedScopeYielding(ctx context.Context,
 		return do(cohortCtx)
 	}
 
-	// ── RESTActions seed — per-binding targets scoped on each RA's TARGET GVR.
-	for _, ref := range restactionRefs {
+	// ── #42 FIX-E: IDENTITY-RANK-MAJOR, CLASS-INTERLEAVED, FIRST-NAV-ORDERED seed.
+	//
+	// Precompute every widget's + restaction's per-binding target set once, then
+	// seed RANK-MAJOR across BOTH classes: for each identity rank r (descending
+	// dedup collapsed-binding count) → widgets(r) in FIRST-NAV WALK ORDER, then
+	// restactions(r). This supersedes FIX-D (rank-major widgets-only) + Fix-A2
+	// (within-rank count-sort): count≠cost was proven twice (A2 seeded a cheap
+	// widget before the dashboard's own widgets), so the within-rank WIDGET order
+	// is now the walk-derived NavOrder (roots in config.json order, depth-first —
+	// dashboard/default-route subtree first). Interleaving restactions INTO each
+	// rank (instead of after ALL widget ranks) is why restactions finally seed:
+	// rank-1's RAs run right after rank-1's widgets, before rank-2 work. Within a
+	// rank the restactions keep the ascending-len(targets) tiebreak (cheap RAs
+	// before the high-fan-out apps/deployments tail).
+	//
+	// PURE ORDERING: the (unit×identity) seed SET is unchanged — same targetsFor,
+	// same primitives, same enterSeedUnit per-unit bound; only the SEQUENCE. No
+	// caps/skips/magic numbers, no static/name literals (rank metric =
+	// CollapsedBindings; widget order = NavOrder; RA tiebreak = len+ns/name).
+	type widgetSeed struct {
+		e       navWidgetEntry
+		targets []seedTarget
+		scoped  bool
+	}
+	type restactionSeed struct {
+		ref       templatesv1.ObjectReference
+		targetGVR schema.GroupVersionResource
+		targets   []seedTarget
+		scoped    bool
+	}
+
+	// identityKey mirrors the dedup key (Username + US + sorted Groups) so an
+	// identity is the SAME rank unit across every widget AND restaction.
+	identityKey := func(c seedTarget) string {
+		g := append([]string(nil), c.Groups...)
+		sort.Strings(g)
+		return c.Username + "\x1f" + strings.Join(g, "\x1f")
+	}
+
+	// (1) Precompute widget target sets (yield/abort-aware).
+	widgetSeeds := make([]widgetSeed, 0, len(widgetEntries))
+	for _, e := range widgetEntries {
 		if ctx.Err() != nil {
+			emitSeedAbort("widgets", ctx.Err())
 			return ctx.Err()
 		}
 		engineYieldCheckpoint(ctx)
+		targets, scoped := targetsFor(e.GVR, true)
+		widgetSeeds = append(widgetSeeds, widgetSeed{e: e, targets: targets, scoped: scoped})
+	}
+	// FIRST-NAV WALK ORDER within rank (FIX-E, replaces the A2 count-sort):
+	// ascending NavOrder, ties on ns/name for determinism.
+	sort.SliceStable(widgetSeeds, func(i, j int) bool {
+		if widgetSeeds[i].e.NavOrder != widgetSeeds[j].e.NavOrder {
+			return widgetSeeds[i].e.NavOrder < widgetSeeds[j].e.NavOrder
+		}
+		ei, ej := widgetSeeds[i].e, widgetSeeds[j].e
+		return ei.W.GetNamespace()+"/"+ei.W.GetName() < ej.W.GetNamespace()+"/"+ej.W.GetName()
+	})
 
-		targetGVR, haveTarget := restActionTargetGVR(ctx, ref)
+	// (2) Precompute restaction target sets (yield/abort-aware); ascending
+	// len(targets) tiebreak within rank (cheap RAs before the fan-out tail).
+	restactionSeeds := make([]restactionSeed, 0, len(restactionRefs))
+	for _, ref := range restactionRefs {
+		if ctx.Err() != nil {
+			emitSeedAbort("restactions", ctx.Err())
+			return ctx.Err()
+		}
+		engineYieldCheckpoint(ctx)
+		targetGVR, haveTarget := restActionTargetGVRFn(ctx, ref)
 		targets, scoped := targetsFor(targetGVR, haveTarget)
+		restactionSeeds = append(restactionSeeds, restactionSeed{
+			ref: ref, targetGVR: targetGVR, targets: targets, scoped: scoped,
+		})
+	}
+	sort.SliceStable(restactionSeeds, func(i, j int) bool {
+		if len(restactionSeeds[i].targets) != len(restactionSeeds[j].targets) {
+			return len(restactionSeeds[i].targets) < len(restactionSeeds[j].targets)
+		}
+		ri, rj := restactionSeeds[i].ref, restactionSeeds[j].ref
+		return ri.Namespace+"/"+ri.Name < rj.Namespace+"/"+rj.Name
+	})
+
+	// (3) Rank the identities over BOTH classes' targets, DESCENDING by
+	// CollapsedBindings; ties on the identity key (deterministic, no starvation).
+	type rankedIdentity struct {
+		key       string
+		collapsed int
+	}
+	rankOf := map[string]rankedIdentity{}
+	noteIdentity := func(c seedTarget) {
+		k := identityKey(c)
+		if _, ok := rankOf[k]; !ok {
+			rankOf[k] = rankedIdentity{key: k, collapsed: c.CollapsedBindings}
+		}
+	}
+	for _, ws := range widgetSeeds {
+		for _, c := range ws.targets {
+			noteIdentity(c)
+		}
+	}
+	for _, rs := range restactionSeeds {
+		for _, c := range rs.targets {
+			noteIdentity(c)
+		}
+	}
+	ranked := make([]rankedIdentity, 0, len(rankOf))
+	for _, ri := range rankOf {
+		ranked = append(ranked, ri)
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].collapsed != ranked[j].collapsed {
+			return ranked[i].collapsed > ranked[j].collapsed
+		}
+		return ranked[i].key < ranked[j].key
+	})
+
+	// Emit per-unit target-count telemetry ONCE up front (the seed loop below is
+	// rank-major, so the *_targets line no longer pairs 1:1 with a contiguous
+	// per-unit block).
+	for _, ws := range widgetSeeds {
+		log.Info("prewarm.engine.seed.widget_targets",
+			slog.String("subsystem", "cache"),
+			slog.String("widget", ws.e.W.GetNamespace()+"/"+ws.e.W.GetName()),
+			slog.String("gvr", ws.e.GVR.String()),
+			slog.Bool("scoped", ws.scoped),
+			slog.Int("targets", len(ws.targets)),
+			slog.Int("nav_order", ws.e.NavOrder),
+		)
+	}
+	for _, rs := range restactionSeeds {
 		log.Info("prewarm.engine.seed.restaction_targets",
 			slog.String("subsystem", "cache"),
-			slog.String("restaction", ref.Namespace+"/"+ref.Name),
-			slog.String("target_gvr", targetGVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("targets", len(targets)),
+			slog.String("restaction", rs.ref.Namespace+"/"+rs.ref.Name),
+			slog.String("target_gvr", rs.targetGVR.String()),
+			slog.Bool("scoped", rs.scoped),
+			slog.Int("targets", len(rs.targets)),
 		)
-		for _, c := range targets {
-			err := seedOneTarget(c, func(cohortCtx context.Context) error {
-				return seedOneRestaction(cohortCtx, cohortLogLabel(c), ref, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
-				return ctx.Err()
+	}
+
+	// seedWidgetTarget / seedRestactionTarget — the per-target seed bodies,
+	// shared by the rank-major loop. Each returns (abort bool, err) where abort
+	// signals a ctx-cancel that must stop the whole seed.
+	seedWidgetTarget := func(e navWidgetEntry, c seedTarget) bool {
+		if ctx.Err() != nil {
+			emitSeedAbort("widgets", ctx.Err())
+			return true
+		}
+		engineYieldCheckpoint(ctx)
+		err := seedOneTarget(c, func(cohortCtx context.Context) error {
+			return seedOneWidgetFn(cohortCtx, e, authnNS)
+		})
+		if err != nil && ctx.Err() != nil {
+			emitSeedAbort("widgets", ctx.Err())
+			return true
+		}
+		if err != nil {
+			classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
+		}
+		targetsProcessed++
+		return false
+	}
+	seedRestactionTarget := func(ref templatesv1.ObjectReference, c seedTarget) bool {
+		if ctx.Err() != nil {
+			emitSeedAbort("restactions", ctx.Err())
+			return true
+		}
+		engineYieldCheckpoint(ctx)
+		err := seedOneTarget(c, func(cohortCtx context.Context) error {
+			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS)
+		})
+		if err != nil && ctx.Err() != nil {
+			emitSeedAbort("restactions", ctx.Err())
+			return true
+		}
+		if err != nil {
+			classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
+		}
+		targetsProcessed++
+		return false
+	}
+
+	// ── #99 FIX-F: FIRST-NAV LATCH ARMING (segment-scoped, F-C2). ──
+	// The readyz gate flips when the rank-1 (ri==0) identity's RootIndex==0
+	// (default-route/dashboard) WIDGET segment has seeded — NOT the whole
+	// rank-1 pass, NOT the full seed (prewarm_first_nav_latch.go). We count
+	// the rank-1 × RootIndex==0 widget-target PAIRS up front so we can fire
+	// the latch the instant the LAST one seeds (mid-rank-1, before the
+	// RootIndex>0 widgets and before ANY rank-1 restaction — the heavy
+	// NON-first-nav tail is still mid-seed, ARM-TAIL). RootIndex is stamped on
+	// widgets only (phase1_pip_seed.go BeginRoot/RootIndex); restactions carry
+	// no first-nav marker, so the segment is the widget subset — the RA cells
+	// warm through FIX-E's ascending-len ordering (cheap dashboard RAs before
+	// the fanout whale) as background tail after the flip. The latch is nil
+	// under the pure-unit seed tests that call seedScopeYielding directly (no
+	// engineSeed wrapper built it) → all fire() calls are nil-safe no-ops, so
+	// those tests are unchanged.
+	latch := currentFirstNavLatch()
+	latchStart := time.Now()
+	firstNavRemaining := 0
+	firstNavWidgets := 0
+	if latch != nil && len(ranked) > 0 {
+		rank1 := ranked[0].key
+		for _, ws := range widgetSeeds {
+			if ws.e.RootIndex != 0 {
+				continue
 			}
-			if err != nil {
-				// #158 — classify (was: blanket Warn, no counter).
-				classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
+			hasRank1Target := false
+			for _, c := range ws.targets {
+				if identityKey(c) == rank1 {
+					firstNavRemaining++
+					hasRank1Target = true
+				}
+			}
+			if hasRank1Target {
+				firstNavWidgets++
 			}
 		}
 	}
-
-	// ── Widgets seed — per-binding targets scoped on each widget's GVR.
-	for _, e := range widgetEntries {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	// firstNavTotal is the segment target count; firstNavRemaining decrements
+	// toward zero as each first-nav target seeds. Captured before the loop so
+	// the fire-log reports the count actually waited on.
+	firstNavTotal := firstNavRemaining
+	// fireFirstNav closes the latch once the segment is complete. reason
+	// discriminates the segment-complete path from the provably-zero path.
+	// segSeeded = the first-nav targets seeded by fire time (= total minus
+	// whatever remains; the zero-targets path reports 0). Nil-safe.
+	fireFirstNav := func(reason string) {
+		if latch != nil {
+			latch.fire(reason, firstNavWidgets, firstNavTotal-firstNavRemaining, time.Since(latchStart))
 		}
-		engineYieldCheckpoint(ctx)
+	}
 
-		targets, scoped := targetsFor(e.GVR, true)
-		log.Info("prewarm.engine.seed.widget_targets",
-			slog.String("subsystem", "cache"),
-			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-			slog.String("gvr", e.GVR.String()),
-			slog.Bool("scoped", scoped),
-			slog.Int("targets", len(targets)),
-		)
-		for _, c := range targets {
-			err := seedOneTarget(c, func(cohortCtx context.Context) error {
-				return seedOneWidgetFn(cohortCtx, e, authnNS)
-			})
-			if err != nil && ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err != nil {
-				// #158 — classify (was: blanket Warn, no counter).
-				classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
+	// (4) RANK-MAJOR, CLASS-INTERLEAVED seed: per rank → widgets(r) in NavOrder,
+	// then restactions(r). FIX-F SEAM (F-C1): the rank-1 first-nav segment
+	// boundary is a clean, well-defined point; the latch fires the instant the
+	// rank-1 RootIndex==0 widget count reaches zero (below), NOT at the rank-1
+	// boundary (which would pull the RA tail into the readyz gate). The seam is
+	// KEPT unobscured — single rank-1 iteration, widgets-then-restactions, no
+	// interleaving of later ranks.
+	for ri := range ranked {
+		// #102 c1: the keepwarm sweep is bounded to rank-1 (ranked[0]) — the
+		// 95%-mix dominant cohort, on ALL pages. Stop after the first rank. This
+		// is the whole c1 scope: re-resolve rank-1's cell set on the TTL×3/4
+		// cadence so those cells never lazy-expire (each sweep Put resets
+		// CreatedAt). Boot passes rank1Only=false and sweeps every rank.
+		if rank1Only && ri > 0 {
+			break
+		}
+		rankKey := ranked[ri].key
+		for _, ws := range widgetSeeds {
+			e := ws.e
+			for _, c := range ws.targets {
+				if identityKey(c) != rankKey {
+					continue
+				}
+				if seedWidgetTarget(e, c) {
+					return ctx.Err()
+				}
+				// F-C2: fire the latch the instant the LAST rank-1
+				// RootIndex==0 widget target has been PROCESSED (mid-rank-1).
+				// Only the rank-1 first-nav segment decrements; RootIndex>0
+				// widgets and lower ranks never touch firstNavRemaining, so this
+				// cannot fire early on a RootIndex>0-only seed (F-C3).
+				//
+				// PROCESSED, NOT SUCCEEDED (deliberate, C2 liveness). We reach
+				// this line whenever seedWidgetTarget did not abort on ctx-cancel;
+				// a per-target seed FAILURE is classified + swallowed inside
+				// seedWidgetTarget (classifyEngineSeedErr), so the count still
+				// decrements. This is intentional: a permanently-failing dashboard
+				// target must NOT hang /readyz to the PHASE1_TIMEOUT backstop
+				// (that is the exact cold-cell degeneration FIX-F removes). The
+				// real guard that the dashboard is genuinely warm is the
+				// on-cluster post-Ready /dashboard nav#1 l1:HIT content check, not
+				// this counter.
+				if latch != nil && ri == 0 && e.RootIndex == 0 && identityKey(c) == rankKey {
+					firstNavRemaining--
+					if firstNavRemaining == 0 {
+						fireFirstNav("segment-complete")
+					}
+				}
 			}
 		}
+		for _, rs := range restactionSeeds {
+			ref := rs.ref
+			for _, c := range rs.targets {
+				if identityKey(c) != rankKey {
+					continue
+				}
+				if seedRestactionTarget(ref, c) {
+					return ctx.Err()
+				}
+			}
+		}
+		// ── FIX-F SEAM: rank-1 (ri==0) segment boundary. If the rank-1
+		// first-nav segment had ZERO widget targets (no RootIndex==0 widget
+		// authorised for the rank-1 identity — e.g. an all-tail topology, or
+		// prewarm reached no dashboard widget), there is provably nothing to
+		// warm on the first-nav path → fire here so the latch never hangs
+		// (the PHASE1_TIMEOUT backstop would otherwise be the only escape).
+		// firstNavTotal==0 is the "no first-nav segment exists" case; a
+		// non-zero total already fired above. ──
+		if latch != nil && ri == 0 && firstNavTotal == 0 {
+			fireFirstNav("zero-first-nav-targets")
+		}
+	}
+	// Defensive: if ranked was empty (no identities enumerated at all — nothing
+	// to seed), fire so readyz does not wait on the backstop for a genuinely
+	// empty seed. Nil-safe.
+	if latch != nil && len(ranked) == 0 {
+		fireFirstNav("zero-first-nav-targets")
 	}
 	return nil
 }

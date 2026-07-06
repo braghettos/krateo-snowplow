@@ -15,8 +15,8 @@ import (
 	"testing"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/plumbing/jqutil"
+	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -107,6 +107,14 @@ func TestRAServe_VerifyThenHit(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
+	// #95 arch C-1: raFullListServe now declines (page-keyed fallback) when the
+	// re-derived BindingUID is "" (the shared empty-identity cell must never be
+	// served/populated). Publish the f6 RBAC grant so admin re-derives a REAL
+	// non-empty BindingUID (C:crb-a-f6-uid) on the restactions GVR — the
+	// production-representative servable state this test exercises. (Pre-C-1
+	// this test rode the no-snapshot→"" path, which was never a legitimate
+	// servable scenario.)
+	newF6Watcher(t, f6BuildFixture()...)
 
 	panels := panelDict(40)
 	var calls atomic.Int64
@@ -157,6 +165,9 @@ func TestRAServe_NonSliceableFallsBack(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
+	// #95 arch C-1: publish the f6 grant so admin re-derives a REAL non-empty
+	// BindingUID (was riding the no-snapshot→"" path, now declined by C-1).
+	newF6Watcher(t, f6BuildFixture()...)
 
 	// Aggregation RA: output depends on the slice (returns a count), so a
 	// Go-slice over the unpaginated full can never reproduce a paginated
@@ -251,9 +262,11 @@ func TestRAServe_CacheOffDeclines(t *testing.T) {
 // full ({compositionspanels: []}). The byte-verify would otherwise see
 // empty-Go-slice == empty-page-keyed → record verdict=sliceable + Put the
 // empty cell → freeze the fast path on empty FOREVER. The guard MUST instead:
-//   (a) record NO sliceable verdict (verdict stays UNKNOWN / re-verifiable),
-//   (b) Put NO cell (no empty cell cached),
-//   (c) serve the correct (empty) page-keyed result this /call.
+//
+//	(a) record NO sliceable verdict (verdict stays UNKNOWN / re-verifiable),
+//	(b) Put NO cell (no empty cell cached),
+//	(c) serve the correct (empty) page-keyed result this /call.
+//
 // Then, after the informer syncs (the stub starts returning real panels), the
 // NEXT /call must re-run first-sight, record a real verdict, and serve
 // non-empty data — proving self-healing.
@@ -261,6 +274,10 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	cache.ResetResolvedCacheForTest()
+	// #95 arch C-1: publish the f6 grant so admin re-derives a REAL non-empty
+	// BindingUID (C:crb-a-f6-uid); the empty-full self-heal path is exercised
+	// under a real identity, not the now-declined ""-path.
+	newF6Watcher(t, f6BuildFixture()...)
 
 	// `synced` flips the stub from the not-synced (empty) state to the
 	// synced (real panels) state, modelling the informer catching up.
@@ -317,14 +334,15 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 	shape := cache.SliceShapeHash(raFullListCallerClass, gvr().Group, gvr().Version,
 		gvr().Resource, "krateo-system", raName, raSliceJQ)
 	// Ship 0.30.242 H.c-layered Phase 2c — the production code path
-	// (ra_full_list.go:85) derives BindingUID via direct rbac.EvaluateRBAC.
-	// In this test harness without a configured RBAC snapshot, the
-	// evaluator returns ("", "", err) — cache.BindingUIDFromCRB/FromRB
-	// is unreachable, so bindingUID == "". The test's raKey computation
-	// MUST match: empty BindingUID.
+	// (ra_full_list.go) derives BindingUID via direct rbac.EvaluateRBAC.
+	// #95 arch C-1: this test now publishes the f6 grant (newF6Watcher above),
+	// so admin re-derives the REAL first-match BindingUID "C:crb-a-f6-uid" (the
+	// f6 crb-A-admin UID). The test's raKey computation MUST match that — NOT
+	// "" (the pre-C-1 no-snapshot path, which C-1 now declines before this
+	// point).
 	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
 		"krateo-system", raName,
-		"", nil)
+		"C:crb-a-f6-uid", nil)
 	raKey := cache.ComputeKey(keyInputs)
 	if _, known := cache.SliceabilityLookup(raKey, shape); known {
 		t.Fatalf("empty full MUST NOT record a sliceability verdict (must stay UNKNOWN/re-verifiable)")
@@ -374,6 +392,55 @@ func TestRAServe_EmptyFullDoesNotFreeze(t *testing.T) {
 	synced.Store(true)
 	ref, _ := resolve(ctx, 5, 1)
 	assertCanonEqual(t, got2, ref, "post-sync-page1")
+}
+
+// TestRAServe_EmptyBindingDeclines — #95 arch C-1: raFullListServe treats a
+// re-derived BindingUID of "" as a decline (page-keyed fallback under the
+// request's own identity), NEVER serving the shared ""-keyed RAFullList cell.
+// This is the read-side leak one layer below the dispatcher guards: reachable
+// via the dispatcher's own #95 fall-through (top-level "" MISS → direct resolve
+// → resolveApiRef → raFullListServe re-derives "").
+//
+// Setup: NO RBAC snapshot published (ctxWithUser has identity but EvaluateRBAC
+// finds no binding → bindingUID==""), then PRE-POPULATE a known-sliceable
+// ""-keyed cell (representing what a broad ""-identity would have populated
+// pre-fix). With C-1 the serve MUST still decline (served=false) despite the
+// hit — proving the ""-guard fires BEFORE the known-sliceable hit path. RED arm
+// = remove the `if bindingUID == "" { return }` guard → it serves the ""-cell.
+func TestRAServe_EmptyBindingDeclines(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	cache.ResetResolvedCacheForTest()
+	// NOTE: NO newF6Watcher / no snapshot → EvaluateRBAC returns "" (the trigger).
+	// Unique raName isolates this test from the process-global sliceability memo.
+
+	const raName = "empty-binding-decline-ra"
+	// The ""-keyed cell + a known-sliceable verdict a broad ""-identity would
+	// have left behind (the shared cross-identity cell C-1 must not serve).
+	shape := cache.SliceShapeHash(raFullListCallerClass, gvr().Group, gvr().Version,
+		gvr().Resource, "krateo-system", raName, raSliceJQ)
+	keyInputs := cache.RAFullListKeyInputs(gvr().Group, gvr().Version, gvr().Resource,
+		"krateo-system", raName, "" /* the empty-identity key */, nil)
+	raKey := cache.ComputeKey(keyInputs)
+	cache.ResolvedCache().PutRAFullList(raKey, keyInputs, panelDict(40))
+	cache.RecordSliceability(raKey, shape, true) // known-sliceable → would HIT
+	if _, ok := cache.ResolvedCache().Get(raKey); !ok {
+		t.Fatalf("setup: the representative empty-identity cell must be present")
+	}
+
+	var calls atomic.Int64
+	resolve := stubResolveRA(t, panelDict(40), &calls)
+
+	// C-1: raFullListServe re-derives bindingUID=="" → declines (served=false)
+	// BEFORE the known-sliceable hit → the shared ""-cell is NEVER served.
+	_, ok, err := raFullListServe(ctxWithUser(t), gvr(), "krateo-system", raName,
+		ra(raSliceJQ), 10, 1, nil, resolve)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ok {
+		t.Fatalf("#95 C-1 RED: raFullListServe SERVED an empty-BindingUID cell (ok=true) — the shared empty-identity RAFullList slice leaks cross-identity. The bindingUID-empty early-return must decline (served=false).")
+	}
 }
 
 func assertCanonEqual(t *testing.T, a, b map[string]any, label string) {

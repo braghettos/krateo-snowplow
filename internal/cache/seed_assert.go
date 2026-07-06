@@ -3,12 +3,15 @@
 //
 // THE INVARIANT: no single prewarm seed unit (one (target, layer) resolve —
 // e.g. a seedRAFullListForWidget UNPAGINATED full-list materialization) may
-// allocate more than the configured seed-footprint budget. The #23 OOM was
-// the legacy errgroup running GOMAXPROCS such units CONCURRENTLY (ΣN ≈ 8 GiB);
-// the engine path is serial today, so its present-day risk is a SINGLE
-// oversized unit — exactly what this assertion catches. Piece B's semaphore
-// is the aggregate bound for the (reachable, engine=false back-out) concurrent
-// path; this assertion is the per-unit guard that fires on BOTH postures.
+// allocate more than the memory headroom it was admitted against. The #23 OOM
+// was the legacy errgroup running GOMAXPROCS such units CONCURRENTLY
+// (ΣN ≈ 8 GiB); the engine path is serial today, so its present-day risk is a
+// SINGLE oversized unit — exactly what this assertion catches. The ADAPTIVE
+// seed-unit admission gate (dispatchers.enterSeedUnit, fold 2026-07-03 —
+// serialize against the ceiling-at-admission = GOMEMLIMIT − liveHeap − reserve)
+// is the mechanism that actually SERIALIZES units to stay within headroom; this
+// assertion is the per-unit OBSERVABILITY guard that fires when a unit's
+// measured delta exceeded the ceiling it was admitted against.
 //
 // APPARATUS: mirrors serve_assert.go's TestMode/prod asymmetry + the
 // snowplow_assertion_violations_total expvar map (fallthrough_meter_expvar.go),
@@ -21,7 +24,8 @@
 //     The seed unit still completed (we sample AFTER it resolved); the
 //     violation is alertable. We do NOT abort the seed — best-effort warmth,
 //     never a boot-fail (feedback_no_park_broken_behind_flag: this is an
-//     OBSERVABILITY assert, the BOUND is Piece B's semaphore which blocks).
+//     OBSERVABILITY assert, the BOUND is the adaptive admission gate
+//     (dispatchers.enterSeedUnit) which serializes against live headroom).
 //
 // Cost-proportional + seed-scoped: sampled once per seed unit, AFTER the unit
 // resolved, on the seed goroutine only — never on the customer /call path
@@ -57,29 +61,30 @@ func ResetSeedUnitFootprintViolationsForTest() {
 }
 
 // AssertSeedUnitFootprint evaluates the per-unit seed-footprint invariant for
-// one resolved seed unit. deltaBytes is the measured HeapInuse delta the
-// caller sampled around the unit's resolve; budgetBytes is the configured
-// SEED_FOOTPRINT_BUDGET_BYTES. label is a short seed-unit descriptor for the
-// log (kind + target — never a per-name special-case).
+// one resolved seed unit. deltaBytes is the measured live-heap delta the caller
+// sampled around the unit's resolve; budgetBytes is the ADAPTIVE ceiling the
+// unit was admitted against (dispatchers.enterSeedUnit passes the
+// ceiling-at-admission = GOMEMLIMIT − liveHeap − reserve). label is a short
+// seed-unit descriptor for the log (kind + target — never a per-name special-case).
 //
 // budgetBytes <= 0 disables the assertion (returns true, no-op) — the
-// transparent-fallback posture when the budget is unset.
+// transparent-fallback posture when GOMEMLIMIT is unset (unlimited headroom).
 //
 // Returns true when within budget (the common path). On breach:
 //   - test mode → panic (loud; an oversized/unpaginated unit is a regression).
 //   - prod mode → count + ERROR log + return false (the unit already resolved;
-//     this is observability, the seed proceeds — Piece B's semaphore is the
-//     mechanism that actually blocks/serializes).
+//     this is observability, the seed proceeds — the adaptive admission gate
+//     (dispatchers.enterSeedUnit) is the mechanism that actually serializes).
 func AssertSeedUnitFootprint(label string, deltaBytes, budgetBytes uint64) bool {
 	if budgetBytes == 0 || deltaBytes <= budgetBytes {
 		return true
 	}
 
 	if env.TestMode() {
-		panic("cache.AssertSeedUnitFootprint: a single prewarm seed unit exceeded the seed footprint budget" +
-			" (label=" + label + ") — a seed unit MUST stay within SEED_FOOTPRINT_BUDGET_BYTES;" +
-			" an unbounded/unpaginated materialization (e.g. seedRAFullListForWidget full-list)" +
-			" is the #23 boot-OOM class")
+		panic("cache.AssertSeedUnitFootprint: a single prewarm seed unit exceeded the memory headroom it was" +
+			" admitted against (label=" + label + ") — a seed unit MUST stay within the adaptive admission" +
+			" ceiling (GOMEMLIMIT − liveHeap − reserve); an unbounded/unpaginated materialization" +
+			" (e.g. seedRAFullListForWidget full-list) is the #23 boot-OOM class")
 	}
 
 	seedUnitFootprintViolations.Add(1)
@@ -88,10 +93,12 @@ func AssertSeedUnitFootprint(label string, deltaBytes, budgetBytes uint64) bool 
 		slog.String("check", "seed_aggregate_footprint"),
 		slog.String("seed_unit", label),
 		slog.Uint64("delta_bytes", deltaBytes),
-		slog.Uint64("budget_bytes", budgetBytes),
-		slog.String("hint", "a single prewarm seed unit's HeapInuse delta exceeded SEED_FOOTPRINT_BUDGET_BYTES "+
-			"— an oversized/unpaginated materialization; the seed proceeds (best-effort warmth) but this is "+
-			"the #23 boot-OOM-class signal, alertable. Piece B's semaphore is the blocking bound."),
+		slog.Uint64("ceiling_bytes", budgetBytes),
+		slog.String("hint", "a single prewarm seed unit's live-heap delta exceeded the adaptive admission "+
+			"ceiling it was admitted against (GOMEMLIMIT − liveHeap − reserve); an oversized/unpaginated "+
+			"materialization. The seed proceeds (best-effort warmth) but this is the #23 boot-OOM-class signal, "+
+			"alertable — the adaptive seed-unit admission gate (dispatchers.enterSeedUnit) is the mechanism that "+
+			"serializes units to stay within headroom."),
 	)
 	return false
 }

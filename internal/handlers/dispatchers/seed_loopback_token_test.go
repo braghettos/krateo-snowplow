@@ -13,9 +13,25 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 )
+
+// shortDeadlineCtx models the production reality that installSeedLoopbackToken
+// always runs under a DEADLINE'd ctx (the seed/p1 ctx, child of
+// pipGlobalTimeout / PHASE1_TIMEOUT_SECONDS). The boot-race-tolerant backoff
+// (§2.3) is STRICTLY ctx-bounded: on a persistently-failing provider it retries
+// until this ctx expires, then degrades token-less. The degrade tests below use
+// a short deadline so the bounded backoff exhausts fast — the degrade POSTURE
+// (token-less + counter bump) is unchanged from the pre-backoff fire-once path;
+// only the number of attempts before the degrade differs.
+func shortDeadlineCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	t.Cleanup(cancel)
+	return ctx
+}
 
 func TestInstallSeedLoopbackToken_InstallsWhenProviderSucceeds(t *testing.T) {
 	t.Cleanup(func() { SetSeedLoopbackTokenProvider(nil) })
@@ -37,7 +53,9 @@ func TestInstallSeedLoopbackToken_DegradesOnProviderError(t *testing.T) {
 	})
 
 	// MUST NOT panic / fail — returns the ctx UNCHANGED (token-less seed).
-	got := installSeedLoopbackToken(context.Background())
+	// Short-deadline ctx: the bounded backoff exhausts on ctx expiry then
+	// degrades (production always runs under a deadline'd seed/p1 ctx).
+	got := installSeedLoopbackToken(shortDeadlineCtx(t))
 	if tok, _ := xcontext.AccessToken(got); tok != "" {
 		t.Fatalf("on a token error the seed ctx must carry NO access token (degrade); got %q", tok)
 	}
@@ -53,7 +71,7 @@ func TestInstallSeedLoopbackToken_DegradesOnEmptyToken(t *testing.T) {
 	SetSeedLoopbackTokenProvider(func(context.Context) (string, error) {
 		return "", nil // no error but empty — still a degrade (counted)
 	})
-	got := installSeedLoopbackToken(context.Background())
+	got := installSeedLoopbackToken(shortDeadlineCtx(t))
 	if tok, _ := xcontext.AccessToken(got); tok != "" {
 		t.Fatalf("empty token must not be installed; got %q", tok)
 	}
