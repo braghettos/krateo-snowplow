@@ -256,10 +256,26 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only bool
 	}
 
 	rewalked := 0
+	// #99b Fix 2 — reset the harvester's config-root index to -1 at the top of
+	// this walk PASS so the per-root BeginRoot() below stamps RootIndex 0..N-1
+	// in config.json order, exactly like the boot walk (phase1_walk.go:401).
+	// WITHOUT the reset the re-walk would resume from the boot walk's final
+	// curRoot=N-1 and a widget FIRST harvested only during this re-walk (the
+	// 50K+ common case, where the effective harvest comes from the config-vars
+	// redrive) would stamp N..2N-1, so its RootIndex would never be 0 → the
+	// first-nav latch zero-fires (multi-root). First-write-wins dedupe
+	// preserves any boot-walk stamp. Nil-safe. Inert on single-root config
+	// (curRoot pinned 0 after the first BeginRoot); required for multi-root.
+	deps.navHarv.BeginWalk()
 	for _, root := range roots {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// #99b Fix 2 — advance the config-root index before descending this
+		// root (mirrors the boot walk's resolver closure, phase1_walk.go:401).
+		// Roots iterate in config.json order every pass, so this stamps
+		// RootIndex 0 for the first (default-route/dashboard) subtree. Nil-safe.
+		deps.navHarv.BeginRoot()
 		// FRESH walker per root — new visited map (phase1_walk.go:679).
 		// Harvesters SHARED BY REFERENCE so the re-walk's harvest lands in
 		// the set the seed drains.
@@ -677,6 +693,7 @@ func seedScopeYielding(ctx context.Context,
 			slog.Bool("scoped", ws.scoped),
 			slog.Int("targets", len(ws.targets)),
 			slog.Int("nav_order", ws.e.NavOrder),
+			slog.Int("root_index", ws.e.RootIndex),
 		)
 	}
 	for _, rs := range restactionSeeds {
@@ -732,39 +749,73 @@ func seedScopeYielding(ctx context.Context,
 	}
 
 	// ── #99 FIX-F: FIRST-NAV LATCH ARMING (segment-scoped, F-C2). ──
-	// The readyz gate flips when the rank-1 (ri==0) identity's RootIndex==0
-	// (default-route/dashboard) WIDGET segment has seeded — NOT the whole
-	// rank-1 pass, NOT the full seed (prewarm_first_nav_latch.go). We count
-	// the rank-1 × RootIndex==0 widget-target PAIRS up front so we can fire
-	// the latch the instant the LAST one seeds (mid-rank-1, before the
-	// RootIndex>0 widgets and before ANY rank-1 restaction — the heavy
-	// NON-first-nav tail is still mid-seed, ARM-TAIL). RootIndex is stamped on
-	// widgets only (phase1_pip_seed.go BeginRoot/RootIndex); restactions carry
-	// no first-nav marker, so the segment is the widget subset — the RA cells
-	// warm through FIX-E's ascending-len ordering (cheap dashboard RAs before
-	// the fanout whale) as background tail after the flip. The latch is nil
-	// under the pure-unit seed tests that call seedScopeYielding directly (no
-	// engineSeed wrapper built it) → all fire() calls are nil-safe no-ops, so
-	// those tests are unchanged.
+	// The readyz gate flips when the FIRST-NAV WIDGET SEGMENT has seeded — NOT
+	// the whole rank pass, NOT the full seed (prewarm_first_nav_latch.go).
+	//
+	// #99b: the segment identity is NOT hard-wired to ranked[0]. ranked is
+	// built over the UNION of widget- AND restaction-target identities
+	// (:635-667, first-seen CollapsedBindings), so ranked[0] can be an
+	// identity that appears ONLY in a restaction target set and has ZERO
+	// RootIndex==0 widget targets (the live boot600 case: a machine SA present
+	// only in RA enumerations out-ranks every widget-floor identity → the
+	// old rank1==ranked[0] arming counted 0 first-nav targets → the latch
+	// zero-fired with the login cohorts' dashboards COLD). Instead we scan
+	// ranked in order and pick the FIRST identity that actually has ≥1
+	// RootIndex==0 widget target as the segment (segKey at rank segRank). The
+	// segment is that identity's RootIndex==0 widget-target PAIRS; the latch
+	// fires the instant the LAST one seeds (mid-segRank pass, before the
+	// RootIndex>0 widgets and before ANY of that rank's restactions — the
+	// heavy NON-first-nav tail is still mid-seed, ARM-TAIL). Seed ORDER is
+	// UNTOUCHED: this is a pure gate fix; the rank-major loop below is
+	// unchanged, so any lower-ranked identity that spends the prime seed slot
+	// (e.g. the bench-SA rank-1 restaction pass) remains a cheap skipped
+	// prefix — the latch simply no longer keys its readiness on it.
+	//
+	// RootIndex is stamped on widgets only (phase1_pip_seed.go
+	// BeginRoot/RootIndex); restactions carry no first-nav marker, so the
+	// segment is the widget subset — the RA cells warm through FIX-E's
+	// ascending-len ordering (cheap dashboard RAs before the fanout whale) as
+	// background tail after the flip. The latch is nil under the pure-unit
+	// seed tests that call seedScopeYielding directly (no engineSeed wrapper
+	// built it) → all fire() calls are nil-safe no-ops, so those tests are
+	// unchanged.
 	latch := currentFirstNavLatch()
 	latchStart := time.Now()
 	firstNavRemaining := 0
 	firstNavWidgets := 0
-	if latch != nil && len(ranked) > 0 {
-		rank1 := ranked[0].key
-		for _, ws := range widgetSeeds {
-			if ws.e.RootIndex != 0 {
-				continue
-			}
-			hasRank1Target := false
-			for _, c := range ws.targets {
-				if identityKey(c) == rank1 {
-					firstNavRemaining++
-					hasRank1Target = true
+	// segKey/segRank identify the segment identity + its rank in `ranked`.
+	// segRank stays -1 when NO ranked identity has any RootIndex==0 widget
+	// target (genuinely-no-first-nav topology, F-C3) — the zero-fire boundary
+	// below keys on segRank<0/unreached, preserving the provably-empty
+	// semantics.
+	segKey := ""
+	segRank := -1
+	if latch != nil {
+		for r := range ranked {
+			candidate := ranked[r].key
+			count := 0
+			widgetsWith := 0
+			for _, ws := range widgetSeeds {
+				if ws.e.RootIndex != 0 {
+					continue
+				}
+				hits := 0
+				for _, c := range ws.targets {
+					if identityKey(c) == candidate {
+						hits++
+					}
+				}
+				if hits > 0 {
+					count += hits
+					widgetsWith++
 				}
 			}
-			if hasRank1Target {
-				firstNavWidgets++
+			if count > 0 {
+				segKey = candidate
+				segRank = r
+				firstNavRemaining = count
+				firstNavWidgets = widgetsWith
+				break
 			}
 		}
 	}
@@ -778,7 +829,7 @@ func seedScopeYielding(ctx context.Context,
 	// whatever remains; the zero-targets path reports 0). Nil-safe.
 	fireFirstNav := func(reason string) {
 		if latch != nil {
-			latch.fire(reason, firstNavWidgets, firstNavTotal-firstNavRemaining, time.Since(latchStart))
+			latch.fire(reason, firstNavWidgets, firstNavTotal-firstNavRemaining, segKey, segRank, time.Since(latchStart))
 		}
 	}
 
@@ -808,11 +859,16 @@ func seedScopeYielding(ctx context.Context,
 				if seedWidgetTarget(e, c) {
 					return ctx.Err()
 				}
-				// F-C2: fire the latch the instant the LAST rank-1
-				// RootIndex==0 widget target has been PROCESSED (mid-rank-1).
-				// Only the rank-1 first-nav segment decrements; RootIndex>0
-				// widgets and lower ranks never touch firstNavRemaining, so this
-				// cannot fire early on a RootIndex>0-only seed (F-C3).
+				// F-C2: fire the latch the instant the LAST segment-identity
+				// RootIndex==0 widget target has been PROCESSED (mid-segRank pass).
+				// #99b: the segment is the segKey identity at rank segRank — the
+				// first ranked identity with a RootIndex==0 widget target, NOT
+				// necessarily ranked[0]. Only that identity's first-nav segment
+				// decrements; RootIndex>0 widgets and every other rank never touch
+				// firstNavRemaining, so this cannot fire early on a RootIndex>0-only
+				// seed (F-C3). segRank<0 means no ranked identity has a first-nav
+				// widget → this branch never matches → the provably-empty fire
+				// below is the only path.
 				//
 				// PROCESSED, NOT SUCCEEDED (deliberate, C2 liveness). We reach
 				// this line whenever seedWidgetTarget did not abort on ctx-cancel;
@@ -824,7 +880,7 @@ func seedScopeYielding(ctx context.Context,
 				// real guard that the dashboard is genuinely warm is the
 				// on-cluster post-Ready /dashboard nav#1 l1:HIT content check, not
 				// this counter.
-				if latch != nil && ri == 0 && e.RootIndex == 0 && identityKey(c) == rankKey {
+				if latch != nil && ri == segRank && e.RootIndex == 0 && identityKey(c) == segKey {
 					firstNavRemaining--
 					if firstNavRemaining == 0 {
 						fireFirstNav("segment-complete")
@@ -843,22 +899,18 @@ func seedScopeYielding(ctx context.Context,
 				}
 			}
 		}
-		// ── FIX-F SEAM: rank-1 (ri==0) segment boundary. If the rank-1
-		// first-nav segment had ZERO widget targets (no RootIndex==0 widget
-		// authorised for the rank-1 identity — e.g. an all-tail topology, or
-		// prewarm reached no dashboard widget), there is provably nothing to
-		// warm on the first-nav path → fire here so the latch never hangs
-		// (the PHASE1_TIMEOUT backstop would otherwise be the only escape).
-		// firstNavTotal==0 is the "no first-nav segment exists" case; a
-		// non-zero total already fired above. ──
-		if latch != nil && ri == 0 && firstNavTotal == 0 {
-			fireFirstNav("zero-first-nav-targets")
-		}
 	}
-	// Defensive: if ranked was empty (no identities enumerated at all — nothing
-	// to seed), fire so readyz does not wait on the backstop for a genuinely
-	// empty seed. Nil-safe.
-	if latch != nil && len(ranked) == 0 {
+	// ── FIX-F SEAM: provably-empty first-nav boundary (F-C3, #99b). ──
+	// segRank<0 means NO ranked identity had a RootIndex==0 widget target —
+	// an all-tail topology, or prewarm reached no dashboard widget, or ranked
+	// was empty (no identities enumerated at all). There is provably nothing
+	// to warm on the first-nav path → fire so the latch never hangs (the
+	// PHASE1_TIMEOUT backstop would otherwise be the only escape). A non-empty
+	// segment already fired "segment-complete" mid-loop (segRank>=0), so this
+	// close is a no-op then (idempotent once). Firing AFTER the seed loop (not
+	// at a per-rank boundary) means the RootIndex>0-only tail is fully
+	// processed first — F-C3 never fires early mid-tail. Nil-safe.
+	if latch != nil && segRank < 0 {
 		fireFirstNav("zero-first-nav-targets")
 	}
 	return nil

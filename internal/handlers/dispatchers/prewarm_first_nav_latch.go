@@ -68,8 +68,12 @@ func newFirstNavLatch() *firstNavLatch {
 // segment-complete path from the provably-zero-targets path (both are
 // legitimate "first-nav is warm / there is no first-nav to warm" states);
 // segWidgets/segTargets are the RootIndex==0 widget + per-target counts the
-// latch waited on (0/0 on the zero-targets path).
-func (l *firstNavLatch) fire(reason string, segWidgets, segTargets int, elapsed time.Duration) {
+// latch waited on (0/0 on the zero-targets path). segIdentity/segRank name the
+// segment identity + its position in the dedup rank (#99b): the identity the
+// latch keyed readiness on — NOT necessarily ranked[0], since ranked[0] can be
+// a restaction-only identity with zero first-nav widgets. Empty/-1 on the
+// zero-targets path (no ranked identity had a first-nav widget).
+func (l *firstNavLatch) fire(reason string, segWidgets, segTargets int, segIdentity string, segRank int, elapsed time.Duration) {
 	l.once.Do(func() {
 		if firstNavFireObserver != nil {
 			// TEST-ONLY synchronous observation of the fire INSTANT (nil in
@@ -85,6 +89,8 @@ func (l *firstNavLatch) fire(reason string, segWidgets, segTargets int, elapsed 
 			slog.String("reason", reason),
 			slog.Int("first_nav_widgets", segWidgets),
 			slog.Int("first_nav_targets", segTargets),
+			slog.String("segment_identity", segIdentity),
+			slog.Int("segment_rank", segRank),
 			slog.Int64("elapsed_ms", elapsed.Milliseconds()),
 			slog.String("effect", "rank-1 RootIndex==0 first-nav segment seeded (or provably empty); "+
 				"engineSeed unblocks → /readyz flips Ready with the dashboard warm. The boot scope "+

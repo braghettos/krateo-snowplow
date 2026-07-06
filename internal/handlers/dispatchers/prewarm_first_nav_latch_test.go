@@ -479,7 +479,7 @@ func TestFirstNavLatch_MutationII_FireBeforeSegment_IsRedUnderGreenGuard(t *test
 
 	installLatchFireObserver(t, rec)
 	// MUTATION (ii): fire BEFORE the segment completes (before any seed).
-	latch.fire("mutation-ii-premature", 0, 0, 0)
+	latch.fire("mutation-ii-premature", 0, 0, "", -1, 0)
 	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
