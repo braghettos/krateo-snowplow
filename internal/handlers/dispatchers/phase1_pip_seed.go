@@ -236,6 +236,27 @@ func newNavWidgetHarvester() *navWidgetHarvester {
 	return &navWidgetHarvester{entries: map[string]navWidgetEntry{}, curRoot: -1}
 }
 
+// BeginWalk resets the current config-root index to -1 (#99b Fix 2) at the top
+// of EACH walk pass so the following per-root BeginRoot() calls stamp RootIndex
+// 0..N-1 in config.json order every pass — the initial boot walk AND every
+// engine/config-vars re-walk. Without the reset, a re-walk that calls BeginRoot
+// per root would resume from the boot walk's final curRoot (N-1) and stamp
+// re-walk-first-harvested widgets N..2N-1 (the naive-BeginRoot-only defect the
+// doc §4 Fix 2 warns against). First-write-wins dedupe (harvestNavWidget)
+// preserves the boot-walk stamp for any widget already harvested, so a widget
+// FIRST harvested during a re-walk gets the correct root index for its pass.
+// Nil-safe. Inert on this deployment's single-root config (curRoot pinned at 0
+// after the first BeginRoot); required the day a second config root
+// (ROUTES_LOADER) is declared and the effective harvest arrives via a re-walk.
+func (h *navWidgetHarvester) BeginWalk() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.curRoot = -1
+	h.mu.Unlock()
+}
+
 // BeginRoot advances the current config-root index (#42 FIX-F seam, STAMP-ONLY).
 // The phase-1 walk calls this before descending each root; roots resolve
 // sequentially so the increment is deterministic — RootIndex 0 is the first
