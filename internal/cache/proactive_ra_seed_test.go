@@ -10,11 +10,36 @@ package cache
 import (
 	"sort"
 	"testing"
+	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// waitInformerSynced blocks until the GVR's boot-anchored informer has
+// completed its initial LIST+Replace (HasSynced), or fails on a bounded
+// deadline. This is the readiness precondition seedRestActionItem depends
+// on: EnsureResourceType registers the informer and its reflector does an
+// asynchronous initial LIST from the fake dynamic client (empty — no
+// RESTAction objects exist) followed by a store Replace([], rv). If the
+// test seeds items into the indexer via GetIndexer().Add() BEFORE that
+// Replace lands, the Replace wipes some or all of them — the CI-order
+// flake where RBACReachableRestActionRefs saw 2 (or 0) of the 3 seeded
+// refs. Waiting for HasSynced guarantees the initial Replace has already
+// occurred, so subsequent manual Adds are stable (the fake client emits no
+// watch events, so the reflector never Replaces again). Mirrors the
+// rw.IsSynced gate in TestFalsifierFR6_RemoveResourceTypeTearsDownOneGVR.
+func waitInformerSynced(t *testing.T, rw *ResourceWatcher, gvr schema.GroupVersionResource) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !rw.IsSynced(gvr) {
+		if time.Now().After(deadline) {
+			t.Fatalf("precondition: informer for %v did not sync within deadline", gvr)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 
 // seedRestActionItem adds an unstructured RESTAction CR (ns/name only —
 // the enumerator reads ns/name via meta.Accessor) to the boot-anchored
@@ -75,6 +100,10 @@ func TestProactiveRASeed_F_intersection(t *testing.T) {
 	rw := newSyntheticRemoveWatcher(t, restActionGVR)
 	t.Cleanup(func() { rw.Stop() })
 	rw.EnsureResourceType(restActionGVR)
+	// Wait for the informer's initial (empty) LIST+Replace to land BEFORE
+	// seeding, or the async Replace races the manual Adds below and wipes
+	// them — the CI-order flake this test tripped.
+	waitInformerSynced(t, rw, restActionGVR)
 
 	// Seed three composition-detail-style RESTActions (the per-composition
 	// RAs the nav walk never reaches). One duplicate add to prove dedup.
