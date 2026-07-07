@@ -154,11 +154,12 @@ func TestKeepwarmSweep_TickerEnqueuesThenStopsOnCancel(t *testing.T) {
 
 // C2-C1 / ARM-SCOPE — the keepwarm c2 sweep-set evolution of GTTL-3.
 //
-// EXPECTATION INVERTS BY DESIGN (design §6 c1-arm table): the pre-c2 arm
-// asserted rank1Only seeds ONLY rank-1 (devs) and NOT rank-2 (ops); both were
-// widget-capable, so c2 sweeps BOTH. The RED boundary MOVES from "rank-2" to
-// "widgetMax==0". The new fixture adds a widget-LESS identity M (RA-only,
-// widgetMax==0) so the boundary is exercisable.
+// EXPECTATION INVERTS BY DESIGN (design §6 c1-arm table): the pre-c2 (c1) arm
+// asserted the rank-1-only sweep bound seeded ONLY rank-1 (devs) and NOT rank-2
+// (ops); both were widget-capable, so c2 (seedModeKeepwarm, widget-capable
+// prefix) sweeps BOTH. The RED boundary MOVES from "rank-2" to "widgetMax==0".
+// The new fixture adds a widget-LESS identity M (RA-only, widgetMax==0) so the
+// boundary is exercisable.
 //
 // Fixture: two widget-capable identities on a widget's GVR — W1 (collapsed=200)
 // and W2 (collapsed=5, a lower rank but still widget-capable) — and a

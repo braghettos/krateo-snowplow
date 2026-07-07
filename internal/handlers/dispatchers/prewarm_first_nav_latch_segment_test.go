@@ -37,18 +37,17 @@
 //     they resume from the boot walk's curRoot and stamp 1). Exercised at the
 //     harvester level (BeginWalk/BeginRoot are the unit under test).
 //
-//   ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling, FIX-3 divergence
-//     fixture): the #102 keepwarm sweep (rank1Only=true) re-seeds ranked[0]'s
-//     CELLS, NOT the segment identity's. segRank is a latch-only concept and
-//     does NOT retarget the keepwarm loop bound. Post-FIX-3 the pre-FIX-3
-//     fixture (ranked[0]=RA-only M) no longer diverges — M drops to the tail
-//     and ranked[0]=U1 is BOTH widget-capable AND the segment, so it would not
-//     discriminate. TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment now uses
-//     a MULTI-ROOT divergence fixture: W (widgetMax 9, but ALL its widgets are
-//     RootIndex==1) is ranked[0]; the segment identity is V (a lower-ranked
-//     identity with a RootIndex==0 widget) at segRank>0. The sweep MUST seed W
-//     (ranked[0]), NOT V (the segment) — proving the loop bound follows
-//     ranked[0], not segKey.
+//   ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling, FIX-3 + c2
+//     divergence fixture): the keepwarm sweep (seedModeKeepwarm) re-seeds the
+//     WIDGET-CAPABLE PREFIX's CELLS; segRank is a latch-only concept and does NOT
+//     retarget the keepwarm loop bound (the bound is the widgetMax tier). c2
+//     WIDENS this from the c1 rank-1-only bound: the sweep now covers every
+//     widget-capable identity. TestKeepwarmSweep_WidgetCapablePrefix_SeedsBothNotSegmentOnly
+//     uses a MULTI-ROOT divergence fixture: W (widgetMax 9, but ALL its widgets
+//     are RootIndex==1) is ranked[0]; the segment identity is V (a lower-ranked
+//     but still widget-capable identity with a RootIndex==0 widget) at segRank>0.
+//     The sweep MUST seed BOTH W and V (both widget-capable), NOT keyed on
+//     segRank — proving the loop bound follows the widgetMax tier, not segKey.
 //
 // Hermetic, -race, seams only. Serializes on engineLatchTestMu.
 

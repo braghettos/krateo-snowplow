@@ -24,9 +24,10 @@
 //     (freshSkip +1, seedResolves flat). No hand-fed keys. + PM F4-C2b:
 //     dirty-mark between runs → skip still fires AND the refresher's independent
 //     re-resolve for that key still fires. MUTATION: mis-key the skip → RED.
-//   4 BOUNDARY (F4-C3): keepwarm-scoped (bootScoped=false) re-Puts a live cell
-//     (CreatedAt slides); gvr-discovered-scoped (bootScoped=false) re-resolves a
-//     live cell. Both prove fresh-skip is boot-only.
+//   4 BOUNDARY (F4-C3): gvr-discovered-scoped (seedModeGVRDiscovered) re-resolves
+//     a live cell — proves the F.4 bare-liveness fresh-skip is boot-only. (The
+//     keepwarm-mode age-skip boundary is pinned separately in the C2 arms:
+//     keepwarm age-skips a YOUNG live cell but re-resolves an OLD-but-live one.)
 //   5 EXACTLY-ONCE cross-chunk (F4-C4): latch fired in chunk 1 (segment done,
 //     tail cut) → chunk 2 completes tail → NO second fire.
 //
