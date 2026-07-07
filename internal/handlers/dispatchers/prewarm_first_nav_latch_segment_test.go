@@ -1,27 +1,34 @@
 // prewarm_first_nav_latch_segment_test.go — #99b FIX-F segment-identity
-// falsifier set (docs/fixf-rootindex-redrive-walk-trace-2026-07-06.md §5).
+// falsifier set (docs/fixf-rootindex-redrive-walk-trace-2026-07-06.md §5),
+// updated 2026-07-07 for FIX-3 rank hygiene
+// (docs/fix3-rank-hygiene-design-2026-07-07.md §7).
 //
-// The live 60K boot600 defect: `ranked` is built over the UNION of widget- AND
-// restaction-target identities, first-seen CollapsedBindings. A machine SA that
-// appears ONLY in a restaction target set (a bench-ns SA, all seeds
-// empty_binding-skipped) can out-rank every login-cohort widget-floor identity
-// and become ranked[0] — with ZERO RootIndex==0 widget targets. The pre-#99b
-// arming (rank1 := ranked[0].key) then counts 0 first-nav targets → the latch
-// zero-fires (reason=zero-first-nav-targets) BEFORE any widget seed, flipping
-// /readyz with the login cohorts' dashboards cold. #99b makes the segment
-// identity the FIRST ranked identity that actually has a RootIndex==0 widget
-// target (segKey/segRank), so the latch keys readiness on the real dashboard.
+// Pre-FIX-3 defect: `ranked` was built over the UNION of widget- AND
+// restaction-target identities by FIRST-SEEN CollapsedBindings. A machine SA
+// present ONLY in a restaction target set (a bench-ns SA, all seeds
+// empty_binding-skipped) out-ranked every login-cohort widget-floor identity
+// and became ranked[0] — with ZERO RootIndex==0 widget targets. #99b's segKey
+// scan then keyed the latch on the FIRST ranked identity with a RootIndex==0
+// widget target (not ranked[0]) so /readyz gated on the real dashboard.
 //
-//   ARM-GREEN-BOOT600 (§5 GREEN, Fix 1): 2 RootIndex==0 widgets {U1 c=5, U2
-//     c=2} + 1 RootIndex==1 widget; 1 restaction whose target set = {M c=50},
-//     M in NO widget set. ranked[0] is M (restaction-only, out-ranks by
-//     collapsed). The latch MUST fire reason=segment-complete, first_nav_
-//     widgets=2, first_nav_targets=2 (U1's 2 RootIndex==0 pairs — U1 out-ranks
-//     U2 among widget-capable identities), positioned AFTER the 2nd U1
-//     RootIndex==0 widget seed and BEFORE the RootIndex==1 widget + the RA tail
-//     (ARM-TAIL). segment_identity == U1, segment_rank == 1 (M is rank 0).
-//   The RED companion (pre-#99b code) is captured empirically to /tmp/fix99b/
-//     (git-stash the fix; the same fixture zero-fires before any widget seed).
+// FIX-3 changes WHO holds each rank: widgetMax DESC now places every
+// widget-capable identity strictly above every widget-less one, so on a
+// SINGLE-root topology the segment identity IS ranked[0] and segRank binds 0
+// (the machine SA drops to the tail). The #99b scan is retained as a SAFETY NET
+// for the MULTI-root case — an identity whose only widget targets are in a
+// non-first root (RootIndex!=0) can still take ranked[0] yet have zero
+// FIRST-NAV targets → segRank>0. TestFirstNavLatch_SegmentIdentity_MultiRoot_*
+// below is the mandatory arm that keeps that scan discriminating post-FIX-3.
+//
+//   ARM-GREEN-BOOT600 (§5 GREEN, now FIX-3 premise): 2 RootIndex==0 widgets {U1
+//     c=5, U2 c=2} + 1 RootIndex==1 widget; 1 restaction whose target set = {M
+//     c=50}, M in NO widget set. Post-FIX-3 ranked = [U1(widgetMax 5),
+//     U2(widgetMax 2), M(widgetMax 0)] — M's 50 no longer wins because it has
+//     zero widget observations. The latch MUST fire reason=segment-complete,
+//     first_nav_widgets=2, first_nav_targets=2 (U1's 2 RootIndex==0 pairs),
+//     positioned AFTER the 2nd U1 RootIndex==0 widget seed and BEFORE the
+//     RootIndex==1 widget (ARM-TAIL). segment_identity == U1, segment_rank == 0
+//     (U1 is ranked[0] post-FIX-3, not rank 1).
 //
 //   ARM-FIX2-REDRIVE (§5 Fix-2 arm): 2 config roots; the boot-walk pass
 //     harvests NOTHING (empty subtrees); a SECOND walk pass (redrive shape:
@@ -30,12 +37,18 @@
 //     they resume from the boot walk's curRoot and stamp 1). Exercised at the
 //     harvester level (BeginWalk/BeginRoot are the unit under test).
 //
-//   ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling): the #102
-//     keepwarm sweep (rank1Only=true) re-seeds ranked[0]'s CELLS, NOT the
-//     segment identity's. With ranked[0]=M (a restaction-only identity), the
-//     sweep MUST still seed M's restaction targets — segRank is a latch-only
-//     concept and does NOT retarget the keepwarm loop bound. Asserts the sweep
-//     seeds the ranked[0] (M) target set, not the segment (U1) set.
+//   ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling, FIX-3 divergence
+//     fixture): the #102 keepwarm sweep (rank1Only=true) re-seeds ranked[0]'s
+//     CELLS, NOT the segment identity's. segRank is a latch-only concept and
+//     does NOT retarget the keepwarm loop bound. Post-FIX-3 the pre-FIX-3
+//     fixture (ranked[0]=RA-only M) no longer diverges — M drops to the tail
+//     and ranked[0]=U1 is BOTH widget-capable AND the segment, so it would not
+//     discriminate. TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment now uses
+//     a MULTI-ROOT divergence fixture: W (widgetMax 9, but ALL its widgets are
+//     RootIndex==1) is ranked[0]; the segment identity is V (a lower-ranked
+//     identity with a RootIndex==0 widget) at segRank>0. The sweep MUST seed W
+//     (ranked[0]), NOT V (the segment) — proving the loop bound follows
+//     ranked[0], not segKey.
 //
 // Hermetic, -race, seams only. Serializes on engineLatchTestMu.
 
@@ -62,10 +75,11 @@ func TestFirstNavLatch_SegmentIdentity_RestactionOnlyRank0_FiresOnWidgetSegment(
 	resetFirstNavLatchForTest()
 	ensureFirstNavLatch()
 
-	// The boot600 shape: M (collapsed 50) is the highest-ranked identity but
-	// appears ONLY in the restaction target set — no widget authorises it.
-	// U1 (collapsed 5) and U2 (collapsed 2) are the login-cohort widget
-	// identities. ranked = [M(0), U1(1), U2(2)].
+	// The boot600 shape: M (collapsed 50) appears ONLY in the restaction target
+	// set — no widget authorises it, so post-FIX-3 its widgetMax is 0. U1
+	// (widgetMax 5) and U2 (widgetMax 2) are the login-cohort widget identities.
+	// FIX-3 ranked = [U1(0), U2(1), M(2)] — widgetMax DESC drops the RA-only M
+	// to the tail; U1 is ranked[0] and segRank binds 0.
 	m := eID{name: "machine-sa", collapsed: 50}
 	u1 := eID{name: "u1", group: true, collapsed: 5}
 	u2 := eID{name: "u2", group: true, collapsed: 2}
@@ -144,12 +158,98 @@ func TestFirstNavLatch_SegmentIdentity_RestactionOnlyRank0_FiresOnWidgetSegment(
 	if tailIdx < len(ev) && latchIdx > tailIdx {
 		t.Fatalf("§5 GREEN/ARM-TAIL: latch fired at idx %d AFTER the RootIndex==1 tail widget (U2, rank 2) at idx %d — readyz would wait on non-first-nav tail; events=%+v", latchIdx, tailIdx, ev)
 	}
-	// The M restaction is ranked[0] (rank 0) and legitimately seeds FIRST under
-	// the rank-major loop — it is NOT the segment's tail, so the latch firing
-	// after it is correct (M is a cheap prefix, not first-nav work readyz gates
-	// on). We only assert the U1 segment fired and the RootIndex>0 widget tail
-	// is excluded. raIdx is retained only to document its position.
-	_ = raIdx
+	// Post-FIX-3 the M restaction is ranked[2] (widgetMax 0) and legitimately
+	// seeds LAST under the rank-major loop — it is NOT the segment (U1 rank 0),
+	// so the latch fires at U1's segment before M's RA tail ever runs. ARM-TAIL:
+	// readyz must not wait on the RA-only tail. Assert the latch fired at or
+	// before the RA (M) seed to pin the segment-before-tail order under FIX-3.
+	if raIdx < len(ev) && latchIdx > raIdx {
+		t.Fatalf("§5 GREEN/ARM-TAIL: latch fired at idx %d AFTER the RA-only tail (M, rank 2) at idx %d — post-FIX-3 M is the widget-less tail, readyz must not wait on it; events=%+v", latchIdx, raIdx, ev)
+	}
+}
+
+// ── COND-2 (FIX-3 mandatory): MULTI-ROOT segKey scan stays discriminating ───
+// Post-FIX-3, ranked[0] is widget-capable by construction — but "widget-capable"
+// means >=1 widget target ANYWHERE, not >=1 RootIndex==0 (first-nav) target. On
+// a MULTI-ROOT config an identity whose ONLY widget targets live in a non-first
+// root can take ranked[0] yet have ZERO first-nav targets. The #99b segKey scan
+// is the guard that walks past it to the first identity with a genuine
+// RootIndex==0 widget. This arm re-covers the retired #99b "scan walks past
+// ranked[0]" property under FIX-3:
+//   (i) ranked[0] = W (widgetMax 9) but ALL W's widgets are RootIndex==1;
+//   (ii) V (widgetMax 2) has a RootIndex==0 widget → segKey==V, segRank>0;
+//   (iii) the latch fires reason=segment-complete on V's FIRST-NAV segment.
+// RED (captured to /tmp/r3/ empirically): neuter the scan (segRank hard-bound
+// to 0) → the latch counts 0 first-nav targets on W → fires
+// "zero-first-nav-targets" BEFORE V's RootIndex==0 widget → the fire-after-V's-
+// widget + reason=segment-complete asserts below both fail.
+func TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	zeroCustomerInFlight()
+	quietLoggingE(t)
+
+	resetFirstNavLatchForTest()
+	ensureFirstNavLatch()
+
+	// W (widgetMax 9) is ranked[0], widget lives in RootIndex==1 only. V
+	// (widgetMax 2) has a RootIndex==0 widget → the segment identity, segRank>0.
+	w := eID{name: "w", group: true, collapsed: 9}
+	v := eID{name: "v", group: true, collapsed: 2}
+
+	h := newNavWidgetHarvester()
+	firstNavW := latchWidgetGVR("flexes")     // RootIndex 0 — V's first-nav widget
+	nonFirstNavW := latchWidgetGVR("tailwid") // RootIndex 1 — W's only widget
+	harvestWidgetAtRoot(h, "first-nav", firstNavW, 0)
+	harvestWidgetAtRoot(h, "non-first-nav", nonFirstNavW, 1)
+	widgets := h.snapshot()
+
+	rec := &latchRecorder{}
+	installLatchSeams(t, rec,
+		func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
+			switch gvr {
+			case firstNavW:
+				return latchTargets(gvr, v) // V, RootIndex 0 → segment
+			case nonFirstNavW:
+				return latchTargets(gvr, w) // W, RootIndex 1 → ranked[0], not first-nav
+			}
+			return nil
+		},
+		func(_ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+			return schema.GroupVersionResource{}, false
+		})
+
+	var fireReason string
+	firstNavFireObserver = func(reason string) {
+		fireReason = reason
+		rec.rec(latchSeedEvent{class: "LATCH", label: reason, rootIdx: -1})
+	}
+	t.Cleanup(func() { firstNavFireObserver = nil })
+
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
+		t.Fatalf("seedScopeYielding returned %v; want nil", err)
+	}
+	ev := rec.snapshot()
+
+	// (iii) fired segment-complete — NOT zero-first-nav-targets (the neutered-
+	// scan RED reason: W has no first-nav widget so a segRank-hard-0 impl would
+	// find nothing and fire the provably-zero path).
+	if fireReason != "segment-complete" {
+		t.Fatalf("COND-2: latch fired reason=%q; want \"segment-complete\" — with the #99b scan neutered (segRank hard-bound to ranked[0]=W, which has zero RootIndex==0 widgets) the latch would fire \"zero-first-nav-targets\"; events=%+v", fireReason, ev)
+	}
+	// (ii)+(iii) the latch fired AFTER V's RootIndex==0 widget seeded — i.e. it
+	// keyed on the true first-nav segment (segRank>0, segKey==V), not ranked[0].
+	latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
+	vWidgetIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.identity == "group:v" && e.rootIdx == 0 })
+	if latchIdx == len(ev) {
+		t.Fatalf("COND-2: latch never fired; events=%+v", ev)
+	}
+	if vWidgetIdx == len(ev) {
+		t.Fatalf("COND-2 setup: V's RootIndex==0 widget never seeded; events=%+v", ev)
+	}
+	if latchIdx < vWidgetIdx {
+		t.Fatalf("COND-2: latch fired at idx %d BEFORE V's first-nav (RootIndex==0) widget at idx %d — the scan did NOT walk past ranked[0]=W to the real first-nav segment; events=%+v", latchIdx, vWidgetIdx, ev)
+	}
 }
 
 // ── ARM-FIX2-REDRIVE (§5 Fix-2 arm) ─────────────────────────────────────────
@@ -201,13 +301,24 @@ func harvestWidgetAtRootNoReset(h *navWidgetHarvester, name string, gvr schema.G
 	eHarvestWidget(h, name, gvr)
 }
 
-// ── ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling) ──────────────
+// ── ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling, FIX-3) ───────
 // The #102 keepwarm sweep (rank1Only=true) bounds the seed to ranked[0] — the
-// dominant-CollapsedBindings cohort's CELLS — regardless of whether ranked[0]
-// has a first-nav widget. segRank (the latch segment identity, #99b) is a
+// dominant cohort's CELLS — regardless of whether ranked[0] has a FIRST-NAV
+// (RootIndex==0) widget. segRank (the latch segment identity, #99b) is a
 // LATCH-ONLY (boot-gate) concept and must NOT retarget the keepwarm loop bound.
-// With ranked[0]=M (restaction-only) and segRank pointing at U1, the sweep MUST
-// still seed M's restaction target (rank 0), NOT U1's widget (rank 1).
+//
+// This arm PINS: sweep bound follows ranked[0], NOT retargeted by segRank. It
+// requires ranked[0] != segKey (a DIVERGENCE fixture) or the assert is a
+// tautology. Post-FIX-3, ranked[0] is always widget-capable, so we force
+// divergence via MULTI-ROOT topology: W (widgetMax 9) is ranked[0] but ALL its
+// widgets are RootIndex==1 → segRank>0 (the segment falls to V, a lower-ranked
+// identity with a RootIndex==0 widget). The sweep MUST seed W (ranked[0]), NOT
+// V (the segment). The property "the loop bound is `ri>0 break`, untouched by
+// segRank" is exactly what this now pins; the old RA-only-ranked[0] property
+// (pre-FIX-3) is subsumed — a widget-less identity can no longer be ranked[0],
+// so the surviving divergence is ranked[0]-widget-capable-but-non-first-nav,
+// covered here. (The multi-root first-nav LATCH behaviour itself is pinned by
+// TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget below.)
 func TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
@@ -221,45 +332,47 @@ func TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment(t *testing.T) {
 	latch := ensureFirstNavLatch()
 	latch.fire("boot-already-fired", 0, 0, "", -1, 0)
 
-	m := eID{name: "machine-sa", collapsed: 50}
-	u1 := eID{name: "u1", group: true, collapsed: 5}
+	// W (widgetMax 9) is ranked[0], but its widget is RootIndex==1 (non-first-
+	// nav) → segRank>0. V (widgetMax 2) has a RootIndex==0 widget → V is the
+	// segment identity, at a lower rank. ranked = [W(0), V(1)].
+	w := eID{name: "w", group: true, collapsed: 9}
+	v := eID{name: "v", group: true, collapsed: 2}
 
 	h := newNavWidgetHarvester()
-	dash := latchWidgetGVR("flexes")
-	harvestWidgetAtRoot(h, "dash", dash, 0) // U1's first-nav widget (rank 1)
+	firstNavW := latchWidgetGVR("flexes")     // RootIndex 0 — V's first-nav widget
+	nonFirstNavW := latchWidgetGVR("tailwid") // RootIndex 1 — W's only widget
+	harvestWidgetAtRoot(h, "first-nav", firstNavW, 0)
+	harvestWidgetAtRoot(h, "non-first-nav", nonFirstNavW, 1)
 	widgets := h.snapshot()
-
-	fanoutRA := latchRA("machine-fanout-ra")
-	ras := []templatesv1.ObjectReference{fanoutRA}
 
 	rec := &latchRecorder{}
 	installLatchSeams(t, rec,
 		func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
 			switch gvr {
-			case dash:
-				return latchTargets(gvr, u1)
-			case eFanoutRAGVR:
-				return latchTargets(eFanoutRAGVR, m) // M = ranked[0].
+			case firstNavW:
+				return latchTargets(gvr, v) // V, RootIndex 0 → the segment
+			case nonFirstNavW:
+				return latchTargets(gvr, w) // W, RootIndex 1 → ranked[0], not first-nav
 			}
 			return nil
 		},
 		func(_ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
-			return eFanoutRAGVR, true
+			return schema.GroupVersionResource{}, false
 		})
 
 	// rank1Only=true — the keepwarm sweep.
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", true, false); err != nil {
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", true, false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()
 
-	seededM := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "restaction" && e.identity == "user:machine-sa" }) < len(ev)
-	seededU1 := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.identity == "group:u1" }) < len(ev)
+	seededW := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.identity == "group:w" }) < len(ev)
+	seededV := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.identity == "group:v" }) < len(ev)
 
-	if !seededM {
-		t.Fatalf("keepwarm ruling: rank1Only sweep did NOT seed ranked[0] (M) restaction target — the sweep must re-seed the dominant cohort's cells; events=%+v", ev)
+	if !seededW {
+		t.Fatalf("keepwarm ruling: rank1Only sweep did NOT seed ranked[0] (W, widgetMax 9) — the sweep bound must follow ranked[0], the dominant cohort's cells; events=%+v", ev)
 	}
-	if seededU1 {
-		t.Fatalf("keepwarm ruling: rank1Only sweep seeded U1 (rank 1, the SEGMENT identity) — segRank must NOT retarget the keepwarm loop bound (that would be a scope change, out of #99b); events=%+v", ev)
+	if seededV {
+		t.Fatalf("keepwarm ruling: rank1Only sweep seeded V (rank 1, the SEGMENT identity) — segRank must NOT retarget the keepwarm loop bound (that would be a scope change, out of #99b); events=%+v", ev)
 	}
 }
