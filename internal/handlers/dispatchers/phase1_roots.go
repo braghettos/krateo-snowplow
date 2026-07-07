@@ -72,6 +72,14 @@ const frontendConfigConfigMapDefault = "frontend-config-vars"
 
 // frontendConfigDataKey is the single key inside the ConfigMap whose
 // value is the `config.json` JSON string.
+//
+// #106 COUPLING: the config-vars UPDATE redrive gate (configVarsDataChanged,
+// phase1_configvars_watch.go) compares the FULL Data + BinaryData maps — a
+// superset of this one consumed key — so if a future walker change starts
+// consuming a SIBLING key here, the gate already covers it (no silent-stale
+// hole). Narrowing the gate to only this key would require widening it in
+// lockstep with any such change; the full-Data compare deliberately avoids that
+// coupling. See docs/configvars-update-datagate-design-2026-07-07.md §Scope.
 const frontendConfigDataKey = "config.json"
 
 // configMapGVR is the GVR for core/v1 ConfigMap — the meta object Phase 1
