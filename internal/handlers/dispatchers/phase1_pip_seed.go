@@ -772,11 +772,13 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// outside Resolve and must be hand-threaded. Absent both blocks ⇒ {} + {}
 	// ⇒ a fresh empty union ⇒ byte-identical to the pre-inline-extras nil arg
 	// (HG-PIP.3 backward-compat). Falsifier #6 asserts the resulting HIT.
-	seedKeyExtras := unionForKey(
-		widgets.GetApiRefExtras(e.W.Object),
-		widgets.GetResourcesRefsExtras(e.W.Object),
-		nil,
-	)
+	// A1: route through the shared effectiveKeyExtras (definitive-architecture
+	// §2.2) — identical to the pre-A1 unionForKey(apiRefInline, rrtInline, nil)
+	// today (injection slot inert), so the seed key stays byte-identical to the
+	// dispatcher key it must match. A2 wires declaredIdentityForKey; the seed ctx
+	// carries the cohort identity (WithUserInfo) so a declared widget's seed key
+	// will fold the same identity a live request folds.
+	seedKeyExtras := effectiveKeyExtras(ctx, e.W.Object, nil)
 
 	// Ship 0.30.187 D2: the dispatcher-lookup key uses the KEY tuple
 	// (KeyPerPage, KeyPage) — derived from the /call Path the walker

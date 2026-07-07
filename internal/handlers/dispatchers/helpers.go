@@ -20,6 +20,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -334,6 +335,61 @@ func unionForKey(apiRefInline, rrtInline, request map[string]any) map[string]any
 		out[k] = v
 	}
 	return out
+}
+
+// effectiveKeyExtras is the SINGLE shared derivation of the "effective key
+// extras" the definitive cache-identity architecture (§2.2,
+// docs/definitive-cache-identity-architecture-2026-07-07.md) mandates for ALL
+// FOUR key-derivation consumers — dispatch lookup (widgets.go), widgetContent
+// lookup (widgets.go), subscription arming (refresh_subscription.go), and the
+// boot/keepwarm seed (phase1_pip_seed.go). Extracting it here is the A1
+// head-start: a pure behavior-preserving refactor that gives every consumer ONE
+// place to fold extras, so the A2 identity-injection lands at a single site and
+// cannot drift across the four consumers (the #64 shadow-drift lesson, applied
+// preemptively — same principle as the normalizePagination extraction).
+//
+// TODAY (A1) it returns EXACTLY what the four sites computed inline before:
+//
+//	unionForKey(GetApiRefExtras(cr), GetResourcesRefsExtras(cr), requestExtras)
+//
+// ⊎ declaredIdentityForKey(ctx, cr), which is INERT in A1 (returns nil → the
+// union is returned unchanged → byte-identical ResolvedKeyInputs at every site).
+// A2 wires declaredIdentityForKey to read spec.identityContext + materialise the
+// declared subset of xcontext.UserInfo(ctx) with injection-wins precedence; the
+// merge slot is present now so A2 is a one-function change with no new call-site
+// plumbing. The ctx parameter is accepted now (unused in A1) for the same
+// reason — A2 needs it, and threading it now keeps A1↔A2 signature-stable.
+//
+// cr is the widget CR's unstructured object map (the accessors deep-copy, so the
+// result never aliases the shared CR); nil-safe (both accessors return {} on a
+// nil/mismatched map → union degenerates to requestExtras → ComputeKey's len>0
+// guard skips the extras fold on an all-empty result — the no-extras backward-
+// compat path).
+func effectiveKeyExtras(ctx context.Context, cr map[string]any, requestExtras map[string]any) map[string]any {
+	base := unionForKey(
+		widgets.GetApiRefExtras(cr),
+		widgets.GetResourcesRefsExtras(cr),
+		requestExtras,
+	)
+	// A2 injection slot (INERT in A1): server-declared identity wins on
+	// collision. declaredIdentityForKey returns nil today, so this loop is a
+	// no-op and `base` is returned byte-identical to the pre-refactor union.
+	for k, v := range declaredIdentityForKey(ctx, cr) {
+		base[k] = v
+	}
+	return base
+}
+
+// declaredIdentityForKey is the A2 injection point, INERT in A1. Under the
+// contract (§2.2) it will read spec.identityContext off the CR and materialise
+// the declared subset of xcontext.UserInfo(ctx) — the server-trusted identity
+// keys that a DECLARED widget's cell must vary on. In A1 it returns nil so
+// effectiveKeyExtras is provably behavior-preserving (no CR declares yet, and
+// the accessor does not exist until A2). Kept as a named function (not an inline
+// nil) so A2 is a localized change and the injection semantics have a home for
+// the F-ARCH-3 precedence falsifier.
+func declaredIdentityForKey(_ context.Context, _ map[string]any) map[string]any {
+	return nil
 }
 
 // cacheHandle is the narrow interface the dispatchers depend on. The

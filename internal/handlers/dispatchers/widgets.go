@@ -149,11 +149,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// blocks ⇒ both accessors return {} ⇒ keyExtras == request extras ⇒
 	// byte-identical keys (backward-compat). The accessors return deep copies,
 	// so keyExtras never aliases the shared CR.
-	keyExtras := unionForKey(
-		widgets.GetApiRefExtras(got.Unstructured.Object),
-		widgets.GetResourcesRefsExtras(got.Unstructured.Object),
-		extras,
-	)
+	keyExtras := effectiveKeyExtras(req.Context(), got.Unstructured.Object, extras)
 
 	// Ship G (0.30.16x) — identity-free widget content L1 lookup runs
 	// FIRST. Same gating semantics as the per-user lookup below
