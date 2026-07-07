@@ -83,14 +83,14 @@ func installRankObsSeams(t *testing.T, ev *[]rankObsEvent,
 	t.Cleanup(func() { restActionTargetGVRFn = prevTGVR })
 
 	prevW := seedOneWidgetFn
-	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string, _ bool) error {
+	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string, _ seedScopeMode) error {
 		*ev = append(*ev, rankObsEvent{class: "widget", unit: e.W.GetNamespace() + "/" + e.W.GetName(), identity: eIdentityLabel(ctx)})
 		return nil
 	}
 	t.Cleanup(func() { seedOneWidgetFn = prevW })
 
 	prevR := seedOneRestactionFn
-	seedOneRestactionFn = func(ctx context.Context, _ string, ref templatesv1.ObjectReference, _ string, _ bool) error {
+	seedOneRestactionFn = func(ctx context.Context, _ string, ref templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
 		*ev = append(*ev, rankObsEvent{class: "restaction", unit: ref.Namespace + "/" + ref.Name, identity: eIdentityLabel(ctx)})
 		return nil
 	}
@@ -165,7 +165,7 @@ func TestFix3Rank_Determinism_MapAndInputOrderInvariant(t *testing.T) {
 		var ev []rankObsEvent
 		installRankObsSeams(t, &ev, enumerate, raTargetGVR)
 
-		if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
+		if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 			t.Fatalf("run %d: seedScopeYielding returned %v; want nil", r, err)
 		}
 		order := rankedOrderFromEvents(ev)
@@ -217,7 +217,7 @@ func TestFix3Rank_Pollution_Boot600_LoginCohortsOverWhale(t *testing.T) {
 			return eFanoutRAGVR, true
 		})
 
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	order := rankedOrderFromEvents(ev)
@@ -265,7 +265,7 @@ func TestFix3Rank_TieBreak_IdentityKeyAscending(t *testing.T) {
 			return schema.GroupVersionResource{}, false
 		})
 
-	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	order := rankedOrderFromEvents(ev)
@@ -322,7 +322,7 @@ func TestFix3Rank_SetEquality_TupleMultiset_SwapIsRed(t *testing.T) {
 			return eFanoutRAGVR, true
 		})
 
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 

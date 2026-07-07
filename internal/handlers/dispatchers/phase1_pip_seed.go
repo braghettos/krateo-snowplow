@@ -457,7 +457,85 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 //   - restactions.Resolve same entrypoint at restactions.go:183-189.
 //   - encodeResolvedJSON + cacheHandle.Put + ensureWatcherInformerForGVR
 //   - cache.Deps().Record — same Put shape as restactions.go:212-230.
-func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string, bootScoped bool) error {
+// seedSkipDecision is the SHARED per-mode seed-skip predicate for both seed
+// primitives (single derivation site — F4-C2a / keepwarm c2 §4.2). It consumes
+// the EXACT `key` the Put will use (passed by the caller, itself the single
+// dispatchCacheLookupKey derivation) so skip-key correctness cannot drift from
+// Put-key correctness. Returns true iff the target should be skipped (resolve +
+// Put elided, target counted processed); the caller returns nil in that case.
+//
+// The mode selects BOTH the skip predicate and the counter:
+//
+//   - seedModeBoot: bare liveness (F.4 boot fresh-skip). A live cell under the
+//     production key is already warm → skip; bumps pipSeedFreshSkipTotal. This
+//     makes a deadline-cut boot chunk's continuation re-pay only the cold
+//     remainder.
+//   - seedModeKeepwarm: age-skip (c2 §4.2). A live cell YOUNGER than
+//     keepwarmAgeSkipThreshold() (= TTL−sweepInterval = TTL/4) is skipped
+//     (bumps keepwarmAgeSkipTotal); a live-but-OLD cell (age ≥ threshold) is NOT
+//     skipped → the caller re-resolves + re-Puts it with a fresh CreatedAt. A
+//     bare-liveness predicate here would make the sweep a no-op (it would skip
+//     the very cells it exists to refresh — the F4-C3 keepwarm boundary); the
+//     age term is what makes the sweep re-Put quiet-but-still-live cells before
+//     they lazy-expire while dedup'ing churny/fresh cells (recovering F.4's
+//     cost-proportional chunk resume for keepwarm with zero cycle-tracking
+//     state).
+//   - seedModeGVRDiscovered: NEVER skip. gvr-discovered must RE-RESOLVE
+//     already-warm cells so the dep edge against the newly-registered GVR is
+//     recorded (the S4 fix; F4-C3 boundary).
+//
+// The store's Get is itself the freshness/liveness oracle — it returns
+// (entry, true) iff the entry exists AND is non-expired per the exact
+// effectiveTTL logic the serve path uses (resolved.go Get, strict `>` expiry).
+// For the age-skip, the entry's CreatedAt (Put-time-stamped, resolved.go Put)
+// is read directly off the returned live entry — no cache-side accessor needed.
+func seedSkipDecision(mode seedScopeMode, handle cacheHandle, key, class, target, cohortLabel string) bool {
+	switch mode {
+	case seedModeBoot:
+		entry, live := handle.Get(key)
+		if !live || entry == nil {
+			return false
+		}
+		pipSeedFreshSkipTotal.Add(1)
+		slog.Default().Debug("phase1.seed.fresh_skip",
+			slog.String("subsystem", "cache"),
+			slog.String("class", class),
+			slog.String("target", target),
+			slog.String("cohort", cohortLabel),
+			slog.String("effect", "boot-scope fresh-skip: live L1 cell under the production key; "+
+				"resolve+Put skipped, target counted as processed (F.4 cost-proportional resume)"),
+		)
+		return true
+	case seedModeKeepwarm:
+		entry, live := handle.Get(key)
+		if !live || entry == nil {
+			return false
+		}
+		// Age-skip: skip iff the live cell is YOUNGER than the threshold. A cell
+		// at or beyond the threshold is re-resolved (return false). Strict `<`
+		// mirrors the store's strict `>` expiry so a cell AT the threshold is
+		// re-resolved, never left to race the expiry edge.
+		if time.Since(entry.CreatedAt) < keepwarmAgeSkipThreshold() {
+			keepwarmAgeSkipTotal.Add(1)
+			slog.Default().Debug("phase1.seed.keepwarm_age_skip",
+				slog.String("subsystem", "cache"),
+				slog.String("class", class),
+				slog.String("target", target),
+				slog.String("cohort", cohortLabel),
+				slog.Int64("age_ms", time.Since(entry.CreatedAt).Milliseconds()),
+				slog.Int64("threshold_ms", keepwarmAgeSkipThreshold().Milliseconds()),
+				slog.String("effect", "keepwarm age-skip: live cell younger than TTL/4; resolve+Put "+
+					"skipped (cell survives to next sweep at age<TTL; refresher/customer-Put dedup)"),
+			)
+			return true
+		}
+		return false
+	default: // seedModeGVRDiscovered — never skip (F4-C3 boundary).
+		return false
+	}
+}
+
+func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
 		// #158 (design §1.3): preserve the typed status error so the call
@@ -517,37 +595,16 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		return nil
 	}
 
-	// F.4 boot-only fresh-skip (design §3.2). When this is the genuine boot
-	// scope (bootScoped) and the production cell key already holds a LIVE
-	// (non-expired) entry, the target is already warm — count it as processed
-	// and skip the resolve + Put, so a deadline-cut boot chunk's continuation
-	// re-pays only the cold remainder (cost-proportional resume). Gated on
-	// bootScoped ONLY: keepwarm must re-Put (reset CreatedAt) and gvr-discovered
-	// must re-resolve (record the new-GVR dep edge), so both pass bootScoped=false
-	// and fall through to the normal resolve (F4-C3 boundary).
-	//
-	// F4-C2a: freshness is the store's OWN TTL-expiry check — handle.Get returns
-	// (entry, true) iff the entry exists AND is non-expired per the exact
-	// effectiveTTL logic the serve path uses (resolved.go Get). No "TTL-remaining
-	// ≥ X" literal, no put-since bookkeeping. The lookup consumes `key` — the
-	// SAME key derived above by dispatchCacheLookupKey that the Put below uses —
-	// so skip-key correctness cannot drift from Put-key correctness (single
-	// derivation site, feedback_consultation_mutation_is_not_key_correctness).
-	// Placed BEFORE enterSeedUnit so a skipped target never consumes the #46
-	// memory admission (the bound composes trivially — strictly fewer admissions).
-	if bootScoped {
-		if _, live := handle.Get(key); live {
-			pipSeedFreshSkipTotal.Add(1)
-			slog.Default().Debug("phase1.seed.fresh_skip",
-				slog.String("subsystem", "cache"),
-				slog.String("class", "restactions"),
-				slog.String("restaction", ref.Namespace+"/"+ref.Name),
-				slog.String("cohort", cohortLabel),
-				slog.String("effect", "boot-scope fresh-skip: live L1 cell under the production key; "+
-					"resolve+Put skipped, target counted as processed (F.4 cost-proportional resume)"),
-			)
-			return nil
-		}
+	// Per-mode seed skip (F.4 boot fresh-skip + keepwarm c2 age-skip, single
+	// derivation site). seedSkipDecision consults `key` — the SAME key derived
+	// above that the Put below uses — via the store's OWN TTL-expiry Get, so
+	// skip-key correctness cannot drift from Put-key correctness (F4-C2a,
+	// feedback_consultation_mutation_is_not_key_correctness). Placed BEFORE
+	// enterSeedUnit so a skipped target never consumes the #46 memory admission.
+	// The mode selects the predicate: boot = bare liveness (F.4), keepwarm =
+	// age-skip (c2 §4.2), gvr-discovered = never skip (F4-C3 boundary).
+	if seedSkipDecision(mode, handle, key, "restactions", ref.Namespace+"/"+ref.Name, cohortLabel) {
+		return nil
 	}
 
 	// #46 / fold 2026-07-03: bound this seed unit's footprint via the ADAPTIVE
@@ -696,7 +753,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 //     matches widgets.go:215-231 (recordWidgetDeps calls
 //     ensureWatcherInformerForGVR for the widget GVR + apiRef GVR +
 //     each resourcesRefs GVR, satisfying AC-PIP.5 for widgets).
-func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, bootScoped bool) error {
+func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode seedScopeMode) error {
 	if e.W == nil {
 		return nil
 	}
@@ -763,30 +820,17 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, bootSc
 		return nil
 	}
 
-	// F.4 boot-only fresh-skip (design §3.2) — mirror of seedOneRestaction. On
-	// the genuine boot scope, if the production widget cell key already holds a
-	// LIVE (non-expired) entry, count it processed and skip resolve+Put so a
-	// deadline-cut boot chunk's continuation is cost-proportional. Gated on
-	// bootScoped ONLY (keepwarm re-Puts, gvr-discovered re-resolves; both pass
-	// false — F4-C3 boundary). Freshness = handle.Get's own TTL-expiry check
-	// (F4-C2a), consuming the SAME `key` derived above (single derivation site,
-	// F4-C2a). BEFORE enterSeedUnit so a skip never consumes the #46 admission.
-	// The unpaginated seedRAFullListForWidget accelerator is skipped along with
-	// the widget resolve — correct, because a live widget cell implies its
-	// first paginated /call already found (or will lazily rebuild) the pinned
-	// full-list; the boot chunk's job is done for this warm target.
-	if bootScoped {
-		if _, live := handle.Get(key); live {
-			pipSeedFreshSkipTotal.Add(1)
-			slog.Default().Debug("phase1.seed.fresh_skip",
-				slog.String("subsystem", "cache"),
-				slog.String("class", "widgets"),
-				slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
-				slog.String("effect", "boot-scope fresh-skip: live L1 cell under the production key; "+
-					"resolve+Put skipped, target counted as processed (F.4 cost-proportional resume)"),
-			)
-			return nil
-		}
+	// Per-mode seed skip (F.4 boot fresh-skip + keepwarm c2 age-skip) — mirror of
+	// seedOneRestaction, via the SHARED seedSkipDecision (single derivation site).
+	// boot = bare liveness (F.4); keepwarm = age-skip (c2 §4.2); gvr-discovered =
+	// never skip (F4-C3). Freshness/age both read the store's OWN TTL-expiry Get
+	// consuming the SAME `key` derived above. BEFORE enterSeedUnit so a skip never
+	// consumes the #46 admission. The unpaginated seedRAFullListForWidget
+	// accelerator is skipped along with the widget resolve — correct, because a
+	// live widget cell implies its first paginated /call already found (or will
+	// lazily rebuild) the pinned full-list.
+	if seedSkipDecision(mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), "") {
+		return nil
 	}
 
 	// #46: bound this seed unit's footprint (semaphore admission + per-unit

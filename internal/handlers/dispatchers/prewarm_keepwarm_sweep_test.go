@@ -1,5 +1,5 @@
-// prewarm_keepwarm_sweep_test.go — #102 c1 keep-warm sweep falsifiers
-// (docs/g-ttl-quiet-page-keepwarm-design-2026-07-04.md §5 + PM GTTL-1..6).
+// prewarm_keepwarm_sweep_test.go — keepwarm sweep falsifiers (c1 cadence arms +
+// the c2 sweep-set evolution of GTTL-3/ARM-SCOPE → C2-C1).
 //
 // Hermetic, -race, seams only (no cluster / apiserver). Serializes on
 // engineLatchTestMu (shares the process engine singleton queue + seed counters
@@ -16,12 +16,19 @@
 //   ARM-KEEPWARM (cadence loop) TestKeepwarmSweep_TickerEnqueuesThenStopsOnCancel
 //           — runKeepwarmSweepLoop enqueues on tick and exits on ctx cancel
 //           (no goroutine leak).
-//   GTTL-3 / ARM-SCOPE TestKeepwarmSweep_RANK1Only_DoesNotSweepRank2 (+ mutation)
-//           — the rank1Only seed touches ONLY rank-1 targets; the sweep-all-ranks
-//           mutation (rank1Only=false under the same fixture) DOES touch rank-2
-//           = RED, proving the bound discriminates.
+//   C2-C1 / ARM-SCOPE (keepwarm c2 sweep-set, evolves GTTL-3) —
+//           TestKeepwarmSweep_WidgetCapablePrefix_SeedsAllCapableNotWidgetless
+//           (+ two mutations): keepwarm mode seeds the WIDGET-CAPABLE PREFIX
+//           (W1 AND W2, both widgetMax>=1) and NOT the widget-less M
+//           (widgetMax==0). Mutation (i) restore the c1 rank-1 bound → RED (W2
+//           unseeded); mutation (ii) drop the widgetMax==0 break → RED (M seeded
+//           = boot behavior leaking into keepwarm).
+//   C2-C2 (machine-SA capability inclusion) — TestKeepwarmSweep_MachineSA... : a
+//           machine SA WITH a widget binding IS swept (capability, not
+//           login-ness). Mirrors the LIVE fresh2 portals-v1-3-5 SA.
 //   GTTL-1 / ARM-BACKSTOP TestSeedPutGate_DeclinesOnStageError (+ mutation +
-//           empty-result control) lives in phase1_seed_put_gate_test.go.
+//           empty-result control) lives in phase1_seed_put_gate_test.go, re-run
+//           under seedModeKeepwarm by C2-C6 in prewarm_keepwarm_c2_test.go.
 
 package dispatchers
 
@@ -33,6 +40,7 @@ import (
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 )
 
@@ -53,10 +61,20 @@ func TestKeepwarmSweep_CadenceIsTTLTimesThreeQuarters(t *testing.T) {
 		t.Fatalf("keepwarmSweepInterval @3600s TTL: want 2700s; got %v", got)
 	}
 
-	// A different TTL re-derives (no hardcoded interval): 800s × 3/4 = 600s.
+	// The c2 age-skip threshold = TTL − sweepInterval = TTL/4, DERIVED (not a
+	// literal): 3600s − 2700s = 900s.
+	if th := keepwarmAgeSkipThreshold(); th != 900*time.Second {
+		t.Fatalf("keepwarmAgeSkipThreshold @3600s TTL: want TTL/4 = 900s; got %v", th)
+	}
+
+	// A different TTL re-derives (no hardcoded interval): 800s × 3/4 = 600s;
+	// threshold 800−600 = 200s.
 	t.Setenv("RESOLVED_CACHE_TTL_SECONDS", "800")
 	if got := keepwarmSweepInterval(); got != 600*time.Second {
 		t.Fatalf("keepwarmSweepInterval @800s TTL: want 600s; got %v", got)
+	}
+	if th := keepwarmAgeSkipThreshold(); th != 200*time.Second {
+		t.Fatalf("keepwarmAgeSkipThreshold @800s TTL: want TTL/4 = 200s; got %v", th)
 	}
 }
 
@@ -134,64 +152,135 @@ func TestKeepwarmSweep_TickerEnqueuesThenStopsOnCancel(t *testing.T) {
 	drainSingletonPending()
 }
 
-// GTTL-3 / ARM-SCOPE — the rank1Only seed touches ONLY rank-1 targets; the
-// sweep-all-ranks mutation (rank1Only=false) DOES touch rank-2 = RED.
+// C2-C1 / ARM-SCOPE — the keepwarm c2 sweep-set evolution of GTTL-3.
 //
-// Fixture: one widget with targets under TWO ranks — devs (collapsed=442, rank
-// 1) and ops (collapsed=5, rank 2). rank1Only=true must seed devs and skip ops;
-// rank1Only=false (boot / the mutation) must seed BOTH.
-func TestKeepwarmSweep_RANK1Only_DoesNotSweepRank2(t *testing.T) {
+// EXPECTATION INVERTS BY DESIGN (design §6 c1-arm table): the pre-c2 (c1) arm
+// asserted the rank-1-only sweep bound seeded ONLY rank-1 (devs) and NOT rank-2
+// (ops); both were widget-capable, so c2 (seedModeKeepwarm, widget-capable
+// prefix) sweeps BOTH. The RED boundary MOVES from "rank-2" to "widgetMax==0".
+// The new fixture adds a widget-LESS identity M (RA-only, widgetMax==0) so the
+// boundary is exercisable.
+//
+// Fixture: two widget-capable identities on a widget's GVR — W1 (collapsed=200)
+// and W2 (collapsed=5, a lower rank but still widget-capable) — and a
+// widget-LESS identity M (collapsed=1344) that appears ONLY in an RA target set
+// (widgetMax==0). keepwarm mode must seed W1 AND W2's widget targets and NONE of
+// M's (M is widget-less → below the break).
+//
+// Mutation (i): restore the c1 rank-1 bound (`ri>0 break`) → RED (W2 unseeded).
+// Mutation (ii): drop the widgetMax==0 break → RED (M's RA targets seeded =
+// boot behavior leaking into keepwarm; the machine-SA-free fixture's M gets
+// seeded).
+func TestKeepwarmSweep_WidgetCapablePrefix_SeedsAllCapableNotWidgetless(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
 	quietLoggingE(t)
 
-	devs := eID{name: "devs", group: true, collapsed: 442}
-	ops := eID{name: "ops", group: true, collapsed: 5}
+	w1 := eID{name: "w1", group: true, collapsed: 200}
+	w2 := eID{name: "w2", group: true, collapsed: 5}
+	m := eID{name: "m", group: true, collapsed: 1344} // widget-less: RA-only
 
 	h := newNavWidgetHarvester()
-	gvr := eWidgetGVR("flexes")
-	eHarvestWidget(h, "dashboard-flex", gvr)
+	widgetGVR := eWidgetGVR("flexes")
+	eHarvestWidget(h, "dashboard-flex", widgetGVR)
 	widgets := h.snapshot()
+	ras := []templatesv1.ObjectReference{eRA("bulk-ra")}
 
 	prevEnum := enumeratePrewarmTargetsForGVRFn
 	enumeratePrewarmTargetsForGVRFn = func(g schema.GroupVersionResource, _ string) []cache.PrewarmTarget {
-		if g == gvr {
-			return eIdentityTargets(gvr, devs, ops)
+		switch g {
+		case widgetGVR:
+			return eIdentityTargets(g, w1, w2) // widget-capable cohorts
+		case eFanoutRAGVR:
+			return eIdentityTargets(g, m) // M appears ONLY here → widgetMax==0
 		}
 		return nil
 	}
 	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
 
-	run := func(rank1Only bool) map[string]bool {
-		seen := map[string]bool{}
+	prevTGVR := restActionTargetGVRFn
+	restActionTargetGVRFn = func(_ context.Context, _ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+		return eFanoutRAGVR, true // bulk-ra LISTs eFanoutRAGVR (M's bucket)
+	}
+	t.Cleanup(func() { restActionTargetGVRFn = prevTGVR })
+
+	// run seeds under seedModeKeepwarm and records which identities seeded a
+	// WIDGET target and which seeded an RA target (M only appears via the RA).
+	run := func() (widgetSeen, raSeen map[string]bool) {
+		widgetSeen, raSeen = map[string]bool{}, map[string]bool{}
 		prevW := seedOneWidgetFn
-		seedOneWidgetFn = func(ctx context.Context, _ navWidgetEntry, _ string, _ bool) error {
-			seen[eIdentityLabel(ctx)] = true
+		prevR := seedOneRestactionFn
+		seedOneWidgetFn = func(ctx context.Context, _ navWidgetEntry, _ string, _ seedScopeMode) error {
+			widgetSeen[eIdentityLabel(ctx)] = true
 			return nil
 		}
-		defer func() { seedOneWidgetFn = prevW }()
-		if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", rank1Only, false); err != nil {
-			t.Fatalf("seedScopeYielding(rank1Only=%v) returned %v; want nil", rank1Only, err)
+		seedOneRestactionFn = func(ctx context.Context, _ string, _ templatesv1.ObjectReference, _ string, _ seedScopeMode) error {
+			raSeen[eIdentityLabel(ctx)] = true
+			return nil
 		}
-		return seen
+		defer func() { seedOneWidgetFn, seedOneRestactionFn = prevW, prevR }()
+		if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeKeepwarm); err != nil {
+			t.Fatalf("seedScopeYielding(keepwarm) returned %v; want nil", err)
+		}
+		return widgetSeen, raSeen
 	}
 
-	// GREEN: rank1Only=true seeds ONLY rank-1 (devs), NOT rank-2 (ops).
-	sweep := run(true)
-	if !sweep["group:devs"] {
-		t.Fatalf("ARM-SCOPE: rank-1 keepwarm sweep did NOT seed the rank-1 identity (devs); seen=%v", sweep)
+	// GREEN: keepwarm seeds BOTH widget-capable cohorts (W1 AND W2) and NONE of
+	// the widget-less M's targets.
+	widgetSeen, raSeen := run()
+	if !widgetSeen["group:w1"] {
+		t.Fatalf("C2-C1: keepwarm sweep did NOT seed W1 (widget-capable, rank 0); widgetSeen=%v", widgetSeen)
 	}
-	if sweep["group:ops"] {
-		t.Fatalf("ARM-SCOPE VIOLATED: the rank-1 keepwarm sweep seeded the rank-2 identity (ops) — the c1 bound is not holding; seen=%v", sweep)
+	if !widgetSeen["group:w2"] {
+		t.Fatalf("C2-C1: keepwarm sweep did NOT seed W2 (widget-capable, LOWER rank) — c2 sweeps the whole widget-capable prefix, not rank-1 only; widgetSeen=%v", widgetSeen)
 	}
+	if raSeen["group:m"] {
+		t.Fatalf("C2-C1: keepwarm sweep seeded the WIDGET-LESS M (widgetMax==0) — the widget-capable prefix must break BEFORE M; raSeen=%v", raSeen)
+	}
+}
 
-	// MUTATION (sweep-all-ranks): rank1Only=false under the SAME fixture DOES
-	// seed rank-2 → proves the ARM-SCOPE assert discriminates the bound (a
-	// no-op bound would seed ops in both arms).
-	full := run(false)
-	if !full["group:devs"] || !full["group:ops"] {
-		t.Fatalf("mutation (rank1Only=false) NOT RED: the all-ranks seed must touch BOTH devs and ops "+
-			"(else the ARM-SCOPE assert cannot discriminate the bound); seen=%v", full)
+// C2-C2 (machine-SA capability inclusion; predicate honesty) — a machine SA
+// carrying a widget binding (widgetMax>=1) IS swept by keepwarm. Pinned so the
+// capability-not-login-ness semantics are explicit, not accidental (design §5
+// C2-C2; the deferred (c) refinement's target). Fixture mirrors the LIVE fresh2
+// instance: system:serviceaccount:krateo-system:portals-v1-3-5 with a widget
+// binding.
+func TestKeepwarmSweep_MachineSAWithWidgetBinding_IsSwept(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	zeroCustomerInFlight()
+	quietLoggingE(t)
+
+	// A machine SA (username form) with a widget binding — widgetMax==1.
+	machineSA := eID{name: "system:serviceaccount:krateo-system:portals-v1-3-5", group: false, collapsed: 1}
+
+	h := newNavWidgetHarvester()
+	widgetGVR := eWidgetGVR("flexes")
+	eHarvestWidget(h, "dashboard-flex", widgetGVR)
+	widgets := h.snapshot()
+
+	prevEnum := enumeratePrewarmTargetsForGVRFn
+	enumeratePrewarmTargetsForGVRFn = func(g schema.GroupVersionResource, _ string) []cache.PrewarmTarget {
+		if g == widgetGVR {
+			return eIdentityTargets(g, machineSA)
+		}
+		return nil
+	}
+	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
+
+	seen := map[string]bool{}
+	prevW := seedOneWidgetFn
+	seedOneWidgetFn = func(ctx context.Context, _ navWidgetEntry, _ string, _ seedScopeMode) error {
+		seen[eIdentityLabel(ctx)] = true
+		return nil
+	}
+	t.Cleanup(func() { seedOneWidgetFn = prevW })
+
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeKeepwarm); err != nil {
+		t.Fatalf("seedScopeYielding(keepwarm) returned %v; want nil", err)
+	}
+	if !seen["user:system:serviceaccount:krateo-system:portals-v1-3-5"] {
+		t.Fatalf("C2-C2: a machine SA WITH a widget binding (widgetMax>=1) must be swept — capability, not login-ness; seen=%v", seen)
 	}
 }
