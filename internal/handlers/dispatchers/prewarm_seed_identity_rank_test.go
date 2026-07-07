@@ -112,7 +112,7 @@ func TestFixD_IdentityRankMajorSeedOrder(t *testing.T) {
 	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
 
 	prevSeed := seedOneWidgetFn
-	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string) error {
+	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string, _ bool) error {
 		rec.record(e.W.GetName(), identityLabelFromCtx(ctx))
 		return nil
 	}
@@ -122,7 +122,7 @@ func TestFixD_IdentityRankMajorSeedOrder(t *testing.T) {
 	// removed — the seam is deleted; widgets-only isolation is carried by the
 	// nil restactions arg below (always was; the seam-set was redundant).
 	// Assertions unchanged. See prewarm_engine_seed_order_test.go migration map.
-	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 

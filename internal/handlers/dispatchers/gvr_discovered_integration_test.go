@@ -74,11 +74,8 @@ func TestGVRDiscoveredIntegration_HookFiresEngineEnqueue(t *testing.T) {
 	// singleton state. We test the hook→enqueueScope mechanism
 	// directly: subscribe with the same closure registerEngineGVRDiscoveredHook
 	// would install, then fire the hook.
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	registerEngineGVRDiscoveredHook(e)
 
 	gvr := schema.GroupVersionResource{
@@ -91,10 +88,10 @@ func TestGVRDiscoveredIntegration_HookFiresEngineEnqueue(t *testing.T) {
 	// API discovery_lookup.go's `if added` branch invokes).
 	cache.NotifyGVRDiscoveredForReprewarmTest(gvr)
 
-	if len(e.pending) != 1 {
-		t.Fatalf("expected 1 pending scope after hook fire, got %d", len(e.pending))
+	if e.pendingLenForTest() != 1 {
+		t.Fatalf("expected 1 pending scope after hook fire, got %d", e.pendingLenForTest())
 	}
-	s, ok := e.dequeueScope()
+	s, ok := e.drainScopeForTest()
 	if !ok {
 		t.Fatal("expected dequeueable scope")
 	}
@@ -118,11 +115,8 @@ func TestGVRDiscoveredIntegration_DistinctGVRs_AllProcessed(t *testing.T) {
 	cache.ResetGVRDiscoveredHooksForTest()
 	defer cache.ResetGVRDiscoveredHooksForTest()
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	registerEngineGVRDiscoveredHook(e)
 
 	gvrs := []schema.GroupVersionResource{
@@ -134,14 +128,14 @@ func TestGVRDiscoveredIntegration_DistinctGVRs_AllProcessed(t *testing.T) {
 		cache.NotifyGVRDiscoveredForReprewarmTest(gvr)
 	}
 
-	if len(e.pending) != len(gvrs) {
-		t.Fatalf("expected %d pending scopes (one per distinct GVR), got %d", len(gvrs), len(e.pending))
+	if e.pendingLenForTest() != len(gvrs) {
+		t.Fatalf("expected %d pending scopes (one per distinct GVR), got %d", len(gvrs), e.pendingLenForTest())
 	}
 
 	// Drain and verify each scope carries one of the GVRs.
 	got := map[schema.GroupVersionResource]struct{}{}
 	for i := 0; i < len(gvrs); i++ {
-		s, ok := e.dequeueScope()
+		s, ok := e.drainScopeForTest()
 		if !ok {
 			t.Fatalf("expected %d scopes, got only %d", len(gvrs), i)
 		}
@@ -164,11 +158,8 @@ func TestGVRDiscoveredIntegration_HookHandlerNonBlocking(t *testing.T) {
 	cache.ResetGVRDiscoveredHooksForTest()
 	defer cache.ResetGVRDiscoveredHooksForTest()
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	registerEngineGVRDiscoveredHook(e)
 
 	// Fire many GVRs in a tight loop. The whole loop must complete
@@ -191,11 +182,11 @@ func TestGVRDiscoveredIntegration_HookHandlerNonBlocking(t *testing.T) {
 	case <-done:
 		// good — all 200 enqueues completed under the deadline
 	case <-deadline:
-		t.Fatalf("hook fire loop blocked beyond 2s — back-pressure detected (pending=%d)", len(e.pending))
+		t.Fatalf("hook fire loop blocked beyond 2s — back-pressure detected (pending=%d)", e.pendingLenForTest())
 	}
 
-	if len(e.pending) != 200 {
-		t.Fatalf("expected 200 pending after 200 distinct GVRs, got %d", len(e.pending))
+	if e.pendingLenForTest() != 200 {
+		t.Fatalf("expected 200 pending after 200 distinct GVRs, got %d", e.pendingLenForTest())
 	}
 }
 
@@ -212,11 +203,8 @@ func TestGVRDiscoveredIntegration_DedupSameGVR(t *testing.T) {
 	cache.ResetGVRDiscoveredHooksForTest()
 	defer cache.ResetGVRDiscoveredHooksForTest()
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	registerEngineGVRDiscoveredHook(e)
 
 	gvr := schema.GroupVersionResource{
@@ -228,8 +216,8 @@ func TestGVRDiscoveredIntegration_DedupSameGVR(t *testing.T) {
 		cache.NotifyGVRDiscoveredForReprewarmTest(gvr)
 	}
 
-	if len(e.pending) != 1 {
-		t.Fatalf("expected 1 pending after 10 same-GVR fires (dedup), got %d", len(e.pending))
+	if e.pendingLenForTest() != 1 {
+		t.Fatalf("expected 1 pending after 10 same-GVR fires (dedup), got %d", e.pendingLenForTest())
 	}
 }
 
@@ -251,11 +239,8 @@ func TestGVRDiscoveredIntegration_WorkerProcessesScope(t *testing.T) {
 		customerInFlightCount.Add(-1)
 	}
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	var (
 		ranMu      sync.Mutex
 		ranScopes  []prewarmScope

@@ -76,7 +76,9 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 	return func(ctx context.Context, s prewarmScope) error {
 		switch s.kind {
 		case scopeKindBoot:
-			return rePrewarmBoot(ctx, deps)
+			// F.4 — bootScoped=true engages the fresh-skip so a deadline-cut
+			// boot chunk's continuation skips already-live cells.
+			return rePrewarmBoot(ctx, deps, true /*bootScoped*/)
 		case scopeKindGVRDiscovered:
 			return rePrewarmGVRDiscovered(ctx, deps, s.gvr)
 		case scopeKindKeepwarm:
@@ -164,7 +166,10 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.
 		slog.String("gvr", gvr.String()),
 		slog.String("note", "Ship 2 Stage 2 — re-walk under cohort identities so iterator-empty short-circuit (resolve.go:377-381) no longer skips dep recording for this GVR"),
 	)
-	err := rePrewarmBoot(ctx, deps)
+	// bootScoped=false: gvr-discovered must RE-RESOLVE already-warm cells so
+	// the dep edge against the newly-registered GVR is recorded (the S4 fix);
+	// a fresh-skip would reintroduce the defect (F4-C3 boundary).
+	err := rePrewarmBoot(ctx, deps, false /*bootScoped*/)
 	if err != nil {
 		slog.Warn("prewarm.engine.gvr_discovered.incomplete",
 			slog.String("subsystem", "cache"),
@@ -187,8 +192,15 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.
 // #102 c1 keepwarm sweep reuses this SAME core via rePrewarmKeepwarm (rank1Only
 // seed), so the sweep gets the boot's dedup, NavOrder, BindingsByGVR index, and
 // yield/memory bounds for free — it IS the seed, just rank-1-bounded.
-func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
-	return rePrewarmBootScoped(ctx, deps, false /*rank1Only*/)
+//
+// bootScoped=true engages the F.4 boot-only fresh-skip in the seed primitives
+// (a live cell is treated as done → not re-resolved), which makes a
+// deadline-cut boot chunk's continuation cost-proportional. It is TRUE only
+// for the genuine boot scope; keepwarm passes false (its Puts must re-resolve
+// fresh bytes + reset CreatedAt) and gvr-discovered passes false (it must
+// re-resolve already-warm cells to record the dep edge against the new GVR).
+func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps, bootScoped bool) error {
+	return rePrewarmBootScoped(ctx, deps, false /*rank1Only*/, bootScoped)
 }
 
 // rePrewarmKeepwarm is the #102 c1 keepwarm-sweep handler: the SAME re-walk +
@@ -200,10 +212,13 @@ func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps) error {
 // shared seed primitives declines a degraded re-resolve rather than overwrite a
 // good warm entry.
 func rePrewarmKeepwarm(ctx context.Context, deps rePrewarmDeps) error {
-	return rePrewarmBootScoped(ctx, deps, true /*rank1Only*/)
+	// bootScoped=false: the sweep's whole purpose is to re-Put (reset CreatedAt)
+	// live rank-1 cells before they lazy-expire; a fresh-skip would make it a
+	// no-op (F4-C3 boundary).
+	return rePrewarmBootScoped(ctx, deps, true /*rank1Only*/, false /*bootScoped*/)
 }
 
-func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only bool) error {
+func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only, bootScoped bool) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -357,7 +372,7 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only bool
 	// propagates; withCohortSeedContext OVERRIDES identity per cohort for the
 	// actual seed, so the SA base is correct for both the derivation fetch
 	// and as the per-cohort seed base.
-	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS, rank1Only); err != nil {
+	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS, rank1Only, bootScoped); err != nil {
 		return err
 	}
 
@@ -442,9 +457,17 @@ var seedOneRestactionFn = seedOneRestaction
 // existing rank-major loop (ranked is sorted DESC by CollapsedBindings, so
 // ranked[0] IS rank-1); no new seam, no separate loop — the sweep re-runs the
 // identical per-identity seed the boot does, just for the one dominant cohort.
+// bootScoped, when true (genuine boot scope ONLY — not keepwarm, not
+// gvr-discovered), engages the F.4 boot-only fresh-skip inside the per-target
+// seed primitives: a target whose production cell key already holds a live
+// (non-expired) L1 entry is counted as processed WITHOUT re-resolving, making a
+// deadline-cut boot chunk's continuation cost-proportional (≈ preamble +
+// remaining cold targets). It threads straight through to seedOneWidgetFn /
+// seedOneRestactionFn — the skip decision lives INSIDE those primitives so it
+// consumes the EXACT key the Put would use (single derivation site, F4-C2a).
 func seedScopeYielding(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
-	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, rank1Only bool) error {
+	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, rank1Only, bootScoped bool) error {
 
 	log := slog.Default()
 
@@ -716,7 +739,7 @@ func seedScopeYielding(ctx context.Context,
 		}
 		engineYieldCheckpoint(ctx)
 		err := seedOneTarget(c, func(cohortCtx context.Context) error {
-			return seedOneWidgetFn(cohortCtx, e, authnNS)
+			return seedOneWidgetFn(cohortCtx, e, authnNS, bootScoped)
 		})
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("widgets", ctx.Err())
@@ -735,7 +758,7 @@ func seedScopeYielding(ctx context.Context,
 		}
 		engineYieldCheckpoint(ctx)
 		err := seedOneTarget(c, func(cohortCtx context.Context) error {
-			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS)
+			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS, bootScoped)
 		})
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("restactions", ctx.Err())

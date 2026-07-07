@@ -466,8 +466,16 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 
 			StartPrewarmEngine(processCtx, makeBootScopeHandler(deps), func(s prewarmScope, err error) {
 				if s.kind == scopeKindBoot {
-					bootErr = err
-					closeOnce.Do(func() { close(bootDone) })
+					// C-F4R-2: assign bootErr INSIDE closeOnce.Do. F.4's engine-owned
+					// requeue makes a SECOND boot completion systematic (a cut chunk-1
+					// followed by a completing chunk-2), so the FIRST completion's err
+					// is the one bootDone reports; a later completion must not race the
+					// :505-512 select's bootErr read. sync.Once serializes the write
+					// with the close, and the close is the read's happens-before edge.
+					closeOnce.Do(func() {
+						bootErr = err
+						close(bootDone)
+					})
 				}
 			})
 			// Ship 1 enqueues only the BOOT scope. Ship 2 Stage 2 (0.30.247)

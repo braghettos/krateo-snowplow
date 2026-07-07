@@ -29,11 +29,8 @@ func TestEngineYieldsWhileCustomerInFlight(t *testing.T) {
 		customerInFlightCount.Add(-1)
 	}
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 
 	done := markCustomerInFlight()
 	if !customerInFlight() {
@@ -73,11 +70,8 @@ func TestEngineYieldNoOpWhenIdle(t *testing.T) {
 	for customerInFlight() {
 		customerInFlightCount.Add(-1)
 	}
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: time.Second,
-	}
+	e := newTestEngine()
+	e.yieldPoll = time.Second
 	start := time.Now()
 	e.yieldToCustomer(context.Background())
 	if d := time.Since(start); d > 50*time.Millisecond {
@@ -88,23 +82,20 @@ func TestEngineYieldNoOpWhenIdle(t *testing.T) {
 // TestEngineQueueDedup asserts enqueueing the same scope key twice
 // coalesces to one pending entry, and dequeue drains it.
 func TestEngineQueueDedup(t *testing.T) {
-	e := &prewarmEngine{
-		pending: map[string]prewarmScope{},
-		signal:  make(chan struct{}, 1),
-	}
+	e := newTestEngine()
 	e.enqueueScope(prewarmScope{kind: scopeKindBoot})
 	e.enqueueScope(prewarmScope{kind: scopeKindBoot})
-	if len(e.pending) != 1 {
-		t.Fatalf("expected 1 pending after dedup, got %d", len(e.pending))
+	if e.pendingLenForTest() != 1 {
+		t.Fatalf("expected 1 pending after dedup, got %d", e.pendingLenForTest())
 	}
 	if e.enqueuedTotal.Load() != 2 {
 		t.Fatalf("expected enqueuedTotal=2 (both calls counted), got %d", e.enqueuedTotal.Load())
 	}
-	s, ok := e.dequeueScope()
+	s, ok := e.drainScopeForTest()
 	if !ok || s.kind != scopeKindBoot {
 		t.Fatalf("expected boot scope dequeued, got %+v ok=%v", s, ok)
 	}
-	if _, ok := e.dequeueScope(); ok {
+	if _, ok := e.drainScopeForTest(); ok {
 		t.Fatal("expected empty queue after drain")
 	}
 }
@@ -116,11 +107,8 @@ func TestEngineWorkerRunsScopeAfterYield(t *testing.T) {
 	for customerInFlight() {
 		customerInFlightCount.Add(-1)
 	}
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	ran := make(chan prewarmScope, 1)
 	e.scopeHandler = func(_ context.Context, s prewarmScope) error {
 		ran <- s
@@ -149,11 +137,8 @@ func TestEngineScopeDoneFiresOnCompletion(t *testing.T) {
 	for customerInFlight() {
 		customerInFlightCount.Add(-1)
 	}
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	e.scopeHandler = func(_ context.Context, _ prewarmScope) error { return nil }
 	done := make(chan prewarmScope, 1)
 	e.scopeDone = func(s prewarmScope, _ error) { done <- s }
@@ -183,10 +168,7 @@ func TestEngineScopeDoneFiresOnCompletion(t *testing.T) {
 // re-prewarm work for the same discovered GVR (a discovery-storm of
 // the same CRD must not amplify into N rePrewarm calls).
 func TestScopeKindGVRDiscovered_KeyDeterminism(t *testing.T) {
-	e := &prewarmEngine{
-		pending: map[string]prewarmScope{},
-		signal:  make(chan struct{}, 1),
-	}
+	e := newTestEngine()
 	gvr := schema.GroupVersionResource{
 		Group:    "composition.krateo.io",
 		Version:  "v1-2-2",
@@ -196,13 +178,13 @@ func TestScopeKindGVRDiscovered_KeyDeterminism(t *testing.T) {
 	e.enqueueScope(prewarmScope{kind: scopeKindGVRDiscovered, gvr: gvr})
 	e.enqueueScope(prewarmScope{kind: scopeKindGVRDiscovered, gvr: gvr})
 
-	if len(e.pending) != 1 {
-		t.Fatalf("expected 1 pending entry after 3 enqueues of the same GVR, got %d", len(e.pending))
+	if e.pendingLenForTest() != 1 {
+		t.Fatalf("expected 1 pending entry after 3 enqueues of the same GVR, got %d", e.pendingLenForTest())
 	}
 	if e.enqueuedTotal.Load() != 3 {
 		t.Fatalf("expected enqueuedTotal=3 (all attempts counted), got %d", e.enqueuedTotal.Load())
 	}
-	s, ok := e.dequeueScope()
+	s, ok := e.drainScopeForTest()
 	if !ok {
 		t.Fatal("expected one scope dequeueable, got empty queue")
 	}
@@ -212,7 +194,7 @@ func TestScopeKindGVRDiscovered_KeyDeterminism(t *testing.T) {
 	if s.gvr != gvr {
 		t.Fatalf("expected gvr payload %+v, got %+v", gvr, s.gvr)
 	}
-	if _, ok := e.dequeueScope(); ok {
+	if _, ok := e.drainScopeForTest(); ok {
 		t.Fatal("expected queue empty after drain")
 	}
 }
@@ -223,10 +205,7 @@ func TestScopeKindGVRDiscovered_KeyDeterminism(t *testing.T) {
 // its own re-prewarm — coalescing distinct GVRs would silently lose
 // re-prewarm work for one of them.
 func TestScopeKindGVRDiscovered_KeyDistinct(t *testing.T) {
-	e := &prewarmEngine{
-		pending: map[string]prewarmScope{},
-		signal:  make(chan struct{}, 1),
-	}
+	e := newTestEngine()
 	gvrA := schema.GroupVersionResource{
 		Group:    "composition.krateo.io",
 		Version:  "v1-2-2",
@@ -240,14 +219,14 @@ func TestScopeKindGVRDiscovered_KeyDistinct(t *testing.T) {
 	e.enqueueScope(prewarmScope{kind: scopeKindGVRDiscovered, gvr: gvrA})
 	e.enqueueScope(prewarmScope{kind: scopeKindGVRDiscovered, gvr: gvrB})
 
-	if len(e.pending) != 2 {
-		t.Fatalf("expected 2 pending entries for distinct GVRs, got %d (false coalesce)", len(e.pending))
+	if e.pendingLenForTest() != 2 {
+		t.Fatalf("expected 2 pending entries for distinct GVRs, got %d (false coalesce)", e.pendingLenForTest())
 	}
 
 	// Both scopes must be dequeueable; collect them.
 	got := map[schema.GroupVersionResource]struct{}{}
 	for i := 0; i < 2; i++ {
-		s, ok := e.dequeueScope()
+		s, ok := e.drainScopeForTest()
 		if !ok {
 			t.Fatalf("expected 2 dequeueable scopes, got only %d", i)
 		}
@@ -318,11 +297,8 @@ func TestEngineWorker_OutlivesBootSeedCtxCancel(t *testing.T) {
 		customerInFlightCount.Add(-1)
 	}
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 
 	var (
 		ranMu     sync.Mutex
@@ -398,11 +374,8 @@ func TestEngineWorker_ProcessCtxCancelStopsWorker(t *testing.T) {
 		customerInFlightCount.Add(-1)
 	}
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	e.scopeHandler = func(ctx context.Context, s prewarmScope) error { return nil }
 
 	processCtx, processCancel := context.WithCancel(context.Background())
@@ -435,11 +408,8 @@ func TestEngineWorker_PerScopeTimeoutAnchoredOnProcessCtx(t *testing.T) {
 		customerInFlightCount.Add(-1)
 	}
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 
 	var observedScopeCtx context.Context
 	var observedDone bool
@@ -481,11 +451,8 @@ func TestEngineWorker_PendingDepthDrainsToZero(t *testing.T) {
 		customerInFlightCount.Add(-1)
 	}
 
-	e := &prewarmEngine{
-		pending:   map[string]prewarmScope{},
-		signal:    make(chan struct{}, 1),
-		yieldPoll: 2 * time.Millisecond,
-	}
+	e := newTestEngine()
+	e.yieldPoll = 2 * time.Millisecond
 	e.scopeHandler = func(ctx context.Context, s prewarmScope) error { return nil }
 
 	processCtx, processCancel := context.WithCancel(context.Background())
@@ -504,12 +471,10 @@ func TestEngineWorker_PendingDepthDrainsToZero(t *testing.T) {
 		})
 	}
 
-	// Wait for the worker to drain. Poll pending depth under e.mu.
+	// Wait for the worker to drain. Poll pending depth.
 	deadline := time.After(2 * time.Second)
 	for {
-		e.mu.Lock()
-		depth := len(e.pending)
-		e.mu.Unlock()
+		depth := e.pendingLenForTest()
 		if depth == 0 {
 			break
 		}

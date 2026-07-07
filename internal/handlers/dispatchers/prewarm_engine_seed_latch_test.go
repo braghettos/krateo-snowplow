@@ -123,7 +123,7 @@ func drainSingletonPending() int {
 	e := prewarmEngineSingleton()
 	n := 0
 	for {
-		if _, ok := e.dequeueScope(); !ok {
+		if _, ok := e.drainScopeForTest(); !ok {
 			break
 		}
 		n++
@@ -138,16 +138,12 @@ func drainSingletonPending() int {
 // coalesce to one map entry.
 func singletonPendingBootCount() int {
 	e := prewarmEngineSingleton()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	n := 0
-	bootKey := prewarmScope{kind: scopeKindBoot}.key()
-	for k := range e.pending {
-		if k == bootKey {
-			n++
-		}
+	// The boot scope coalesces to a single queue item on key()=="boot", so the
+	// count is 0 or 1 — presence is equivalent to the old map-count.
+	if e.pendingHasBootForTest() {
+		return 1
 	}
-	return n
+	return 0
 }
 
 // withSeamsAndCounters wires the two seams + log capture + counter snapshots
@@ -165,7 +161,7 @@ type seedRunResult struct {
 func runSeedScopeYielding(t *testing.T,
 	widgets []navWidgetEntry,
 	enumFn func(schema.GroupVersionResource, string) []cache.PrewarmTarget,
-	seedFn func(context.Context, navWidgetEntry, string) error,
+	seedFn func(context.Context, navWidgetEntry, string, bool) error,
 ) seedRunResult {
 	t.Helper()
 
@@ -196,7 +192,7 @@ func runSeedScopeYielding(t *testing.T,
 	// short-circuits before any of them is dereferenced for I/O.
 	if err := seedScopeYielding(context.Background(),
 		nil /* restactionRefs */, widgets,
-		endpoints.Endpoint{}, nil /* saRC */, "test-authn-ns", false /* rank1Only */); err != nil {
+		endpoints.Endpoint{}, nil /* saRC */, "test-authn-ns", false /* rank1Only */, false /* bootScoped */); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil (per-target errors are non-fatal)", err)
 	}
 
@@ -234,7 +230,7 @@ func TestSeedScopeYielding_OneOperationalFailure_EnqueuesExactlyOnce(t *testing.
 	// ONE target, fails operationally.
 	res := runSeedScopeYielding(t, widgets,
 		func(schema.GroupVersionResource, string) []cache.PrewarmTarget { return makeTargets(1) },
-		func(context.Context, navWidgetEntry, string) error { return opErr() },
+		func(context.Context, navWidgetEntry, string, bool) error { return opErr() },
 	)
 
 	if res.enqDelta != 1 {
@@ -284,7 +280,7 @@ func TestSeedScopeYielding_NOperationalFailures_LatchEnqueuesExactlyOnce(t *test
 	widgets := []navWidgetEntry{makeWidgetEntry("ns", "w0")}
 	res := runSeedScopeYielding(t, widgets,
 		func(schema.GroupVersionResource, string) []cache.PrewarmTarget { return makeTargets(n) },
-		func(context.Context, navWidgetEntry, string) error { return opErr() },
+		func(context.Context, navWidgetEntry, string, bool) error { return opErr() },
 	)
 
 	if res.opDelta != n {
@@ -314,7 +310,7 @@ func TestSeedScopeYielding_RBACDeny_NoEnqueue_BumpsDenyCounter(t *testing.T) {
 	widgets := []navWidgetEntry{makeWidgetEntry("ns", "w0")}
 	res := runSeedScopeYielding(t, widgets,
 		func(schema.GroupVersionResource, string) []cache.PrewarmTarget { return makeTargets(1) },
-		func(context.Context, navWidgetEntry, string) error { return deny403() },
+		func(context.Context, navWidgetEntry, string, bool) error { return deny403() },
 	)
 
 	if res.denyDelta != 1 {
@@ -405,7 +401,7 @@ func TestSeedScopeYielding_CounterSumInvariant(t *testing.T) {
 			var idx int
 			res := runSeedScopeYielding(t, widgets,
 				func(schema.GroupVersionResource, string) []cache.PrewarmTarget { return targets },
-				func(context.Context, navWidgetEntry, string) error {
+				func(context.Context, navWidgetEntry, string, bool) error {
 					u := targets[idx].Subject.Username
 					idx++
 					return outcome[u]
@@ -454,7 +450,7 @@ func TestSeedScopeYielding_TwoInvocations_QueueCoalescesToOnePending(t *testing.
 
 	widgets := []navWidgetEntry{makeWidgetEntry("ns", "w0")}
 	enumFn := func(schema.GroupVersionResource, string) []cache.PrewarmTarget { return makeTargets(1) }
-	seedFn := func(context.Context, navWidgetEntry, string) error { return opErr() }
+	seedFn := func(context.Context, navWidgetEntry, string, bool) error { return opErr() }
 
 	// Invocation 1 — fresh latch, enqueues one boot scope.
 	runSeedScopeYielding(t, widgets, enumFn, seedFn)
@@ -473,15 +469,13 @@ func TestSeedScopeYielding_TwoInvocations_QueueCoalescesToOnePending(t *testing.
 	}
 	// And the queue holds exactly one entry total (no stray scope kinds).
 	e := prewarmEngineSingleton()
-	e.mu.Lock()
-	total := len(e.pending)
-	e.mu.Unlock()
+	total := e.pendingLenForTest()
 	if total != 1 {
 		t.Errorf("singleton total pending entries = %d; want 1 (only the coalesced boot scope)", total)
 	}
 
 	// Sanity: the one entry dequeues as a boot scope.
-	s, ok := prewarmEngineSingleton().dequeueScope()
+	s, ok := prewarmEngineSingleton().drainScopeForTest()
 	if !ok || s.kind != scopeKindBoot {
 		t.Fatalf("expected one boot scope to dequeue, got %+v ok=%v", s, ok)
 	}
@@ -492,5 +486,5 @@ func TestSeedScopeYielding_TwoInvocations_QueueCoalescesToOnePending(t *testing.
 // not silently at the swap site).
 var (
 	_ func(schema.GroupVersionResource, string) []cache.PrewarmTarget = cache.EnumeratePrewarmTargetsForGVR
-	_ func(context.Context, navWidgetEntry, string) error             = seedOneWidget
+	_ func(context.Context, navWidgetEntry, string, bool) error       = seedOneWidget
 )

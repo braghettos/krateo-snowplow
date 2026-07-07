@@ -18,10 +18,13 @@
 //     drained.
 //   - snowplow_prewarm_engine_yield_total     — ticks the worker parked
 //     while a customer /call was in flight (customer-priority yield).
-//   - snowplow_prewarm_engine_pending_depth   — live len(e.pending)
-//     under the engine mutex. Steady-state expectation: 0 once the
+//   - snowplow_prewarm_engine_pending_depth   — live e.queue.Len()
+//     (F.4 / R1 workqueue). Steady-state expectation: 0 once the
 //     worker drains. A non-zero value sustained over many scrapes
 //     signals the worker is dead (Fix-v2 falsifier).
+//   - snowplow_prewarm_engine_requeued_total  — scopes engine-requeued
+//     after an error via AddRateLimited (F.4 §3.1). A boot deadline-cut
+//     bumps this once per continuation chunk.
 //
 // REGISTRATION: registerPrewarmEngineMetrics(e) is called from inside
 // StartPrewarmEngine's startedOnce.Do(...) block. Single registration
@@ -63,11 +66,18 @@ func registerPrewarmEngineMetrics(e *prewarmEngine) {
 			return e.yieldTotal.Load()
 		}))
 		expvar.Publish("snowplow_prewarm_engine_pending_depth", expvar.Func(func() any {
-			// Read pending depth under e.mu so the observation is
-			// race-free against enqueue/dequeue (which mutate the map).
-			e.mu.Lock()
-			defer e.mu.Unlock()
-			return len(e.pending)
+			// F.4 / R1 — the workqueue's own Len() (internally synchronized).
+			// Steady-state expectation: 0 once the worker drains. A sustained
+			// non-zero value signals a dead worker or a permanently-failing
+			// scope backing off (Fix-v2 falsifier).
+			return e.queue.Len()
+		}))
+		// F.4 — scopes the engine requeued after an error (AddRateLimited). A
+		// non-zero value with a settling pending_depth is the normal
+		// boot-continuation signal; a monotonically climbing value that never
+		// settles is a zero-progress scope hitting the backoff floor (F4-C8).
+		expvar.Publish("snowplow_prewarm_engine_requeued_total", expvar.Func(func() any {
+			return e.requeuedTotal.Load()
 		}))
 	})
 }

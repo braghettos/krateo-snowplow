@@ -98,6 +98,20 @@ var (
 	// attributable in /debug/vars (the falsifier keys on this DELTA, not the
 	// refresher's counter). Exposed as snowplow_phase1_seed_skipped_stage_error_total.
 	pipSeedSkippedStageErrorTotal atomic.Uint64
+
+	// F.4 (design §3.2) — pipSeedFreshSkipTotal counts boot-scope seed targets
+	// fast-forwarded by the boot-only fresh-skip: a live (non-expired) L1 cell
+	// already existed under the production key, so the resolve + Put were
+	// skipped and the target counted as processed. This is what makes a
+	// deadline-cut boot chunk's continuation cost-proportional (chunk N+1 ≈
+	// preamble + only the cold remainder). SEED-SCOPED and DISTINCT from every
+	// other seed counter: freshSkip does NOT bump seed_resolves (no Put) nor
+	// skipped_stage_error (no resolve at all). A boot re-drive over a fully-warm
+	// set drives this ≈ the chunk-1 seeded count while seed_resolves stays flat.
+	// Boot-only: keepwarm / gvr-discovered never fresh-skip (F4-C3), so this
+	// stays flat outside boot chunks. Exposed as
+	// snowplow_phase1_seed_fresh_skip_total.
+	pipSeedFreshSkipTotal atomic.Uint64
 )
 
 // Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
@@ -212,6 +226,13 @@ func registerPIPMetrics() {
 		// refresherSkippedStageError so a keepwarm-sweep decline is attributable.
 		expvar.Publish("snowplow_phase1_seed_skipped_stage_error_total", expvar.Func(func() any {
 			return pipSeedSkippedStageErrorTotal.Load()
+		}))
+
+		// F.4 (design §3.2) — boot-scope seed targets fresh-skipped (live cell
+		// already under the production key; resolve+Put skipped, counted
+		// processed). SEED-SCOPED, boot-only; distinct from seed_resolves.
+		expvar.Publish("snowplow_phase1_seed_fresh_skip_total", expvar.Func(func() any {
+			return pipSeedFreshSkipTotal.Load()
 		}))
 
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so

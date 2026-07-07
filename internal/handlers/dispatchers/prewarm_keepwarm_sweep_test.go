@@ -71,10 +71,11 @@ func TestKeepwarmSweep_EnqueuesScopeNotStoreScan(t *testing.T) {
 	enqueueKeepwarmSweep() // second tick coalesces (dedup on key()=="keepwarm")
 
 	e := prewarmEngineSingleton()
-	e.mu.Lock()
-	n := len(e.pending)
-	_, hasKeepwarm := e.pending[string(scopeKindKeepwarm)]
-	e.mu.Unlock()
+	n := e.pendingLenForTest()
+	// Drain the single coalesced scope to confirm it is the keepwarm kind
+	// (the workqueue has no key-peek; presence == a drained keepwarm scope).
+	s, ok := e.drainScopeForTest()
+	hasKeepwarm := ok && s.kind == scopeKindKeepwarm
 
 	if !hasKeepwarm {
 		t.Fatalf("expected a pending scopeKindKeepwarm after enqueue; pending has no \"keepwarm\" key")
@@ -106,12 +107,14 @@ func TestKeepwarmSweep_TickerEnqueuesThenStopsOnCancel(t *testing.T) {
 	enqueued := false
 	for time.Now().Before(deadline) {
 		e := prewarmEngineSingleton()
-		e.mu.Lock()
-		_, ok := e.pending[string(scopeKindKeepwarm)]
-		e.mu.Unlock()
-		if ok {
-			enqueued = true
-			break
+		// Only keepwarm scopes are enqueued in this test (clean slate), so a
+		// non-empty queue with a keepwarm-kind head confirms the tick fired.
+		if e.pendingLenForTest() > 0 {
+			s, ok := e.drainScopeForTest()
+			if ok && s.kind == scopeKindKeepwarm {
+				enqueued = true
+				break
+			}
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -163,12 +166,12 @@ func TestKeepwarmSweep_RANK1Only_DoesNotSweepRank2(t *testing.T) {
 	run := func(rank1Only bool) map[string]bool {
 		seen := map[string]bool{}
 		prevW := seedOneWidgetFn
-		seedOneWidgetFn = func(ctx context.Context, _ navWidgetEntry, _ string) error {
+		seedOneWidgetFn = func(ctx context.Context, _ navWidgetEntry, _ string, _ bool) error {
 			seen[eIdentityLabel(ctx)] = true
 			return nil
 		}
 		defer func() { seedOneWidgetFn = prevW }()
-		if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", rank1Only); err != nil {
+		if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", rank1Only, false); err != nil {
 			t.Fatalf("seedScopeYielding(rank1Only=%v) returned %v; want nil", rank1Only, err)
 		}
 		return seen

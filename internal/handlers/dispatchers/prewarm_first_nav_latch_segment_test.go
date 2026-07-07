@@ -110,7 +110,7 @@ func TestFirstNavLatch_SegmentIdentity_RestactionOnlyRank0_FiresOnWidgetSegment(
 	}
 	t.Cleanup(func() { firstNavFireObserver = nil })
 
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false); err != nil {
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()
@@ -248,7 +248,7 @@ func TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment(t *testing.T) {
 		})
 
 	// rank1Only=true — the keepwarm sweep.
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", true); err != nil {
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", true, false); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()

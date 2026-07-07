@@ -40,10 +40,17 @@
 // customer path needs; the yield is a cooperative check, not a hard mutex.
 //
 // BOUNDED QUEUE (refresher.go:95 shape). The engine owns a
-// workqueue.TypedRateLimitingInterface[prewarmScope-key] so Ship 2 can
-// enqueue re-prewarm work (widget CR change, RBAC shift) with idempotent
-// dedup + exponential-backoff retry + never-drop semantics — the exact
-// properties the refresher relies on. Ship 1 enqueues only the BOOT scope.
+// workqueue.TypedRateLimitingInterface[prewarmScope] (F.4 / R1 — the
+// hand-rolled pending-map+signal-channel it replaced was a
+// half-reimplementation of exactly this). prewarmScope is comparable
+// (string kind + GVR struct), so the item IS its own dedup key — the
+// per-key coalescing the map gave us is preserved 1:1 because key() and
+// item identity coincide. This gets FIFO ordering, AddRateLimited
+// exponential-backoff requeue (client-go stock defaults, no new knob),
+// Forget-on-success, and never-drop from tested client-go code. Widget CR
+// changes / RBAC shifts (Ship 2) enqueue with the same idempotent dedup.
+// The BOOT scope re-enqueues itself on a per-scope-budget deadline-cut
+// (F.4 §3.1) so a cut boot chunk resumes deterministically.
 //
 // LIFECYCLE. The engine's workers run under a context bounded by the
 // engine timeout (boot: pipGlobalTimeout); they exit on ctx cancel /
@@ -62,6 +69,7 @@ import (
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/workqueue"
 )
 
 // PrewarmEngineEnabled reports whether the unified dynamic cohort-prewarm
@@ -226,9 +234,12 @@ type prewarmEngine struct {
 	// start; read by workers.
 	scopeHandler func(ctx context.Context, s prewarmScope) error
 
-	mu      sync.Mutex
-	pending map[string]prewarmScope // key -> scope, the bounded dedup queue
-	signal  chan struct{}           // wakes a worker when pending grows
+	// queue is the client-go rate-limiting workqueue (F.4 / R1). prewarmScope
+	// is comparable so the item is its own dedup key — Add coalesces on scope
+	// identity exactly as the old map keyed on key(). FIFO + AddRateLimited
+	// backoff + Forget + never-drop + ShutDown come from client-go. Constructed
+	// once in prewarmEngineSingleton.
+	queue workqueue.TypedRateLimitingInterface[prewarmScope]
 
 	// scopeDone, when set, is invoked by the worker after each scope is
 	// processed (success or error) with the processed scope + its err. The
@@ -243,9 +254,10 @@ type prewarmEngine struct {
 	yieldPoll time.Duration // how long a worker parks while a customer call is in flight
 
 	// Falsifier / telemetry counters.
-	enqueuedTotal atomic.Uint64
+	enqueuedTotal  atomic.Uint64
 	processedTotal atomic.Uint64
 	yieldTotal     atomic.Uint64 // engine yields to a customer call
+	requeuedTotal  atomic.Uint64 // F.4 — scopes engine-requeued after an error (AddRateLimited)
 }
 
 var (
@@ -262,40 +274,29 @@ const defaultEngineYieldPoll = 25 * time.Millisecond
 func prewarmEngineSingleton() *prewarmEngine {
 	prewarmEngineOnce.Do(func() {
 		prewarmEngineInstance = &prewarmEngine{
-			pending:   map[string]prewarmScope{},
-			signal:    make(chan struct{}, 1),
+			// F.4 / R1 — client-go rate-limiting workqueue with stock default
+			// controller rate-limiter (exponential per-item backoff + overall
+			// bucket). prewarmScope is comparable so it is its own dedup key.
+			queue: workqueue.NewTypedRateLimitingQueue(
+				workqueue.DefaultTypedControllerRateLimiter[prewarmScope](),
+			),
 			yieldPoll: defaultEngineYieldPoll,
 		}
 	})
 	return prewarmEngineInstance
 }
 
-// enqueueScope adds a scope to the bounded dedup queue and wakes a worker.
-// Idempotent: a scope whose key is already pending coalesces (the latest
-// wins, but Ship 1's scopes carry no payload so it is a true no-op
-// dedup). Never blocks: the signal channel is buffered=1 and a full
-// channel means a worker is already about to wake.
+// enqueueScope adds a scope to the workqueue. Idempotent: prewarmScope is
+// comparable and IS its own dedup key, so a scope already present (queued
+// or being processed) coalesces exactly as the old map keyed on key()
+// (Ship 1's scopes carry no payload, so it is a true no-op dedup; a
+// scopeKindGVRDiscovered coalesces per-GVR). Never blocks — workqueue.Add
+// is a mutex critical section. Immediate (not rate-limited) add: this is
+// the fresh-arrival path; the engine-owned failure requeue uses
+// AddRateLimited in runWorker.
 func (e *prewarmEngine) enqueueScope(s prewarmScope) {
-	e.mu.Lock()
-	e.pending[s.key()] = s
-	e.mu.Unlock()
+	e.queue.Add(s)
 	e.enqueuedTotal.Add(1)
-	select {
-	case e.signal <- struct{}{}:
-	default:
-	}
-}
-
-// dequeueScope pops one scope from the pending set, or reports empty. The
-// caller drains until empty.
-func (e *prewarmEngine) dequeueScope() (prewarmScope, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for k, s := range e.pending {
-		delete(e.pending, k)
-		return s, true
-	}
-	return prewarmScope{}, false
 }
 
 // StartPrewarmEngine starts the engine worker(s) bound to the given scope
@@ -349,8 +350,8 @@ func StartPrewarmEngine(ctx context.Context, handler func(ctx context.Context, s
 		// Ship 2 Stage 2 — wire the cache→engine hook. The hook fires
 		// from inside cache.DiscoverGroupResources (the `if added`
 		// branch of EnsureResourceType for genuinely-new GVRs). The
-		// callback is non-blocking: enqueueScope is O(1) under a
-		// sync.Mutex + a buffered=1 signal-channel send.
+		// callback is non-blocking: enqueueScope is O(1) — a single
+		// workqueue.Add (a mutex critical section; F.4 / R1).
 		//
 		// REGISTRATION ORDER (PM observation 3, R4 startup-storm):
 		// runs BEFORE `go e.runWorker(ctx)` below so a discovery firing
@@ -367,7 +368,7 @@ func StartPrewarmEngine(ctx context.Context, handler func(ctx context.Context, s
 		go e.runWorker(ctx)
 		slog.Info("prewarm.engine.started",
 			slog.String("subsystem", "cache"),
-			slog.String("queue", "bounded-dedup"),
+			slog.String("queue", "workqueue-ratelimiting"), // F.4 / R1 — client-go typed workqueue
 			slog.String("customer_priority", "yield-on-inflight"),
 			slog.String("gvr_discovered_hook", "wired"),
 			slog.String("ctx_lifetime", "process"),
@@ -393,65 +394,122 @@ func prewarmScopeTimeout(s prewarmScope) time.Duration {
 	return pipGlobalTimeout
 }
 
-// runWorker is the engine worker loop. It blocks on the signal channel,
-// drains the pending queue, and runs each scope through the handler —
-// YIELDING to any in-flight customer /call before each scope. Exits on
-// ctx cancel.
+// prewarmScopeTimeoutFn is a 1-LOC test seam over prewarmScopeTimeout — the
+// SAME `var fooFn = foo` pattern as seedCohortFn (phase1_pip_seed.go) and the
+// seedOneWidgetFn / enumeratePrewarmTargetsForGVRFn seams
+// (prewarm_engine_boot.go). runWorker's per-scope context.WithTimeout routes
+// through it so the F.4 straddle falsifier can shrink one chunk's budget to
+// force a mid-segment deadline-cut without a live cluster or an 8-minute wait.
+// PRODUCTION ALWAYS uses prewarmScopeTimeout (8m, F4-C6 no-new-knob — the
+// budget literal is untouched); only a _test.go override reassigns this var.
+var prewarmScopeTimeoutFn = prewarmScopeTimeout
+
+// runWorker is the engine worker loop. It blocks on the workqueue's Get,
+// runs each scope through the handler — YIELDING to any in-flight customer
+// /call before each scope — and, on error with the process ctx still
+// alive, ENGINE-OWNS the resume by requeueing the scope with rate-limited
+// backoff (F.4 §3.1). Exits on ctx cancel (which ShutDowns the queue so
+// the blocking Get unblocks).
 //
 // CTX CONTRACT (Fix v2 / 0.30.248). `ctx` is the worker's process-lifetime
 // context passed from StartPrewarmEngine. The worker exits ONLY on
 // process shutdown. Per-scope wall-clock bounds are derived inside the
-// drain via context.WithTimeout(ctx, prewarmScopeTimeout(s)) so a
+// loop via context.WithTimeout(ctx, prewarmScopeTimeoutFn(s)) so a
 // single misbehaving scope cannot stall the worker indefinitely; the
-// scope ctx cancels the instant the scope returns (deferred
-// scopeCancel) so resources never leak.
+// scope ctx cancels the instant the scope returns (scopeCancel) so
+// resources never leak.
+//
+// F.4 ENGINE-OWNED RESUME. A boot scope cut by its per-scope budget
+// returns ctx.DeadlineExceeded → the worker requeues it (AddRateLimited)
+// so the continuation chunk runs deterministically, with zero dependence
+// on an external config-vars event (the pre-F.4 nondeterministic redrive
+// trigger). Uniform across scope kinds: gvr-discovered and keepwarm
+// errors requeue too. On success we Forget the item so its backoff
+// history resets. Never-drop: retries space out via exponential backoff
+// (client-go stock rate-limiter) but never stop while the process lives
+// (F4-C8 futility bound — no hot loop).
 func (e *prewarmEngine) runWorker(ctx context.Context) {
+	// ShutDown the queue when the process ctx cancels so the blocking
+	// queue.Get below returns shutdown==true and the worker exits. The
+	// queue never delivers items after ShutDown.
+	go func() {
+		<-ctx.Done()
+		e.queue.ShutDown()
+	}()
+
 	for {
-		select {
-		case <-ctx.Done():
+		s, shutdown := e.queue.Get()
+		if shutdown {
 			return
-		case <-e.signal:
 		}
-		// Drain every pending scope. New enqueues during the drain re-fire
-		// the signal so we loop back.
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			s, ok := e.dequeueScope()
-			if !ok {
-				break
-			}
-			// CUSTOMER PRIORITY — yield before running the scope while any
-			// customer /call is in flight. The seed work inside the handler
-			// also yields between cohorts (see seedScopeYielding), so a
-			// burst that arrives mid-scope is also deferred.
-			e.yieldToCustomer(ctx)
-			if e.scopeHandler == nil {
-				continue
-			}
-			// Per-scope bound: anchor on the long-lived worker ctx so the
-			// scope shares the worker's lifetime (boot/process), but cap
-			// the scope's own wall-clock at prewarmScopeTimeout(s) so a
-			// single misbehaving scope cannot occupy the worker forever.
-			// scopeCancel is deferred-equivalent (called at the bottom of
-			// this iteration via the explicit invocation) so it fires
-			// promptly whether the scope returns nil or an error.
-			scopeCtx, scopeCancel := context.WithTimeout(ctx, prewarmScopeTimeout(s))
-			err := e.scopeHandler(scopeCtx, s)
-			scopeCancel()
-			if err != nil {
-				slog.Warn("prewarm.engine.scope_incomplete",
-					slog.String("subsystem", "cache"),
-					slog.String("scope", s.key()),
-					slog.Any("err", err),
-				)
-			}
-			e.processedTotal.Add(1)
-			if e.scopeDone != nil {
-				e.scopeDone(s, err)
-			}
+		e.processScope(ctx, s)
+	}
+}
+
+// processScope runs one dequeued scope under the customer-priority yield +
+// per-scope timeout, then Done()s it and either Forgets (success) or
+// AddRateLimited-requeues (error, process alive) — the F.4 engine-owned
+// resume. Split out from runWorker so the whole item lifecycle
+// (Get→Done→Forget/requeue) is one auditable unit.
+func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
+	// Done MUST be called for every Get, whatever the outcome, or the queue
+	// leaks the "processing" mark and refuses to re-deliver the item.
+	defer e.queue.Done(s)
+
+	// CUSTOMER PRIORITY — yield before running the scope while any customer
+	// /call is in flight. The seed work inside the handler also yields
+	// between cohorts (see seedScopeYielding), so a burst arriving mid-scope
+	// is also deferred.
+	e.yieldToCustomer(ctx)
+	if e.scopeHandler == nil {
+		e.queue.Forget(s)
+		return
+	}
+	// Per-scope bound: anchor on the long-lived worker ctx so the scope
+	// shares the worker's lifetime (boot/process), but cap the scope's own
+	// wall-clock at prewarmScopeTimeoutFn(s) so a single misbehaving scope
+	// cannot occupy the worker forever. prewarmScopeTimeoutFn is a 1-LOC
+	// test seam over prewarmScopeTimeout (same pattern as seedCohortFn) so
+	// the straddle falsifier can shrink the budget without a live cluster;
+	// production ALWAYS uses prewarmScopeTimeout (8m, unchanged).
+	scopeCtx, scopeCancel := context.WithTimeout(ctx, prewarmScopeTimeoutFn(s))
+	err := e.scopeHandler(scopeCtx, s)
+	scopeCancel()
+	e.processedTotal.Add(1)
+
+	if err != nil {
+		slog.Warn("prewarm.engine.scope_incomplete",
+			slog.String("subsystem", "cache"),
+			slog.String("scope", s.key()),
+			slog.Any("err", err),
+		)
+		// F.4 engine-owned failure-requeue. Only while the process ctx is
+		// alive — on shutdown the scope error is the ctx cancel itself and a
+		// requeue would race the ShutDown (the queue drops rate-limited adds
+		// after ShutDown anyway, but skipping keeps the counter honest and
+		// avoids a spurious scope_requeued line at teardown).
+		if ctx.Err() == nil {
+			e.queue.AddRateLimited(s)
+			e.requeuedTotal.Add(1)
+			slog.Info("prewarm.engine.scope_requeued",
+				slog.String("subsystem", "cache"),
+				slog.String("scope", s.key()),
+				slog.Int("attempt", e.queue.NumRequeues(s)),
+				slog.Any("err", err),
+				slog.String("effect", "engine-owned resume: cut/failed scope re-enqueued with "+
+					"rate-limited backoff (F.4); a boot deadline-cut resumes as a continuation chunk, "+
+					"no dependence on config-vars events"),
+			)
 		}
+	} else {
+		// Success — reset the item's backoff history (F4-C8: Forget-on-success
+		// so a later transient failure starts from zero backoff, not the tail
+		// of an old streak).
+		e.queue.Forget(s)
+	}
+
+	if e.scopeDone != nil {
+		e.scopeDone(s, err)
 	}
 }
 
