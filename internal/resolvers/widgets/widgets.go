@@ -1,10 +1,12 @@
 package widgets
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/maps"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 )
@@ -23,7 +25,115 @@ const (
 	// (resourcesRefsTemplateKey, below) stays byte-identical and existing
 	// blueprints are untouched (the PM-endorsed non-breaking shape).
 	resourcesRefsTemplateExtrasKey = "resourcesRefsTemplateExtras"
+
+	// identityContextKey — the A2 author-declared identity-dependence field
+	// (definitive-cache-identity-architecture §1.1): spec.identityContext is an
+	// OPTIONAL []string enumerating which authenticated-principal keys the
+	// widget's rendered output depends on. Absent/empty = identity-free (the
+	// default; per-binding-shareable + seedable). Read off the unstructured spec
+	// (same absence-tolerant pattern as the extras accessors).
+	identityContextKey = "identityContext"
 )
+
+// identityContextEnumUsername / identityContextEnumGroups are the ONLY enum
+// values the Phase A contract honors — exactly jwtutil.UserInfo (username,
+// groups). D1 (Diego 2026-07-07): displayName is FORECLOSED from the enum (it is
+// not a JWT claim for any strategy, §1.3), so the accessor FILTERS to these two
+// IN CODE — an out-of-enum value (a stale/typo'd/displayName declaration) is
+// dropped, never injected. This is the code-side twin of the CRD enum bound: the
+// server never injects a key the principal does not carry.
+const (
+	identityContextEnumUsername = "username"
+	identityContextEnumGroups   = "groups"
+)
+
+// GetIdentityContext reads spec.identityContext off the unstructured widget CR
+// and returns the DECLARED identity keys FILTERED to the Phase A enum
+// ({username, groups}) — the A2 declaration accessor
+// (definitive-cache-identity-architecture §1.1). Absence-tolerant: absent /
+// wrong-type / empty ⇒ nil (identity-free default, byte-identical to pre-A2).
+// Out-of-enum entries (e.g. displayName, a typo) are DROPPED in code (D1
+// foreclosure) — never a silent inject of a key the principal lacks. Order is
+// preserved and duplicates are collapsed so the derived identity map is
+// deterministic. Reads the raw slice via maps.NestedSlice (deep copy → no CR
+// aliasing), mirroring GetResourcesRefsExtras.
+func GetIdentityContext(obj map[string]any) []string {
+	raw, ok, err := maps.NestedSlice(obj, "spec", identityContextKey)
+	if !ok || err != nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, v := range raw {
+		s, isStr := v.(string)
+		if !isStr {
+			continue
+		}
+		// D1 enum filter IN CODE: honor only username/groups.
+		if s != identityContextEnumUsername && s != identityContextEnumGroups {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// DeclaredIdentity is the SINGLE derivation of a declared widget's
+// server-trusted identity map (definitive-cache-identity-architecture §1.3 +
+// §2.2). It is the ONE place identity ever meets the resolve input / key fold,
+// called from BOTH the key path (dispatchers effectiveKeyExtras via
+// declaredIdentityForKey) and the resolve-input path (widgets Resolve) — so the
+// key and the body cannot desync (the #64 anti-drift principle at the identity
+// dimension).
+//
+// It reads the widget's declared identityContext (GetIdentityContext, already
+// enum-filtered) and materialises ONLY those keys from the authenticated
+// principal on ctx (xcontext.UserInfo — the JWT the authn middleware minted).
+//
+// GATE AUTHN-1 (Diego binding constraint): the ONLY source is
+// xcontext.UserInfo(ctx). ZERO user-store reads — no User CR, no IdP call, no
+// LDAP query, no apiserver fetch — so it is STRATEGY-AGNOSTIC by construction
+// (basic / OIDC / LDAP / serviceaccount all mint the same JWT tuple). displayName
+// is not derivable here (not in the JWT); the enum forecloses declaring it.
+//
+// Returns nil when: no declaration (identity-free widget — the ~99% corpus
+// path), or no/invalid UserInfo on ctx (fail-safe: absent identity yields no
+// injection, never a spurious key). A nil return makes the caller's fold a
+// no-op → byte-identical to pre-A2 for every undeclared widget (the prod-inert
+// acceptance). Values: username → ui.Username; groups → a fresh copy of
+// ui.Groups (never aliases the ctx slice). Only NON-EMPTY values are injected —
+// an empty username is not a key (jq `// empty` semantics apply downstream).
+func DeclaredIdentity(ctx context.Context, obj map[string]any) map[string]any {
+	declared := GetIdentityContext(obj)
+	if len(declared) == 0 {
+		return nil // identity-free widget — no injection (prod-inert default)
+	}
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return nil // no authenticated principal → inject nothing (fail-safe)
+	}
+	out := map[string]any{}
+	for _, key := range declared {
+		switch key {
+		case identityContextEnumUsername:
+			if ui.Username != "" {
+				out[identityContextEnumUsername] = ui.Username
+			}
+		case identityContextEnumGroups:
+			if len(ui.Groups) > 0 {
+				out[identityContextEnumGroups] = append([]string(nil), ui.Groups...)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
 
 func GetAPIVersion(obj map[string]any) string {
 	val, err := maps.NestedString(obj, "apiVersion")

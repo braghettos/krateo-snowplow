@@ -45,6 +45,33 @@ type ResolveOptions struct {
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
 
+	// A2 contract: server-trusted identity injection into the RESOLVE INPUT
+	// (definitive-cache-identity-architecture §1.3 + §2.4). For a widget whose CR
+	// declares spec.identityContext, fold the declared subset of the
+	// authenticated principal (DeclaredIdentity — the SAME derivation the cache
+	// key path uses via effectiveKeyExtras) into opts.Extras, so the declared
+	// identity reaches BOTH the widgetDataTemplate/resourcesRefsTemplate jq
+	// (mergeExtras(ds, opts.Extras) below) AND the apiRef fetch (resolveApiRef).
+	// INJECTION WINS over any client-supplied value for the declared keys — this
+	// is the quarantine that closes the spoofability hole (§1.3, F-ARCH-3): a
+	// request carrying extras.username=SOMEONE_ELSE is overwritten by the JWT's
+	// own username. CACHE-OFF TRANSPARENT (§2.4, F-ARCH-6): this is part of the
+	// widget's INPUT contract, not a cache feature — it runs here in the resolve
+	// path whether or not the cache is on, so declared-widget output is identical
+	// cache-on vs cache-off for the same JWT. INERT for the ~99% identity-free
+	// corpus: DeclaredIdentity returns nil when no identityContext is declared →
+	// opts.Extras is untouched → byte-identical to pre-A2.
+	if inj := DeclaredIdentity(ctx, opts.In.Object); len(inj) > 0 {
+		merged := make(map[string]any, len(opts.Extras)+len(inj))
+		for k, v := range opts.Extras {
+			merged[k] = v
+		}
+		for k, v := range inj { // injection wins on collision (quarantine)
+			merged[k] = v
+		}
+		opts.Extras = merged
+	}
+
 	// Ship 0.30.193 Checkpoint 1 — widget-resolve phase wall-clocks.
 	// Captured per-phase so seedOneWidget's deferred log can attribute
 	// total widget-resolve cost across apiref / widgetData / resrefs /

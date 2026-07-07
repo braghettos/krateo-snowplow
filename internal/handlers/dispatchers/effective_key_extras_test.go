@@ -62,26 +62,46 @@ func TestA1_EffectiveKeyExtras_ByteIdenticalToInlineFold(t *testing.T) {
 	}
 }
 
-// TestA1_DeclaredIdentityForKey_InertInA1 — pins that the A2 injection slot is
-// INERT in A1: declaredIdentityForKey returns nil regardless of ctx/CR, so
-// effectiveKeyExtras adds nothing beyond the union. If A2 wiring lands, THIS test
-// is the one that must be deliberately updated — a guard that A1 shipped with the
-// slot provably off (and that a stray early-wire is caught).
-func TestA1_DeclaredIdentityForKey_InertInA1(t *testing.T) {
-	ctx := ctxWithIdentity()
-	// Even a CR that (in A2) would declare identityContext must yield nil in A1 —
-	// the accessor does not exist yet, so any CR shape returns nil.
-	cr := map[string]any{"spec": map[string]any{
+// TestA2_DeclaredIdentityForKey_WiresInjection — the A1 inert-slot guard,
+// deliberately FLIPPED for A2 (the stray-early-wire guard becomes the wiring
+// proof — per the definitive-arch A2 brief, converted not deleted). In A1 this
+// asserted declaredIdentityForKey returns nil for a CR declaring identityContext;
+// A2 WIRES the injection, so a declared CR under an identity-carrying ctx now
+// materialises the declared subset of the principal, and effectiveKeyExtras folds
+// it into the key (which the pure pre-A2 union does NOT). The inert half survives
+// as the undeclared control (still nil → still byte-identical to pre-A2).
+func TestA2_DeclaredIdentityForKey_WiresInjection(t *testing.T) {
+	ctx := ctxWithIdentity() // cyberjoker / [devs]
+
+	// DECLARED: spec.identityContext:[username,groups] → injection now materialises
+	// {username: cyberjoker, groups: [devs]} from the ctx JWT (A2 wired).
+	declaredCR := map[string]any{"spec": map[string]any{
 		"identityContext": []any{"username", "groups"},
 		"apiRef":          map[string]any{"extras": map[string]any{"k": "v"}},
 	}}
-	if got := declaredIdentityForKey(ctx, cr); got != nil {
-		t.Fatalf("A1: declaredIdentityForKey must be INERT (nil) until A2 wires it; got %#v", got)
-	}
-	// And effectiveKeyExtras over that CR equals the pure union (no identity keys).
-	want := keyExtrasFor(cr, nil)
-	got := effectiveKeyExtras(ctx, cr, nil)
+	got := declaredIdentityForKey(ctx, declaredCR)
+	want := map[string]any{"username": "cyberjoker", "groups": []string{"devs"}}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("A1: with the injection inert, effectiveKeyExtras must equal the pure union\n  got  = %#v\n  want = %#v", got, want)
+		t.Fatalf("A2: declaredIdentityForKey must materialise the declared identity subset from ctx; got %#v want %#v", got, want)
+	}
+	// effectiveKeyExtras folds the identity into the key (differs from the pure union).
+	eff := effectiveKeyExtras(ctx, declaredCR, nil)
+	if eff["username"] != "cyberjoker" {
+		t.Fatalf("A2: effectiveKeyExtras must fold the declared username into the key; got %#v", eff)
+	}
+	if pure := keyExtrasFor(declaredCR, nil); reflect.DeepEqual(eff, pure) {
+		t.Fatalf("A2: a DECLARED widget's key must DIFFER from the pure pre-A2 union (identity folded); both = %#v", eff)
+	}
+
+	// UNDECLARED control: no identityContext → still nil → key byte-identical to
+	// the pure union (the prod-inert acceptance for the ~99% corpus survives).
+	undeclaredCR := map[string]any{"spec": map[string]any{
+		"apiRef": map[string]any{"extras": map[string]any{"k": "v"}},
+	}}
+	if got := declaredIdentityForKey(ctx, undeclaredCR); got != nil {
+		t.Fatalf("A2: an UNDECLARED widget must inject nothing (nil); got %#v", got)
+	}
+	if eff, pure := effectiveKeyExtras(ctx, undeclaredCR, nil), keyExtrasFor(undeclaredCR, nil); !reflect.DeepEqual(eff, pure) {
+		t.Fatalf("A2: an UNDECLARED widget's key must equal the pure union (prod-inert)\n  got  = %#v\n  want = %#v", eff, pure)
 	}
 }
