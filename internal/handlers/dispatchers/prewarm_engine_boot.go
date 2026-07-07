@@ -671,27 +671,63 @@ func seedScopeYielding(ctx context.Context,
 		return ri.Namespace+"/"+ri.Name < rj.Namespace+"/"+rj.Name
 	})
 
-	// (3) Rank the identities over BOTH classes' targets, DESCENDING by
-	// CollapsedBindings; ties on the identity key (deterministic, no starvation).
+	// (3) FIX-3 RANK HYGIENE: rank the identities over BOTH classes' targets by
+	// (widgetMax DESC, allMax DESC, identityKey ASC), where both counts are
+	// MAX-FOLDS over every observation of the identity across the precomputed
+	// target sets. This supersedes the FIX-D first-seen CollapsedBindings rank
+	// (docs/fix3-rank-hygiene-design-2026-07-07.md):
+	//
+	//   - DETERMINISTIC. The old noteIdentity kept the FIRST-SEEN count (a
+	//     map-iteration-order-dependent value: an identity carries a different
+	//     count per GVR bucket, and restaction refs iterate a Go-map snapshot
+	//     upstream), so ranked order flipped across boots. max is commutative/
+	//     associative/idempotent → the fold is a pure function of the
+	//     observation multiset, independent of widgetSeeds/restactionSeeds order
+	//     and of Go map order. With the full-key comparator there is exactly one
+	//     ranked order per (harvest, index) snapshot.
+	//   - WIDGET-CAPABLE-FIRST as a tier, without a tier flag. CollapsedBindings
+	//     is >=1 for every observation (prewarm_enumeration.go:207), so
+	//     widgetMax>=1 IFF the identity appears in some widget target set.
+	//     Sorting widgetMax DESC alone places every widget-capable identity
+	//     strictly above every widget-less one (widgetMax==0). This fixes the
+	//     boot600 pollution: a machine SA present ONLY in a 1,344-binding RA
+	//     bucket (widgetMax 0) no longer out-ranks a login cohort's dashboard
+	//     widgets — the prime seed slot goes to an identity that renders a page.
+	//   - allMax is the secondary key: it orders the widget-less tail and breaks
+	//     widget-count ties inside the widget-capable tier by breadth elsewhere.
+	//     Genuine ties fall to identityKey ASC (total, deterministic, no
+	//     starvation).
+	//
+	// PURE ORDERING (FIX-E invariant preserved): the seeded (unit x identity)
+	// SET is unchanged — widget-less identities keep their RA seeds, ranked at
+	// the tail; only the SEQUENCE changes. No caps/skips/static lists; the rank
+	// metric stays data-derived CollapsedBindings.
 	type rankedIdentity struct {
 		key       string
-		collapsed int
+		widgetMax int
+		allMax    int
 	}
 	rankOf := map[string]rankedIdentity{}
-	noteIdentity := func(c seedTarget) {
+	noteIdentity := func(c seedTarget, isWidget bool) {
 		k := identityKey(c)
-		if _, ok := rankOf[k]; !ok {
-			rankOf[k] = rankedIdentity{key: k, collapsed: c.CollapsedBindings}
+		ri := rankOf[k] // zero value {key:"", 0, 0} for a first observation
+		ri.key = k
+		if c.CollapsedBindings > ri.allMax {
+			ri.allMax = c.CollapsedBindings
 		}
+		if isWidget && c.CollapsedBindings > ri.widgetMax {
+			ri.widgetMax = c.CollapsedBindings
+		}
+		rankOf[k] = ri
 	}
 	for _, ws := range widgetSeeds {
 		for _, c := range ws.targets {
-			noteIdentity(c)
+			noteIdentity(c, true)
 		}
 	}
 	for _, rs := range restactionSeeds {
 		for _, c := range rs.targets {
-			noteIdentity(c)
+			noteIdentity(c, false)
 		}
 	}
 	ranked := make([]rankedIdentity, 0, len(rankOf))
@@ -699,11 +735,28 @@ func seedScopeYielding(ctx context.Context,
 		ranked = append(ranked, ri)
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].collapsed != ranked[j].collapsed {
-			return ranked[i].collapsed > ranked[j].collapsed
+		if ranked[i].widgetMax != ranked[j].widgetMax {
+			return ranked[i].widgetMax > ranked[j].widgetMax
+		}
+		if ranked[i].allMax != ranked[j].allMax {
+			return ranked[i].allMax > ranked[j].allMax
 		}
 		return ranked[i].key < ranked[j].key
 	})
+	// Ride-along observability (boot scope only): one line per ranked identity
+	// so two consecutive boots' rank order can be diffed clean (R3-C8 d).
+	// Suppressed under rank1Only to keep the keepwarm sweep logs quiet.
+	if !rank1Only {
+		for r := range ranked {
+			log.Info("prewarm.engine.seed.rank",
+				slog.String("subsystem", "cache"),
+				slog.Int("rank", r),
+				slog.String("identity", ranked[r].key),
+				slog.Int("widget_max", ranked[r].widgetMax),
+				slog.Int("all_max", ranked[r].allMax),
+			)
+		}
+	}
 
 	// Emit per-unit target-count telemetry ONCE up front (the seed loop below is
 	// rank-major, so the *_targets line no longer pairs 1:1 with a contiguous
@@ -775,24 +828,25 @@ func seedScopeYielding(ctx context.Context,
 	// The readyz gate flips when the FIRST-NAV WIDGET SEGMENT has seeded — NOT
 	// the whole rank pass, NOT the full seed (prewarm_first_nav_latch.go).
 	//
-	// #99b: the segment identity is NOT hard-wired to ranked[0]. ranked is
-	// built over the UNION of widget- AND restaction-target identities
-	// (:635-667, first-seen CollapsedBindings), so ranked[0] can be an
-	// identity that appears ONLY in a restaction target set and has ZERO
-	// RootIndex==0 widget targets (the live boot600 case: a machine SA present
-	// only in RA enumerations out-ranks every widget-floor identity → the
-	// old rank1==ranked[0] arming counted 0 first-nav targets → the latch
-	// zero-fired with the login cohorts' dashboards COLD). Instead we scan
-	// ranked in order and pick the FIRST identity that actually has ≥1
-	// RootIndex==0 widget target as the segment (segKey at rank segRank). The
+	// #99b: the segment identity is NOT hard-wired to ranked[0], and the scan
+	// stays live as a SAFETY NET after FIX-3. Post-FIX-3, widgetMax DESC makes
+	// ranked[0] widget-capable by construction in a single-root topology, so the
+	// old "machine SA out-ranks the widget floor" pollution is gone at the RANK
+	// level. But "widget-capable" means >=1 widget target ANYWHERE, not >=1
+	// RootIndex==0 widget target: on a MULTI-ROOT config an identity whose ONLY
+	// widget targets live in a non-first root (RootIndex!=0) can still take
+	// ranked[0]. Then rank1==ranked[0] arming would count 0 FIRST-NAV targets
+	// and the latch would zero-fire with the first-root dashboard COLD. So we
+	// still scan ranked in order and pick the FIRST identity that actually has
+	// >=1 RootIndex==0 widget target as the segment (segKey at rank segRank). The
 	// segment is that identity's RootIndex==0 widget-target PAIRS; the latch
 	// fires the instant the LAST one seeds (mid-segRank pass, before the
 	// RootIndex>0 widgets and before ANY of that rank's restactions — the
 	// heavy NON-first-nav tail is still mid-seed, ARM-TAIL). Seed ORDER is
 	// UNTOUCHED: this is a pure gate fix; the rank-major loop below is
-	// unchanged, so any lower-ranked identity that spends the prime seed slot
-	// (e.g. the bench-SA rank-1 restaction pass) remains a cheap skipped
-	// prefix — the latch simply no longer keys its readiness on it.
+	// unchanged, so a higher-ranked identity with only RootIndex!=0 widgets
+	// remains a cheap non-first-nav prefix — the latch simply keys its readiness
+	// on the first identity that renders the first-nav page.
 	//
 	// RootIndex is stamped on widgets only (phase1_pip_seed.go
 	// BeginRoot/RootIndex); restactions carry no first-nav marker, so the
