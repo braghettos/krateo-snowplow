@@ -438,7 +438,16 @@ func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[stri
 		out["username"] = ui.Username
 	}
 	if len(ui.Groups) > 0 {
-		out["groups"] = append([]string(nil), ui.Groups...)
+		// JSON-native []any (NOT []string) — key-only here, so this doesn't hit
+		// the resolve-input DeepCopyJSON panic today, but mirror DeclaredIdentity
+		// so ALL identity-extras are JSON-native by construction (shape
+		// uniformity, feedback_no_special_cases). Key-parity byte-identical:
+		// json.Marshal treats []string and []any identically.
+		g := make([]any, len(ui.Groups))
+		for i, v := range ui.Groups {
+			g[i] = v
+		}
+		out["groups"] = g
 	}
 	if len(out) == 0 {
 		return nil

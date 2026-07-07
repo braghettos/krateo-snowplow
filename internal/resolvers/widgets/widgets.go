@@ -125,7 +125,21 @@ func DeclaredIdentity(ctx context.Context, obj map[string]any) map[string]any {
 			}
 		case identityContextEnumGroups:
 			if len(ui.Groups) > 0 {
-				out[identityContextEnumGroups] = append([]string(nil), ui.Groups...)
+				// JSON-native []any (NOT []string): this identity map is folded
+				// into opts.Extras (resolve.go:64-73) and threaded through
+				// resolveApiRef → mergeRequestWins → plumbing/maps.DeepCopyJSON,
+				// which PANICS on a Go []string ("cannot deep copy []string" — it
+				// only handles the json.Unmarshal-produced []any). A fresh []any
+				// keeps the value deep-copy-safe AND non-aliasing
+				// (feedback_shared_vs_copy_is_a_concurrency_change), and is
+				// key-parity byte-identical: json.Marshal([]string{"devs"}) ==
+				// json.Marshal([]any{"devs"}) == ["devs"], so canonicaliseExtras
+				// hashes it identically (the A1 prod-inert goldens stay green).
+				g := make([]any, len(ui.Groups))
+				for i, v := range ui.Groups {
+					g[i] = v
+				}
+				out[identityContextEnumGroups] = g
 			}
 		}
 	}

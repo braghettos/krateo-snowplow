@@ -312,6 +312,60 @@ func TestFARCH6_CacheOffTransparency_ResolvedOutputIdentical(t *testing.T) {
 		"declared[username] echoing .username → status.widgetData.echoedUser: driven through REAL widgets.Resolve under CACHE_ENABLED=true (cold) AND CACHE_ENABLED=false — both render echoedUser=alice (JWT identity in the resolve input) AND are byte-identical. Injection is an INPUT-contract property, transparent to the cache toggle.")
 }
 
+// TestFARCH3_GroupsResolveOutput_GroupScopedOnly — the SECOND-DIMENSION arm for a
+// declared[groups] widget (the A2-fix falsifier AND the A4 seed-safety resolve-output
+// closure; §4.4.6 group-shared cell). Two properties in one arm:
+//
+//  1. JSON-NATIVE FIX GUARD: a declared[groups] widget must resolve through the REAL
+//     widgets.Resolve WITHOUT PANIC. Pre-fix, DeclaredIdentity emitted groups as a Go
+//     []string, which mergeRequestWins → plumbing DeepCopyJSON panicked on ("cannot
+//     deep copy []string"). The fix emits JSON-native []any. RED (i): revert the fix
+//     (DeclaredIdentity groups → []string) → this arm's own driver PANICS. No A2/A4
+//     key-side arm drives Resolve with [groups], so this is the FIRST arm to exercise
+//     that path — the gap both re-gaters proved (whole A4 battery stayed green under
+//     the []string panic AND under the content-spoof).
+//
+//  2. RESOLVE-OUTPUT SCOPE (the content dimension a key-side arm is blind to): the
+//     seeded group-shared cell's rendered body must carry ONLY the group, NEVER the
+//     cohort representative's per-user username. Drive Resolve under a group-only-rep
+//     ctx that ALSO carries a NON-EMPTY username ("rep-admin"); the widget declares
+//     [groups] only, so DeclaredIdentity (the SAME function that scopes the key)
+//     injects only {groups} into the resolve input → the body echoes the groups and
+//     NOT rep-admin. RED (ii): a content-spoof that folds the rep username into the
+//     resolve input while the KEY stays group-only → echoedUser=rep-admin here while
+//     the key-side case-3 stays GREEN — the invisible-to-key-arms leak.
+//
+// Since seedOneWidget calls widgets.Resolve with NO Extras (phase1_pip_seed.go), the
+// seed's resolve-input identity IS this same A2 injection, so this serve-path arm IS
+// the seed-safety guard for the group-shared cell — A4 needs no separate seed-ctx variant.
+func TestFARCH3_GroupsResolveOutput_GroupScopedOnly(t *testing.T) {
+	// declared[groups] echo CR: echoes BOTH .groups and .username into the rendered
+	// body so we assert groups-present AND rep-username-ABSENT.
+	cr := map[string]any{"spec": map[string]any{
+		"identityContext": []any{"groups"},
+		"widgetData":      map[string]any{},
+		"widgetDataTemplate": []any{
+			map[string]any{"forPath": ".echoedGroups", "expression": "${ .groups }"},
+			map[string]any{"forPath": ".echoedUser", "expression": "${ .username }"},
+		},
+	}}
+	// Cohort representative ctx: a group (devs) AND a non-empty username — the
+	// User-kind representative shape. resolveRenderedWidgetData drives the REAL
+	// widgets.Resolve; pre-fix this PANICS on the []string groups deep-copy (RED i).
+	rendered := resolveRenderedWidgetData(t, ctxAsIdentity("rep-admin", "devs"), cr, nil)
+
+	// (1) group-scoped content present.
+	if rendered["echoedGroups"] == nil {
+		t.Fatalf("F-ARCH-3 groups resolve-output: a declared[groups] widget's rendered body must carry the group-scoped identity; got %#v", rendered)
+	}
+	// (2) the rep's per-user username must NOT reach the resolve input / body.
+	if got := rendered["echoedUser"]; got == "rep-admin" {
+		t.Fatalf("F-ARCH-3 groups resolve-output LEAK: the group-shared body carries the cohort representative's username %q — every devs member would be served rep-admin's identity. declared[groups] must inject ONLY groups. RED(ii) = content-spoof folds the rep username into the resolve input while the key stays group-only.", got)
+	}
+	writeA2Artifact(t, "farch3_groups_resolve_output.txt",
+		"declared[groups] echoing .groups + .username, driven through REAL widgets.Resolve under a group-only-rep ctx (rep-admin/devs): echoedGroups=[devs] present, echoedUser ABSENT (not rep-admin) — group-shared body is group-scoped only, no per-user leak; and Resolve does NOT panic (JSON-native []any groups fix). RED(i)=revert to []string → panic; RED(ii)=content-spoof rep username into resolve input → echoedUser=rep-admin while key-side stays green.")
+}
+
 // mapStr renders a map for artifact transcripts deterministically-enough.
 func mapStr(m map[string]any) string {
 	b := ""

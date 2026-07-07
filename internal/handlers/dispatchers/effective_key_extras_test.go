@@ -80,7 +80,12 @@ func TestA2_DeclaredIdentityForKey_WiresInjection(t *testing.T) {
 		"apiRef":          map[string]any{"extras": map[string]any{"k": "v"}},
 	}}
 	got := declaredIdentityForKey(ctx, declaredCR)
-	want := map[string]any{"username": "cyberjoker", "groups": []string{"devs"}}
+	// groups is JSON-native []any (NOT []string) — the A2 fix: identity extras
+	// must be deep-copy-safe for the resolve-input path (mergeRequestWins →
+	// plumbing DeepCopyJSON panics on []string). Key-parity byte-identical
+	// (json.Marshal treats []string and []any the same), proven by the A1
+	// byte-identical goldens above.
+	want := map[string]any{"username": "cyberjoker", "groups": []any{"devs"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("A2: declaredIdentityForKey must materialise the declared identity subset from ctx; got %#v want %#v", got, want)
 	}
