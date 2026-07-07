@@ -43,6 +43,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
@@ -94,6 +95,21 @@ var configVarsEnqueuedTotal atomic.Uint64
 // count (falsifier + telemetry).
 func ConfigVarsEnqueuedTotal() uint64 { return configVarsEnqueuedTotal.Load() }
 
+// configVarsSkippedTotal counts config-vars UPDATE events the data-change gate
+// (#106, configVarsDataChanged) SUPPRESSED because Data + BinaryData were
+// byte-identical to the previously-delivered state — i.e. a metadata-only write
+// (the KrateoFrontend CDC re-apply bumps annotations/managedFields with a fresh
+// krateo.io/traceparent span each reconcile, ~1/min on fresh2). Steady-state
+// rate == the CDC churn rate, so a climbing value PROVES the gate is actively
+// firing (distinguishes gate-working from informer-dead / churn-stopped).
+// Exact mirror of the enqueued-counter shape above; exposed via expvar
+// snowplow_phase1_configvars_skipped_total (phase1_pip_metrics.go).
+var configVarsSkippedTotal atomic.Uint64
+
+// ConfigVarsSkippedTotal exposes the count of UPDATE events suppressed by the
+// data-change gate (falsifier + telemetry).
+func ConfigVarsSkippedTotal() uint64 { return configVarsSkippedTotal.Load() }
+
 // buildConfigVarsWatchClient builds the typed clientset the informer uses —
 // the injected fake in tests, else kubernetes.NewForConfig(rc). Mirrors
 // cache.buildSecretsClient.
@@ -118,6 +134,40 @@ func matchesConfigVars(obj interface{}, cmName string) bool {
 		return false
 	}
 	return cm.Name == cmName
+}
+
+// configVarsDataChanged reports whether the config-vars ConfigMap's CONSUMED
+// content changed between the informer's previously-delivered state (oldObj) and
+// the new one (newObj) — #106 data-change redrive gate (design
+// docs/configvars-update-datagate-design-2026-07-07.md).
+//
+// WHY. UpdateFunc used to enqueue a full boot re-walk on ANY object write. The
+// KrateoFrontend CDC re-apply bumps annotations/managedFields (a fresh
+// krateo.io/traceparent span each reconcile) → new ResourceVersion → informer
+// UPDATE ~1/min, each paying the ~2.3-min walk at 60K while config.json is
+// byte-identical. This predicate gates the enqueue on the actual consumed
+// content so metadata-only churn stops driving the walk.
+//
+// SCOPE = FULL Data + BinaryData (superset of the single consumed key
+// Data["config.json"], phase1_roots.go frontendConfigDataKey), never narrower
+// than consumed: a future walker reading a sibling key must NOT silently go
+// stale, and a redundant coalesced walk on a real frontend deploy touching a
+// sibling key is self-limiting. Matches the Helm checksum/config prior-art.
+//
+// FAIL-OPEN. If EITHER object is not a *corev1.ConfigMap (unexpected type /
+// tombstone) the function returns true (== the pre-#106 unconditional-enqueue
+// behavior) — never suppress a redrive on doubt (a suppressed genuine redrive is
+// the cold-first-nav class this watcher exists to kill, and it fails silent).
+// O(1)-ish map compare over a 1-key ConfigMap; the HOOK-MUST-NOT-BLOCK contract
+// holds (no parse, no apiserver read).
+func configVarsDataChanged(oldObj, newObj interface{}) bool {
+	oldCM, oldOK := oldObj.(*corev1.ConfigMap)
+	newCM, newOK := newObj.(*corev1.ConfigMap)
+	if !oldOK || !newOK {
+		return true // fail OPEN — pre-#106 behavior; never suppress on doubt
+	}
+	return !apiequality.Semantic.DeepEqual(oldCM.Data, newCM.Data) ||
+		!apiequality.Semantic.DeepEqual(oldCM.BinaryData, newCM.BinaryData)
 }
 
 // enqueueBootReDrive is the AddFunc/UpdateFunc body: it ONLY calls the
@@ -202,21 +252,43 @@ func StartConfigVarsWatch(ctx context.Context, rc *rest.Config, authnNS string) 
 
 	if _, err := inf.AddEventHandler(clientcache.ResourceEventHandlerFuncs{
 		// AddFunc: config-vars appeared (or the initial-list replay when it
-		// is already present at boot). Drives the boot re-walk.
+		// is already present at boot). Drives the boot re-walk. UNGATED
+		// (#106 C106-3a): first appearance / initial-LIST replay always
+		// redrives — it is the boot-race self-heal trigger itself and has no
+		// prior state to diff.
 		AddFunc: func(obj interface{}) {
 			if matchesConfigVars(obj, cmName) {
 				enqueueBootReDrive("configmap_added")
 			}
 		},
-		// UpdateFunc: config.json changed (e.g. the frontend rewrote its
-		// INIT/ROUTES_LOADER entry points). Re-drives so the new roots warm.
-		UpdateFunc: func(_, newObj interface{}) {
-			if matchesConfigVars(newObj, cmName) {
-				enqueueBootReDrive("configmap_updated")
+		// UpdateFunc: re-drives ONLY when the consumed content actually changed
+		// (#106 data-change gate). The KrateoFrontend CDC re-apply bumps
+		// annotations/managedFields (fresh traceparent span each reconcile) →
+		// UPDATE ~1/min with byte-identical config.json; without the gate each
+		// paid a full ~2.3-min boot re-walk and starved the keepwarm sweep. The
+		// gate compares the informer's own delivered (old,new) pair — last-seen
+		// ≡ last-redriven, no stored hash, so a flap A→B→A redrives on BOTH
+		// events by construction (design §"No stored hash").
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if !matchesConfigVars(newObj, cmName) {
+				return
 			}
+			if !configVarsDataChanged(oldObj, newObj) {
+				configVarsSkippedTotal.Add(1)
+				slog.Info("prewarm.configvars.redrive_skipped",
+					slog.String("subsystem", "cache"),
+					slog.String("reason", "data_unchanged_metadata_only"),
+					slog.String("configmap", cmName),
+					slog.String("effect", "config-vars UPDATE was metadata-only (Data+BinaryData byte-identical); "+
+						"boot re-walk SUPPRESSED (#106 CDC-churn gate) — the walk reads the live CM, nothing to re-warm"),
+				)
+				return
+			}
+			enqueueBootReDrive("configmap_data_changed")
 		},
 		// No DeleteFunc: a deleted config-vars ConfigMap has no roots to
-		// re-walk — nothing to enqueue.
+		// re-walk — nothing to enqueue. delete→recreate is covered by the
+		// unconditional AddFunc (recreate == ADD).
 	}); err != nil {
 		log.Warn("prewarm.configvars.add_event_handler_failed",
 			slog.String("subsystem", "cache"),

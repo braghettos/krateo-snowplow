@@ -257,6 +257,14 @@ func registerPIPMetrics() {
 			return keepwarmAgeSkipTotal.Load()
 		}))
 
+		// #106 — config-vars UPDATE events suppressed by the data-change gate
+		// (metadata-only CDC churn; Data+BinaryData byte-identical). Steady-state
+		// rate == the CDC churn rate, so a climbing value proves the gate is
+		// actively firing (gate-working vs informer-dead/churn-stopped).
+		expvar.Publish("snowplow_phase1_configvars_skipped_total", expvar.Func(func() any {
+			return configVarsSkippedTotal.Load()
+		}))
+
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so
 		// operators see WHICH widget/restaction broke WHICH cohort.
 		// Composite key shape: "cohort|name|gvr" (widgets) /
