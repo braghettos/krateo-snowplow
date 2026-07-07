@@ -20,6 +20,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -332,6 +333,124 @@ func unionForKey(apiRefInline, rrtInline, request map[string]any) map[string]any
 	}
 	for k, v := range request {
 		out[k] = v
+	}
+	return out
+}
+
+// effectiveKeyExtras is the SINGLE shared derivation of the "effective key
+// extras" the definitive cache-identity architecture (§2.2,
+// docs/definitive-cache-identity-architecture-2026-07-07.md) mandates for ALL
+// FOUR key-derivation consumers — dispatch lookup (widgets.go), widgetContent
+// lookup (widgets.go), subscription arming (refresh_subscription.go), and the
+// boot/keepwarm seed (phase1_pip_seed.go). Extracting it here is the A1
+// head-start: a pure behavior-preserving refactor that gives every consumer ONE
+// place to fold extras, so the A2 identity-injection lands at a single site and
+// cannot drift across the four consumers (the #64 shadow-drift lesson, applied
+// preemptively — same principle as the normalizePagination extraction).
+//
+// TODAY (A1) it returns EXACTLY what the four sites computed inline before:
+//
+//	unionForKey(GetApiRefExtras(cr), GetResourcesRefsExtras(cr), requestExtras)
+//
+// ⊎ declaredIdentityForKey(ctx, cr), which is INERT in A1 (returns nil → the
+// union is returned unchanged → byte-identical ResolvedKeyInputs at every site).
+// A2 wires declaredIdentityForKey to read spec.identityContext + materialise the
+// declared subset of xcontext.UserInfo(ctx) with injection-wins precedence; the
+// merge slot is present now so A2 is a one-function change with no new call-site
+// plumbing. The ctx parameter is accepted now (unused in A1) for the same
+// reason — A2 needs it, and threading it now keeps A1↔A2 signature-stable.
+//
+// cr is the widget CR's unstructured object map (the accessors deep-copy, so the
+// result never aliases the shared CR); nil-safe (both accessors return {} on a
+// nil/mismatched map → union degenerates to requestExtras → ComputeKey's len>0
+// guard skips the extras fold on an all-empty result — the no-extras backward-
+// compat path).
+func effectiveKeyExtras(ctx context.Context, cr map[string]any, requestExtras map[string]any) map[string]any {
+	base := unionForKey(
+		widgets.GetApiRefExtras(cr),
+		widgets.GetResourcesRefsExtras(cr),
+		requestExtras,
+	)
+	// A2 identity injection (§2.2): server-declared identity wins on collision.
+	// declaredIdentityForKey → widgets.DeclaredIdentity reads the parent CR's OWN
+	// spec.identityContext; nil for an undeclared widget → no-op → byte-identical
+	// to pre-A2 for the identity-free corpus.
+	for k, v := range declaredIdentityForKey(ctx, cr) {
+		base[k] = v
+	}
+	// A2 inline-variance union (§4.3, F-ARCH-5) — arch ruling option (d): an
+	// inline-embedding parent (hasInlineGETRef) embeds children rendered UNDER the
+	// requesting user's identity (widgets_inline.go), so its cell must be per-USER
+	// even if the PARENT declares no identityContext and even if the embedded
+	// child is a template-expanded ref not enumerable pre-resolve. Fold the FULL
+	// request identity ({username, groups}) into the KEY as a conservative marker
+	// = treat the inline parent as effectively declaring identityContext:[username,
+	// groups]. This is a SUPERSET of any child's declared identity (own ∪ children
+	// ⊆ full), so the effective-union rule is satisfied by over-approximation with
+	// ZERO child-fetch on the hot key path (O(1), C-INLINE-2 triviality) and NO
+	// template-surface hole. KEY-ONLY: it does NOT enter the resolve input (the
+	// parent's own jq gets only its declared identity via widgets.Resolve) — the
+	// child render varies by identity through ResolveNestedCall's per-user ctx.
+	// INERT for the ~99% corpus: inline is opt-in + default-off, and a non-inline
+	// widget returns nil here → byte-identical to pre-A2.
+	for k, v := range inlineParentIdentityForKey(ctx, cr) {
+		base[k] = v
+	}
+	return base
+}
+
+// declaredIdentityForKey is the KEY-side injection point for the A2 contract
+// (definitive-cache-identity-architecture §2.2). It delegates to the SINGLE
+// shared derivation widgets.DeclaredIdentity(ctx, cr) — the SAME function the
+// resolve-input path calls (widgets.Resolve) — so a declared widget's key fold
+// and its rendered body see byte-identical identity material and cannot desync
+// (the #64 anti-drift principle at the identity dimension). Returns nil for an
+// undeclared widget or an identity-less ctx → the effectiveKeyExtras merge is a
+// no-op → byte-identical to pre-A2 for the ~99% identity-free corpus (the
+// prod-inert acceptance). GATE AUTHN-1: the only identity source is
+// xcontext.UserInfo (inside DeclaredIdentity) — zero store reads.
+func declaredIdentityForKey(ctx context.Context, cr map[string]any) map[string]any {
+	return widgets.DeclaredIdentity(ctx, cr)
+}
+
+// inlineParentIdentityForKey is the KEY-side inline-variance marker (A2 §4.3,
+// F-ARCH-5, arch ruling option (d)). It returns the FULL request identity
+// ({username, groups} from xcontext.UserInfo) as key extras iff the widget CR is
+// an inline-embedding parent (hasInlineGETRef) — making the parent cell per-USER
+// so an embedded child's identity-varying rendered body cannot leak across users
+// sharing one binding. Conservative by construction: the full identity is a
+// superset of any child's declared identityContext, so it closes the leak for
+// BOTH static AND template-expanded inline children WITHOUT fetching any child CR
+// at key time (O(1), no hot-path fan-out). Returns nil for a non-inline widget
+// (byte-identical to pre-A2) or an identity-less ctx (fail-safe: the request
+// already fail-closes to the ""-BindingUID MISS path in dispatchCacheLookupKey).
+// KEY-ONLY — never injected into the resolve input.
+func inlineParentIdentityForKey(ctx context.Context, cr map[string]any) map[string]any {
+	if !hasInlineGETRef(cr) {
+		return nil
+	}
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return nil
+	}
+	out := map[string]any{}
+	if ui.Username != "" {
+		out["username"] = ui.Username
+	}
+	if len(ui.Groups) > 0 {
+		// JSON-native []any (NOT []string) — key-only here, so this doesn't hit
+		// the resolve-input DeepCopyJSON panic today, but mirror DeclaredIdentity
+		// so ALL identity-extras are JSON-native by construction (shape
+		// uniformity, feedback_no_special_cases). Key-parity byte-identical:
+		// json.Marshal treats []string and []any identically.
+		g := make([]any, len(ui.Groups))
+		for i, v := range ui.Groups {
+			g[i] = v
+		}
+		out["groups"] = g
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

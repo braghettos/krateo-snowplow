@@ -38,7 +38,6 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -135,11 +134,7 @@ func subscriptionKeyExtras(ctx context.Context, c SubscriptionCoordinates) (map[
 		// same, the log noise is gone.
 		return nil, false
 	}
-	return unionForKey(
-		widgets.GetApiRefExtras(got.Unstructured.Object),
-		widgets.GetResourcesRefsExtras(got.Unstructured.Object),
-		c.Extras,
-	), true
+	return effectiveKeyExtras(ctx, got.Unstructured.Object, c.Extras), true
 }
 
 // SubscriptionSkipReason classifies WHY a coordinate did not arm — for the

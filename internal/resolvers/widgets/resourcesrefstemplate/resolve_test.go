@@ -146,3 +146,50 @@ func TestResolve_EmptyWindowYieldsNoRefs(t *testing.T) {
 		t.Fatalf("empty post-chokepoint ds fanned %d refs; want 0", len(refs))
 	}
 }
+
+// TestFARCH_InlineNeverPropagatesFromTemplate — A2 F-ARCH-5 guard-completeness
+// invariant (definitive-cache-identity-architecture §4.4.6 + §8.1). The
+// inline-parent per-USER key marker (dispatchers inlineParentIdentityForKey →
+// hasInlineGETRef) statically scans a widget's DECLARED spec.resourcesRefs for
+// inline:true. That static scan is SOUND only because createResourceRef here
+// NEVER copies Template.Inline into the expanded ref (it copies only
+// ID/Verb/APIVersion/Name/Namespace/Resource — resolve.go:75-81): a
+// template-expanded ref cannot silently become inline post-scan.
+//
+// This arm PINS that non-propagation directly: a ResourceRefTemplate whose
+// Template.Inline is TRUE must expand to refs with Inline UNSET (false). If a
+// later change adds `out.Inline = in.Template.Inline` to createResourceRef,
+// this arm goes RED — catching the leak BEFORE the F-ARCH-5 static scan silently
+// under-approximates (a template-expanded inline child would then bypass the
+// per-user marker, embed identity-varying content under a per-binding-shared
+// key, and reopen the cross-user leak §4.4.6 closes). Cheap, hermetic, no cluster.
+func TestFARCH_InlineNeverPropagatesFromTemplate(t *testing.T) {
+	items := []templatesv1.ResourceRefTemplate{{
+		Iterator: ptr.To("${.items}"),
+		Template: templatesv1.ResourceRef{
+			Inline:     true, // author sets Inline on the TEMPLATE
+			Verb:       "get",
+			Resource:   "configmaps",
+			APIVersion: "v1",
+			Name:       "${ .name }",
+			Namespace:  "demo-system",
+		},
+	}}
+	ds := map[string]any{"items": []any{
+		map[string]any{"name": "cm-a"},
+		map[string]any{"name": "cm-b"},
+	}}
+
+	refs, err := Resolve(context.Background(), items, ds)
+	if err != nil {
+		t.Fatalf("Resolve errored: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 expanded refs (one per ds item); got %d", len(refs))
+	}
+	for i, r := range refs {
+		if r.Inline {
+			t.Fatalf("F-ARCH inline-completeness: expanded ref[%d] carries Inline=true — createResourceRef must NOT propagate Template.Inline (resolve.go:75-81 copies only ID/Verb/APIVersion/Name/Namespace/Resource). A template-expanded inline child would bypass the F-ARCH-5 static hasInlineGETRef scan and reopen the §4.4.6 cross-user leak. RED = someone added out.Inline = in.Template.Inline.", i)
+		}
+	}
+}
