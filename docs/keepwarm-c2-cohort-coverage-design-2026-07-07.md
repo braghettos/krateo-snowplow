@@ -365,3 +365,38 @@ arm retargeted to gvr-discovered no-skip; prewarm_first_nav_latch_segment_test.g
 arm widened to the widget-capable prefix. Five RED mutations proven by source-revert-rerun:
 (a) boot gains age-skip, (b) keepwarm loses age-skip, (c) gvr-discovered gains a skip, (i)
 c1 rank-1 bound restored, (ii) widgetMax==0 break dropped.
+
+## 10. C2-C10 deploy-probe spec — REAL names (as-built)
+
+The §5 C2-C10 (a-e) on-cluster probes, keyed to the real emitted names + counters
+(fresh2 60K, PRETTY_LOG:false):
+
+- **(a) admin l1:HIT after >1h idle (SCORING artifact).** Replay an admin /call
+  after the idle window; assert `resolved_cache.lookup hit=true` for the admin
+  cell (the 92-miss window shape gone). This is the customer-facing scorecard row.
+- **(b) admin + narrow cohorts re-seeded, not devs-only.** Grep ONE INFO line per
+  swept cohort: `prewarm.keepwarm.cohort_summary` with fields
+  `{identity, widget_max, reseeds, age_skips, attempted}`. Presence of a line for
+  the admin identity + the narrow login cohorts (not just the devs cohort)
+  confirms the widget-capable-prefix coverage. reseeds>0 on a cohort = its quiet
+  cells were refreshed this cycle; age_skips>0 = its young/churny cells were
+  elided.
+- **(c) evictTTL≈0 for widget-capable cells over a multi-hour soak.** Watch
+  `snowplow_phase1_keepwarm_age_skip_total` climb (steady-state age-skips of
+  churny cells) while the store's `evictTTLTotal` stays ≈0 for the swept cohorts'
+  cells (they are re-Put before expiry). A rising age_skip total with flat
+  evictTTL = the sweep is keeping cells warm cost-proportionally.
+- **(d) /call p95 flat during sweep windows (storm band).** The sweep is
+  engine-yielded; p95 must not move when a sweep runs. The sweep window is
+  bracketed by the `prewarm.keepwarm.sweep.tick` INFO line and the final
+  `prewarm.engine.boot.complete scope=keepwarm` line.
+- **(e) completion, not thrash.** Each cycle's final chunk emits
+  `prewarm.engine.boot.complete` with `scope=keepwarm`. Mid-cycle
+  `prewarm.engine.scope_incomplete` / `scope_requeued` lines are NORMAL for
+  keepwarm at 60K (the chunked sweep straddles budgets); the completion signal is
+  the `scope=keepwarm ... complete` line per cycle, NOT their absence.
+
+Per-cohort seed timing (where applicable) still flows through
+`phase1.seed.restaction.timing` / `phase1.seed.widget.timing` (carry the `cohort`
+field), but probe (b) is the one-line-per-cohort grep that closes the "who was
+re-seeded" question without per-cell noise.

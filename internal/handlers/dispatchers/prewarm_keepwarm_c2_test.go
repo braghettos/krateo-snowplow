@@ -20,12 +20,16 @@ package dispatchers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/krateoplatformops/plumbing/endpoints"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
 )
@@ -379,4 +383,126 @@ func TestC2Cost_SecondSweepOverYoungSet_AgeSkipsAll(t *testing.T) {
 		t.Fatalf("C2-C7: an age-skipped cell must NOT contribute a resolve (cost = quiet-cell segments only); seedResolves delta=%d", got)
 	}
 	writeC2Artifact(t, "c2c7_cost_proportional.txt", "young/churny cell → age-skip (no re-resolve); cost = Σ quiet-cell segments only")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// cohort_summary LINE-CONTENT (PM rework #3, probe (b); #98 pin-the-line
+// discipline). Drive the REAL seedScopeYielding under seedModeKeepwarm over a
+// MIXED fixture of two widget-capable cohorts on the SAME widget GVR:
+//   - cohort "reseed"  : all targets RE-SEEDED  → summary {reseeds==targets, age_skips==0}
+//   - cohort "skipall" : all targets AGE-SKIPPED → summary {age_skips==targets, reseeds==0}
+// We assert the EMITTED prewarm.keepwarm.cohort_summary line CONTENT per cohort
+// (identity, reseeds, age_skips) — not the plumbing. The seams model each
+// cohort's per-target outcome: the skipall seam bumps keepwarmAgeSkipTotal (as
+// the real primitive does on an age-skip) and the reseed seam does not (as the
+// real primitive's re-Put path does). The cohort-boundary AGGREGATION + the
+// emitted line are the REAL prod code under test (prewarm_engine_boot.go).
+// ─────────────────────────────────────────────────────────────────────────
+
+func TestC2CohortSummary_LineContent_MixedFixture(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	zeroCustomerInFlight()
+
+	// Two widget-capable cohorts; distinct collapsed counts so ranked order is
+	// deterministic (both widgetMax>=1 → both in the swept prefix).
+	reseed := eID{name: "reseed", group: true, collapsed: 200}
+	skipall := eID{name: "skipall", group: true, collapsed: 50}
+
+	h := newNavWidgetHarvester()
+	widgetGVR := eWidgetGVR("flexes")
+	// Two widgets so each cohort attempts >1 target (targets==2 per cohort).
+	eHarvestWidget(h, "dashboard-flex", widgetGVR)
+	eHarvestWidget(h, "obs-panel", widgetGVR)
+	widgets := h.snapshot()
+
+	prevEnum := enumeratePrewarmTargetsForGVRFn
+	enumeratePrewarmTargetsForGVRFn = func(g schema.GroupVersionResource, _ string) []cache.PrewarmTarget {
+		if g == widgetGVR {
+			return eIdentityTargets(g, reseed, skipall)
+		}
+		return nil
+	}
+	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
+
+	// The seam models each cohort's per-target outcome: skipall bumps the
+	// age-skip counter (the real primitive's age-skip path), reseed does not
+	// (the real primitive's re-Put path). The cohort-boundary aggregation reads
+	// keepwarmAgeSkipTotal's delta, exactly as it does for the real primitive.
+	prevW := seedOneWidgetFn
+	seedOneWidgetFn = func(ctx context.Context, _ navWidgetEntry, _ string, mode seedScopeMode) error {
+		if eIdentityLabel(ctx) == "group:skipall" {
+			keepwarmAgeSkipTotal.Add(1) // model an age-skip
+		}
+		return nil
+	}
+	t.Cleanup(func() { seedOneWidgetFn = prevW })
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeKeepwarm); err != nil {
+		t.Fatalf("seedScopeYielding(keepwarm) returned %v; want nil", err)
+	}
+
+	// Parse the emitted cohort_summary lines and index by identity.
+	type summary struct {
+		Msg      string `json:"msg"`
+		Identity string `json:"identity"`
+		Reseeds  int64  `json:"reseeds"`
+		AgeSkips int64  `json:"age_skips"`
+		Attempt  int    `json:"attempted"`
+	}
+	// Index by a stable substring of the identity: the emitted `identity` field
+	// is the raw rankKey (identityKey(c) = Username + \x1f + sorted-Groups), so
+	// for a group cohort it CONTAINS the group name. Match on Contains rather
+	// than hardcoding the \x1f separator.
+	find := func(want string) (summary, bool) {
+		for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
+			var s summary
+			if err := json.Unmarshal(line, &s); err != nil {
+				continue
+			}
+			if s.Msg == "prewarm.keepwarm.cohort_summary" && bytes.Contains([]byte(s.Identity), []byte(want)) {
+				return s, true
+			}
+		}
+		return summary{}, false
+	}
+	// Count total cohort_summary lines: EXACTLY two (one per swept cohort).
+	nLines := 0
+	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+		var s summary
+		if len(line) > 0 && json.Unmarshal(line, &s) == nil && s.Msg == "prewarm.keepwarm.cohort_summary" {
+			nLines++
+		}
+	}
+	if nLines != 2 {
+		t.Fatalf("cohort_summary: want exactly 2 lines (one per swept cohort); got %d. logs:\n%s", nLines, buf.String())
+	}
+
+	rs, ok := find("reseed")
+	if !ok {
+		t.Fatalf("cohort_summary: missing line for the reseed cohort. logs:\n%s", buf.String())
+	}
+	if rs.Attempt != 2 || rs.Reseeds != 2 || rs.AgeSkips != 0 {
+		t.Fatalf("cohort_summary(reseed): want {attempted:2, reseeds:2, age_skips:0}; got {attempted:%d, reseeds:%d, age_skips:%d}", rs.Attempt, rs.Reseeds, rs.AgeSkips)
+	}
+
+	sk, ok := find("skipall")
+	if !ok {
+		t.Fatalf("cohort_summary: missing line for the skipall cohort. logs:\n%s", buf.String())
+	}
+	if sk.Attempt != 2 || sk.AgeSkips != 2 || sk.Reseeds != 0 {
+		t.Fatalf("cohort_summary(skipall): want {attempted:2, age_skips:2, reseeds:0} (skips==targets, reseeds==0); got {attempted:%d, reseeds:%d, age_skips:%d}", sk.Attempt, sk.Reseeds, sk.AgeSkips)
+	}
+
+	writeC2Artifact(t, "cohort_summary_line_content.txt", fmt.Sprintf(
+		"reseed cohort: attempted=%d reseeds=%d age_skips=%d\nskipall cohort: attempted=%d reseeds=%d age_skips=%d\n(one INFO line per swept cohort; probe b = grep prewarm.keepwarm.cohort_summary)",
+		rs.Attempt, rs.Reseeds, rs.AgeSkips, sk.Attempt, sk.Reseeds, sk.AgeSkips))
 }

@@ -795,6 +795,14 @@ func seedScopeYielding(ctx context.Context,
 		)
 	}
 
+	// cohortAttempted counts per-cohort targets attempted (widgets + restactions)
+	// for the keepwarm cohort_summary line (below). Incremented in the two
+	// seed-target closures; snapshotted + reset at each cohort boundary. Safe as
+	// a plain int: the keepwarm seed loop runs SERIALLY (one resolve in flight,
+	// WithPrewarmIterSerial; engineYieldCheckpoint only DEFERS, never parallelises)
+	// so there is no concurrent writer.
+	cohortAttempted := 0
+
 	// seedWidgetTarget / seedRestactionTarget — the per-target seed bodies,
 	// shared by the rank-major loop. Each returns (abort bool, err) where abort
 	// signals a ctx-cancel that must stop the whole seed.
@@ -815,6 +823,7 @@ func seedScopeYielding(ctx context.Context,
 			classifyEngineSeedErr("widget", e.W.GetNamespace()+"/"+e.W.GetName(), cohortLogLabel(c), err)
 		}
 		targetsProcessed++
+		cohortAttempted++
 		return false
 	}
 	seedRestactionTarget := func(ref templatesv1.ObjectReference, c seedTarget) bool {
@@ -834,6 +843,7 @@ func seedScopeYielding(ctx context.Context,
 			classifyEngineSeedErr("restaction", ref.Namespace+"/"+ref.Name, cohortLogLabel(c), err)
 		}
 		targetsProcessed++
+		cohortAttempted++
 		return false
 	}
 
@@ -947,6 +957,16 @@ func seedScopeYielding(ctx context.Context,
 			break
 		}
 		rankKey := ranked[ri].key
+		// keepwarm cohort_summary (PM probe (b), design §9): snapshot the
+		// age-skip counter + attempted count at this cohort's start so the
+		// per-cohort delta is exact. The keepwarm seed loop is the SOLE
+		// keepwarm-mode caller and runs SERIALLY (one resolve in flight,
+		// WithPrewarmIterSerial), so keepwarmAgeSkipTotal's delta across this
+		// cohort's targets is precisely this cohort's age-skips — no other
+		// keepwarm writer races it. (Boot/gvr-discovered never age-skip, so this
+		// bookkeeping is inert outside keepwarm; emitted only for keepwarm below.)
+		cohortAgeSkipStart := keepwarmAgeSkipTotal.Load()
+		cohortAttempted = 0
 		for _, ws := range widgetSeeds {
 			e := ws.e
 			for _, c := range ws.targets {
@@ -995,6 +1015,32 @@ func seedScopeYielding(ctx context.Context,
 					return ctx.Err()
 				}
 			}
+		}
+		// keepwarm cohort_summary (PM probe (b), design §9): ONE INFO line per
+		// SWEPT cohort per sweep cycle — {identity, reseeds, age_skips}. age_skips
+		// = the per-cohort delta of keepwarmAgeSkipTotal; reseeds = attempted −
+		// age_skips (a re-resolve+Put, OR a declined/failed re-resolve — all
+		// non-skip work). Emitted at the cohort boundary (bounded by cohort count
+		// per cycle — no per-cell noise) so a PRETTY_LOG:false deployment can grep
+		// ONE line to confirm "admin + narrow cohorts re-seeded, not devs-only".
+		// Keepwarm-only: boot/gvr-discovered would flood this with per-boot ranks
+		// and never age-skip, so it is scoped to the cadence sweep.
+		if mode == seedModeKeepwarm {
+			ageSkips := keepwarmAgeSkipTotal.Load() - cohortAgeSkipStart
+			reseeds := int64(cohortAttempted) - int64(ageSkips)
+			if reseeds < 0 {
+				reseeds = 0 // defensive: attempted is the loop's own count, cannot underflow in practice
+			}
+			log.Info("prewarm.keepwarm.cohort_summary",
+				slog.String("subsystem", "cache"),
+				slog.String("identity", rankKey),
+				slog.Int("widget_max", ranked[ri].widgetMax),
+				slog.Int64("reseeds", reseeds),
+				slog.Int64("age_skips", int64(ageSkips)),
+				slog.Int("attempted", cohortAttempted),
+				slog.String("effect", "keepwarm sweep re-Put this cohort's quiet cells (reseeds) and elided its "+
+					"young/churny cells (age_skips); one line per swept cohort per cycle (probe b)"),
+			)
 		}
 	}
 	// ── FIX-F SEAM: provably-empty first-nav boundary (F-C3, #99b). ──
