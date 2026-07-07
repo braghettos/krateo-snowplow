@@ -188,7 +188,7 @@ func TestFixC_SeedOneWidget_SkipsEmptyBinding(t *testing.T) {
 
 	// GREEN: deny cohort → "" → skip log, returns nil (non-fatal).
 	buf.Reset()
-	if err := seedOneWidget(fixCCohortCtx("userDenied"), e, "authn-ns", false); err != nil {
+	if err := seedOneWidget(fixCCohortCtx("userDenied"), e, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("FIX-C: seedOneWidget for a \"\"-binding cohort returned %v; want nil", err)
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("phase1.seed.skip.empty_binding")) {
@@ -200,7 +200,7 @@ func TestFixC_SeedOneWidget_SkipsEmptyBinding(t *testing.T) {
 	// the FIX-C decision — the ABSENCE of the skip log is the signal FIX-C did
 	// not fire for a non-empty identity).
 	buf.Reset()
-	_ = seedOneWidget(fixCCohortCtx("userGranted"), e, "authn-ns", false)
+	_ = seedOneWidget(fixCCohortCtx("userGranted"), e, "authn-ns", seedModeBoot)
 	if bytes.Contains(buf.Bytes(), []byte("phase1.seed.skip.empty_binding")) {
 		t.Fatalf("FIX-C ARM-2 control: a GRANTED cohort (non-empty BindingUID) must NOT emit the empty_binding skip; logs:\n%s", buf.String())
 	}

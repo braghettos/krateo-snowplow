@@ -191,6 +191,52 @@ const (
 	// with no refactor.
 )
 
+// seedScopeMode is the per-scope seed policy the rePrewarm core threads through
+// seedScopeYielding → seedOneWidget/seedOneRestaction. It REPLACES the two
+// accreted bools (rank1Only, bootScoped) that used to thread the same path
+// (keepwarm c2, design §4.1): those two bools admitted an ILLEGAL 4th state
+// (rank1Only && bootScoped — a keepwarm that also fresh-skips) and scattered
+// the per-mode skip semantics across call sites. The enum makes each mode's
+// (sweep-set bound × skip predicate) a single closed choice, pinned at the type
+// level; a cross-mode skip leak is impossible to express and is additionally
+// caught by the per-mode falsifier arms (F-C2 (a)/(b)/(c)).
+//
+// The three modes and their (bound, skip) semantics:
+//   - seedModeBoot: ALL ranks; F.4 live-cell fresh-skip (a live cell is done →
+//     not re-resolved), so a deadline-cut boot chunk's continuation is
+//     cost-proportional. UNCHANGED from the pre-c2 bootScoped=true behavior.
+//   - seedModeKeepwarm: the WIDGET-CAPABLE PREFIX of `ranked` (widgetMax>=1,
+//     a contiguous prefix post-Fix-3); AGE-SKIP (a young live cell is skipped,
+//     an OLD live cell is re-resolved+re-Put). This SUPERSEDES the c1 rank-1
+//     bound + the pre-c2 keepwarm no-skip (which restarted from rank-1 each
+//     deadline-cut chunk — a non-completing loop at 60K, design §4.2).
+//   - seedModeGVRDiscovered: ALL ranks; NO skip (it must RE-RESOLVE already-warm
+//     cells to record the dep edge against the newly-registered GVR — the S4
+//     fix; F4-C3 boundary). UNCHANGED from the pre-c2 gvr-discovered
+//     bootScoped=false behavior.
+type seedScopeMode int
+
+const (
+	seedModeBoot seedScopeMode = iota
+	seedModeKeepwarm
+	seedModeGVRDiscovered
+)
+
+// String renders the mode for the seed's completion log (replaces the old
+// bool→string map at rePrewarmBootScoped's boot.complete line).
+func (m seedScopeMode) String() string {
+	switch m {
+	case seedModeBoot:
+		return "boot"
+	case seedModeKeepwarm:
+		return "keepwarm"
+	case seedModeGVRDiscovered:
+		return "gvr-discovered"
+	default:
+		return "unknown"
+	}
+}
+
 // prewarmScope is one engine work item.
 //
 // SCOPE-KIND-CARRIED PAYLOAD:

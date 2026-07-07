@@ -112,6 +112,21 @@ var (
 	// stays flat outside boot chunks. Exposed as
 	// snowplow_phase1_seed_fresh_skip_total.
 	pipSeedFreshSkipTotal atomic.Uint64
+
+	// keepwarm c2 (design §4.2) — keepwarmAgeSkipTotal counts KEEPWARM-scope seed
+	// targets elided by the AGE-SKIP: a live L1 cell already existed under the
+	// production key AND was YOUNG (age < TTL−sweepInterval = TTL/4), so the
+	// resolve + Put were skipped. This is what makes a deadline-cut keepwarm
+	// chunk's continuation cost-proportional (chunk N+1 skips the prefix the
+	// earlier chunk re-Put) AND lets the sweep dedup churny cells the refresher /
+	// a customer Put already refreshed this window. DISTINCT from
+	// pipSeedFreshSkipTotal (that is BOOT-scope, bare-liveness): a keepwarm sweep
+	// over a set of OLD live cells drives keepwarmAgeSkip ≈ 0 (they are re-Put,
+	// bumping seed_resolves), while a sweep over recently-refreshed cells drives
+	// it up (seed_resolves flat). Keepwarm-only: boot / gvr-discovered never
+	// age-skip (F4-C3 per-mode boundary). Exposed as
+	// snowplow_phase1_keepwarm_age_skip_total.
+	keepwarmAgeSkipTotal atomic.Uint64
 )
 
 // Ship 0.30.187 D1 — per-(cohort, target) failure maps. Keyed by
@@ -233,6 +248,13 @@ func registerPIPMetrics() {
 		// processed). SEED-SCOPED, boot-only; distinct from seed_resolves.
 		expvar.Publish("snowplow_phase1_seed_fresh_skip_total", expvar.Func(func() any {
 			return pipSeedFreshSkipTotal.Load()
+		}))
+
+		// keepwarm c2 (design §4.2) — keepwarm-scope seed targets elided by the
+		// age-skip (live cell younger than TTL/4; resolve+Put skipped). SEED-SCOPED,
+		// keepwarm-only; distinct from fresh_skip (boot, bare-liveness).
+		expvar.Publish("snowplow_phase1_keepwarm_age_skip_total", expvar.Func(func() any {
+			return keepwarmAgeSkipTotal.Load()
 		}))
 
 		// Ship 0.30.187 D1 — per-(cohort, target) seed-failure maps so

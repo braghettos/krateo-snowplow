@@ -70,6 +70,28 @@ func keepwarmSweepInterval() time.Duration {
 	return cache.ResolvedCacheTTL() * keepwarmCadenceNumerator / keepwarmCadenceDenominator
 }
 
+// keepwarmAgeSkipThreshold is the age below which the keepwarm-mode seed SKIPS a
+// live cell instead of re-resolving it (keepwarm c2, design §4.2). It is
+// TTL − sweepInterval = TTL − TTL×3/4 = TTL/4 — DERIVED from the two existing
+// constants (cache.ResolvedCacheTTL and the TTL×3/4 sweep fraction), NOT a new
+// knob and NOT a literal; if the cadence ratio ever changes, this follows.
+//
+// GUARANTEE. A cell whose age < TTL−sweepInterval when the sweep examines it
+// survives to the NEXT cycle's examination (one sweepInterval later) at age <
+// TTL — so it never lazy-expires between sweeps. Skipping it this cycle is
+// therefore safe AND cost-proportional (a cell an earlier chunk of THIS cycle
+// already re-Put has age ≈ minutes ≪ TTL/4 → skipped → the requeued
+// continuation pays preamble + remainder only, recovering F.4's boot property
+// for keepwarm with zero cycle-tracking state). A cell at or beyond the
+// threshold is re-resolved + re-Put now (fresh CreatedAt). The store's Get uses
+// a STRICT `>` expiry (resolved.go: time.Since(CreatedAt) > eff), so a cell at
+// exactly TTL is still live; this threshold's strict `<` leaves that boundary
+// interplay intact (a cell AT the threshold is re-resolved, never left to race
+// the expiry edge).
+func keepwarmAgeSkipThreshold() time.Duration {
+	return cache.ResolvedCacheTTL() - keepwarmSweepInterval()
+}
+
 // StartKeepwarmSweep starts the #102 c1 keep-warm sweep ticker on the given
 // process-lifetime context (main.go passes cacheCtx). Idempotent: the first
 // call wins; later calls are no-ops. The ticker goroutine exits when ctx is

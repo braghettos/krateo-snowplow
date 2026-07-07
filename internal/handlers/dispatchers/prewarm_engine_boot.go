@@ -76,13 +76,13 @@ func makeBootScopeHandler(deps rePrewarmDeps) func(ctx context.Context, s prewar
 	return func(ctx context.Context, s prewarmScope) error {
 		switch s.kind {
 		case scopeKindBoot:
-			// F.4 — bootScoped=true engages the fresh-skip so a deadline-cut
-			// boot chunk's continuation skips already-live cells.
-			return rePrewarmBoot(ctx, deps, true /*bootScoped*/)
+			// seedModeBoot engages the F.4 fresh-skip so a deadline-cut boot
+			// chunk's continuation skips already-live cells (all ranks).
+			return rePrewarmBoot(ctx, deps, seedModeBoot)
 		case scopeKindGVRDiscovered:
 			return rePrewarmGVRDiscovered(ctx, deps, s.gvr)
 		case scopeKindKeepwarm:
-			// #102 c1 — the TTL-cadenced rank-1 keep-warm sweep.
+			// keepwarm c2 — the TTL-cadenced widget-capable-cohort keep-warm sweep.
 			return rePrewarmKeepwarm(ctx, deps)
 		default:
 			// Ship 2 future scopes (scopeKindWidgetCR / scopeKindRBACShift)
@@ -166,10 +166,10 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.
 		slog.String("gvr", gvr.String()),
 		slog.String("note", "Ship 2 Stage 2 — re-walk under cohort identities so iterator-empty short-circuit (resolve.go:377-381) no longer skips dep recording for this GVR"),
 	)
-	// bootScoped=false: gvr-discovered must RE-RESOLVE already-warm cells so
-	// the dep edge against the newly-registered GVR is recorded (the S4 fix);
-	// a fresh-skip would reintroduce the defect (F4-C3 boundary).
-	err := rePrewarmBoot(ctx, deps, false /*bootScoped*/)
+	// seedModeGVRDiscovered: NO skip — gvr-discovered must RE-RESOLVE already-warm
+	// cells so the dep edge against the newly-registered GVR is recorded (the S4
+	// fix); any skip would reintroduce the defect (F4-C3 boundary).
+	err := rePrewarmGVRDiscoveredSeed(ctx, deps)
 	if err != nil {
 		slog.Warn("prewarm.engine.gvr_discovered.incomplete",
 			slog.String("subsystem", "cache"),
@@ -185,40 +185,46 @@ func rePrewarmGVRDiscovered(ctx context.Context, deps rePrewarmDeps, gvr schema.
 	return nil
 }
 
-// rePrewarmBoot runs the boot re-walk + per-target-GVR-scoped seed. The
-// SAME walk() is used (via the deps.lister + a fresh phase1Walker per
-// root); the harvesters are shared by reference with the boot pass.
-// rePrewarmBoot runs the full re-walk + index rebuild + per-identity seed. The
-// #102 c1 keepwarm sweep reuses this SAME core via rePrewarmKeepwarm (rank1Only
-// seed), so the sweep gets the boot's dedup, NavOrder, BindingsByGVR index, and
-// yield/memory bounds for free — it IS the seed, just rank-1-bounded.
+// rePrewarmBoot runs the full re-walk + index rebuild + per-identity seed under
+// the given seedScopeMode. The SAME walk() is used (via the deps.lister + a
+// fresh phase1Walker per root); the harvesters are shared by reference with the
+// boot pass. The keepwarm sweep + gvr-discovered scope reuse this SAME core via
+// rePrewarmKeepwarm / rePrewarmGVRDiscoveredSeed, so each gets the boot's dedup,
+// NavOrder, BindingsByGVR index, and yield/memory bounds for free — they ARE the
+// seed, just with a different (sweep-set × skip) mode.
 //
-// bootScoped=true engages the F.4 boot-only fresh-skip in the seed primitives
-// (a live cell is treated as done → not re-resolved), which makes a
-// deadline-cut boot chunk's continuation cost-proportional. It is TRUE only
-// for the genuine boot scope; keepwarm passes false (its Puts must re-resolve
-// fresh bytes + reset CreatedAt) and gvr-discovered passes false (it must
-// re-resolve already-warm cells to record the dep edge against the new GVR).
-func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps, bootScoped bool) error {
-	return rePrewarmBootScoped(ctx, deps, false /*rank1Only*/, bootScoped)
+// mode selects the seed policy in seedScopeYielding + the primitives:
+//   - seedModeBoot: all ranks; F.4 fresh-skip (deadline-cut resume is
+//     cost-proportional).
+//   - seedModeKeepwarm: widget-capable prefix; age-skip (keepwarm c2 §4).
+//   - seedModeGVRDiscovered: all ranks; no skip (record the new-GVR dep edge).
+func rePrewarmBoot(ctx context.Context, deps rePrewarmDeps, mode seedScopeMode) error {
+	return rePrewarmBootScoped(ctx, deps, mode)
 }
 
-// rePrewarmKeepwarm is the #102 c1 keepwarm-sweep handler: the SAME re-walk +
-// seed core as boot, but the seed is bounded to rank-1 (the 95%-mix cohort, all
-// pages). Fires on the TTL×3/4 cadence (keepwarmTicker) so rank-1's cells are
-// re-Put — resetting CreatedAt — before they lazy-expire at TTL. Re-resolving
-// (not TTL-extending) preserves the §1.6 staleness backstop by construction:
-// every sweep Put is FRESH bytes, and the GTTL-1 error-aware Put-gate in the
-// shared seed primitives declines a degraded re-resolve rather than overwrite a
-// good warm entry.
+// rePrewarmKeepwarm is the keepwarm-sweep handler (keepwarm c2): the SAME
+// re-walk + seed core as boot, but seedModeKeepwarm bounds the seed to the
+// WIDGET-CAPABLE PREFIX of `ranked` (every login-cohort-shaped identity, all
+// pages) and applies the age-skip. Fires on the TTL×3/4 cadence
+// (keepwarmTicker) so those cells are re-Put — resetting CreatedAt — before they
+// lazy-expire at TTL. Re-resolving (not TTL-extending) preserves the §1.6
+// staleness backstop by construction: every sweep Put is FRESH bytes, and the
+// GTTL-1 error-aware Put-gate in the shared seed primitives declines a degraded
+// re-resolve rather than overwrite a good warm entry.
 func rePrewarmKeepwarm(ctx context.Context, deps rePrewarmDeps) error {
-	// bootScoped=false: the sweep's whole purpose is to re-Put (reset CreatedAt)
-	// live rank-1 cells before they lazy-expire; a fresh-skip would make it a
-	// no-op (F4-C3 boundary).
-	return rePrewarmBootScoped(ctx, deps, true /*rank1Only*/, false /*bootScoped*/)
+	return rePrewarmBootScoped(ctx, deps, seedModeKeepwarm)
 }
 
-func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only, bootScoped bool) error {
+// rePrewarmGVRDiscoveredSeed is the gvr-discovered seed entrypoint
+// (seedModeGVRDiscovered: all ranks, NO skip). Split out from rePrewarmBoot's
+// bool-arg form so the mode is explicit at the call site (the S4 fix depends on
+// the no-skip semantics; naming it prevents a future edit passing the wrong
+// mode).
+func rePrewarmGVRDiscoveredSeed(ctx context.Context, deps rePrewarmDeps) error {
+	return rePrewarmBootScoped(ctx, deps, seedModeGVRDiscovered)
+}
+
+func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScopeMode) error {
 	log := slog.Default()
 	start := time.Now()
 
@@ -372,14 +378,13 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, rank1Only, boo
 	// propagates; withCohortSeedContext OVERRIDES identity per cohort for the
 	// actual seed, so the SA base is correct for both the derivation fetch
 	// and as the per-cohort seed base.
-	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS, rank1Only, bootScoped); err != nil {
+	if err := seedScopeYielding(rctx, restactionRefs, widgetEntries, deps.saEP, deps.saRC, deps.authnNS, mode); err != nil {
 		return err
 	}
 
 	log.Info("prewarm.engine.boot.complete",
 		slog.String("subsystem", "cache"),
-		slog.Bool("rank1_only", rank1Only),
-		slog.String("scope", map[bool]string{false: "boot", true: "keepwarm"}[rank1Only]),
+		slog.String("scope", mode.String()),
 		slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 	)
 	return nil
@@ -451,23 +456,31 @@ var seedOneRestactionFn = seedOneRestaction
 // the regression journal). Deleting the seam also removes test-only prod code
 // (the #66 shadow class).
 
-// rank1Only, when true, bounds the seed to the rank-1 identity (ranked[0], the
-// highest-CollapsedBindings 95%-mix cohort) — the #102 c1 keepwarm sweep scope.
-// The boot seed passes false (all ranks). It is a pure LOOP BOUND on the
-// existing rank-major loop (ranked is sorted DESC by CollapsedBindings, so
-// ranked[0] IS rank-1); no new seam, no separate loop — the sweep re-runs the
-// identical per-identity seed the boot does, just for the one dominant cohort.
-// bootScoped, when true (genuine boot scope ONLY — not keepwarm, not
-// gvr-discovered), engages the F.4 boot-only fresh-skip inside the per-target
-// seed primitives: a target whose production cell key already holds a live
-// (non-expired) L1 entry is counted as processed WITHOUT re-resolving, making a
-// deadline-cut boot chunk's continuation cost-proportional (≈ preamble +
-// remaining cold targets). It threads straight through to seedOneWidgetFn /
-// seedOneRestactionFn — the skip decision lives INSIDE those primitives so it
-// consumes the EXACT key the Put would use (single derivation site, F4-C2a).
+// mode (seedScopeMode) selects BOTH the SWEEP-SET bound and the per-target skip
+// predicate; it replaces the pre-c2 (rank1Only, bootScoped) bool pair (which
+// admitted an illegal 4th state and scattered skip semantics — keepwarm c2
+// §4.1):
+//
+//   - seedModeBoot: ALL ranks; the seed primitives apply the F.4 fresh-skip
+//     (a live cell is done → not re-resolved), so a deadline-cut boot chunk's
+//     continuation is cost-proportional. UNCHANGED from bootScoped=true.
+//   - seedModeKeepwarm: the WIDGET-CAPABLE PREFIX of `ranked` (widgetMax>=1) —
+//     a CONTIGUOUS PREFIX post-Fix-3 (widgetMax DESC is the primary rank key),
+//     so the sweep-set is a pure LOOP BOUND (`break` at the first widgetMax==0
+//     entry); the primitives apply the AGE-SKIP (keepwarm c2 §4.2). This
+//     SUPERSEDES the c1 rank-1 bound: every login-cohort-shaped (widget-capable)
+//     identity is swept, not just ranked[0], so the admin + narrow cohorts
+//     (widget-capable but rank≥1) are covered — the c2 cohort-coverage fix.
+//   - seedModeGVRDiscovered: ALL ranks; NO skip (the primitives re-resolve
+//     already-warm cells to record the new-GVR dep edge — the S4 fix). UNCHANGED
+//     from bootScoped=false / gvr-discovered.
+//
+// The skip decision lives INSIDE seedOneWidgetFn / seedOneRestactionFn (via the
+// shared seedSkipDecision) so it consumes the EXACT key the Put would use
+// (single derivation site, F4-C2a); mode threads straight through.
 func seedScopeYielding(ctx context.Context,
 	restactionRefs []templatesv1.ObjectReference, widgetEntries []navWidgetEntry,
-	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, rank1Only, bootScoped bool) error {
+	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, mode seedScopeMode) error {
 
 	log := slog.Default()
 
@@ -745,8 +758,8 @@ func seedScopeYielding(ctx context.Context,
 	})
 	// Ride-along observability (boot scope only): one line per ranked identity
 	// so two consecutive boots' rank order can be diffed clean (R3-C8 d).
-	// Suppressed under rank1Only to keep the keepwarm sweep logs quiet.
-	if !rank1Only {
+	// Suppressed for keepwarm to keep the sweep logs quiet (it runs on a cadence).
+	if mode != seedModeKeepwarm {
 		for r := range ranked {
 			log.Info("prewarm.engine.seed.rank",
 				slog.String("subsystem", "cache"),
@@ -792,7 +805,7 @@ func seedScopeYielding(ctx context.Context,
 		}
 		engineYieldCheckpoint(ctx)
 		err := seedOneTarget(c, func(cohortCtx context.Context) error {
-			return seedOneWidgetFn(cohortCtx, e, authnNS, bootScoped)
+			return seedOneWidgetFn(cohortCtx, e, authnNS, mode)
 		})
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("widgets", ctx.Err())
@@ -811,7 +824,7 @@ func seedScopeYielding(ctx context.Context,
 		}
 		engineYieldCheckpoint(ctx)
 		err := seedOneTarget(c, func(cohortCtx context.Context) error {
-			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS, bootScoped)
+			return seedOneRestactionFn(cohortCtx, cohortLogLabel(c), ref, authnNS, mode)
 		})
 		if err != nil && ctx.Err() != nil {
 			emitSeedAbort("restactions", ctx.Err())
@@ -918,12 +931,19 @@ func seedScopeYielding(ctx context.Context,
 	// KEPT unobscured — single rank-1 iteration, widgets-then-restactions, no
 	// interleaving of later ranks.
 	for ri := range ranked {
-		// #102 c1: the keepwarm sweep is bounded to rank-1 (ranked[0]) — the
-		// 95%-mix dominant cohort, on ALL pages. Stop after the first rank. This
-		// is the whole c1 scope: re-resolve rank-1's cell set on the TTL×3/4
-		// cadence so those cells never lazy-expire (each sweep Put resets
-		// CreatedAt). Boot passes rank1Only=false and sweeps every rank.
-		if rank1Only && ri > 0 {
+		// keepwarm c2 (design §4.1): the keepwarm sweep set is the WIDGET-CAPABLE
+		// PREFIX of `ranked` — every identity with widgetMax>=1 (i.e. that renders
+		// at least one widget somewhere), on ALL pages. Because widgetMax DESC is
+		// the primary rank key (Fix-3), the widget-capable identities are a
+		// CONTIGUOUS PREFIX, so the sweep set is a pure LOOP BOUND: break at the
+		// first widgetMax==0 entry (the widget-less tail — RA-only machine SAs,
+		// which the keepwarm sweep does not cover; their cells warm on-demand /
+		// via the refresher). This SUPERSEDES the c1 rank-1 bound: the admin +
+		// narrow login cohorts (widget-capable but rank>=1) are now swept, closing
+		// the c1 cohort-coverage gap. Boot / gvr-discovered sweep every rank (no
+		// break). The age-skip (§4.2) + F.4 requeue stagger this prefix across
+		// chunks so a full sweep completes cost-proportionally.
+		if mode == seedModeKeepwarm && ranked[ri].widgetMax == 0 {
 			break
 		}
 		rankKey := ranked[ri].key

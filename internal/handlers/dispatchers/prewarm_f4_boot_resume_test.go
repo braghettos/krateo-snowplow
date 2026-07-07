@@ -333,7 +333,7 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	_ = seedOneWidget(granted, e, "authn-ns", true /*bootScoped*/)
+	_ = seedOneWidget(granted, e, "authn-ns", seedModeBoot)
 	if pipSeedFreshSkipTotal.Load() != skipBefore {
 		t.Fatalf("F4-C2: seedOneWidget must NOT fresh-skip when NO live cell exists (cold first run); freshSkip moved by %d", pipSeedFreshSkipTotal.Load()-skipBefore)
 	}
@@ -352,7 +352,7 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 	buf.Reset()
 	skipMid := pipSeedFreshSkipTotal.Load()
 	resolvesMid := pipBindingSetSeedResolvesTotal.Load()
-	if err := seedOneWidget(granted, e, "authn-ns", true /*bootScoped*/); err != nil {
+	if err := seedOneWidget(granted, e, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("F4-C2: fresh-skip run returned %v; want nil (skip is non-fatal)", err)
 	}
 	if got := pipSeedFreshSkipTotal.Load() - skipMid; got != 1 {
@@ -381,7 +381,7 @@ func TestF4_FreshSkip_RealSeedOneWidget_SkipsLiveCell(t *testing.T) {
 		t.Fatal("F4-C2b: a dirty-marked (updated) cell must remain live per the store's TTL-expiry Get (dirty enqueues for the refresher, does not evict)")
 	}
 	skipC2b := pipSeedFreshSkipTotal.Load()
-	_ = seedOneWidget(granted, e, "authn-ns", true /*bootScoped*/)
+	_ = seedOneWidget(granted, e, "authn-ns", seedModeBoot)
 	if got := pipSeedFreshSkipTotal.Load() - skipC2b; got != 1 {
 		t.Fatalf("F4-C2b: a dirty-marked-but-live cell must still fresh-skip in the boot seed (refresher owns the re-resolve); freshSkip delta=%d", got)
 	}
@@ -414,7 +414,7 @@ func TestF4_FreshSkip_MisKeyedLookupDoesNotSkip_MutationShape(t *testing.T) {
 	handle.Put(key+"-WRONG", &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 
 	skipBefore := pipSeedFreshSkipTotal.Load()
-	_ = seedOneWidget(granted, e, "authn-ns", true /*bootScoped*/)
+	_ = seedOneWidget(granted, e, "authn-ns", seedModeBoot)
 	if pipSeedFreshSkipTotal.Load() != skipBefore {
 		t.Fatalf("F4-C2 mutation shape: a live cell under a NON-production key must NOT cause a fresh-skip — the skip consumes the production-key derivation; freshSkip moved by %d", pipSeedFreshSkipTotal.Load()-skipBefore)
 	}
@@ -423,14 +423,16 @@ func TestF4_FreshSkip_MisKeyedLookupDoesNotSkip_MutationShape(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// ARM 4 — BOUNDARY (F4-C3): fresh-skip is boot-only. seedOneWidget(bootScoped=
-// FALSE) over a LIVE cell must NOT skip — it proceeds to resolve (as keepwarm
-// re-Put and gvr-discovered re-resolve both require). We assert the ABSENCE of
-// the fresh-skip: freshSkip flat + no phase1.seed.fresh_skip log, even though a
-// live cell exists under the production key.
+// ARM 4 — BOUNDARY (F4-C3): the F.4 bare-liveness fresh-skip is boot-only.
+// seedModeGVRDiscovered over a LIVE cell must NOT skip AT ALL (neither the
+// fresh-skip nor the c2 age-skip) — it must re-resolve to record the new-GVR
+// dep edge (the S4 fix). We assert BOTH counters flat + no skip log, even though
+// a live cell exists under the production key. (keepwarm c2 §6 F4-C3 per-mode
+// boundary: this arm now pins the gvr-discovered no-skip; the keepwarm age-skip
+// boundary is pinned by TestC2AgeSkip_* in prewarm_keepwarm_c2_test.go.)
 // ─────────────────────────────────────────────────────────────────────────
 
-func TestF4_Boundary_NonBootScopeDoesNotFreshSkipLiveCell(t *testing.T) {
+func TestF4_Boundary_GVRDiscoveredScopeNeverSkipsLiveCell(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 
@@ -442,7 +444,7 @@ func TestF4_Boundary_NonBootScopeDoesNotFreshSkipLiveCell(t *testing.T) {
 	if handle == nil || key == "" {
 		t.Fatal("setup: real key derivation")
 	}
-	// Install a live cell — the exact condition boot-scope WOULD skip.
+	// Install a live cell — the exact condition boot-scope WOULD fresh-skip.
 	handle.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"warm":true}`), Inputs: inputs})
 	if _, live := handle.Get(key); !live {
 		t.Fatal("setup: live cell installed")
@@ -453,17 +455,22 @@ func TestF4_Boundary_NonBootScopeDoesNotFreshSkipLiveCell(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	skipBefore := pipSeedFreshSkipTotal.Load()
-	// bootScoped=FALSE — the keepwarm / gvr-discovered path. MUST NOT fresh-skip.
-	_ = seedOneWidget(granted, e, "authn-ns", false /*bootScoped*/)
-	if got := pipSeedFreshSkipTotal.Load() - skipBefore; got != 0 {
-		t.Fatalf("F4-C3 BOUNDARY: a NON-boot scope (keepwarm/gvr-discovered) must NOT fresh-skip a live cell — it must re-Put/re-resolve; freshSkip delta=%d (want 0)", got)
+	freshBefore := pipSeedFreshSkipTotal.Load()
+	ageBefore := keepwarmAgeSkipTotal.Load()
+	// seedModeGVRDiscovered — MUST NOT skip (neither predicate); re-resolves to
+	// record the new-GVR dep edge.
+	_ = seedOneWidget(granted, e, "authn-ns", seedModeGVRDiscovered)
+	if got := pipSeedFreshSkipTotal.Load() - freshBefore; got != 0 {
+		t.Fatalf("F4-C3 BOUNDARY: gvr-discovered must NOT fresh-skip a live cell; freshSkip delta=%d (want 0)", got)
 	}
-	if bytes.Contains(buf.Bytes(), []byte("phase1.seed.fresh_skip")) {
-		t.Fatalf("F4-C3 BOUNDARY: a non-boot scope must NOT emit phase1.seed.fresh_skip over a live cell; logs:\n%s", buf.String())
+	if got := keepwarmAgeSkipTotal.Load() - ageBefore; got != 0 {
+		t.Fatalf("F4-C3 BOUNDARY: gvr-discovered must NOT age-skip a live cell (age-skip is keepwarm-only); ageSkip delta=%d (want 0)", got)
 	}
-	writeF4Artifact(t, "arm4_boundary_nonboot_no_skip.txt",
-		"bootScoped=false over a LIVE cell → no fresh-skip (keepwarm re-Puts, gvr-discovered re-resolves; fresh-skip is boot-only)")
+	if bytes.Contains(buf.Bytes(), []byte("phase1.seed.fresh_skip")) || bytes.Contains(buf.Bytes(), []byte("phase1.seed.keepwarm_age_skip")) {
+		t.Fatalf("F4-C3 BOUNDARY: gvr-discovered must NOT emit any skip log over a live cell; logs:\n%s", buf.String())
+	}
+	writeF4Artifact(t, "arm4_boundary_gvrdiscovered_no_skip.txt",
+		"seedModeGVRDiscovered over a LIVE cell → no fresh-skip AND no age-skip (must re-resolve to record the new-GVR dep edge; the S4 fix)")
 }
 
 // ─────────────────────────────────────────────────────────────────────────

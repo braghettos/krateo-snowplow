@@ -124,7 +124,7 @@ func TestFirstNavLatch_SegmentIdentity_RestactionOnlyRank0_FiresOnWidgetSegment(
 	}
 	t.Cleanup(func() { firstNavFireObserver = nil })
 
-	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()
@@ -226,7 +226,7 @@ func TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget(t *test
 	}
 	t.Cleanup(func() { firstNavFireObserver = nil })
 
-	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", false, false); err != nil {
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()
@@ -301,25 +301,25 @@ func harvestWidgetAtRootNoReset(h *navWidgetHarvester, name string, gvr schema.G
 	eHarvestWidget(h, name, gvr)
 }
 
-// ── ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling, FIX-3) ───────
-// The #102 keepwarm sweep (rank1Only=true) bounds the seed to ranked[0] — the
-// dominant cohort's CELLS — regardless of whether ranked[0] has a FIRST-NAV
-// (RootIndex==0) widget. segRank (the latch segment identity, #99b) is a
-// LATCH-ONLY (boot-gate) concept and must NOT retarget the keepwarm loop bound.
+// ── ARM-KEEPWARM-SEGRANK (segRank/keepwarm interaction ruling, FIX-3 + c2) ───
+// keepwarm c2 WIDENS this arm (design §6 c1-arm table): the keepwarm sweep now
+// bounds the seed to the WIDGET-CAPABLE PREFIX (widgetMax>=1), not ranked[0]
+// only — so it seeds W AND V (both widget-capable). The #99b ruling this arm
+// encodes SURVIVES the widening: the loop bound is the widgetMax TIER, still NOT
+// segRank. segRank (the latch segment identity, #99b) is a LATCH-ONLY (boot-gate)
+// concept and must NOT retarget the keepwarm loop bound — this arm pins that the
+// sweep's coverage follows the widgetMax tier regardless of which identity is
+// the first-nav segment.
 //
-// This arm PINS: sweep bound follows ranked[0], NOT retargeted by segRank. It
-// requires ranked[0] != segKey (a DIVERGENCE fixture) or the assert is a
-// tautology. Post-FIX-3, ranked[0] is always widget-capable, so we force
-// divergence via MULTI-ROOT topology: W (widgetMax 9) is ranked[0] but ALL its
-// widgets are RootIndex==1 → segRank>0 (the segment falls to V, a lower-ranked
-// identity with a RootIndex==0 widget). The sweep MUST seed W (ranked[0]), NOT
-// V (the segment). The property "the loop bound is `ri>0 break`, untouched by
-// segRank" is exactly what this now pins; the old RA-only-ranked[0] property
-// (pre-FIX-3) is subsumed — a widget-less identity can no longer be ranked[0],
-// so the surviving divergence is ranked[0]-widget-capable-but-non-first-nav,
-// covered here. (The multi-root first-nav LATCH behaviour itself is pinned by
-// TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget below.)
-func TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment(t *testing.T) {
+// DIVERGENCE fixture (ranked[0] != segKey): W (widgetMax 9) is ranked[0] but ALL
+// its widgets are RootIndex==1 → segRank>0 (the segment falls to V, a
+// lower-ranked identity with a RootIndex==0 widget). Both are widget-capable, so
+// c2 sweeps BOTH; the assert is that the sweep coverage is the widget-capable
+// tier (W and V), NOT keyed on segRank (which would, wrongly, retarget the loop
+// to only V or reorder around it). (The multi-root first-nav LATCH behaviour
+// itself is pinned by TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget
+// below.)
+func TestKeepwarmSweep_WidgetCapablePrefix_SeedsBothNotSegmentOnly(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
@@ -334,7 +334,7 @@ func TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment(t *testing.T) {
 
 	// W (widgetMax 9) is ranked[0], but its widget is RootIndex==1 (non-first-
 	// nav) → segRank>0. V (widgetMax 2) has a RootIndex==0 widget → V is the
-	// segment identity, at a lower rank. ranked = [W(0), V(1)].
+	// segment identity, at a lower rank. ranked = [W(0), V(1)]; BOTH widget-capable.
 	w := eID{name: "w", group: true, collapsed: 9}
 	v := eID{name: "v", group: true, collapsed: 2}
 
@@ -360,8 +360,8 @@ func TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment(t *testing.T) {
 			return schema.GroupVersionResource{}, false
 		})
 
-	// rank1Only=true — the keepwarm sweep.
-	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", true, false); err != nil {
+	// seedModeKeepwarm — the c2 keepwarm sweep (widget-capable prefix).
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeKeepwarm); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 	ev := rec.snapshot()
@@ -370,9 +370,9 @@ func TestKeepwarmSweep_RankOne_SeedsRankZeroNotSegment(t *testing.T) {
 	seededV := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.identity == "group:v" }) < len(ev)
 
 	if !seededW {
-		t.Fatalf("keepwarm ruling: rank1Only sweep did NOT seed ranked[0] (W, widgetMax 9) — the sweep bound must follow ranked[0], the dominant cohort's cells; events=%+v", ev)
+		t.Fatalf("c2 keepwarm ruling: sweep did NOT seed ranked[0] (W, widgetMax 9) — the widget-capable prefix must include ranked[0]; events=%+v", ev)
 	}
-	if seededV {
-		t.Fatalf("keepwarm ruling: rank1Only sweep seeded V (rank 1, the SEGMENT identity) — segRank must NOT retarget the keepwarm loop bound (that would be a scope change, out of #99b); events=%+v", ev)
+	if !seededV {
+		t.Fatalf("c2 keepwarm ruling: sweep did NOT seed V (widgetMax 2, widget-capable) — c2 WIDENS coverage to the whole widget-capable prefix, not ranked[0] only; the #99b property (bound is the widgetMax tier, NOT segRank) must still seed V; events=%+v", ev)
 	}
 }
