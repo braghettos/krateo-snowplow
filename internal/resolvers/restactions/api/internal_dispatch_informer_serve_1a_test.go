@@ -137,12 +137,13 @@ func newServe1aLiveFixtureRVOffset(t *testing.T, totalItems, pageSize, rvBase in
 			fmt.Fprintf(&itemsBuf,
 				`{"apiVersion":%q,"kind":%q,`+
 					`"metadata":{"name":"composition-%d","namespace":"bench-ns-%d","resourceVersion":"%d",`+
+					`"uid":"uid-%d","creationTimestamp":"2026-07-09T0%d:00:00Z",`+
 					`"managedFields":[{"manager":"kubectl","operation":"Update","apiVersion":%q}],`+
 					`"labels":{"app.krateo.io/tier":"t%d"},`+
 					`"annotations":{"app.krateo.io/note":"note-%d","kubectl.kubernetes.io/last-applied-configuration":"{\"apiVersion\":\"%s\"}"}},`+
 					`"spec":{"replicas":%d,"image":"img-%d"},`+
 					`"status":{"ready":%t,"phase":"Running"}}`,
-				serve1aAPIVersion, serve1aItemKind, gi, gi, rvBase+gi, serve1aAPIVersion, gi%3, gi, serve1aAPIVersion, gi, gi, gi%2 == 0)
+				serve1aAPIVersion, serve1aItemKind, gi, gi, rvBase+gi, gi, gi%10, serve1aAPIVersion, gi%3, gi, serve1aAPIVersion, gi, gi, gi%2 == 0)
 		}
 		nextContinue := ""
 		if pageIdx+1 < len(f.pages) {
@@ -193,8 +194,15 @@ func serve1aItem(idx int, name, ns string) *unstructured.Unstructured {
 			"name":            name,
 			"namespace":       ns,
 			"resourceVersion": itoa(2000 + idx), // asserted EQUAL (informer preserves per-item RV verbatim)
-			"labels":          map[string]any{"app.krateo.io/tier": "t" + itoa(idx%3)},
-			"annotations":     map[string]any{"app.krateo.io/note": "note-" + itoa(idx)},
+			// uid + creationTimestamp: IMMUTABLE + consumer-read (compositions-panel
+			// row-table renders .metadata.uid; compositions-panels RA sorts on
+			// .metadata.creationTimestamp) → the negative projection asserts them
+			// equal, and RED_PerItemUIDDrop/CreationTimestampCorrupt pin the coverage.
+			// Both arms emit the SAME values so the assert-equal holds.
+			"uid":               "uid-" + itoa(idx),
+			"creationTimestamp": "2026-07-09T0" + itoa(idx%10) + ":00:00Z",
+			"labels":            map[string]any{"app.krateo.io/tier": "t" + itoa(idx%3)},
+			"annotations":       map[string]any{"app.krateo.io/note": "note-" + itoa(idx)},
 		},
 		"spec":   map[string]any{"replicas": int64(idx), "image": "img-" + itoa(idx)},
 		"status": map[string]any{"ready": idx%2 == 0, "phase": "Running"},
@@ -490,6 +498,60 @@ func TestServe1a_ByteParity_RED_PerItemSpecStatus(t *testing.T) {
 		t.Fatal("RED ARM FAIL: mutating per-item spec.replicas + status.phase did NOT break " +
 			"content equality — the golden does not assert spec/status fidelity, so a serve " +
 			"path that corrupted rendered content would pass (the floor's blind spot).")
+	}
+}
+
+// TestServe1a_ByteParity_RED_PerItemUIDDrop is the completeness RED arm for
+// metadata.uid: uid is IMMUTABLE + consumer-read (compositions-panel row-table
+// renders .metadata.uid), so the negative projection MUST compare it. The
+// fixture emits uid on BOTH arms; corrupting it MUST break the golden. Without
+// the fixture-emit + this arm the negative-projection uid coverage is a no-op
+// (the 1b9729f-lineage fixture-blindspot PM caught).
+func TestServe1a_ByteParity_RED_PerItemUIDDrop(t *testing.T) {
+	resetInternalClientCacheForTest()
+	t.Cleanup(resetInternalClientCacheForTest)
+
+	const n = 12
+	items := make([]*unstructured.Unstructured, 0, n)
+	for i := 0; i < n; i++ {
+		items = append(items, serve1aItem(i, "composition-"+itoa(i), "bench-ns-"+itoa(i)))
+	}
+	liveRaw, infRaw := serve1aLiveAndInformerRaw(t, n, items)
+	liveItems := indexContentItemsByName(t, liveRaw)
+	infItems := indexContentItemsByName(t, infRaw)
+	if diff := contentItemsDiff(liveItems, infItems); diff != "" {
+		t.Fatalf("precondition FAIL: unmutated items already differ:\n%s", diff)
+	}
+	if diff := contentItemsDiff(liveItems, mutateContentUID(infItems)); diff == "" {
+		t.Fatal("RED ARM FAIL: mutating per-item metadata.uid did NOT break content " +
+			"equality — uid is NOT asserted (fixture may not emit it, or projection drops it). " +
+			"uid is immutable + consumer-read → MUST be in the compared set.")
+	}
+}
+
+// TestServe1a_ByteParity_RED_PerItemCreationTimestampCorrupt is the completeness
+// RED arm for metadata.creationTimestamp (immutable + consumer-read: the
+// compositions-panels RA sort_by(.metadata.creationTimestamp)). Corrupting it
+// MUST break the golden.
+func TestServe1a_ByteParity_RED_PerItemCreationTimestampCorrupt(t *testing.T) {
+	resetInternalClientCacheForTest()
+	t.Cleanup(resetInternalClientCacheForTest)
+
+	const n = 12
+	items := make([]*unstructured.Unstructured, 0, n)
+	for i := 0; i < n; i++ {
+		items = append(items, serve1aItem(i, "composition-"+itoa(i), "bench-ns-"+itoa(i)))
+	}
+	liveRaw, infRaw := serve1aLiveAndInformerRaw(t, n, items)
+	liveItems := indexContentItemsByName(t, liveRaw)
+	infItems := indexContentItemsByName(t, infRaw)
+	if diff := contentItemsDiff(liveItems, infItems); diff != "" {
+		t.Fatalf("precondition FAIL: unmutated items already differ:\n%s", diff)
+	}
+	if diff := contentItemsDiff(liveItems, mutateContentCreationTimestamp(infItems)); diff == "" {
+		t.Fatal("RED ARM FAIL: mutating per-item metadata.creationTimestamp did NOT break " +
+			"content equality — creationTimestamp is NOT asserted. It is immutable + " +
+			"consumer-read (sort key) → MUST be in the compared set.")
 	}
 }
 
@@ -897,6 +959,45 @@ func mutateContentPerItemRV(in map[string]string) map[string]string {
 		_ = json.Unmarshal([]byte(raw), &obj)
 		if md, ok := obj["metadata"].(map[string]any); ok {
 			md["resourceVersion"] = "999999" // a value neither arm emits
+		}
+		b, _ := json.Marshal(obj)
+		out[name] = string(b)
+	}
+	return out
+}
+
+// mutateContentUID corrupts each item's metadata.uid — PRESENT-ONLY (guarded)
+// so if the projection ever dropped uid this becomes a no-op and the RED arm
+// correctly FAILS (proving uid must be IN the compared set). uid is immutable +
+// consumer-read (compositions-panel row-table renders .metadata.uid).
+func mutateContentUID(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for name, raw := range in {
+		var obj map[string]any
+		_ = json.Unmarshal([]byte(raw), &obj)
+		if md, ok := obj["metadata"].(map[string]any); ok {
+			if _, has := md["uid"]; has {
+				md["uid"] = "uid-CORRUPTED"
+			}
+		}
+		b, _ := json.Marshal(obj)
+		out[name] = string(b)
+	}
+	return out
+}
+
+// mutateContentCreationTimestamp corrupts each item's metadata.creationTimestamp
+// — PRESENT-ONLY guarded (no-op if the projection dropped it → RED arm FAILS).
+// Immutable + consumer-read (compositions-panels RA sort_by(.metadata.creationTimestamp)).
+func mutateContentCreationTimestamp(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for name, raw := range in {
+		var obj map[string]any
+		_ = json.Unmarshal([]byte(raw), &obj)
+		if md, ok := obj["metadata"].(map[string]any); ok {
+			if _, has := md["creationTimestamp"]; has {
+				md["creationTimestamp"] = "1999-01-01T00:00:00Z"
+			}
 		}
 		b, _ := json.Marshal(obj)
 		out[name] = string(b)
