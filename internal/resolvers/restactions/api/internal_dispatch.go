@@ -137,6 +137,22 @@ import (
 // 162 s body-read that the browser cancels).
 const internalDispatchListPageLimit int64 = 500
 
+// internalDispatchServeSyncWait bounds the per-GVR sync-wait the #121 1a
+// informer-serve branch performs before falling through to the live paged
+// LIST. SMALL by design (C1 "never worse"): the measured boot race has the
+// composition informer synced ~24s BEFORE the walk's LIST dispatch, so in the
+// common case WaitForGVRSync returns TRUE immediately (already synced) and
+// this bound is never consumed. It exists only for the narrow window where a
+// GVR lazy-registered mid-walk hasn't quite finished its initial LIST — a few
+// seconds of wait then trades a 27.5s live LIST for an informer read. If the
+// wait expires the branch falls through to the live LIST exactly as today
+// (the ~136s headroom 1a frees dwarfs this bound, so a never-syncing GVR
+// cannot re-create the seed deadline-cut). A const, not a CRD field: it is an
+// internal timeout with no per-resource semantics (feedback_no_special_cases
+// is about path/resource carve-outs, not tunables); centralised so the C1
+// falsifier pins it.
+const internalDispatchServeSyncWait = 5 * time.Second
+
 // internalClientCache memoises the client-go dynamic client built from a
 // given internal *rest.Config. Phase 1's walk fans out many inner api[]
 // calls all carrying the SAME SA *rest.Config pointer; rebuilding the
@@ -337,6 +353,50 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	// fallback is exactly the failure mode the fix exists to remove. A
 	// 410 here is rare (the apiserver compacted between pages) and the
 	// caller (or the prewarm refresher) will retry with a fresh RV.
+	// #121 1a — INFORMER-SERVE BRANCH. Before paying the live paged LIST,
+	// try to serve this cluster/namespace-wide LIST from the (already-synced)
+	// informer indexer. The root cause of the boot-walk deadline-cut is that
+	// this dispatcher ALWAYS ran the live LIST — even for a GVR whose informer
+	// was fully synced — so the 50K-composition boot re-walk paid a 27.5s /
+	// 60K-item live LIST ~24s AFTER the benchapps informer had synced (pure
+	// waste that ate the boot-scope budget and deadline-cut the seed;
+	// docs/boot-walk-deadline-rootcause-2026-07-09.md).
+	//
+	// SCOPE: gated on a serve-watcher being attached to ctx. ONLY the Phase 1
+	// prewarm walk/seed context attaches it (withPhase1SAContext); ordinary
+	// per-user /call requests do NOT, so their dispatch is byte-identical to
+	// pre-1a — rw==false here → the whole branch is skipped and the live LIST
+	// runs exactly as today. NEVER WORSE (C1): a bounded WaitForGVRSync then
+	// an IsServable re-check; on any miss (no watcher, unregistered, unsynced
+	// past the bound, or not-servable) we fall through to the live paged LIST
+	// below unchanged.
+	//
+	// RBAC: the walk runs under the SA identity and the live LIST it replaces
+	// is the SAME cluster/namespace-wide SA read — ListServableEnvelopeJSON
+	// returns the full informer set (no per-user narrowing), byte-parity with
+	// the SA LIST. The downstream userAccessFilter refilter (if any) runs
+	// identically on either envelope. No per-user path reaches here (scope
+	// gate above), so there is no cross-user serve.
+	if rw, haveRW := cache.ServeWatcherFromContext(ctx); haveRW {
+		// Bounded per-GVR sync-wait (returns immediately when already synced —
+		// the common boot case), then the SAME four-conjunct IsServable gate
+		// ListObjectsServable enforces. Both must hold to serve from cache.
+		synced := rw.WaitForGVRSync(ctx, gvr, internalDispatchServeSyncWait)
+		if synced && rw.IsServable(gvr) {
+			if served, ok := rw.ListServableEnvelopeJSON(gvr, namespace); ok {
+				xcontext.Logger(ctx).Info("internal_dispatch.list.informer_served",
+					slog.String("subsystem", "cache"),
+					slog.String("gvr", gvr.String()),
+					slog.String("namespace", namespace),
+					slog.Int("bytes", len(served)),
+					slog.String("note", "Task #121 1a — served the prewarm-walk LIST from the synced informer instead of a live paged apiserver LIST"),
+				)
+				return served, true, nil
+			}
+		}
+		// Fall through to the live paged LIST below (never worse).
+	}
+
 	listStart := time.Now()
 	resultList := &unstructured.UnstructuredList{}
 	opts := metav1.ListOptions{Limit: internalDispatchListPageLimit}

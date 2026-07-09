@@ -21,9 +21,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/itchyny/gojq"
 )
+
+// jqCompileCount counts CompileJQ invocations (every gojq.Parse+Compile pair
+// snowplow's refilter path performs). It is the falsifier seam for #121 1b's
+// C3 "compile-once-per-filter" assertion: a test resets it, drives an N-item
+// refilterSlice through ONE NamespaceFrom filter, and asserts the delta == 1
+// (NOT N). A RED run against the pre-1b per-item-recompile code would show
+// delta == N. Prod-inert: a single monotonic atomic add per compile, never
+// read outside the test hook.
+var jqCompileCount atomic.Int64
+
+// JQCompileCountForTest returns the current CompileJQ invocation count. Test
+// seam only (see jqCompileCount) — used by the #121 1b C3 falsifier to prove
+// compile-count == 1 across N items.
+func JQCompileCountForTest() int64 { return jqCompileCount.Load() }
 
 // ErrMultiYield is the package-level sentinel returned by EvalValue when a
 // jq query yields more than one value. It is matchable via errors.Is.
@@ -59,10 +74,31 @@ var ErrMultiYield = errors.New("jq query yielded more than one value, expected e
 // unless `data` is already per-call-private. All three Ship A migrated
 // callers satisfy this (see the AC-A.6 proof in jqvalue_test.go).
 func EvalValue(ctx context.Context, query string, data any, ml gojq.ModuleLoader) (value any, ok bool, err error) {
+	code, cerr := CompileJQ(query, ml)
+	if cerr != nil {
+		return nil, false, cerr
+	}
+	return EvalValueCompiled(ctx, code, data)
+}
+
+// CompileJQ parses + compiles `query` into a reusable *gojq.Code, returning
+// the SAME wrapped parse/compile errors EvalValue historically returned
+// inline (design §1 — the parse/compile rows of the outcome contract). It is
+// the compile HALF of EvalValue split out so a caller that evaluates ONE
+// fixed query against MANY inputs (the refilter per-item RBAC NamespaceFrom
+// loop, #121 1b) compiles ONCE and reuses the code across items, instead of
+// re-Parse+Compiling per item.
+//
+// The compiled *gojq.Code is safe for concurrent RunWithContext calls (gojq
+// contract: Code is immutable after Compile; the mutable state lives in the
+// per-Run iterator). ModuleLoader option is appended only when non-nil,
+// byte-identical to the pre-split inline path.
+func CompileJQ(query string, ml gojq.ModuleLoader) (*gojq.Code, error) {
+	jqCompileCount.Add(1) // #121 1b C3 falsifier seam (see jqCompileCount).
 	// Parse — the same call jqutil makes at jqutil.go:23.
 	q, perr := gojq.Parse(query)
 	if perr != nil {
-		return nil, false, fmt.Errorf("invalid jq query %q: %w", query, perr)
+		return nil, fmt.Errorf("invalid jq query %q: %w", query, perr)
 	}
 
 	// Compile — jqutil.go:28-38. ModuleLoader option only when non-nil,
@@ -73,9 +109,21 @@ func EvalValue(ctx context.Context, query string, data any, ml gojq.ModuleLoader
 	}
 	code, cerr := gojq.Compile(q, comopts...)
 	if cerr != nil {
-		return nil, false, fmt.Errorf("unable to compile jq query %q: %w", query, cerr)
+		return nil, fmt.Errorf("unable to compile jq query %q: %w", query, cerr)
 	}
+	return code, nil
+}
 
+// EvalValueCompiled is the RUN half of EvalValue: it runs an ALREADY-compiled
+// *gojq.Code against `data` and applies the identical five-outcome contract
+// (zero / single / multi / runtime-error) EvalValue documents. Split out for
+// #121 1b so a fixed-query loop compiles once (CompileJQ) and calls this per
+// item — the parse+compile cost is paid once, not O(items).
+//
+// Behaviour is byte-identical to the inline body EvalValue used before the
+// split: the same aliasing caveat (§4 / AC-A.6) applies — the returned value
+// can alias sub-trees of `data`; callers must treat it read-only.
+func EvalValueCompiled(ctx context.Context, code *gojq.Code, data any) (value any, ok bool, err error) {
 	// Run + drain the iterator. jqutil.go:40-52 stops on the first
 	// error-typed yielded value and returns it as err; EvalValue does the
 	// same, then additionally distinguishes zero / single / multi yield.

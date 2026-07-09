@@ -1018,6 +1018,15 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	rctx := xcontext.BuildContext(ctx, opts...)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
+	// #121 1a — attach the shared watcher so the internal-dispatch LIST path
+	// (dispatchViaInternalRESTConfig) can serve a servable GVR's LIST from the
+	// synced informer indexer instead of a live 27.5s/60K paged apiserver LIST
+	// (the boot-walk deadline-cut root cause). PREWARM-SCOPED: only this SA
+	// walk/seed context carries it; per-user /call never does, so the customer
+	// dispatch path is byte-identical. nil-safe (cache.Global() may be nil
+	// under CACHE_ENABLED=false → WithServeWatcher returns ctx unchanged →
+	// the live LIST runs as today).
+	rctx = cache.WithServeWatcher(rctx, cache.Global())
 	// Gate 1 (0.30.201-diag) — stamp the DIAGNOSTIC boot-prewarm-walk
 	// fallthrough scope so the existing RecordApiserverFallthrough calls
 	// on the discovery-walk path (KindFor at resourcesrefs/resolve.go,
