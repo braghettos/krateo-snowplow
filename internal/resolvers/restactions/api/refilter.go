@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/itchyny/gojq"
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
@@ -117,8 +118,11 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		if !hasItems {
 			// Some endpoints return a single object without an "items"
 			// wrapper (cluster-scoped GET-by-name). Treat the whole
-			// map as the single object.
-			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v)
+			// map as the single object. #121 1b — compile the
+			// NamespaceFrom expression once (single item, but shares the
+			// hoisted signature).
+			nsExpr, nsCode := compileNamespaceFrom(uaf)
+			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v, nsExpr, nsCode)
 			res.EvaluateRBACCalls++
 			if permitted {
 				res.Kept++
@@ -183,13 +187,33 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 	kept := make([]any, 0, len(items))
 	dropped := 0
 	calls := 0
+
+	// #121 1b — compile the per-item NamespaceFrom expression ONCE for the
+	// whole slice, not O(items) times. The expression is the SAME for every
+	// item (it comes from uaf.NamespaceFrom / the Ship-S.1 default), so the
+	// pre-1b path re-Parse+Compiled the identical query per item inside
+	// EvalValue (jqvalue.go), paying N parse+compile cycles for one filter.
+	// At the 50K composition boot walk an 8854-item RBAC filter paid ~0.3s of
+	// pure recompile (docs/boot-walk-deadline-rootcause-2026-07-09.md §4).
+	// Hoisting the compile here shaves that off every large filter. The
+	// compiled *gojq.Code is reused read-only across items — gojq.Code is
+	// immutable after Compile (mutable state lives in the per-Run iterator),
+	// so this is safe even though evalSingle runs it per item.
+	//
+	// SECURITY / fail-closed is UNCHANGED: nsCode is threaded into evalSingle
+	// → evalJQString, which applies the SAME (value, ok, err) contract as
+	// before; a compile error here fails closed (nsCode==nil → evalSingle
+	// treats every item as denied), exactly as the pre-1b inline EvalValue
+	// compile-error branch did per item.
+	nsExpr, nsCode := compileNamespaceFrom(uaf)
+
 	for _, item := range items {
 		switch item.(type) {
 		case map[string]any, string:
 			// Object OR bare scalar — both reach the evaluator. evalSingle
 			// resolves NamespaceFrom against the item (jq handles a string
 			// receiver fine) and calls EvaluateRBAC.
-			permitted := evalSingle(ctx, log, username, groups, uaf, resources, item)
+			permitted := evalSingle(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode)
 			calls++
 			if permitted {
 				kept = append(kept, item)
@@ -223,22 +247,20 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 //
 // JQ-eval errors and RBAC errors both fail closed. An EMPTY `resources`
 // set denies (no resource to grant against) — never allow-all.
-func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any) bool {
-	// Ship S.1 — an absent/empty NamespaceFrom defaults to
-	// ".metadata.namespace" (the dominant namespaced-object shape) rather
-	// than a cluster-scope (namespace=="") RBAC check. The cluster-scope
-	// default was a SEMANTICS BUG: it denied narrow devs who hold the grant
-	// only in their own namespace. The CRD-level +kubebuilder:default makes
-	// the apiserver fill this for stored RESTAction CRs; this in-code
-	// default is the belt-and-suspenders for pre-default CRs and any caller
-	// that passes a UAF with an empty NamespaceFrom directly. An explicit
-	// "." or ".metadata.name" still overrides verbatim. Fail-closed on JQ
-	// error is preserved on every branch.
-	nsExpr := uaf.NamespaceFrom
-	if nsExpr == "" {
-		nsExpr = ".metadata.namespace"
+func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code) bool {
+	// #121 1b — nsExpr + nsCode are the ONCE-compiled NamespaceFrom
+	// expression, hoisted out of the per-item loop by the caller
+	// (compileNamespaceFrom). nsExpr is kept for error/log fidelity; nsCode
+	// is the reusable compiled program. A nil nsCode means the expression
+	// failed to compile — fail-closed (deny the item), matching the pre-1b
+	// per-item EvalValue compile-error branch.
+	if nsCode == nil {
+		log.Warn("userAccessFilter: NamespaceFrom JQ compile failed; treating item as denied",
+			slog.String("expr", nsExpr),
+		)
+		return false
 	}
-	ns, err := evalJQString(ctx, nsExpr, item)
+	ns, err := evalJQStringCompiled(ctx, nsCode, item)
 	if err != nil {
 		log.Warn("userAccessFilter: NamespaceFrom JQ eval failed; treating item as denied",
 			slog.String("expr", nsExpr),
@@ -283,6 +305,37 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 		}
 	}
 	return false
+}
+
+// compileNamespaceFrom resolves the effective NamespaceFrom expression for a
+// UAF and compiles it ONCE (#121 1b), returning (expr, code). It centralises
+// the Ship-S.1 default so the per-item loop and the single-object branches
+// share one derivation — the expression is item-independent, so it is
+// compiled here, before any item is evaluated, and reused across every item.
+//
+// Ship S.1 — an absent/empty NamespaceFrom defaults to ".metadata.namespace"
+// (the dominant namespaced-object shape) rather than a cluster-scope
+// (namespace=="") RBAC check. The cluster-scope default was a SEMANTICS BUG:
+// it denied narrow devs who hold the grant only in their own namespace. The
+// CRD-level +kubebuilder:default makes the apiserver fill this for stored
+// RESTAction CRs; this in-code default is the belt-and-suspenders for
+// pre-default CRs and any caller that passes a UAF with an empty
+// NamespaceFrom directly. An explicit "." or ".metadata.name" still overrides
+// verbatim.
+//
+// A compile error returns (expr, nil): evalSingle then fails closed (deny),
+// identical to the pre-1b per-item EvalValue compile-error branch. The
+// ModuleLoader matches the pre-1b evalJQString call (jqsupport.ModuleLoader()).
+func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Code) {
+	nsExpr := uaf.NamespaceFrom
+	if nsExpr == "" {
+		nsExpr = ".metadata.namespace"
+	}
+	code, err := CompileJQ(nsExpr, jqsupport.ModuleLoader())
+	if err != nil {
+		return nsExpr, nil
+	}
+	return nsExpr, code
 }
 
 // resolveUAFResources resolves the RBAC resource-plural set for a UAF
@@ -369,6 +422,34 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 // a map receiver is unchanged.
 func evalJQString(ctx context.Context, expr string, data any) (string, error) {
 	v, ok, err := EvalValue(ctx, expr, data, jqsupport.ModuleLoader())
+	return jqValueToString(v, ok, err)
+}
+
+// evalJQStringCompiled is the #121 1b compiled-code twin of evalJQString: it
+// runs an already-compiled *gojq.Code (via EvalValueCompiled) instead of
+// re-Parse+Compiling `expr` per call. Byte-identical (value, ok, err)
+// mapping to evalJQString — both delegate to jqValueToString — so a caller
+// switching from evalJQString to this pays the compile once (CompileJQ) and
+// gets the SAME string/error result per item, including the DELIBERATE
+// multi-yield error surface (§3.4.5).
+func evalJQStringCompiled(ctx context.Context, code *gojq.Code, data any) (string, error) {
+	v, ok, err := EvalValueCompiled(ctx, code, data)
+	return jqValueToString(v, ok, err)
+}
+
+// jqValueToString maps EvalValue's (value, ok, err) triple to the (string,
+// error) shape evalJQString has always returned. Extracted for #121 1b so
+// the recompiling path (evalJQString) and the compiled-code path
+// (evalJQStringCompiled) apply IDENTICAL mapping — the anti-drift principle
+// (a single body, not two copies that can diverge).
+//
+// DELIBERATE CHANGE (design §3.4.5, RATIFIED): a multi-yield expression
+// pre-Ship-A returned the concatenated invalid-JSON string verbatim with
+// err==nil — silent garbage flowing into a URL path / ResourceRef field /
+// RBAC namespace. Ship A surfaces it as ErrMultiYield, so this returns
+// ("", err) and the caller's existing error handling fires (fail-closed at
+// both consumers — evalSingle's NamespaceFrom RBAC path treats it as denied).
+func jqValueToString(v any, ok bool, err error) (string, error) {
 	if errors.Is(err, ErrMultiYield) {
 		// DELIBERATE CHANGE — see §3.4.5. Pre-Ship-A a multi-yield expr
 		// returned the concatenated invalid-JSON string verbatim (latent
@@ -465,8 +546,10 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	case map[string]any:
 		itemsRaw, hasItems := v["items"]
 		if !hasItems {
-			// Single-object shape (GET-by-name).
-			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v)
+			// Single-object shape (GET-by-name). #121 1b — compile the
+			// NamespaceFrom expression once (shares the hoisted signature).
+			nsExpr, nsCode := compileNamespaceFrom(uaf)
+			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v, nsExpr, nsCode)
 			res.EvaluateRBACCalls++
 			if permitted {
 				res.Kept++

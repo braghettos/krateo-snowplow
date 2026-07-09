@@ -482,8 +482,10 @@ func TestResourcesFrom_FailClosed(t *testing.T) {
 	if !ok || len(got) != 0 {
 		t.Fatalf("an empty ResourcesFrom array must yield ([], true); got %v ok=%v", got, ok)
 	}
+	emptyResUAF := &templates.UserAccessFilterSpec{Verb: "list"}
+	emptyResExpr, emptyResCode := compileNamespaceFrom(emptyResUAF)
 	if evalSingle(context.Background(), log, "u", []string{"g"},
-		&templates.UserAccessFilterSpec{Verb: "list"}, nil, "ns-a") {
+		emptyResUAF, nil, "ns-a", emptyResExpr, emptyResCode) {
 		t.Errorf("fail-closed: evalSingle with an empty resource set must DENY")
 	}
 }

@@ -505,8 +505,9 @@ func TestSite3_NamespaceFrom_Consumer(t *testing.T) {
 			Verb:          "list",
 			Resource:      "compositions",
 		}
+		nsExpr, nsCode := compileNamespaceFrom(uaf)
 		permitted := evalSingle(context.Background(), log, "alice", nil, uaf,
-			[]string{"compositions"}, item)
+			[]string{"compositions"}, item, nsExpr, nsCode)
 		if permitted {
 			t.Errorf("multi-yield NamespaceFrom permitted the item; want denied (fail-closed)")
 		}
@@ -518,8 +519,16 @@ func TestSite3_NamespaceFrom_Consumer(t *testing.T) {
 			Verb:          "list",
 			Resource:      "compositions",
 		}
+		// #121 1b — a parse-error NamespaceFrom now surfaces at
+		// compileNamespaceFrom (nsCode==nil), and evalSingle fails closed on
+		// the nil-code branch. Same DENY outcome as the pre-1b per-item
+		// EvalValue parse-error branch, moved to compile time.
+		nsExpr, nsCode := compileNamespaceFrom(uaf)
+		if nsCode != nil {
+			t.Fatalf("parse-error NamespaceFrom %q must fail to compile (nsCode==nil)", uaf.NamespaceFrom)
+		}
 		permitted := evalSingle(context.Background(), log, "alice", nil, uaf,
-			[]string{"compositions"}, item)
+			[]string{"compositions"}, item, nsExpr, nsCode)
 		if permitted {
 			t.Errorf("parse-error NamespaceFrom permitted the item; want denied")
 		}

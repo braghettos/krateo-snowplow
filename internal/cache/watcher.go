@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -1597,6 +1598,46 @@ func (rw *ResourceWatcher) WaitForCacheSync(ctx context.Context, timeout time.Du
 	return nil
 }
 
+// WaitForGVRSync blocks until gvr's informer HasSynced, or the timeout /
+// ctx elapses — a per-GVR bounded twin of WaitForCacheSync (#121 1a).
+//
+// Returns true iff the informer is registered AND reached HasSynced within
+// the bound. Returns false for: an unregistered gvr (nothing to wait on),
+// passthrough mode (no informer), a nil receiver, or a timeout. A false
+// return is the signal for the caller to fall through to its live-apiserver
+// path — the bound guarantees the wait can never wedge boot (C1 "never
+// worse": a genuinely-unsyncable GVR costs at most `timeout`, then the live
+// LIST runs exactly as today).
+//
+// This waits ONLY on conjunct 2 (HasSynced), not the full four-conjunct
+// IsServable — the caller re-checks IsServable after this returns true, so a
+// GVR that syncs but is watch-broken / unconfirmed still correctly falls
+// through. Reuses client-go's WaitForCacheSync on the single informer's
+// HasSynced (feedback_check_k8s_clientgo_prior_art — same primitive as the
+// package's other sync gates).
+func (rw *ResourceWatcher) WaitForGVRSync(ctx context.Context, gvr schema.GroupVersionResource, timeout time.Duration) bool {
+	if rw == nil || rw.mode == modePassthrough {
+		return false
+	}
+	rw.mu.RLock()
+	gi, registered := rw.informers[gvr]
+	rw.mu.RUnlock()
+	if !registered {
+		return false
+	}
+	// Already synced — no wait. (The common 1a case: benchapps synced long
+	// before the walk's LIST dispatch, so this returns true immediately.)
+	if gi.Informer().HasSynced() {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return clientcache.WaitForCacheSync(cctx.Done(), gi.Informer().HasSynced)
+}
+
 // passthroughGetTimeout bounds the apiserver Get/List call in
 // modePassthrough so a stalled apiserver cannot wedge a caller
 // indefinitely. 30s mirrors the dynamic.Client default behaviour
@@ -1788,6 +1829,68 @@ func (rw *ResourceWatcher) ListObjectsServable(gvr schema.GroupVersionResource, 
 		return nil, false
 	}
 	return listFromIndexer(gi, namespace), true
+}
+
+// ListServableEnvelopeJSON serves gvr's namespace-scoped (or cluster-wide
+// when namespace=="") item set from the informer indexer as a marshalled
+// K8s LIST envelope — the informer-served form of the internal-dispatch
+// paged LIST (#121 1a). Returns (bytes, true) only when the GVR is servable
+// (the SAME four-conjunct IsServable gate ListObjectsServable enforces);
+// (nil, false) otherwise, signalling the caller to fall through to the live
+// apiserver LIST (never worse).
+//
+// ENVELOPE PARITY (the byte-parity contract): the returned bytes are
+// json.Marshal of an unstructured.UnstructuredList's UnstructuredContent() —
+// the EXACT marshal path the live internal-dispatch LIST uses
+// (internal_dispatch.go), so the {apiVersion, kind, metadata, items} shape
+// and the per-item bytes are identical. The List-level apiVersion/kind are
+// synthesized from the items' own GroupVersionKind (`<Kind>List`), matching
+// the apiserver's collection-kind convention. Two DELIBERATE differences
+// from a fresh live LIST, both provably JQ-invariant for the composition-
+// list consumers and both matching what the live path ALREADY does:
+//   - metadata.resourceVersion is empty. A cached snapshot has no single
+//     live collection RV, and the live paged path pins page-1's RV but the
+//     downstream composition-list JQ reads only `.items[]` (never the
+//     list-level RV). Leaving it empty is the honest, drift-free choice.
+//   - metadata.continue is empty and remainingItemCount is nil — identical
+//     to the live path, which clears both on the accumulated list.
+// The dev's byte-parity golden asserts items-equality + envelope-shape-
+// equality against a live LIST modulo these two fields (see the 1a
+// falsifier). No per-GVR carve-out — uniform over every servable GVR
+// (feedback_no_special_cases).
+func (rw *ResourceWatcher) ListServableEnvelopeJSON(gvr schema.GroupVersionResource, namespace string) ([]byte, bool) {
+	items, ok := rw.ListObjectsServable(gvr, namespace)
+	if !ok {
+		return nil, false
+	}
+	list := &unstructured.UnstructuredList{}
+	// Synthesize the collection envelope from the items' own GVK. Every
+	// informer item carries its singular apiVersion/kind; the LIST kind is
+	// the apiserver convention `<Kind>List`. When the set is empty we cannot
+	// read a per-item GVK — fall back to the GVR's group/version and a
+	// resource-derived kind is not available, so leave the envelope kind
+	// empty (the live empty-LIST path likewise carries only whatever the
+	// apiserver returned; the composition-list JQ reads `.items[]`, which is
+	// an empty array here — shape-correct).
+	list.Items = make([]unstructured.Unstructured, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		list.Items = append(list.Items, *it)
+	}
+	if len(list.Items) > 0 {
+		gvk := list.Items[0].GroupVersionKind()
+		if gvk.Kind != "" {
+			list.SetAPIVersion(gvk.GroupVersion().String())
+			list.SetKind(gvk.Kind + "List")
+		}
+	}
+	raw, err := json.Marshal(list.UnstructuredContent())
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
 }
 
 // IsServable reports whether the watcher can vouch for a cache-served

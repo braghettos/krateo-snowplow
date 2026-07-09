@@ -634,3 +634,54 @@ func InternalRESTConfigFromContext(ctx context.Context) (any, bool) {
 	}
 	return v, true
 }
+
+// ctxKeyServeWatcherType is the typed empty-struct context key for
+// WithServeWatcher / ServeWatcherFromContext.
+type ctxKeyServeWatcherType struct{}
+
+var ctxKeyServeWatcher = ctxKeyServeWatcherType{}
+
+// WithServeWatcher attaches the shared *ResourceWatcher to ctx so an
+// internal-dispatch LIST can serve from the informer indexer instead of a
+// live apiserver LIST when the GVR is servable — #121 1a.
+//
+// WHY (the #121 root cause): the internal-REST-config LIST path
+// (dispatchViaInternalRESTConfig) ALWAYS issues a live paged apiserver LIST;
+// it never consults the informer, even for a GVR whose informer is fully
+// synced. At 50K compositions the boot re-walk's benchapps LIST is therefore
+// a 27.5s / 60K-item live LIST that runs ~24s AFTER the informer already
+// synced (measured: informer HasSynced ~3.9s, LIST at ~27.5s) — pure waste
+// that eats the boot-scope budget and deadline-cuts the seed
+// (docs/boot-walk-deadline-rootcause-2026-07-09.md).
+//
+// This mechanism is PREWARM-SCOPED by construction: only the Phase 1 walk /
+// seed context attaches it (withPhase1SAContext, alongside the SA
+// WithInternalRESTConfig it already sets). Ordinary per-user /call requests
+// NEVER attach it, so their dispatch is byte-identical to pre-1a — the
+// informer-serve branch is skipped entirely (ServeWatcherFromContext returns
+// false) and the live LIST runs exactly as today.
+//
+// GENERAL, not a per-resource carve-out (feedback_no_special_cases): any
+// internal driver can attach the watcher; the serve/fall-through decision is
+// the uniform IsServable predicate over every GVR. nil rw returns the parent
+// context unchanged (the fall-through-to-live-LIST path is preserved).
+func WithServeWatcher(ctx context.Context, rw *ResourceWatcher) context.Context {
+	if ctx == nil || rw == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyServeWatcher, rw)
+}
+
+// ServeWatcherFromContext returns the *ResourceWatcher attached by
+// WithServeWatcher, or (nil, false) when none was set (the ordinary per-user
+// request path — the caller then takes its unchanged live-LIST dispatch).
+func ServeWatcherFromContext(ctx context.Context) (*ResourceWatcher, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	rw, ok := ctx.Value(ctxKeyServeWatcher).(*ResourceWatcher)
+	if !ok || rw == nil {
+		return nil, false
+	}
+	return rw, true
+}
