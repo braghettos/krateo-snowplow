@@ -181,8 +181,10 @@ const (
 // byte-parity arm compares like-for-like. TL DECISION (A): carries the full
 // content-load-bearing field set — labels + annotations + spec + status (the
 // widget JQ renders spec/status; the RBAC refilter reads namespace) — plus a
-// per-item resourceVersion (asserted MODULO: the informer's watch RV differs
-// from a fresh live-LIST item RV by construction).
+// per-item resourceVersion (asserted EQUAL: the informer preserves the item's
+// own RV verbatim at Put (bytesobject.go SetResourceVersion), so for a static
+// object it matches a fresh live-LIST item RV — RED_PerItemRVMismatch pins it.
+// Only the LIST-LEVEL RV is modulo, since streaming_list synthesizes it).
 func serve1aItem(idx int, name, ns string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": serve1aAPIVersion,
@@ -190,7 +192,7 @@ func serve1aItem(idx int, name, ns string) *unstructured.Unstructured {
 		"metadata": map[string]any{
 			"name":            name,
 			"namespace":       ns,
-			"resourceVersion": itoa(2000 + idx), // MODULO: informer watch-RV ≠ fresh live RV
+			"resourceVersion": itoa(2000 + idx), // asserted EQUAL (informer preserves per-item RV verbatim)
 			"labels":          map[string]any{"app.krateo.io/tier": "t" + itoa(idx%3)},
 			"annotations":     map[string]any{"app.krateo.io/note": "note-" + itoa(idx)},
 		},
@@ -632,6 +634,67 @@ func TestServe1a_NoServeWatcher_ByteIdenticalToPre1a(t *testing.T) {
 	if strings.Contains(logBuf.String(), `"msg":"internal_dispatch.list.informer_served"`) {
 		t.Fatal("SCOPE FAIL: informer_served fired WITHOUT a serve-watcher — the branch " +
 			"must be gated on the ctx watcher (customer path must not serve from informer)")
+	}
+}
+
+// TestServe1a_CustomerPath_Gate1EarlyReturn_NoInformerServe is the HARD scope
+// arm: it proves the informer-serve branch is unreachable on the customer path
+// even when a fully-servable watcher is GLOBALLY reachable (cache.Global()).
+// This is strictly stronger than NoServeWatcher_ByteIdenticalToPre1a (which
+// proves "no watcher in ctx → no serve"): here the watcher IS published as
+// cache.Global() and servable, so a branch that read the global (instead of
+// ctx) OR that ran before Gate 1 WOULD serve — the arm proves neither happens,
+// so the scoping is independent of handle-plumbing. (Grafted from a80cd96; the
+// serve branch here reads ServeWatcherFromContext ctx-only, so this pins that
+// the ctx-only contract holds AND that Gate 1 short-circuits the customer path.)
+func TestServe1a_CustomerPath_Gate1EarlyReturn_NoInformerServe(t *testing.T) {
+	resetInternalClientCacheForTest()
+	t.Cleanup(resetInternalClientCacheForTest)
+
+	// Publish a fully-servable GVR as cache.Global() — if the branch were
+	// customer-reachable it WOULD serve from it; the arm proves it does NOT
+	// because Gate 1 short-circuits first. SetGlobal is REQUIRED here (unlike
+	// the ctx-watcher arms which attach rw via ctx): without it cache.Global()
+	// is nil and the leak-probe RED would be vacuous (a leaked branch reading
+	// cache.Global() would find nil and not serve, hiding the leak). With the
+	// global published + servable, a leak past Gate 1 WOULD serve → the arm's
+	// served=false assertion fires. Verified discriminating: injecting an
+	// informer-serve above Gate 1 makes this arm FAIL.
+	const n = 8
+	items := make([]*unstructured.Unstructured, 0, n)
+	for i := 0; i < n; i++ {
+		items = append(items, serve1aItem(i, "composition-"+itoa(i), "bench-ns-"+itoa(i)))
+	}
+	rw := newServe1aWatcher(t, true, items...)
+	if !rw.IsServable(serve1aGVR) {
+		t.Fatalf("precondition: %s must be servable so the leak-probe RED is non-vacuous", serve1aGVR)
+	}
+	cache.SetGlobal(rw)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// CUSTOMER-SHAPED ctx: NO WithInternalRESTConfig (the per-user /call path).
+	ctx := withSlogLogger(context.Background(), logger)
+
+	raw, served, err := dispatchViaInternalRESTConfig(ctx, httpcall.RequestOptions{
+		RequestInfo: httpcall.RequestInfo{Path: serve1aListPath},
+	})
+	// Gate 1 early-return: (nil,false,nil).
+	if err != nil {
+		t.Fatalf("customer-path arm: expected nil err at Gate 1 early-return, got %v", err)
+	}
+	if served {
+		t.Fatal("SCOPE FAIL: dispatch served a customer-shaped ctx (no InternalRESTConfig) — " +
+			"the function must early-return at Gate 1 so the informer-serve branch is unreachable")
+	}
+	if raw != nil {
+		t.Fatalf("SCOPE FAIL: expected nil bytes at Gate 1 early-return, got %d bytes", len(raw))
+	}
+	if strings.Contains(logBuf.String(), `"msg":"internal_dispatch.list.informer_served"`) {
+		t.Fatal("SCOPE FAIL: informer_served fired for a customer-shaped ctx — the branch " +
+			"leaked past Gate 1 (customer path MUST NOT serve from informer)")
 	}
 }
 
