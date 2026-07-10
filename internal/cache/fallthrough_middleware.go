@@ -61,10 +61,11 @@ const (
 	ScopeNestedCall        = "nested-call"
 	ScopeResolverInnerCall = "resolver-inner-call"
 
-	// ScopeBootPrewarmWalk — Gate 1 (0.30.201-diag) DIAGNOSTIC scope.
-	// NOT a /call-class route: it is stamped on the Phase 1 prewarm
-	// discovery-walk context (phase1_walk.go withPhase1SAContext) so the
-	// existing RecordApiserverFallthrough calls on that path (KindFor at
+	// ScopeBootPrewarmWalk — Gate 1 (0.30.201-diag) diagnostic scope, now ALSO
+	// LOAD-BEARING for a behavioral gate (#42 Option-2). NOT a /call-class
+	// route: it is stamped on the Phase 1 prewarm discovery-walk context
+	// (phase1_walk.go withPhase1SAContext) so the existing
+	// RecordApiserverFallthrough calls on that path (KindFor at
 	// resourcesrefs/resolve.go, informer-not-synced/not-servable at
 	// informer_dispatch.go) become LIVE during boot and land in
 	// snowplow_apiserver_fallthrough_cells keyed
@@ -73,8 +74,31 @@ const (
 	// apiRef-resolved-but-empty) for the navmenu's boot children=0
 	// observation. It is NEVER registered as a route (RegisterScopedRoute
 	// is not called for it), so AssertReadPathsScoped's route-coverage
-	// check is unaffected. Diagnostic-only; removable with the gate.
+	// check is unaffected.
+	//
+	// #42 Option-2 — apiref.shouldServeRAFullList EXCLUDES this scope from the
+	// Ship-4a unpaginated first-sight (the discovery walk harvests only nav
+	// STRUCTURE, not composition DATA, so the 60K unpaginated materialization
+	// is pure waste that blows the PHASE1_TIMEOUT budget). Do NOT delete this
+	// stamp believing it diagnostic-only — removing it re-introduces the ~411s
+	// re-walk.
 	ScopeBootPrewarmWalk = "boot-prewarm-walk"
+
+	// ScopeBootPrewarmSeed — the per-cohort SEED context scope (#42 Option-2).
+	// The seed (seedScopeYielding) runs under the SAME rctx the discovery walk
+	// stamps ScopeBootPrewarmWalk on (rePrewarmBootScoped passes the walk-scoped
+	// rctx to seedScopeYielding), and withCohortSeedContext layers values via
+	// xcontext.BuildContext WITHOUT stripping the inherited scope. So the seed
+	// cohort ctx would otherwise INHERIT ScopeBootPrewarmWalk and be wrongly
+	// excluded from Ship-4a — but the seed's seedRAFullListForWidget resolve
+	// EXISTS precisely to engage raFullListServe and pin the per-cohort
+	// full-list cell (phase1_pip_seed.go:1237 "Resolve at a paginated tuple so
+	// apiref.Resolve engages raFullListServe"). withCohortSeedContext OVERRIDES
+	// the inherited walk scope with THIS seed scope (last WithValue on the chain
+	// wins) so shouldServeRAFullList — which excludes ONLY ScopeBootPrewarmWalk
+	// — lets the seed's paginated 4a serve through. NOT a route; diagnostic +
+	// gate-discriminator only.
+	ScopeBootPrewarmSeed = "boot-prewarm-seed"
 )
 
 // validScopeNames is the boot-time validation set used by
@@ -93,6 +117,7 @@ var validScopeNames = map[string]struct{}{
 	ScopeNestedCall:        {},
 	ScopeResolverInnerCall: {},
 	ScopeBootPrewarmWalk:   {},
+	ScopeBootPrewarmSeed:   {},
 }
 
 // routeScopeRegistry records the routes whose middleware chain has

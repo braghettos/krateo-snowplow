@@ -59,11 +59,15 @@ type FallthroughScopeData struct {
 	Path   string
 }
 
-// WithFallthroughScope stamps a `/call`-class scope marker onto ctx.
-// Called by the FallthroughScopeMiddleware in
-// internal/handlers/middleware/. Direct callers in production code
-// SHOULD NOT exist — the middleware is the single entry point so the
-// boot-time AssertReadPathsScoped can verify the wiring at startup.
+// WithFallthroughScope stamps a scope marker onto ctx. For `/call`-class
+// ROUTE scopes the FallthroughScopeMiddleware (internal/handlers/middleware/)
+// is the single entry point so boot-time AssertReadPathsScoped can verify the
+// route wiring. Two NON-route boot scopes are stamped directly in production —
+// ScopeBootPrewarmWalk (phase1_walk.go withPhase1SAContext) and
+// ScopeBootPrewarmSeed (phase1_pip_seed.go withCohortSeedContext); both are
+// diagnostic + gate-discriminator scopes that are never registered as routes,
+// so AssertReadPathsScoped (which iterates only the required ROUTE set) is
+// unaffected by them.
 //
 // Cache-toggle gate: when `cache.Disabled() == true`, returns the
 // parent ctx UNCHANGED. Cache=off mode makes every apiserver hop
