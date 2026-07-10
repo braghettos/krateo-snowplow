@@ -1027,17 +1027,25 @@ func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *res
 	// under CACHE_ENABLED=false → WithServeWatcher returns ctx unchanged →
 	// the live LIST runs as today).
 	rctx = cache.WithServeWatcher(rctx, cache.Global())
-	// Gate 1 (0.30.201-diag) — stamp the DIAGNOSTIC boot-prewarm-walk
-	// fallthrough scope so the existing RecordApiserverFallthrough calls
-	// on the discovery-walk path (KindFor at resourcesrefs/resolve.go,
-	// informer-not-synced/not-servable at informer_dispatch.go) become
-	// LIVE during boot and land in snowplow_apiserver_fallthrough_cells
-	// keyed "boot-prewarm-walk|<gvr>|<reason>". Without this the walk
-	// context carries no scope (fallthrough_ctx.go lists "Phase 1 walker"
-	// as a non-/call path) so those recorders no-op and the Gate-1
-	// sub-cause discrimination (discovery vs informer-sync vs
-	// resolved-but-empty) would be blind. Telemetry-only; no behaviour
-	// change (RecordApiserverFallthrough never short-circuits the walk).
+	// Gate 1 (0.30.201-diag) — stamp the boot-prewarm-walk fallthrough scope so
+	// the existing RecordApiserverFallthrough calls on the discovery-walk path
+	// (KindFor at resourcesrefs/resolve.go, informer-not-synced/not-servable at
+	// informer_dispatch.go) become LIVE during boot and land in
+	// snowplow_apiserver_fallthrough_cells keyed "boot-prewarm-walk|<gvr>|
+	// <reason>". Without this the walk context carries no scope
+	// (fallthrough_ctx.go lists "Phase 1 walker" as a non-/call path) so those
+	// recorders no-op and the Gate-1 sub-cause discrimination (discovery vs
+	// informer-sync vs resolved-but-empty) would be blind.
+	//
+	// #42 Option-2 — this scope is now ALSO LOAD-BEARING for a behavioral gate:
+	// apiref.shouldServeRAFullList EXCLUDES ScopeBootPrewarmWalk from the Ship-4a
+	// unpaginated first-sight (the discovery walk harvests only nav STRUCTURE,
+	// so the 60K unpaginated materialization is pure waste that blows the
+	// PHASE1_TIMEOUT budget). DO NOT delete this stamp believing it
+	// diagnostic-only — removing it re-introduces the ~411s re-walk. The
+	// per-cohort SEED runs under this same rctx but OVERRIDES the scope with
+	// ScopeBootPrewarmSeed (withCohortSeedContext) so its 4a full-list pin is
+	// preserved.
 	rctx = cache.WithFallthroughScope(rctx, cache.ScopeBootPrewarmWalk)
 	// Ship 0.30.127 — FORK B (deliberate, Diego-confirmed). The
 	// discovery walk does NOT mark its context cache.WithPrewarmIterSerial,

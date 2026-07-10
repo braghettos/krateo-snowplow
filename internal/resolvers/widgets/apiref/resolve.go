@@ -25,6 +25,56 @@ type ResolveOptions struct {
 	Extras  map[string]any
 }
 
+// shouldServeRAFullList is the SINGLE gate for the Ship-4a page-independent
+// RAFullList serve at the apiRef chokepoint (single-derivation site so the
+// decision is stated + tested once). It is true iff ALL hold:
+//
+//   - the request is PAGINATED (perPage>0 && page>0) — Ship 4a serves only a
+//     bounded page window from the shared full list; an unpaginated (0,0)
+//     resolve IS the first-sight that populates it and must not re-enter here;
+//   - the cache is ON (cache.ResolvedCacheEnabled()) — flag-off (CACHE_ENABLED
+//     =false) this is byte-identical to pre-4a (raFullListServe would decline
+//     anyway; short-circuiting here keeps the pre-4a path clean);
+//   - this resolve is NOT the boot prewarm DISCOVERY WALK.
+//
+// #42 Option-2 (boot-seed cold-dashboard enabler) — the last conjunct. The
+// discovery walk stamps ctx cache.WithFallthroughScope(ScopeBootPrewarmWalk)
+// (phase1_walk.go withPhase1SAContext — a plain context value that propagates
+// UNCHANGED into this nested apiRef resolve; the resolver packages never
+// re-stamp it). Ship-4a's
+// first-sight resolves the RA UNPAGINATED (resolveRA(fullCtx,0,0) at
+// ra_full_list.go:347) to establish the byte-verify sliceability verdict — which,
+// for the 60K-composition compositions-panel RA, is a whole-GVR materialization
+// (~22-28 s each, 4× per re-walk = ~411 s, blowing the PHASE1_TIMEOUT budget so
+// the per-cohort first-nav seed never starts in budget → the first-nav latch
+// never fires → per-cohort dashboard cells cold for the ~7 min backstop window).
+// The nav-STRUCTURE harvest needs ONLY the widget's bounded page-1
+// resourcesRefs.items[] (child nav endpoints), NOT composition DATA, and has no
+// use for a serve-time page-independent slice cache. Excluding it here falls
+// straight through to the bounded page-keyed resolveRA(ctx, PerPage, Page) in
+// Resolve (perPage=prewarmPageLimit()=5, page=1) — the composition GVR is LISTed
+// bounded/informer-served (the #121 1a branch), never a 60K materialization.
+//
+// SCOPE-PRECISE, NOT a resource/scale special-case (feedback_no_special_cases):
+// the exclusion reads the EXISTING generic discovery-walk scope marker, so ANY
+// GVR resolved by the discovery walk skips 4a first-sight (no benchapps/50K
+// literal). It is deliberately NARROWER than BackgroundResolveFromContext: a
+// per-user (foreground) /call never carries this scope AND the REFRESHER
+// (resolveOnceProd → WithBackgroundResolve, resolve_populate.go:367) is NOT
+// stamped ScopeBootPrewarmWalk, so the refresher's serve-time full-list re-pin is
+// UNTOUCHED — only the discovery walk (which has no use for the slice cache) is
+// suppressed. The serve-time slice cache is populated by the first real
+// foreground /call, exactly as before this change.
+func shouldServeRAFullList(ctx context.Context, perPage, page int) bool {
+	if perPage <= 0 || page <= 0 || !cache.ResolvedCacheEnabled() {
+		return false
+	}
+	if fs := cache.FallthroughScope(ctx); fs != nil && fs.Path == cache.ScopeBootPrewarmWalk {
+		return false
+	}
+	return true
+}
+
 func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	if opts.ApiRef.Name == "" || opts.ApiRef.Namespace == "" {
 		return map[string]any{}, nil
@@ -109,16 +159,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	}
 
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef
-	// chokepoint. Engaged ONLY when the cache is on AND the request is
-	// paginated (perPage>0 && page>0). On a hit / verified-sliceable shape it
-	// serves a cheap Go-slice over the cached full list, shared across pages
-	// AND widgets. On a miss / not-cleanly-sliceable shape it transparently
-	// falls back to today's page-keyed resolve below — NEVER a wrong result.
-	//
-	// Flag-off (CACHE_ENABLED=false → ResolvedCacheEnabled()=false) raFullListServe
-	// returns served=false on its first nil-cache check and this whole branch
-	// is byte-identical to pre-4a.
-	if opts.PerPage > 0 && opts.Page > 0 && cache.ResolvedCacheEnabled() {
+	// chokepoint. Engaged ONLY when shouldServeRAFullList (below) is true. On a
+	// hit / verified-sliceable shape it serves a cheap Go-slice over the cached
+	// full list, shared across pages AND widgets. On a miss / not-cleanly-
+	// sliceable shape it transparently falls back to today's page-keyed resolve
+	// below — NEVER a wrong result.
+	if shouldServeRAFullList(ctx, opts.PerPage, opts.Page) {
 		if served, ok, serr := raFullListServe(ctx, res.GVR, opts.ApiRef.Namespace,
 			opts.ApiRef.Name, &ra, opts.PerPage, opts.Page, opts.Extras, resolveRA); serr != nil {
 			return map[string]any{}, serr

@@ -438,6 +438,20 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 	rctx = cache.WithPrewarmIterSerial(rctx)
+	// #42 Option-2 — OVERRIDE the inherited discovery-walk scope with the SEED
+	// scope. rePrewarmBootScoped passes seedScopeYielding the SAME walk-scoped
+	// rctx (withPhase1SAContext stamped ScopeBootPrewarmWalk), and BuildContext
+	// above layers values without stripping it — so without this the seed cohort
+	// ctx would carry ScopeBootPrewarmWalk and apiref.shouldServeRAFullList would
+	// WRONGLY exclude the seed's seedRAFullListForWidget 4a serve (the resolve
+	// that EXISTS to pin the per-cohort full-list cell — the whole point of the
+	// seed). WithFallthroughScope is a plain WithValue, so this last stamp on the
+	// chain wins over the inherited walk scope. The seed scope is NOT
+	// ScopeBootPrewarmWalk, so the gate lets its paginated 4a serve through; the
+	// discovery walk (which never enters withCohortSeedContext) keeps the walk
+	// scope and stays excluded. Inert under cache-off (WithFallthroughScope
+	// returns ctx unchanged when Disabled(); the seed never runs cache-off).
+	rctx = cache.WithFallthroughScope(rctx, cache.ScopeBootPrewarmSeed)
 	return rctx
 }
 
