@@ -642,6 +642,28 @@ func setRefreshKeyHeader(wri http.ResponseWriter, key, class string) {
 	}
 }
 
+// setRefreshKeyHeaderUnlessExternal is the external-widget bounded-TTL cache
+// (Option A, 2026-07-10) arming-kill choke point. It stamps the refresh-key
+// header EXACTLY like setRefreshKeyHeader, EXCEPT when externalTTL is true, in
+// which case it stamps NOTHING — equivalent to passing an empty key.
+//
+// Why: an external-TTL entry has NO dep edges and never publishes (§6.3 of the
+// design), so arming a /refreshes subscription for its key is a wasted
+// subscription that can never fire. The subscription is armed browser-side on
+// seeing X-Snowplow-Refresh-Key; suppressing the header at the single serve
+// choke point (both the HIT branch and the cold Put tail) is the minimal kill
+// — it reuses setRefreshKeyHeader's existing key=="" no-op rather than adding a
+// class-skip that the subscription path would have to learn to ignore.
+//
+// externalTTL=false → byte-identical to setRefreshKeyHeader (C4). This is the
+// only difference from the plain helper, so a NON-external serve is unchanged.
+func setRefreshKeyHeaderUnlessExternal(wri http.ResponseWriter, key, class string, externalTTL bool) {
+	if externalTTL {
+		return
+	}
+	setRefreshKeyHeader(wri, key, class)
+}
+
 // writeResolvedJSON writes the canonical Content-Type + 200 + payload.
 // We deliberately do NOT log here on errors writing to the wire — a
 // client disconnect mid-write is normal and not actionable.

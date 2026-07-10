@@ -264,6 +264,25 @@ type ResolvedEntry struct {
 	// also folded into the metadata ttl-remaining projection. Set before
 	// Put; not mutated after.
 	TTLOverride time.Duration
+
+	// ExternalTTL — external-widget bounded-TTL cache (Option A,
+	// 2026-07-10). Set true ONLY on the external-TTL Put branch
+	// (widgets.go, the `krateo.io/external-cache-ttl-seconds` opt-in).
+	// Marks a bounded-staleness external entry that has NO dep edges and
+	// therefore MUST NOT arm a /refreshes subscription. It is read on the
+	// HIT-serve path to SUPPRESS the X-Snowplow-Refresh-Key header (the
+	// browser-side arming trigger) — the one runtime signal the HIT path
+	// has that the entry is external-TTL, since the context-scoped
+	// ExternalTouchedSink is gone by then (it lives only for the duration
+	// of a resolve, and a HIT does no resolve).
+	//
+	// Zero value (false) = a normal entry → today's behavior byte-
+	// identical (C4): the header stamps exactly as before. In-memory cache
+	// state ONLY — never wire-encoded (not part of RawJSON), so a rolling
+	// restart or feature-off deploy simply loses the marker and the entry
+	// TTL-evicts / re-resolves as a plain entry. Set before Put; not
+	// mutated after.
+	ExternalTTL bool
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set
