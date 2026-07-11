@@ -176,6 +176,19 @@ func TestFirstNavLatch_FiresBeforeTail_GreenAndMutationRed(t *testing.T) {
 	run := func(t *testing.T, mutateNeuterSegment bool) []latchSeedEvent {
 		resetFirstNavLatchForTest()
 		ensureFirstNavLatch() // build the process latch so seedScopeYielding can fire it
+		// #130 F3 cascade-harden (arch point 5): a FAILED arm previously left the
+		// process-global first-nav latch singleton armed/fired + the fire observer
+		// installed, poisoning the NEXT test in the package (the observed
+		// TestF5_RealCheckDispatchRBAC cascade). Reset the process-global seed
+		// state in t.Cleanup so a mid-seed Fatalf cannot leak it forward. (The
+		// observer is also cleared by installLatchFireObserver's own Cleanup; this
+		// is belt-and-suspenders + the latch/customer-in-flight reset the prior
+		// code only did at the NEXT run's start.)
+		t.Cleanup(func() {
+			resetFirstNavLatchForTest()
+			firstNavFireObserver = nil
+			zeroCustomerInFlight()
+		})
 
 		devs := eID{name: "devs", group: true, collapsed: 442}
 		ops := eID{name: "ops", group: true, collapsed: 5}
@@ -226,26 +239,63 @@ func TestFirstNavLatch_FiresBeforeTail_GreenAndMutationRed(t *testing.T) {
 		return rec.snapshot()
 	}
 
-	t.Run("green_fires_before_tail", func(t *testing.T) {
+	t.Run("green_fires_after_all_reachable_dashboards_before_last_tail", func(t *testing.T) {
+		// #130 F3 Lever 2 — the latch now waits for EVERY first-nav-reachable
+		// cohort's dashboard segment (devs AND ops), not just rank-0's. The
+		// invariant is re-expressed for the multi-cohort case (arch-ruled: the
+		// single-cohort "fire before ANY tail" is genuinely incompatible with
+		// "wait for all cohorts' dashboards" under the rank-major loop — reaching
+		// ops' dashboard requires traversing devs' full rank first, including devs'
+		// tail widget + devs' fanout RA. That interleaving is intended and
+		// unavoidable without a larger dashboard-first seed reorder, which is out
+		// of F3 scope). The load-bearing readyz-correctness properties that SURVIVE:
+		//   (1) fire AFTER both reachable cohorts' RootIndex==0 dashboards (Ready
+		//       does not flip until every login cohort's dashboard is warm), and
+		//   (2) fire BEFORE the LAST reachable cohort's (ops') tail widget + RA,
+		//       and before the filler-only RA (readyz does not wait on the LAST
+		//       cohort's non-dashboard tail — the whale-fanout the latch removes).
 		ev := run(t, false)
 		latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
-		dashIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.label == "dashboard-flex" && e.identity == "group:devs" })
-		tailWidgetIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.label == "estate-graph" })
-		raIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "restaction" })
+		devsDashIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
+			return e.class == "widget" && e.label == "dashboard-flex" && e.identity == "group:devs"
+		})
+		opsDashIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
+			return e.class == "widget" && e.label == "dashboard-flex" && e.identity == "group:ops"
+		})
+		opsTailWidgetIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
+			return e.class == "widget" && e.label == "estate-graph" && e.identity == "group:ops"
+		})
+		opsRAIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
+			return e.class == "restaction" && e.identity == "group:ops"
+		})
+		fillerRAIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
+			return e.class == "restaction" && e.identity == "user:filler"
+		})
 
 		if latchIdx == len(ev) {
 			t.Fatalf("F-C1: latch never fired; events=%+v", ev)
 		}
-		// Fire AFTER the rank-1 dashboard widget seeds (segment complete)...
-		if latchIdx < dashIdx {
-			t.Fatalf("F-C1: latch fired at idx %d BEFORE the rank-1 dashboard widget seeded at idx %d — ARM-COLD RED; events=%+v", latchIdx, dashIdx, ev)
+		// (1) fire AFTER BOTH reachable cohorts' dashboards — the Lever-2 core.
+		if devsDashIdx == len(ev) || opsDashIdx == len(ev) {
+			t.Fatalf("F3 Lever2 setup: both devs+ops dashboards must seed; devsDash=%d opsDash=%d events=%+v", devsDashIdx, opsDashIdx, ev)
 		}
-		// ...and BEFORE any tail work (RootIndex>0 widget + fanout RA) — ARM-TAIL.
-		if tailWidgetIdx < len(ev) && latchIdx > tailWidgetIdx {
-			t.Fatalf("F-C1/ARM-TAIL: latch fired at idx %d AFTER the NON-first-nav tail widget seeded at idx %d — readyz would wait on tail work; events=%+v", latchIdx, tailWidgetIdx, ev)
+		if latchIdx < devsDashIdx || latchIdx < opsDashIdx {
+			t.Fatalf("F3 Lever2 ARM-COLD: latch fired at idx %d BEFORE a reachable cohort's dashboard "+
+				"(devsDash=%d opsDash=%d) — readyz would flip with a login cohort's dashboard cold; events=%+v",
+				latchIdx, devsDashIdx, opsDashIdx, ev)
 		}
-		if raIdx < len(ev) && latchIdx > raIdx {
-			t.Fatalf("F-C1/ARM-TAIL: latch fired at idx %d AFTER the fanout restaction seeded at idx %d — readyz would wait on the RA tail; events=%+v", latchIdx, raIdx, ev)
+		// (2) fire BEFORE the LAST cohort's (ops') tail widget + ops' RA + the
+		//     filler-only RA — readyz does not wait on the last cohort's tail whale.
+		if opsTailWidgetIdx < len(ev) && latchIdx > opsTailWidgetIdx {
+			t.Fatalf("F3 Lever2 ARM-TAIL: latch fired at idx %d AFTER ops' NON-first-nav tail widget at idx %d "+
+				"— readyz would wait on the last cohort's tail; events=%+v", latchIdx, opsTailWidgetIdx, ev)
+		}
+		if opsRAIdx < len(ev) && latchIdx > opsRAIdx {
+			t.Fatalf("F3 Lever2 ARM-TAIL: latch fired at idx %d AFTER ops' fanout restaction at idx %d; events=%+v", latchIdx, opsRAIdx, ev)
+		}
+		if fillerRAIdx < len(ev) && latchIdx > fillerRAIdx {
+			t.Fatalf("F3 Lever2 ARM-TAIL: latch fired at idx %d AFTER the filler-only restaction at idx %d "+
+				"— readyz would wait on the RA-only tail; events=%+v", latchIdx, fillerRAIdx, ev)
 		}
 	})
 

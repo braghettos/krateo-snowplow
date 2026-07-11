@@ -48,11 +48,22 @@ import (
 )
 
 // l1LookupCell holds the hit + miss counters for one
-// (handlerKind, gvrString) pair.
+// (handlerKind, gvrString) pair. seedHit (#130 F3) counts the subset of
+// hits served from a boot-seeded cell (ResolvedEntry.SeededAtBoot) — the
+// seed-attribution observable answering "did the boot seed warm this cell".
 type l1LookupCell struct {
-	hit  atomic.Uint64
-	miss atomic.Uint64
+	hit     atomic.Uint64
+	miss    atomic.Uint64
+	seedHit atomic.Uint64
 }
+
+// hitsSeedAttributable is the process-wide aggregate of resolved-cache hits
+// served from a boot-seeded cell (#130 F3). Published as
+// snowplow_resolved_cache_hits_seed_attributable so acceptance can read ONE
+// number ("the seed warmed >0 browser-hittable cells") without summing the
+// per-(handler,gvr) cells, and every future boot reports it as the standing
+// seed-reachability probe (design §9).
+var hitsSeedAttributable atomic.Uint64
 
 // l1LookupCells is the sync.Map keyed by "<handlerKind>|<gvrString>"
 // → *l1LookupCell. Lazily populated on first observation; never
@@ -68,7 +79,10 @@ var l1LookupCells sync.Map
 // LoadOrStore pattern matches phase1_pip_metrics.go's
 // incFailureCounter so a concurrent first-observation from N workers
 // converges on one cell.
-func recordL1Lookup(handlerKind, gvrString string, hit bool) {
+// #130 F3: seededAtBoot is meaningful only when hit==true (the hit entry's
+// ResolvedEntry.SeededAtBoot). On a miss it is ignored. A seed-attributable
+// hit bumps BOTH the per-cell seedHit counter and the process-wide aggregate.
+func recordL1Lookup(handlerKind, gvrString string, hit, seededAtBoot bool) {
 	if handlerKind == "" {
 		return
 	}
@@ -86,6 +100,10 @@ func recordL1Lookup(handlerKind, gvrString string, hit bool) {
 	c := cell.(*l1LookupCell)
 	if hit {
 		c.hit.Add(1)
+		if seededAtBoot {
+			c.seedHit.Add(1)
+			hitsSeedAttributable.Add(1)
+		}
 	} else {
 		c.miss.Add(1)
 	}
@@ -122,12 +140,18 @@ func registerL1LookupMetrics() {
 					return true
 				}
 				out[ks] = map[string]uint64{
-					"hit_total":  cell.hit.Load(),
-					"miss_total": cell.miss.Load(),
+					"hit_total":      cell.hit.Load(),
+					"miss_total":     cell.miss.Load(),
+					"seed_hit_total": cell.seedHit.Load(),
 				}
 				return true
 			})
 			return out
+		}))
+		// #130 F3: the process-wide seed-attributable aggregate — one scalar
+		// answering "did the boot seed warm any browser-hittable cell".
+		expvar.Publish("snowplow_resolved_cache_hits_seed_attributable", expvar.Func(func() any {
+			return hitsSeedAttributable.Load()
 		}))
 	})
 }

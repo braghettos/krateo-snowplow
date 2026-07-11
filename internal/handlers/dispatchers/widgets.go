@@ -192,7 +192,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					cache.RecordApiserverFallthrough(req.Context(),
 						cache.ReasonWidgetContentHit, got.GVR.String())
 					emitResolvedCacheLookup(log, "widgetContent", got.GVR.String(),
-						contentKey, true, len(gated))
+						contentKey, true, entry.SeededAtBoot, len(gated))
 					pcs.l1Hit = "content-hit"
 					setRefreshKeyHeader(wri, contentKey, "widgetContent")
 					writeResolvedJSON(wri, gated)
@@ -239,7 +239,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// populate-side skip; uniform predicate (serveFromCacheEligible, helpers.go).
 	if cacheHandle != nil && serveFromCacheEligible(cacheInputs) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
-			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, len(entry.RawJSON))
+			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
 			setRefreshKeyHeader(wri, cacheKey, "widgets")
 			writeResolvedJSON(wri, entry.RawJSON)
@@ -249,7 +249,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			)
 			return
 		}
-		emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, false, 0)
+		emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, false, false, 0)
 		pcs.l1Hit = "miss"
 	}
 

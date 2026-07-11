@@ -722,8 +722,9 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
 	handle.Put(key, &cache.ResolvedEntry{
-		RawJSON: encoded,
-		Inputs:  inputs,
+		RawJSON:      encoded,
+		Inputs:       inputs,
+		SeededAtBoot: true, // #130 F3 seed-attribution: this cell was warmed by the boot seed
 	})
 	// counters-hygiene 2026-07-04: this success Put is a seed UNIT resolved +
 	// written to per-user L1 — the real meaning of
@@ -930,8 +931,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	}
 
 	handle.Put(key, &cache.ResolvedEntry{
-		RawJSON: encoded,
-		Inputs:  inputs,
+		RawJSON:      encoded,
+		Inputs:       inputs,
+		SeededAtBoot: true, // #130 F3 seed-attribution: this cell was warmed by the boot seed
 	})
 	// counters-hygiene 2026-07-04 — see seedOneRestaction: this success Put is
 	// a seed UNIT resolved+written; wired so snowplow_phase1_bindingset_seed_resolves_total

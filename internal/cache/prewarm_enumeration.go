@@ -171,6 +171,38 @@ func EnumeratePrewarmTargetsForGVR(gvr schema.GroupVersionResource, verb string)
 		// match_subject.go (the SOT for binding-identity primitives);
 		// it picks the first non-empty User/Group/SA subject.
 		//
+		// #130 F3 (Diego directive 2026-07-11) — EXCLUDE ServiceAccount-only
+		// bindings from the seed target set. A binding whose subject set contains
+		// ZERO User and ZERO Group subjects (i.e. every subject is a
+		// ServiceAccount) is a machine/controller cohort that never renders the
+		// frontend; seeding it starved the login cohorts (admins) out of the boot
+		// budget. Skipping it here removes it from EVERY seed class (widgets, RAs,
+		// proactive_ra_seed) in ONE insertion.
+		//
+		// PREDICATE = the whole SUBJECT SET, NOT the picked representative's kind.
+		// pickRepresentativeFromSubjectKeys is first-non-empty-by-slice-order (NOT
+		// kind-priority), so a MIXED binding [SA-first, Group-second] would pick
+		// the SA as representative even though a Group subject exists — gating on
+		// the winner's kind would WRONGLY drop that login-cohort binding (arch-
+		// caught latent bug). allSubjectsAreServiceAccountKind is independent of
+		// pickRepresentative: it excludes ONLY when no User/Group subject exists
+		// at all, so a mixed binding is always KEPT.
+		//
+		// Subject-KIND discriminator (subjectKey.Kind from subjectsFromRBAC), not
+		// a name allowlist: `system:masters` is a GROUP subject and is correctly
+		// KEPT despite the system: name (feedback_no_special_cases).
+		//
+		// NEVER-WORSE (serve unaffected): this touches ONLY the boot SEED target
+		// set. An excluded SA that issues a real /call (loopback, controllers,
+		// portals SA) still resolves per-user through the normal dispatch +
+		// EvaluateRBAC path and its cell cold-fills on first request
+		// (hit_source:"traffic"). The #57 snowplow loopback SA is a seed MECHANISM
+		// identity (it runs the seed), never itself a seed TARGET in this index, so
+		// this exclusion does not touch it.
+		if allSubjectsAreServiceAccountKind(entry.subjects) {
+			continue
+		}
+
 		// The bindingEntry's subjects slice was projected at enrol
 		// time (subjectsFromRBAC) to a []subjectKey; reconstitute a
 		// minimal rbacv1.Subject slice so we can re-use the SOT helper
@@ -259,4 +291,33 @@ func pickRepresentativeFromSubjectKeys(subjects []subjectKey) SubjectIdentity {
 		})
 	}
 	return pickRepresentativeFromSubjects(retyped)
+}
+
+// allSubjectsAreServiceAccountKind reports whether a binding's projected
+// subject set is NON-EMPTY and consists ENTIRELY of ServiceAccount-kind
+// subjects — i.e. it has zero User and zero Group subjects. This is the #130 F3
+// seed-exclusion predicate (Diego directive 2026-07-11): such a binding is a
+// machine/controller cohort that never renders the frontend, so it is dropped
+// from the boot seed target set.
+//
+// It is deliberately a SET predicate (not "the representative's kind"):
+// pickRepresentativeFromSubjects is first-non-empty-by-slice-order, so a mixed
+// [SA, Group] binding would pick the SA as representative — but it MUST still be
+// seeded (it grants a Group login cohort). Returning false whenever ANY User or
+// Group subject is present guarantees a mixed binding is never excluded.
+//
+// Empty set → false (nothing to exclude on; the caller's rep would be the empty
+// identity anyway). subjectsFromRBAC only projects User/Group/SA kinds, so an
+// unknown-kind-only binding projects to an empty set → false → kept (harmless;
+// it dedups to the empty representative as today).
+func allSubjectsAreServiceAccountKind(subjects []subjectKey) bool {
+	if len(subjects) == 0 {
+		return false
+	}
+	for _, s := range subjects {
+		if s.Kind != rbacv1.ServiceAccountKind {
+			return false
+		}
+	}
+	return true
 }

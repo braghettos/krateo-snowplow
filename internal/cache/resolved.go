@@ -194,6 +194,19 @@ type ResolvedEntry struct {
 	RawJSON   []byte    // pre-encoded resolver output, ready to write
 	CreatedAt time.Time // for TTL eviction
 
+	// SeededAtBoot marks an entry written by the Phase-1 boot seed
+	// (seedOneWidget / seedOneRestaction Put), as opposed to a real
+	// user-/call resolve. #130 F3 seed-attribution observable: the
+	// resolved_cache.lookup hit path reads this to tag hit_source
+	// "seed" vs "traffic" and increment hits_seed_attributable, so
+	// "did the boot seed warm this cell" is answerable without forensics.
+	// Boolean provenance ONLY — carries no per-user data, so it is
+	// leak-safe. A refresher/traffic re-Put of the same key overwrites the
+	// entry with SeededAtBoot=false (the natural zero value), correctly
+	// re-classifying the cell as traffic-warmed once real traffic replaces
+	// the seed. Purely additive: legacy entries default false = "traffic".
+	SeededAtBoot bool
+
 	// Inputs is the canonical key-input bundle the entry was resolved
 	// from. The refresher uses it to drive a re-resolve when an
 	// UPDATE/PATCH event fires for any of this entry's dep tuples.
