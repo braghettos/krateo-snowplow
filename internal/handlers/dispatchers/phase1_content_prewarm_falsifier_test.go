@@ -148,6 +148,85 @@ func TestFAL_ContentPrewarmSAContext_Markers(t *testing.T) {
 	}
 }
 
+// TestFAL_F2_ContentPrewarmSAContext_AttachesServeWatcher is the #130 F2
+// HEADLINE hermetic falsifier (C-F2-1): withContentPrewarmSAContext MUST attach
+// cache.WithServeWatcher(rctx, cache.Global()) so the content pass's inner LIST
+// calls reach the internal-dispatch informer-serve branch
+// (internal_dispatch.go:380 `ServeWatcherFromContext(ctx); haveRW`) instead of a
+// live paged apiserver LIST (the 3× residual benchapps LISTs traced in 1.7.5).
+//
+// The arm publishes a NON-NIL cache.Global() first — WithServeWatcher no-ops on
+// a nil rw, so without a published global the attachment (and this assertion)
+// would be vacuous. With the global published, the content ctx MUST carry that
+// exact watcher.
+//
+// RED (remove the `rctx = cache.WithServeWatcher(rctx, cache.Global())` line):
+// ServeWatcherFromContext(contentCtx) returns haveRW=false → the content
+// pass's LIST takes the live paged LIST (the pre-F2 behavior). Positive control:
+// the discovery walk's withPhase1SAContext has ALWAYS carried the watcher
+// (phase1_walk.go:1029), so this arm also asserts the walk ctx carries it —
+// proving the content ctx now MATCHES the walk (the F2 parity).
+func TestFAL_F2_ContentPrewarmSAContext_AttachesServeWatcher(t *testing.T) {
+	// Publish a non-nil global so WithServeWatcher(ctx, cache.Global()) actually
+	// attaches (it no-ops on nil rw — see cache.WithServeWatcher). Without this
+	// the GREEN assertion would be vacuously satisfiable and the RED non-
+	// discriminating. phase1TestWatcher builds a cache=on watcher (RBAC GVRs
+	// eager-registered) — reused from phase1_walk_test.go.
+	rw := phase1TestWatcher(t)
+	cache.SetGlobal(rw)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	saEP := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc"}
+	contentCtx := withContentPrewarmSAContext(context.Background(), saEP, nil)
+
+	gotRW, haveRW := cache.ServeWatcherFromContext(contentCtx)
+	if !haveRW {
+		t.Fatalf("F2 C-F2-1: content-prewarm ctx MUST carry a serve-watcher " +
+			"(cache.WithServeWatcher) — without it the internal-dispatch informer-serve " +
+			"branch is never entered and the content pass's benchapps LIST takes the live " +
+			"paged apiserver LIST (the 3× residual). This is the RED signature of removing " +
+			"the WithServeWatcher line.")
+	}
+	if gotRW != rw {
+		t.Fatalf("F2: content-prewarm ctx carries a DIFFERENT watcher than cache.Global() "+
+			"— must attach cache.Global() exactly; got %p want %p", gotRW, rw)
+	}
+
+	// Positive control / parity: the discovery walk ctx has always carried the
+	// watcher; the content ctx now matches it. If the walk ctx somehow lost it,
+	// the "parity with the walk" claim would be false.
+	walkCtx := withPhase1SAContext(context.Background(), saEP, nil)
+	if _, walkHasRW := cache.ServeWatcherFromContext(walkCtx); !walkHasRW {
+		t.Fatalf("F2 parity control: the discovery-walk ctx (withPhase1SAContext) must carry " +
+			"the serve-watcher (phase1_walk.go:1029) — the F2 fix brings the content ctx to " +
+			"the SAME state, so this control must hold")
+	}
+}
+
+// TestFAL_F2_ContentPrewarmSAContext_NilGlobalIsSafe proves the flag-off / no-
+// consumer path: with cache.Global()==nil (CACHE_ENABLED=false) the content ctx
+// is built WITHOUT a serve-watcher (WithServeWatcher no-ops on nil rw) and does
+// not panic — byte-identical to pre-F2 flag-off behavior (the live LIST runs as
+// today because the serve branch is never entered).
+func TestFAL_F2_ContentPrewarmSAContext_NilGlobalIsSafe(t *testing.T) {
+	cache.SetGlobal(nil)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	saEP := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc"}
+	contentCtx := withContentPrewarmSAContext(context.Background(), saEP, nil)
+
+	if _, haveRW := cache.ServeWatcherFromContext(contentCtx); haveRW {
+		t.Fatalf("F2 nil-safe: with cache.Global()==nil the content ctx must NOT carry a " +
+			"serve-watcher (WithServeWatcher no-ops on nil rw) — flag-off must be byte-identical " +
+			"to pre-F2")
+	}
+	// The other markers must still be set (nil global must not perturb them).
+	if !cache.ApistagePrewarmFromContext(contentCtx) || !cache.PrewarmIterSerialFromContext(contentCtx) {
+		t.Fatalf("F2 nil-safe: the ApistagePrewarm + PrewarmIterSerial markers must survive " +
+			"the nil-global path unchanged")
+	}
+}
+
 // TestFAL_ContrastPhase1SAContext confirms the DELIBERATE difference vs
 // the discovery walk's context: withPhase1SAContext does NOT set the
 // content-prewarm markers. Fork B (0.30.127): the discovery walk runs at

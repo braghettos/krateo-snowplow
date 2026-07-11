@@ -220,6 +220,21 @@ func withContentPrewarmSAContext(ctx context.Context, saEP endpoints.Endpoint, s
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 	rctx = cache.WithApistagePrewarm(rctx)   // populate content L1, skip the per-user gate
 	rctx = cache.WithPrewarmIterSerial(rctx) // OOM mitigation 2 / Fork B serial — serial inner-call fan-out
+	// #130 F2 — attach the shared watcher so the content pass's inner LIST calls
+	// (dispatchViaInternalRESTConfig, resolve.go:849) serve a servable GVR's LIST
+	// from the synced informer indexer instead of a live ~23s/60K paged apiserver
+	// LIST. BYTE-IDENTICAL to the discovery walk's withPhase1SAContext
+	// (phase1_walk.go:1029): without it the internal-dispatch informer-serve branch
+	// (internal_dispatch.go:380, `ServeWatcherFromContext(ctx); haveRW`) is never
+	// entered, so the content-prewarm benchapps LIST always took the live paged
+	// LIST (the 3× residual traced in boot-1.7.5-t0.log). ctx is rebuilt from
+	// scratch above (xcontext.BuildContext), so the watcher cannot be inherited
+	// from the caller — it MUST be attached here. PREWARM-SCOPED: only this SA
+	// content context carries it; per-user /call never does, so the customer
+	// dispatch path is byte-identical. nil-safe (cache.Global() may be nil under
+	// CACHE_ENABLED=false → WithServeWatcher returns ctx unchanged → the live LIST
+	// runs as today).
+	rctx = cache.WithServeWatcher(rctx, cache.Global())
 	return rctx
 }
 
