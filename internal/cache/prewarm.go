@@ -25,47 +25,44 @@
 // place (the same anchor the inventory walker already uses) — that is
 // the bare meta-query seed, not a per-resource policy.
 //
-// GATED DEFAULT-OFF — PREWARM_REGISTER_ENABLED (main.go). This walk does
-// NOT run unless PREWARM_REGISTER_ENABLED=true. The gate exists because
-// a startup GVR-walk RE-ARMS multiple documented regressions while the
-// pivot consumer is off:
+// IMPLICIT-ON under CACHE_ENABLED (#130 1.7.5) — resolved by
+// resolvePrewarmRegisterDefault (main.go): the walk runs by default
+// whenever the cache subsystem is on; only an explicit
+// PREWARM_REGISTER_ENABLED=false opts out. This inverts the pre-1.7.5
+// default-OFF gate. The inversion is safe because the historical
+// default-OFF rationale was TRACED to be inaccurate:
 //
-//   - No-consumer apiserver pressure (0.30.6 / 0.30.61). When the
-//     resolver pivot is inactive (historically RESOLVER_USE_INFORMER OFF;
-//     post-#57 the pivot is implicit-on-cache, so "inactive" == cache
-//     off) the resolver pivot does not read from these informers. Each
-//     EnsureResourceType the walk fires
-//     lands in the post-Start late-registration branch and immediately
-//     spawns a LIST+WATCH against the apiserver — N informers nobody
-//     reads. The 0.30.61 feature-journal entry recorded exactly this:
-//     "no consumer reads from the eagerly-registered informers ...
-//     eager-register = pure apiserver overhead", and that is why
-//     EAGER_REGISTER_ENABLED was reverted to default-OFF.
+//   - The walk registers ONLY the STATIC (non-JQ-templated) inventory
+//     GVR subset. CollectResourceTypesFromRestActions derives GVRs from
+//     spec.api[*].path via ParseAPIServerPathToGVR, which REJECTS any
+//     path carrying an unresolved `${...}` JQ template (inventory.go:171).
+//     Every composition.krateo.io path is JQ-templated, so the walk
+//     CANNOT register composition GVRs — the walk's set is the trivial
+//     static/CRD-meta class, NOT the "same 58 GVRs" earlier comments
+//     claimed. (The lazy dispatch path evaluates the JQ and derives the
+//     composition GVR at request time; the eager walk cannot.)
 //
-//   - OOM-at-50K (0.30.8 rev 104, 0.30.92), UNMITIGATED. Composition
-//     GVRs (~50K objects at production scale) take the FULL-Unstructured
-//     informer, not the §0.30.93 metadata-only PartialObjectMetadata
-//     path: `metadataOnlyGVRSeed` is empty (`[]gvrPattern{}`) and
-//     customer core-provider CRDs are not annotated
-//     `krateo.io/cache-mode: metadata`, so `shouldUseMetadataOnly`
-//     returns false for them. A startup walk that registers those GVRs
-//     up front incurs the same RSS burst the OOM post-mortems recorded.
+//   - OOM-at-50K is NOT re-armed by this flag. The composition informers
+//     (the OOM-relevant mass) are registered LAZILY via the resolver
+//     inner-call DiscoverGroupResources / EnsureResourceType hook
+//     (resolve.go) REGARDLESS of PREWARM_REGISTER_ENABLED. Flipping this
+//     flag neither adds nor removes composition informers, so it does not
+//     touch the 0.30.8/0.30.92 RSS surface at all.
+//
+//   - The 0.30.6/0.30.61 "no consumer reads the eagerly-registered
+//     informers = pure apiserver overhead" note is OBSOLETE. Consumers
+//     now exist: the #130 F1 confirm-prime batch (below) makes the
+//     walk-registered GVRs conjunct-4 servable, the informer-serve branch
+//     reads them, and the Phase 1 seed replays navigation against them
+//     (#57: the pivot is implicit-on-cache; there is no separate
+//     RESOLVER_USE_INFORMER flag).
 //
 // FIRE-AND-FORGET (the distinction from EagerRegisterAll): the walk
 // calls EnsureResourceType per GVR and returns immediately — it does NOT
 // WaitForCacheSync over the inventory. Each informer's initial LIST runs
 // asynchronously on its own goroutine (the standard EnsureResourceType
-// late-registration branch). So the walk does not add the blocking
-// bulk-sync startup-latency burst EagerRegisterAll has — but
-// fire-and-forget removes ONLY the blocking-sync mode; it does NOT
-// remove the no-consumer apiserver-QPS or the OOM modes above. That is
-// why the gate, not fire-and-forget alone, is the safety mechanism.
-//
-// Promotion to default-ON requires a PREWARM_REGISTER_ENABLED=true bench
-// at 50K scale measuring apiserver QPS + RSS-under-load, run with the
-// cache subsystem on (CACHE_ENABLED=true) so the resolver pivot consumer
-// is actually present (#57: the pivot is implicit-on-cache — there is no
-// longer a separate RESOLVER_USE_INFORMER flag to set).
+// late-registration branch), so the walk adds no blocking bulk-sync
+// startup-latency burst.
 
 package cache
 

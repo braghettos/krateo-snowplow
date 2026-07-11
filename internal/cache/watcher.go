@@ -677,6 +677,11 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 			slog.String("reason", metadataOnlyReason(gvr)),
 			slog.String("hint", "PartialObjectMetadata informer — ~10x smaller than full Unstructured; DepTracker preserved"),
 		)
+		// Fix #130 F1b: prime conjunct-4 (typeConfirmed) for the GVR this call
+		// just lazily registered so the NEXT dispatch serves from the informer
+		// rather than falling through to a live LIST. Async + skip-guarded; runs
+		// after this critical section releases rw.mu. See primeConfirmAsyncLocked.
+		rw.primeConfirmAsyncLocked(gvr)
 		return true, ch
 	}
 	// Soft-fail observability: if the predicate WOULD have routed
@@ -711,6 +716,14 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 		slog.String("path", "full-unstructured"),
 		slog.String("hint", "first resolver touch — informer registered + dep-tracker handlers wired"),
 	)
+
+	// Fix #130 F1b: prime conjunct-4 (typeConfirmed) for the GVR this call just
+	// lazily registered so the NEXT dispatch serves from the informer rather
+	// than falling through to a live LIST (the 23s benchapps 60K-item boot-walk
+	// fall-through the 1.7.3/1.7.4 serve_miss readout showed). Async +
+	// skip-guarded; runs after this critical section releases rw.mu. See
+	// primeConfirmAsyncLocked.
+	rw.primeConfirmAsyncLocked(gvr)
 
 	return true, ch
 }
@@ -898,6 +911,103 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 		defer rw.goroutineWG.Done()
 		waitInformerSync(hasSynced, ch, stop)
 	}(gi.Informer().HasSynced)
+}
+
+// primeConfirmAsyncLocked schedules a one-shot conjunct-4 (typeConfirmed)
+// confirm-prime for a GVR that was JUST lazily registered by
+// EnsureResourceType / EnsureResourceTypeMetadataOnly. Callers MUST hold
+// rw.mu.Lock() (both EnsureResourceType success paths do, via their deferred
+// unlock).
+//
+// # Why this exists (Fix #130 F1b — the REACHABILITY close)
+//
+// F1 (1.7.4) wired the approved confirm-prime (ConfirmResourceTypes) onto the
+// discovery-walk register path (PrewarmRegisterFromNavigation) — but that walk
+// is gated behind PREWARM_REGISTER_ENABLED, default OFF, so under the DEPLOYED
+// default config it never runs and F1's on-deploy deltas were all zero. The
+// registration path the default binary ACTUALLY runs is lazy registration:
+// EnsureResourceType, reached from the dispatch seams (informer_dispatch.go,
+// internal_dispatch.go via the walk-era GVRs). The 1.7.3/1.7.4 boot logs showed
+// every lazily-registered GVR (incl. benchapps) latch
+// {Registered:true HasSynced:true WatchHealthy:true TypeConfirmed:false} and
+// fall through to the 23s live 60K LIST — conjunct 4 (typeConfirmed) was the
+// sole universal blocker of informer-serve at boot. Priming confirm HERE, at
+// the lazy-register success path, makes the F1 mechanism runtime-reachable with
+// NO env flag on the call chain. Precedent: the Gate-6 dispatch path already
+// primes ConfirmResourceType on ITS register (informer_dispatch.go, added &&
+// name==""); this generalises that prime to the register site itself so it is
+// independent of the dispatch's added/name gating.
+//
+// # Async, not sync (deadlock + no-stall — architect-settled)
+//
+// ConfirmResourceType issues a blocking discovery round-trip
+// (ServerResourcesForGroupVersion) and then RE-ACQUIRES rw.mu to write
+// rw.confirmed. Calling it inline here would (a) DEADLOCK — the caller holds
+// rw.mu.Lock() — and (b) even if the lock were re-entrant, serialise every
+// other dispatch behind a ~10ms network call held under the writer lock
+// (F-no-stall). So the prime is dispatched on a watcher-owned goroutine that
+// runs AFTER this critical section releases the lock. It uses a background
+// context (independent of the registering caller's request ctx, which may be
+// cancelled the instant the dispatch falls through) bounded by rw.stopCh so it
+// cannot outlive Stop().
+//
+// # Skip-if-already-confirmed guard (cost bound)
+//
+// The prime is skipped when gvr is ALREADY confirmed (rw.confirmed has the key)
+// — a re-registration of a confirmed GVR pays zero discovery calls. It is also
+// a no-op when no discovery client is wired (rw.disco == nil): conjunct 4 is
+// degraded-true in that mode (resourceTypeConfirmedLocked returns true), so
+// there is nothing to fetch — the offline degrade is preserved byte-identically.
+// Net cost bound: at most ONE discovery round-trip per GVR over the process
+// lifetime of lazy registration (a GVR registers-lazily once; a re-register
+// after CRD delete+recreate is the intended re-confirm, not waste).
+//
+// The FIRST dispatch after a lazy register is exactly the one we want to serve;
+// ~10ms of async discovery beats a 23s live-LIST fall-through, and because the
+// confirm runs off the register path's lock it never stalls unrelated
+// dispatches.
+func (rw *ResourceWatcher) primeConfirmAsyncLocked(gvr schema.GroupVersionResource) {
+	// Skip-guard 1 — offline degrade preserved: with no discovery client,
+	// conjunct 4 is degraded-true and there is nothing to confirm. Bail before
+	// spawning a goroutine that would immediately no-op inside ConfirmResourceType.
+	if rw.disco == nil {
+		return
+	}
+	// Skip-guard 2 — already confirmed: a re-registration of a GVR that is
+	// already conjunct-4 confirmed pays no discovery call. rw.confirmed may be
+	// nil (never allocated) — a nil-map read is a safe miss.
+	if _, ok := rw.confirmed[gvr]; ok {
+		return
+	}
+	// Respect shutdown ordering (Task #85): the stopRequestedLocked() check
+	// under rw.mu keeps goroutineWG.Add ordered before Stop's Wait, so we never
+	// Add after Stop has begun draining.
+	if rw.stopRequestedLocked() {
+		return
+	}
+	rw.goroutineWG.Add(1)
+	go func() {
+		defer rw.goroutineWG.Done()
+		// Background context: the registering caller's request ctx may be
+		// cancelled the moment its dispatch falls through, but the prime must
+		// still land so the NEXT dispatch of this GVR serves from the informer.
+		// ConfirmResourceType is itself ctx-cancel and passthrough/nil safe; it
+		// does the discovery call OFF rw.mu then re-locks to write rw.confirmed.
+		bgCtx := context.Background()
+		// Bound teardown: if Stop() has closed stopCh, abandon the prime rather
+		// than issue a discovery call against a client that may be tearing down.
+		select {
+		case <-rw.stopCh:
+			return
+		default:
+		}
+		rw.ConfirmResourceType(bgCtx, gvr)
+		slog.Info("cache.lazy_register.confirm_primed",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("hint", "Fix #130 F1b — primed conjunct-4 typeConfirmed at the default-config lazy-register seam so the next dispatch serves from the informer instead of a live LIST fall-through"),
+		)
+	}()
 }
 
 // EnsureResourceTypeMetadataOnly is the explicit, signature-preserving

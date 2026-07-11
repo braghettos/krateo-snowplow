@@ -283,14 +283,20 @@ func TestFalsifierHealB_PreFixControl_NotServableNoEviction(t *testing.T) {
 		rw.Stop()
 		time.Sleep(50 * time.Millisecond)
 	})
-	rw.SetDiscoveryClient(healBDiscovery{})
-
+	// #130 F1b: register BEFORE wiring the discovery client so the
+	// lazy-register auto-prime short-circuits (disco==nil guard) and the
+	// "registered + synced but UNCONFIRMED" pre-fix control below is
+	// establishable by hand. This arm NEVER calls ConfirmResourceType — its
+	// whole point is that the latch persists without a confirm — so the
+	// auto-prime, which would confirm it, must be prevented from running by the
+	// disco==nil-at-register condition.
 	_, syncCh := rw.EnsureResourceType(healBSecretsGVR)
 	select {
 	case <-syncCh:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("informer did not sync within 5s")
 	}
+	rw.SetDiscoveryClient(healBDiscovery{})
 
 	// PRE-FIX: do NOT call ConfirmResourceType. The GVR is registered +
 	// synced but UNCONFIRMED → not-servable (the latched state).

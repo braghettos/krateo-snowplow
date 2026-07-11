@@ -666,45 +666,45 @@ func main() {
 						// gate in watcher.AddResourceType).
 						w.MarkEagerSet([]schema.GroupVersionResource{})
 
-						// 0.30.99 Tag B — startup navigation GVR-walk,
-						// gated behind PREWARM_REGISTER_ENABLED (default
-						// OFF, mirrors EAGER_REGISTER_ENABLED). Not in the
-						// chart configmap — absent ⇒ OFF, so Tag B is
-						// chart-change-free and behavior-neutral for
-						// production.
+						// 0.30.99 Tag B — startup navigation GVR-walk.
 						//
-						// Why default OFF (architect REJECT of default-on,
-						// adjudicated): when the resolver pivot is inactive
-						// (historically RESOLVER_USE_INFORMER OFF; post-#57
-						// the pivot is implicit-on-cache, so "inactive" ==
-						// cache off) the resolver pivot does NOT consume the
-						// informers a startup walk would register. A walk
-						// would register N informers nobody reads — each
-						// EnsureResourceType lands in the post-Start branch
-						// and immediately spawns a LIST+WATCH against
-						// apiserver. That is the exact "pure apiserver
-						// pressure, no consumer" regression the 0.30.6 /
-						// 0.30.61 post-mortems reverted (feature journal
-						// 0.30.61: "no consumer reads from the eagerly-
-						// registered informers ... eager-register = pure
-						// apiserver overhead"). The 0.30.8 (rev 104) and
-						// 0.30.92 OOM-at-50K modes are also unmitigated:
-						// composition GVRs route to the FULL-Unstructured
-						// informer because metadataOnlyGVRSeed is empty and
-						// customer core-provider CRDs are not annotated
-						// krateo.io/cache-mode: metadata.
+						// #130 1.7.5 — IMPLICIT-ON under CACHE_ENABLED. We are
+						// inside the !cache.Disabled() branch, so the cache
+						// subsystem is on and the walk now runs by DEFAULT here;
+						// only an explicit PREWARM_REGISTER_ENABLED=false opts
+						// out (emergency lever). This INVERTS the pre-1.7.5
+						// default-OFF gate. resolvePrewarmRegisterDefault encodes
+						// the contract (unset/"true"/other => ON, "false" => OFF)
+						// and is unit-tested. Not in the chart configmap: absent
+						// now means ON (was OFF).
 						//
-						// Promotion to ON-by-default requires a
-						// PREWARM_REGISTER_ENABLED=true bench at 50K
-						// measuring apiserver QPS + RSS-under-load, with the
-						// cache subsystem on (CACHE_ENABLED=true) so the
-						// pivot consumer is actually present (#57: the pivot
-						// is implicit-on-cache; no separate
-						// RESOLVER_USE_INFORMER flag to set).
-						if os.Getenv("PREWARM_REGISTER_ENABLED") == "true" {
-							log.Info("prewarm-register: enabled via PREWARM_REGISTER_ENABLED=true",
+						// Why implicit-on is safe (TRACED — supersedes the
+						// obsolete default-OFF "no-consumer QPS / OOM" rationale,
+						// which was falsified; the walk is NOT the "same 58 GVRs"):
+						//
+						//   - The walk registers ONLY the STATIC (non-JQ-templated)
+						//     inventory GVR subset. Every composition.krateo.io path
+						//     is JQ-templated and is REJECTED by the ${-guard in
+						//     ParseAPIServerPathToGVR (inventory.go:171) — so the
+						//     walk CANNOT register composition GVRs. Its incremental
+						//     footprint is the trivial static/CRD-meta GVR class.
+						//   - The composition informers (the OOM-relevant mass at
+						//     50K) are registered LAZILY via the
+						//     DiscoverGroupResources / EnsureResourceType hook on the
+						//     resolver inner-call path (resolve.go) REGARDLESS of
+						//     this flag. Flipping it neither adds nor removes them,
+						//     so it does not touch the 0.30.8/0.30.92 OOM surface.
+						//   - A consumer now EXISTS for the walk-registered
+						//     informers: the #130 F1 confirm-prime + the
+						//     informer-serve branch + the Phase 1 seed read them.
+						//     The 0.30.61 "no consumer reads the eagerly-registered
+						//     informers" regression the default-OFF gate guarded
+						//     against no longer applies (pivot is implicit-on-cache,
+						//     #57).
+						if resolvePrewarmRegisterDefault(os.Getenv("PREWARM_REGISTER_ENABLED")) {
+							log.Info("prewarm-register: enabled (implicit-on under CACHE_ENABLED; set PREWARM_REGISTER_ENABLED=false to opt out)",
 								slog.String("subsystem", "cache"),
-								slog.String("hint", "startup navigation GVR-walk active; opt-in only — costs apiserver QPS when the resolver pivot is inactive (cache off, #57)"),
+								slog.String("hint", "startup navigation GVR-walk active; registers the STATIC (non-${-templated) inventory GVR subset only — composition GVRs arrive lazily via the resolver DiscoverGroupResources hook regardless of this flag"),
 							)
 							// Soft failure: a LIST error is logged +
 							// ignored — the lazy register-on-navigation
@@ -725,9 +725,9 @@ func main() {
 									slog.Int("already_present", present))
 							}
 						} else {
-							log.Info("prewarm-register: disabled (default); set PREWARM_REGISTER_ENABLED=true to opt-in",
+							log.Info("prewarm-register: disabled via explicit PREWARM_REGISTER_ENABLED=false opt-out",
 								slog.String("subsystem", "cache"),
-								slog.String("rationale", "startup walk registers informers the pivot does not consume when the pivot is inactive (cache off, #57) — re-arms the 0.30.61 no-consumer apiserver-QPS regression + the unmitigated 0.30.8/0.30.92 OOM modes"),
+								slog.String("rationale", "explicit emergency opt-out (PREWARM_REGISTER_ENABLED=false); the walk registers only the static non-${-templated inventory GVR subset — composition informers still arrive lazily via the resolver DiscoverGroupResources hook, so this opt-out does NOT change the composition-informer footprint"),
 							)
 						}
 
@@ -1161,6 +1161,39 @@ func main() {
 // input → empty slice (subsystem-defined behavior: the per-
 // namespace Deployment + Endpoints watches stay inert; cluster-
 // scoped webhook watches still run).
+// resolvePrewarmRegisterDefault decides whether the startup navigation
+// GVR-walk (PrewarmRegisterFromNavigation) runs, from the raw
+// PREWARM_REGISTER_ENABLED env value.
+//
+// #130 1.7.5 — IMPLICIT-ON under CACHE_ENABLED. The walk is now enabled by
+// default whenever the cache subsystem is on; only an EXPLICIT
+// PREWARM_REGISTER_ENABLED=false opts out (emergency lever). This is the
+// inverse of the pre-1.7.5 default-OFF gate (== "true" to enable). Rationale
+// (TRACED, supersedes the obsolete "no-consumer QPS" note that justified
+// default-OFF):
+//
+//   - The walk registers ONLY the STATIC (non-JQ-templated) inventory GVR
+//     subset. JQ-templated apiserver paths — every composition.krateo.io path
+//     is one — are rejected by the `${`-guard in ParseAPIServerPathToGVR
+//     (inventory.go:171), so the walk CANNOT register composition GVRs. Its
+//     incremental footprint is bounded to the trivial static/CRD-meta class.
+//   - The composition informers (the OOM-relevant mass at 50K) are registered
+//     lazily via the DiscoverGroupResources / EnsureResourceType hook on the
+//     resolver inner-call path (resolve.go) REGARDLESS of this flag — flipping
+//     it neither adds nor removes them.
+//   - A consumer now DOES exist for the walk-registered informers: the #130 F1
+//     confirm-prime + the informer-serve branch + the Phase 1 seed all read
+//     them. The "walk registers informers nobody reads" regression the
+//     default-OFF gate guarded against no longer applies.
+//
+// Contract: only the exact string "false" disables. Empty (unset), "true", and
+// any other value all enable — an implicit-on lever with a single explicit
+// opt-out. CACHE-off unreachability is enforced by the CALLER (this resolves
+// only inside the !cache.Disabled() branch), not here.
+func resolvePrewarmRegisterDefault(raw string) bool {
+	return raw != "false"
+}
+
 func splitCommaList(s string) []string {
 	if s == "" {
 		return nil
