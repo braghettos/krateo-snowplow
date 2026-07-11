@@ -1929,6 +1929,44 @@ func (rw *ResourceWatcher) IsServable(gvr schema.GroupVersionResource) bool {
 	return ok
 }
 
+// ServabilitySnapshot is a diagnostic read-only view of the four
+// servableLocked conjuncts for a single GVR, captured under ONE
+// rw.mu.RLock() so the tuple is internally consistent (no check-then-act
+// gap between four separate public accessors). It carries NO behaviour —
+// it is consumed only by the internal_dispatch.list.serve_miss slog to
+// discriminate WHY the informer-serve branch was not taken on a given
+// boot. Task #130 F1.
+type ServabilitySnapshot struct {
+	Registered    bool
+	HasSynced     bool
+	WatchHealthy  bool
+	TypeConfirmed bool
+}
+
+// ServabilitySnapshotFor returns the four servability conjuncts for gvr
+// under a single read lock. Read-only: it inspects the same maps
+// servableLocked reads and mutates nothing. On a nil / passthrough
+// watcher every conjunct is false (the serve branch never engages there).
+//
+// Safe for concurrent use; takes rw.mu in read mode.
+func (rw *ResourceWatcher) ServabilitySnapshotFor(gvr schema.GroupVersionResource) ServabilitySnapshot {
+	if rw == nil || rw.mode == modePassthrough {
+		return ServabilitySnapshot{}
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	gi, registered := rw.informers[gvr]
+	snap := ServabilitySnapshot{Registered: registered}
+	if !registered {
+		return snap
+	}
+	snap.HasSynced = gi.Informer().HasSynced()
+	_, broken := rw.watchBroken[gvr]
+	snap.WatchHealthy = !broken
+	snap.TypeConfirmed = rw.resourceTypeConfirmedLocked(gvr)
+	return snap
+}
+
 // servableLocked is the single four-conjunct servability predicate
 // shared by IsServable and ListObjectsServable. Callers MUST hold rw.mu
 // (read or write). Returns the resolved GenericInformer alongside the

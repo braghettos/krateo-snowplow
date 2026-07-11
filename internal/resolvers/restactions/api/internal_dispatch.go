@@ -394,6 +394,20 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 				return served, true, nil
 			}
 		}
+		// Serve branch NOT taken — capture the four servability conjuncts under
+		// one read lock so the boot log discriminates ALL miss reasons (sync
+		// timeout, unregistered, watch-broken, or typeConfirmed=false) before
+		// we fall through to the live paged LIST. Diagnostic only (Task #130 F1);
+		// the dispatch flow below is byte-identical whether or not this fires.
+		snap := rw.ServabilitySnapshotFor(gvr)
+		xcontext.Logger(ctx).Info("internal_dispatch.list.serve_miss",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.Bool("registered", snap.Registered),
+			slog.Bool("hasSynced", snap.HasSynced),
+			slog.Bool("watchHealthy", snap.WatchHealthy),
+			slog.Bool("typeConfirmed", snap.TypeConfirmed),
+		)
 		// Fall through to the live paged LIST below (never worse).
 	}
 
