@@ -162,9 +162,17 @@ func registerAndSync(t *testing.T, rw *cache.ResourceWatcher, gvr schema.GroupVe
 func TestF1Walk_ConfirmPrimed_ServableWithoutTicker(t *testing.T) {
 	rw := newF1WalkWatcher(t)
 	disco := newCountingDiscovery(map[string]bool{"walk.example/v1": true})
-	rw.SetDiscoveryClient(disco)
 
+	// #130 F1b: register with NO discovery client wired so the lazy-register
+	// auto-prime short-circuits (disco==nil guard) — this test's negative
+	// control is "registered+synced but UNCONFIRMED ⇒ not-servable", which the
+	// auto-prime would otherwise dissolve. Wire discovery AFTER register so the
+	// walk-path ConfirmResourceTypes below is the ONLY confirm that runs. (The
+	// F1b auto-prime's own reachability is proven in
+	// lazy_register_confirm_prime_f1b_test.go; this arm still guards F1's
+	// walk-path batch confirm.)
 	registerAndSync(t, rw, f1WalkGVRa)
+	rw.SetDiscoveryClient(disco)
 
 	// RED control: BEFORE any confirm, the GVR is registered + synced but
 	// NOT confirmed → not servable. This is exactly the 1.7.3 readout state.
@@ -205,11 +213,23 @@ func TestF1Walk_ConfirmResourceTypes_DedupsPerGV(t *testing.T) {
 		"walk.example/v1":  true,
 		"other.example/v1": true,
 	})
-	rw.SetDiscoveryClient(disco)
 
+	// #130 F1b: register the three GVRs with NO discovery client wired so the
+	// lazy-register auto-prime short-circuits (disco==nil guard) and issues
+	// ZERO discovery calls. This isolates the per-GV dedup contract of the
+	// walk-path ConfirmResourceTypes BATCH — the property this test exists to
+	// prove — from the per-GVR auto-prime (which has no per-GV dedup and would
+	// otherwise add same-GV calls, the got==3 the pre-rework test saw). Wire
+	// discovery AFTER register, then the batch below is the ONLY discovery
+	// caller, so its per-GV dedup is asserted cleanly: a==b share
+	// walk.example/v1 ⇒ exactly ONE call for that GV; c is other.example/v1 ⇒
+	// exactly one more. (NOT a papering of the count to 3 — the batch really
+	// does dedup to 1/GV; the auto-prime's per-GVR cost is asserted separately
+	// in TestF1b_SkipGuard_ReEnsureConfirmedGVR_ZeroDiscovery.)
 	registerAndSync(t, rw, f1WalkGVRa)
 	registerAndSync(t, rw, f1WalkGVRb)
 	registerAndSync(t, rw, f1WalkGVRc)
+	rw.SetDiscoveryClient(disco)
 
 	rw.ConfirmResourceTypes(context.Background(), []schema.GroupVersionResource{
 		f1WalkGVRa, f1WalkGVRb, f1WalkGVRc,

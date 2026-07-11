@@ -125,9 +125,17 @@ func TestFalsifierHealA_ScopedConfirmMatchesRefreshDiscovery(t *testing.T) {
 	// type ("apps/v1"). A scoped confirm of secrets must confirm secrets
 	// and leave deployments unconfirmed.
 	disco := &fakeDiscovery{served: map[string]bool{"v1": true}}
-	rw.SetDiscoveryClient(disco)
 
-	// Register + sync both informers.
+	// #130 F1b: register the informers with NO discovery client wired so the
+	// lazy-register auto-prime (primeConfirmAsyncLocked) short-circuits on its
+	// disco==nil guard — this test needs to establish the "registered + synced
+	// but UNCONFIRMED" latched pre-state by hand, which the auto-prime would
+	// otherwise dissolve. The discovery client is wired AFTER registration so
+	// the SCOPED ConfirmResourceType this test exercises is the ONLY confirm
+	// path that runs. (feedback_no_shortcuts_or_workarounds: this is not a
+	// bypass of the fix — it is the correct way to set up a negative control
+	// for a helper the fix now also auto-invokes; the fix's own reachability is
+	// proven in lazy_register_confirm_prime_f1b_test.go.)
 	for _, gvr := range []schema.GroupVersionResource{servableTestGVR, healSecondGVR} {
 		added, syncCh := rw.EnsureResourceType(gvr)
 		if !added {
@@ -139,6 +147,7 @@ func TestFalsifierHealA_ScopedConfirmMatchesRefreshDiscovery(t *testing.T) {
 			t.Fatalf("EnsureResourceType(%s): informer did not sync within 5s", gvr)
 		}
 	}
+	rw.SetDiscoveryClient(disco)
 
 	// PRE: neither GVR is confirmed yet (no RefreshDiscovery pass run), so
 	// both are not-servable — the latched state the content cache shields.
@@ -353,8 +362,12 @@ func TestFalsifierHealC_LatchedNotServableHealsOnConfirm(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	})
 	disco := &fakeDiscovery{served: map[string]bool{"v1": true}}
-	rw.SetDiscoveryClient(disco)
 
+	// #130 F1b: register with NO discovery client wired so the lazy-register
+	// auto-prime short-circuits (disco==nil guard) and this test can establish
+	// the "registered + synced but UNCONFIRMED" latched control by hand; wire
+	// the discovery client AFTER register so the scoped ConfirmResourceType
+	// below is the only confirm that runs.
 	added, syncCh := rw.EnsureResourceType(servableTestGVR)
 	if !added {
 		t.Fatalf("EnsureResourceType: want added=true")
@@ -364,6 +377,7 @@ func TestFalsifierHealC_LatchedNotServableHealsOnConfirm(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("informer did not sync within 5s")
 	}
+	rw.SetDiscoveryClient(disco)
 
 	// BEFORE: registered + synced but unconfirmed -> not-servable. This is
 	// the exact latch the content cache shields permanently pre-fix.
