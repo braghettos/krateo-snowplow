@@ -106,6 +106,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -310,6 +311,43 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 			return nil, false, mErr
 		}
 		return raw, true, nil
+	}
+
+	// Task #118 — unintended-collapse WARN (diagnostic only, NO behavior
+	// change). The by-name GET branch above is taken when the resolved path
+	// carries a non-empty terminal name segment; falling through to here
+	// means name=="" and we are about to serve a cluster/namespace-wide LIST.
+	//
+	// That is CORRECT for an intentional LIST step (an RA whose api-step path
+	// authored NO name segment, e.g. `.../compositiondefinitions`). But it is
+	// ALSO where a by-name step SILENTLY collapses: when an RA authors a name
+	// (and/or namespace) path segment via a jq concat template
+	// (`... + "/compositiondefinitions/" + .name`) and the fed value is
+	// null/absent, gojq's `string + null == string` folds the segment away,
+	// leaving a TRAILING SLASH (`.../compositiondefinitions/`) or an EMPTY
+	// INTERIOR SEGMENT (`.../namespaces//...`). ParseAPIServerPathToDep strips
+	// the trailing slash and parses name=="" — so the by-name GET the author
+	// intended becomes an unbounded cluster LIST. Downstream jq that expects a
+	// single object then chokes (the blueprint-formdef "split cannot be
+	// applied to: null" class traced in task #117). EMPIRICALLY VERIFIED
+	// (jqutil.Eval probe): the concat idiom renders exactly these shapes,
+	// while an authored nameless LIST and a resolved by-name GET do NOT — so
+	// pathHasNullPathSegment discriminates the unintended collapse from the
+	// legitimate LIST. (The interpolation idiom `\(.name)` renders the literal
+	// "null" and takes the GET branch above instead, so it never lands here.)
+	//
+	// This is a WARN only. The dispatch still LISTs exactly as before — the
+	// served envelope is byte-identical to pre-#118. The single log line lets
+	// an operator see that a caller supplied a null where a name was expected,
+	// instead of the failure only surfacing as a confusing downstream jq error.
+	if pathHasNullPathSegment(call.Path) {
+		xcontext.Logger(ctx).Warn("internal_dispatch.list.unintended_collapse: api-step path resolved to a cluster LIST because a name/namespace path segment was null — check the caller's extras",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("namespace", namespace),
+			slog.String("resolved_path", call.Path),
+			slog.String("note", "Task #118 — a jq-templated name/namespace segment folded to empty (string+null); the intended by-name GET became a cluster-wide LIST"),
+		)
 	}
 
 	// Task #268 / 0.30.250 — paged LIST walk.
@@ -534,4 +572,51 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 		return nil, false, mErr
 	}
 	return raw, true, nil
+}
+
+// pathHasNullPathSegment reports whether a RESOLVED apiserver path carries the
+// fingerprint of a jq-templated segment that folded to empty — i.e. a TRAILING
+// SLASH (`.../compositiondefinitions/`) or an EMPTY INTERIOR SEGMENT
+// (`.../namespaces//...`). Task #118.
+//
+// This is the discriminator between the two ways name=="" is reached in the
+// LIST branch of dispatchViaInternalRESTConfig:
+//
+//   - Unintended collapse (returns true): an RA authored a name and/or
+//     namespace segment through a jq concat template
+//     (`... + "/<resource>/" + .name`) and the fed value was null/absent.
+//     gojq evaluates `string + null == string`, so the segment disappears and
+//     the path keeps the separator slash that framed it — a trailing '/' when
+//     the last segment folded, an empty '//' when an interior segment folded.
+//     ParseAPIServerPathToDep then strips the trailing slash and parses
+//     name=="", turning the intended by-name GET into a cluster-wide LIST.
+//
+//   - Intentional LIST (returns false): the RA authored NO name segment
+//     (`.../compositiondefinitions`, or `.../namespaces/<ns>/<resource>`), so
+//     the resolved path has neither a trailing slash nor an empty interior
+//     segment. This is a legitimate "list all of kind X" step and MUST NOT
+//     warn — else every legitimate LIST spams the log.
+//
+// The query string is stripped first (a resolved path may carry `?extras=...`);
+// the check is purely on path structure. Note this also flags a null-namespace
+// collapse that still carries a name (`.../namespaces//<resource>/foo`) — that
+// too is an unintended collapse (an empty interior segment addresses the wrong
+// scope), which the caller can log even though such a path takes the GET
+// branch; here it is only consulted on the LIST branch, so it fires precisely
+// on the null→cluster-LIST case task #118 targets.
+func pathHasNullPathSegment(path string) bool {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path == "" {
+		return false
+	}
+	// A trailing slash means the terminal templated segment folded to empty.
+	if strings.HasSuffix(path, "/") {
+		return true
+	}
+	// An empty interior segment ("//") means an interior templated segment
+	// (typically the namespace) folded to empty. TrimPrefix the leading '/'
+	// so the mandatory leading separator is not mistaken for an empty segment.
+	return strings.Contains(strings.TrimPrefix(path, "/"), "//")
 }
