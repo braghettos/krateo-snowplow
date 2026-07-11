@@ -74,6 +74,7 @@ import (
 	"log/slog"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 )
 
@@ -139,6 +140,14 @@ func (rw *ResourceWatcher) PrewarmRegisterFromNavigation(ctx context.Context, dy
 		return 0, 0, walkErr
 	}
 
+	// Fix #130 F1: collect the GVRs this walk newly registers so we can
+	// prime ONE scoped conjunct-4 confirm over exactly that set after the
+	// loop (below). Without the prime, a walk-registered GVR latches
+	// typeConfirmed:false until the next discoveryRefreshInterval (30s)
+	// ticker tick — the 1.7.3 serve_miss readout showed conjunct 4 was the
+	// sole universal blocker of informer-serve at boot for every walk GVR.
+	walkRegistered := make([]schema.GroupVersionResource, 0, len(inv))
+
 	for _, gvr := range inv {
 		if ctx.Err() != nil {
 			// Boot context cancelled — stop early. Whatever we did not
@@ -160,18 +169,39 @@ func (rw *ResourceWatcher) PrewarmRegisterFromNavigation(ctx context.Context, dy
 		added, _ := rw.EnsureResourceType(gvr)
 		if added {
 			registered++
+			walkRegistered = append(walkRegistered, gvr)
 		} else {
 			alreadyPresent++
 		}
 	}
+
+	// Fix #130 F1: prime conjunct-4 (typeConfirmed) for the GVRs this walk
+	// registered, in ONE scoped pass. ConfirmResourceTypes reuses
+	// RefreshDiscovery's exact per-GV-deduped confirm body (no forked
+	// predicate) — one ServerResourcesForGroupVersion per distinct
+	// group/version, bounded by ctx, run off the lock. This lands well
+	// before the walk's informers issue their first LIST (~seconds), so the
+	// FIRST post-walk dispatch of these GVRs can take the informer-serve
+	// branch instead of the live paged LIST fall-through.
+	//
+	// Scope is exactly the walk-registered set — the RBAC bootstrap GVRs are
+	// already confirmed by StartDiscoveryRefresher's startup prime, and
+	// already-present GVRs (added==false) were confirmed on their original
+	// registration path. Offline (disco==nil) degrades to conjunct-4 true
+	// per resourceTypeConfirmedLocked — ConfirmResourceTypes leaves
+	// rw.confirmed untouched, so the degraded-true path is preserved.
+	confirmStart := time.Now()
+	rw.ConfirmResourceTypes(ctx, walkRegistered)
 
 	slog.Info("cache.prewarm.completed",
 		slog.String("subsystem", "cache"),
 		slog.Int("inventory_size", len(inv)),
 		slog.Int("registered", registered),
 		slog.Int("already_present", alreadyPresent),
+		slog.Int("confirm_primed", len(walkRegistered)),
+		slog.Int64("confirm_ms", time.Since(confirmStart).Milliseconds()),
 		slog.Int64("walk_ms", time.Since(start).Milliseconds()),
-		slog.String("mode", "fire-and-forget — informers sync asynchronously; boot not blocked"),
+		slog.String("mode", "fire-and-forget informers; conjunct-4 primed synchronously — informer-serve alive at boot"),
 	)
 	return registered, alreadyPresent, nil
 }

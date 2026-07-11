@@ -24,6 +24,7 @@ import (
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
@@ -107,6 +108,123 @@ func TestPrewarmRegisterFromNavigation_RegistersInventoryGVRs(t *testing.T) {
 			t.Fatalf("informer for %s did not sync within 5s", gvr)
 		}
 	}
+}
+
+// TestPrewarmRegisterFromNavigation_PrimesConfirm is the #130 F1 end-to-end
+// wiring falsifier: the walk must leave every GVR it registers CONFIRMED
+// (conjunct 4) so the FIRST post-walk dispatch can take the informer-serve
+// branch instead of a live paged LIST — WITHOUT waiting a discovery-refresh
+// ticker tick.
+//
+// A discovery client that serves the navigation GVRs' types is wired before
+// the walk. After the walk returns (and the informers sync), every
+// walk-registered GVR must be IsServable — all four conjuncts true. Pre-F1
+// (no confirm prime in the walk) these GVRs would be registered+synced but
+// typeConfirmed:false → NOT servable until the 30s ticker — the exact 1.7.3
+// serve_miss state this fix eliminates.
+func TestPrewarmRegisterFromNavigation_PrimesConfirm(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		buildSchemeWithRestActions(),
+		inventoryListKinds(),
+		makeRestAction("ra-confirm", "demo",
+			"/api/v1/namespaces",
+			"/apis/apps/v1/deployments",
+		),
+	)
+
+	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
+	if err != nil {
+		t.Fatalf("NewResourceWatcher: %v", err)
+	}
+	t.Cleanup(func() {
+		rw.Stop()
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	navGVRs := []schema.GroupVersionResource{
+		{Group: "", Version: "v1", Resource: "namespaces"},
+		{Group: "apps", Version: "v1", Resource: "deployments"},
+	}
+
+	// Wire a discovery client that serves the navigation GVRs' types. This
+	// is what StartDiscoveryRefresher would use in production; here we drive
+	// the walk directly, so the walk's own confirm prime is the ONLY thing
+	// that can confirm these GVRs (no ticker runs in this test).
+	rw.SetDiscoveryClient(f1WalkPrimeDiscovery(navGVRs))
+
+	// Generous ctx: ConfirmResourceTypes correctly honors ctx cancellation
+	// (early-return before the apply-loop if the deadline trips). A tight
+	// deadline under CPU starvation could early-return the confirm and
+	// produce a TypeConfirmed:false snapshot that MASQUERADES as the 1.7.3
+	// symptom — a false-RED. 60s is far beyond a few in-process discovery
+	// round-trips; the explicit ctx.Err() guard below makes any deadline
+	// trip fail loud as "ctx expired" rather than impersonate the bug.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	registered, _, walkErr := rw.PrewarmRegisterFromNavigation(ctx, dyn)
+	if walkErr != nil {
+		t.Fatalf("PrewarmRegisterFromNavigation: %v", walkErr)
+	}
+	// Guard against a ctx-timeout false-RED: if the boot ctx expired, the
+	// confirm may have early-returned and the servability assertion below
+	// would fail with the exact 1.7.3 snapshot for the WRONG reason. Fail
+	// loud here instead so the flake is unambiguous.
+	if ctx.Err() != nil {
+		t.Fatalf("walk ctx expired (%v) — confirm may have early-returned; "+
+			"this is a harness-timeout, NOT the F1 symptom", ctx.Err())
+	}
+	if registered != 2 {
+		t.Fatalf("walk: want registered=2, got %d", registered)
+	}
+
+	// The walk is fire-and-forget on SYNC — wait for the informers to sync
+	// so conjunct 2 (HasSynced) holds. Conjunct 4 (typeConfirmed) must
+	// already have been primed by the walk itself.
+	for _, gvr := range navGVRs {
+		if !rw.WaitForGVRSync(ctx, gvr, 5*time.Second) {
+			t.Fatalf("informer for %s did not sync within 5s", gvr)
+		}
+	}
+
+	// F1 acceptance: every walk-registered GVR is servable with NO ticker
+	// tick — the walk primed conjunct 4.
+	for _, gvr := range navGVRs {
+		if !rw.IsServable(gvr) {
+			t.Fatalf("F1: walk-registered GVR %s must be servable after the walk "+
+				"(conjunct 4 primed by the walk, no ticker); got servable=false snap=%+v",
+				gvr, rw.ServabilitySnapshotFor(gvr))
+		}
+	}
+}
+
+// gvrSetDiscovery is a discovery double that serves EXACTLY the resource
+// types (group/version → resource names) it is constructed with, so the
+// walk's confirm can match arbitrary real k8s plurals (namespaces,
+// deployments) rather than the alphas/betas/gammas of countingDiscovery.
+type gvrSetDiscovery struct {
+	byGV map[string][]metav1.APIResource
+}
+
+func (d *gvrSetDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	rs := d.byGV[groupVersion]
+	return &metav1.APIResourceList{GroupVersion: groupVersion, APIResources: rs}, nil
+}
+
+// f1WalkPrimeDiscovery returns a discovery double that serves the resource
+// types of the given GVRs (grouped by group/version) and reports empty for
+// anything else.
+func f1WalkPrimeDiscovery(gvrs []schema.GroupVersionResource) *gvrSetDiscovery {
+	byGV := map[string][]metav1.APIResource{}
+	for _, gvr := range gvrs {
+		gv := gvr.Version
+		if gvr.Group != "" {
+			gv = gvr.Group + "/" + gvr.Version
+		}
+		byGV[gv] = append(byGV[gv], metav1.APIResource{Name: gvr.Resource, Namespaced: true})
+	}
+	return &gvrSetDiscovery{byGV: byGV}
 }
 
 // TestPrewarmRegisterFromNavigation_FireAndForget asserts the walk does
