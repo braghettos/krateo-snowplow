@@ -95,14 +95,22 @@ func TestPrewarmDedup_ARM_DISTINCT_OneTargetPerIdentity(t *testing.T) {
 	BuildBindingsByGVRIndex([]schema.GroupVersionResource{g})
 
 	targets := EnumeratePrewarmTargetsForGVR(g, "list")
-	if len(targets) != 3 {
-		t.Fatalf("ARM-DISTINCT: expected 3 deduped targets (devs, alice, sa) from 6 bindings, got %d: %+v", len(targets), targets)
+	// #130 F3 (Diego directive 2026-07-11): the SA-only binding (installer) is now
+	// EXCLUDED from the seed target set — it is a machine cohort that never renders
+	// the frontend. So the 6 bindings dedup to EXACTLY 2 login-cohort targets
+	// (devs, alice); the SA is gone. (Pre-F3 this asserted 3 incl. the SA. The
+	// dedup contract for the login cohorts is unchanged — this arm now doubles as
+	// the "login cohorts survive, SA excluded" check; the dedicated exclusion arms
+	// live in prewarm_sa_exclusion_f3_test.go.)
+	if len(targets) != 2 {
+		t.Fatalf("ARM-DISTINCT (F3): expected 2 deduped login-cohort targets (devs, alice) from 6 bindings "+
+			"with the SA-only binding excluded, got %d: %+v", len(targets), targets)
 	}
 	got := subjectSetOf(targets)
-	want := []string{"group:devs", "user:alice", "user:system:serviceaccount:krateo-system:installer"}
+	want := []string{"group:devs", "user:alice"}
 	sort.Strings(want)
 	if !equalSorted(got, want) {
-		t.Fatalf("ARM-DISTINCT: Subject set = %v; want %v (each distinct identity must survive dedup)", got, want)
+		t.Fatalf("ARM-DISTINCT (F3): Subject set = %v; want %v (login cohorts survive dedup; SA-only binding excluded)", got, want)
 	}
 }
 

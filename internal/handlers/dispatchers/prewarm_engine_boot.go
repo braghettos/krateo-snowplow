@@ -719,6 +719,14 @@ func seedScopeYielding(ctx context.Context,
 		key       string
 		widgetMax int
 		allMax    int
+		// firstNavReachable (#130 F3 Lever 1) — the identity has >=1 RootIndex==0
+		// (first-nav) widget target. PRIMARY rank tier: frontend-reachable cohorts
+		// sort above any cohort with only non-first-nav widget targets, so every
+		// login cohort's dashboard segment seeds before the non-first-nav tail.
+		// Derived from the SAME RootIndex==0 widget-target data the Lever-2 latch
+		// arms on (uniform discriminator, no static list). Post-SA-exclusion the
+		// seed set is login cohorts only, so this orders WITHIN the login tier.
+		firstNavReachable bool
 	}
 	rankOf := map[string]rankedIdentity{}
 	noteIdentity := func(c seedTarget, isWidget bool) {
@@ -743,11 +751,33 @@ func seedScopeYielding(ctx context.Context,
 			noteIdentity(c, false)
 		}
 	}
+	// #130 F3 Lever 1: compute the first-nav-reachable set — identities with
+	// >=1 RootIndex==0 widget target. This is the SAME RootIndex==0 scan the
+	// Lever-2 latch does (below); computed once here so it can be a rank tier.
+	// Uniform data-derived discriminator, no static cohort list.
+	firstNavReachableSet := map[string]bool{}
+	for _, ws := range widgetSeeds {
+		if ws.e.RootIndex != 0 {
+			continue
+		}
+		for _, c := range ws.targets {
+			firstNavReachableSet[identityKey(c)] = true
+		}
+	}
 	ranked := make([]rankedIdentity, 0, len(rankOf))
 	for _, ri := range rankOf {
+		ri.firstNavReachable = firstNavReachableSet[ri.key]
 		ranked = append(ranked, ri)
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
+		// #130 F3 Lever 1 — PRIMARY tier: frontend-reachable (has a first-nav
+		// widget) cohorts sort first, so every login cohort's dashboard segment
+		// seeds before any cohort whose widgets are all non-first-nav. PURE
+		// ORDERING — the ranked SET is unchanged (SA-only cohorts are already
+		// removed upstream at enumeration); this only reorders the survivors.
+		if ranked[i].firstNavReachable != ranked[j].firstNavReachable {
+			return ranked[i].firstNavReachable // true sorts before false
+		}
 		if ranked[i].widgetMax != ranked[j].widgetMax {
 			return ranked[i].widgetMax > ranked[j].widgetMax
 		}
@@ -883,11 +913,31 @@ func seedScopeYielding(ctx context.Context,
 	latchStart := time.Now()
 	firstNavRemaining := 0
 	firstNavWidgets := 0
-	// segKey/segRank identify the segment identity + its rank in `ranked`.
-	// segRank stays -1 when NO ranked identity has any RootIndex==0 widget
-	// target (genuinely-no-first-nav topology, F-C3) — the zero-fire boundary
-	// below keys on segRank<0/unreached, preserving the provably-empty
-	// semantics.
+	// ── #130 F3 Lever 2: latch waits for EVERY reachable cohort's first-nav
+	// segment, not just the first (rank-0) one. ──
+	//
+	// PRE-F3 (segment-scoped): the latch armed on the FIRST ranked identity with
+	// a RootIndex==0 widget target (segKey at segRank) and fired the instant THAT
+	// ONE identity's first-nav segment completed — so /readyz flipped with every
+	// OTHER login cohort's dashboard still cold (the admins-starved defect: Ready
+	// fired on devs while admins' cells were never seeded).
+	//
+	// F3: arm firstNavRemaining as the SUM over ALL first-nav-reachable
+	// identities' RootIndex==0 widget targets, and record that set in
+	// reachableFirstNav. Ready fires only when the LAST first-nav target of ANY
+	// reachable cohort seeds (firstNavRemaining==0) — i.e. "every login cohort's
+	// dashboard is warm," which IS the milestone. The MarkPhase1Done /
+	// PHASE1_TIMEOUT backstop is UNCHANGED (C2 liveness — a pathological cohort
+	// cannot hang readiness forever; it goes Ready-degraded for that cohort, the
+	// exception not the rule).
+	//
+	// reachableFirstNav is the membership set the fire-decrement below keys on
+	// (an identity is "reachable" iff it has >=1 RootIndex==0 widget target).
+	// segKey/segRank retain their PRE-F3 meaning (the FIRST reachable identity +
+	// its rank) purely for the fire-log fields + the segRank<0 provably-empty
+	// boundary (F-C3) — segRank stays -1 when NO ranked identity has any
+	// RootIndex==0 widget target, preserving the zero-fire semantics.
+	reachableFirstNav := map[string]bool{}
 	segKey := ""
 	segRank := -1
 	if latch != nil {
@@ -911,11 +961,16 @@ func seedScopeYielding(ctx context.Context,
 				}
 			}
 			if count > 0 {
-				segKey = candidate
-				segRank = r
-				firstNavRemaining = count
-				firstNavWidgets = widgetsWith
-				break
+				// F3: accumulate EVERY reachable cohort (do NOT break at the first).
+				reachableFirstNav[candidate] = true
+				firstNavRemaining += count
+				firstNavWidgets += widgetsWith
+				if segRank < 0 {
+					// First reachable identity — retain for the log fields + the
+					// provably-empty boundary (unchanged semantics).
+					segKey = candidate
+					segRank = r
+				}
 			}
 		}
 	}
@@ -976,16 +1031,17 @@ func seedScopeYielding(ctx context.Context,
 				if seedWidgetTarget(e, c) {
 					return ctx.Err()
 				}
-				// F-C2: fire the latch the instant the LAST segment-identity
-				// RootIndex==0 widget target has been PROCESSED (mid-segRank pass).
-				// #99b: the segment is the segKey identity at rank segRank — the
-				// first ranked identity with a RootIndex==0 widget target, NOT
-				// necessarily ranked[0]. Only that identity's first-nav segment
-				// decrements; RootIndex>0 widgets and every other rank never touch
+				// F-C2 / #130 F3 Lever 2: fire the latch the instant the LAST
+				// FIRST-NAV target of ANY reachable cohort has been PROCESSED. The
+				// decrement now keys on reachableFirstNav MEMBERSHIP (every login
+				// cohort with a RootIndex==0 widget target), NOT the single segKey
+				// identity — so /readyz waits for EVERY reachable cohort's dashboard
+				// segment, not just rank-0's (the admins-starved fix). RootIndex>0
+				// widgets and non-reachable (SA-tail) identities never touch
 				// firstNavRemaining, so this cannot fire early on a RootIndex>0-only
-				// seed (F-C3). segRank<0 means no ranked identity has a first-nav
-				// widget → this branch never matches → the provably-empty fire
-				// below is the only path.
+				// or non-first-nav seed (F-C3). segRank<0 (reachableFirstNav empty)
+				// means no ranked identity has a first-nav widget → this branch never
+				// matches → the provably-empty fire below is the only path.
 				//
 				// PROCESSED, NOT SUCCEEDED (deliberate, C2 liveness). We reach
 				// this line whenever seedWidgetTarget did not abort on ctx-cancel;
@@ -997,7 +1053,7 @@ func seedScopeYielding(ctx context.Context,
 				// real guard that the dashboard is genuinely warm is the
 				// on-cluster post-Ready /dashboard nav#1 l1:HIT content check, not
 				// this counter.
-				if latch != nil && ri == segRank && e.RootIndex == 0 && identityKey(c) == segKey {
+				if latch != nil && e.RootIndex == 0 && reachableFirstNav[identityKey(c)] {
 					firstNavRemaining--
 					if firstNavRemaining == 0 {
 						fireFirstNav("segment-complete")

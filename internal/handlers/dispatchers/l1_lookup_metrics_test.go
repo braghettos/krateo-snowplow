@@ -48,9 +48,11 @@ func TestRecordL1Lookup_BumpsHitMissPerCell(t *testing.T) {
 	}
 	beforeHit, beforeMiss := readCell(t, v, handler+"|"+gvr)
 
-	recordL1Lookup(handler, gvr, true)
-	recordL1Lookup(handler, gvr, true)
-	recordL1Lookup(handler, gvr, false)
+	// #130 F3: two hits (one seed-attributable, one traffic) + one miss.
+	seedAttrBefore := hitsSeedAttributable.Load()
+	recordL1Lookup(handler, gvr, true, true)  // seed hit
+	recordL1Lookup(handler, gvr, true, false) // traffic hit
+	recordL1Lookup(handler, gvr, false, false)
 
 	afterHit, afterMiss := readCell(t, v, handler+"|"+gvr)
 	if got, want := afterHit-beforeHit, uint64(2); got != want {
@@ -58,6 +60,15 @@ func TestRecordL1Lookup_BumpsHitMissPerCell(t *testing.T) {
 	}
 	if got, want := afterMiss-beforeMiss, uint64(1); got != want {
 		t.Fatalf("miss_total delta = %d, want %d", got, want)
+	}
+	// #130 F3: exactly ONE of the two hits was seed-attributable — both the
+	// per-cell seed_hit_total and the process-wide aggregate bump by 1.
+	if got, want := hitsSeedAttributable.Load()-seedAttrBefore, uint64(1); got != want {
+		t.Fatalf("hits_seed_attributable delta = %d, want %d (only the SeededAtBoot hit counts)", got, want)
+	}
+	seedHit := readSeedHitCell(t, v, handler+"|"+gvr)
+	if seedHit < 1 {
+		t.Fatalf("seed_hit_total = %d, want >=1 (the seed-attributable hit)", seedHit)
 	}
 }
 
@@ -82,7 +93,7 @@ func TestRecordL1Lookup_ConcurrentFirstObservation(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			recordL1Lookup(handler, gvr, true)
+			recordL1Lookup(handler, gvr, true, false)
 		}()
 	}
 	close(start)
@@ -113,4 +124,17 @@ func readCell(t *testing.T, v expvar.Var, cellKey string) (uint64, uint64) {
 		return 0, 0
 	}
 	return cell["hit_total"], cell["miss_total"]
+}
+
+// readSeedHitCell reads the #130 F3 seed_hit_total for a cell (0 if absent).
+func readSeedHitCell(t *testing.T, v expvar.Var, cellKey string) uint64 {
+	t.Helper()
+	var parsed map[string]map[string]uint64
+	if err := json.Unmarshal([]byte(v.String()), &parsed); err != nil {
+		t.Fatalf("decode expvar JSON: %v", err)
+	}
+	if cell, ok := parsed[cellKey]; ok {
+		return cell["seed_hit_total"]
+	}
+	return 0
 }

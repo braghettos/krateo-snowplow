@@ -477,18 +477,33 @@ type cacheHandle interface {
 // l1_lookup_metrics.go so /debug/vars exposes the same signal
 // without requiring log-line scraping. The bump is one atomic add
 // per call — already on the request-path serial budget.
-func emitResolvedCacheLookup(log *slog.Logger, handlerKind, gvrString, key string, hit bool, residentBytes int) {
+// #130 F3 seed-attribution: seededAtBoot is the hit entry's
+// ResolvedEntry.SeededAtBoot (meaningful only on a hit; pass false on a miss).
+// It drives the hit_source tag ("seed" | "traffic") in the lookup log and the
+// hits_seed_attributable expvar — leak-safe boolean provenance, no per-user data.
+func emitResolvedCacheLookup(log *slog.Logger, handlerKind, gvrString, key string, hit, seededAtBoot bool, residentBytes int) {
 	if log != nil {
+		// hit_source is only meaningful on a hit; on a miss it is "" so a
+		// grep for hit_source:"seed" counts exactly the seed-attributable hits.
+		hitSource := ""
+		if hit {
+			if seededAtBoot {
+				hitSource = "seed"
+			} else {
+				hitSource = "traffic"
+			}
+		}
 		log.Info("resolved_cache.lookup",
 			slog.String("subsystem", "cache"),
 			slog.String("handler", handlerKind),
 			slog.String("gvr", gvrString),
 			slog.String("key_hash", key),
 			slog.Bool("hit", hit),
+			slog.String("hit_source", hitSource),
 			slog.Int("resident_bytes", residentBytes),
 		)
 	}
-	recordL1Lookup(handlerKind, gvrString, hit)
+	recordL1Lookup(handlerKind, gvrString, hit, seededAtBoot)
 }
 
 // emitDispatchCacheKeyDiag — Ship 0.30.188 — pure-additive diagnostic
