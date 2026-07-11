@@ -400,6 +400,84 @@ func (rw *ResourceWatcher) ConfirmResourceType(ctx context.Context, gvr schema.G
 	rw.applyConfirmLocked(gvr, curGI, disco != nil, typeServed)
 }
 
+// ConfirmResourceTypes runs the scoped conjunct-3/4 confirmation pass over a
+// caller-supplied SET of GVRs in one shot, reusing RefreshDiscovery's exact
+// per-GV dedup + applyConfirmLocked body (it does NOT fork a parallel
+// predicate). It is ConfirmResourceType's plural sibling: same confirm/recover
+// semantics, but it issues ONE ServerResourcesForGroupVersion per distinct
+// group/version across the whole set rather than one-per-GVR — so a walk that
+// registers many GVRs sharing a group/version (e.g. several CompositionDefinition
+// versions) costs one discovery round-trip per GV, not per GVR.
+//
+// Fix #130 F1: primed by the discovery-walk registration path
+// (PrewarmRegisterFromNavigation, prewarm.go) so a GVR the walk lazily
+// registers becomes conjunct-4 typeConfirmed within one discovery round-trip
+// instead of waiting a full discoveryRefreshInterval (30s) ticker tick. The
+// 1.7.3 serve_miss readout showed EVERY walk-registered GVR latched
+// typeConfirmed:false (registered/hasSynced/watchHealthy all true) until the
+// ticker — conjunct 4 was the sole universal blocker of informer-serve at boot.
+//
+// Only the SUBSET of gvrs currently registered is confirmed — an unregistered
+// gvr in the set is a cheap no-op (nothing to confirm; the walk's
+// EnsureResourceType runs first, so a walk-registered GVR is registered by the
+// time this runs). Idempotent + re-runnable: confirming an already-confirmed
+// GVR is a map write of an existing key. Discovery calls run OFF the lock and
+// are bounded by ctx.
+//
+// Concurrency: writes rw.confirmed / rw.watchBroken / rw.lastSyncRV under
+// rw.mu.Lock() — the SAME maps + lock the discovery-refresh ticker and the
+// scoped ConfirmResourceType use, so all three are serialised. Informer handles
+// are re-read under the write lock (N2), not captured under the earlier RLock,
+// to survive a delete+recreate interleave.
+//
+// Nil-receiver / passthrough safe. Empty / nil set = no-op.
+func (rw *ResourceWatcher) ConfirmResourceTypes(ctx context.Context, gvrs []schema.GroupVersionResource) {
+	if rw == nil || rw.mode == modePassthrough || len(gvrs) == 0 {
+		return
+	}
+
+	rw.mu.RLock()
+	disco := rw.disco
+	rw.mu.RUnlock()
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
+
+	// Resolve resource-type existence per group/version, deduped — identical
+	// to RefreshDiscovery's dedup loop, run OFF the lock. One discovery call
+	// per distinct gv across the whole set (the cost bound), not per GVR.
+	served := map[string]bool{}
+	if disco != nil {
+		queried := map[string]struct{}{}
+		for _, gvr := range gvrs {
+			if ctx != nil && ctx.Err() != nil {
+				return
+			}
+			gv := groupVersionString(gvr)
+			if _, done := queried[gv]; done {
+				continue
+			}
+			queried[gv] = struct{}{}
+			served[gv] = resourceTypeServed(disco, gvr)
+		}
+	}
+
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.ensureConfirmMapsLocked()
+	for _, gvr := range gvrs {
+		// Re-read the informer under the write lock (N2): only confirm a GVR
+		// that is CURRENTLY registered. A GVR unregistered between the walk's
+		// EnsureResourceType and here (CRD-DELETE teardown) is skipped, so we
+		// never resurrect a stale rw.confirmed entry.
+		curGI, stillRegistered := rw.informers[gvr]
+		if !stillRegistered {
+			continue
+		}
+		rw.applyConfirmLocked(gvr, curGI, disco != nil, served[groupVersionString(gvr)])
+	}
+}
+
 // ServableGVRStatus is a read-only per-GVR servability snapshot row,
 // surfaced by the /debug/servable diagnostic. It exposes the four
 // servability conjuncts so an operator can see WHY a GVR is (not) servable
