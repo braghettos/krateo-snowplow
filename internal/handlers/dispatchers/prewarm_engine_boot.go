@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/krateoplatformops/plumbing/endpoints"
+	pmaps "github.com/krateoplatformops/plumbing/maps"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
@@ -483,6 +484,34 @@ func seedScopeYielding(ctx context.Context,
 	saEP endpoints.Endpoint, saRC *rest.Config, authnNS string, mode seedScopeMode) error {
 
 	log := slog.Default()
+
+	// #130 F4 — install ONE per-seed-pass RA-resolve memo on ctx for the whole
+	// pass. Every per-cohort cohortCtx (withCohortSeedContext → BuildContext)
+	// inherits it, so the ~71 statistics/tag widgets that share a heavy
+	// RESTAction (compositions-list / dashboard-data, ~18s of gojq over the 60K
+	// benchapps array) resolve it ONCE per distinct (RA, identity, page, extras)
+	// rather than 2× per widget per cohort. The memo lives ONLY for this
+	// function's scope — nothing references it once seedScopeYielding returns
+	// (C-F4-5 teardown: the next pass builds a fresh one). Keyed by the full
+	// RBAC identity so it is per-cohort correct (C-F4-4). Inert under
+	// Disabled(): WithSeedResolveMemo returns ctx unchanged (C-F4-9). copyFn =
+	// plumbing/maps.DeepCopyJSON (JSON-native round-trip on every hit, C-F4-3).
+	memo := cache.NewSeedResolveMemo(pmaps.DeepCopyJSON)
+	ctx = cache.WithSeedResolveMemo(ctx, memo)
+	defer func() {
+		h, m := memo.Stats()
+		if h+m == 0 {
+			return // never consulted (cache-off / no heavy widgets this pass)
+		}
+		log.Info("phase1.seed.memo.summary",
+			slog.String("subsystem", "cache"),
+			slog.String("mode", mode.String()),
+			slog.Uint64("memo_hits", h),
+			slog.Uint64("memo_misses", m),
+			slog.String("effect", "F4 per-seed-pass RA-resolve memo — each hit skipped a full "+
+				"gojq-over-benchapps re-resolve of a heavy RESTAction shared across statistics/tag widgets"),
+		)
+	}()
 
 	// CTX-CANCEL ABORT OBSERVABILITY (fold 2026-07-03, §4.3b — migrated from the
 	// deleted seedCohort's 0.30.191 Fix-C `phase1.cohort.abort` reporter). The

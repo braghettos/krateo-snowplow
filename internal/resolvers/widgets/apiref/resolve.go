@@ -9,6 +9,7 @@ import (
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	pmaps "github.com/krateoplatformops/plumbing/maps"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
@@ -65,8 +66,24 @@ type ResolveOptions struct {
 // UNTOUCHED — only the discovery walk (which has no use for the slice cache) is
 // suppressed. The serve-time slice cache is populated by the first real
 // foreground /call, exactly as before this change.
+// IsPaginatedResolve is the SINGLE pagination predicate that gates the Ship-4a
+// full-list machinery: 4a serves a bounded page window from a shared full list,
+// so it is meaningful ONLY for a paginated resolve (perPage>0 && page>0). An
+// unpaginated resolve (0,0 / -1,-1) consumes the whole list wholesale (e.g. a
+// Statistic/Tag widget counting `list:`) and gains nothing from the slice cache.
+//
+// #130 F4 Option 2 reuses this exact predicate at the seed to SKIP
+// seedRAFullListForWidget for an unpaginated-consuming widget — the second full
+// ~18s benchapps materialization that only ever pinned a slice cache the
+// widget's own unpaginated /call would never engage. Data-derived (reads
+// pagination only, never widget-kind — feedback_no_special_cases). Exported so
+// the seed and the serve gate share ONE derivation and cannot drift.
+func IsPaginatedResolve(perPage, page int) bool {
+	return perPage > 0 && page > 0
+}
+
 func shouldServeRAFullList(ctx context.Context, perPage, page int) bool {
-	if perPage <= 0 || page <= 0 || !cache.ResolvedCacheEnabled() {
+	if !IsPaginatedResolve(perPage, page) || !cache.ResolvedCacheEnabled() {
 		return false
 	}
 	if fs := cache.FallthroughScope(ctx); fs != nil && fs.Path == cache.ScopeBootPrewarmWalk {
@@ -158,6 +175,45 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		return rawExtensionToMap(local.Status)
 	}
 
+	// #130 F4 — per-seed-pass RA-resolve memo. Installed ONLY on the boot-seed
+	// context (cache.WithSeedResolveMemo in withCohortSeedContext); nil (a strict
+	// no-op) on the user /call path, the refresher, and the discovery walk, so
+	// the request path is provably untouched (C-F4-8). The memo collapses the
+	// ~71 statistics/tag widgets that share a small set of heavy RESTActions
+	// (compositions-list / dashboard-data — ~18s of gojq over the 60K benchapps
+	// array each) to ONE real resolve per distinct (RA, identity, page, extras)
+	// within the pass. Keyed by the FULL RBAC-determining identity (username +
+	// sorted groups off ctx — the same tuple refilter/cluster_list/ra_full_list
+	// read to FILTER the list) so a hit is only ever served to a caller who would
+	// compute a byte-identical body; dropping identity would leak cohort A's
+	// RBAC-filtered body to cohort B (C-F4-4, proven RED by the divergent-output
+	// arm). The memo wraps BOTH the 4a serve and the page-keyed fallthrough: the
+	// key includes (perPage, page), so the unpaginated first-sight (0,0), the 4a
+	// paginated serve, and any page-keyed fallthrough occupy distinct memo slots
+	// and never cross-serve.
+	memo := cache.SeedResolveMemoFromContext(ctx)
+	var memoKey string
+	if memo != nil {
+		username, groups := identityForMemo(ctx)
+		memoKey = memo.Key(opts.ApiRef.Namespace, opts.ApiRef.Name,
+			username, groups, cache.HashExtras(opts.Extras), opts.PerPage, opts.Page)
+		if hit, ok := memo.Load(memoKey); ok {
+			// Load returns a fresh deep copy; safe to hand straight back.
+			return hit, nil
+		}
+	}
+
+	// storeMemo deep-copies the resolved body (JSON-native round-trip, C-F4-3 —
+	// panics AT THIS SEAM on a non-JSON-native value rather than aliasing a bad
+	// value into the shared memo) and records it so sibling widgets in the pass
+	// hit it. No-op when no memo is installed (nil memo / empty key).
+	storeMemo := func(out map[string]any) {
+		if memo == nil || memoKey == "" || out == nil {
+			return
+		}
+		memo.Store(memoKey, pmaps.DeepCopyJSON(out))
+	}
+
 	// Ship 4a (0.30.198) — page-independent RAFullList serve at the apiRef
 	// chokepoint. Engaged ONLY when shouldServeRAFullList (below) is true. On a
 	// hit / verified-sliceable shape it serves a cheap Go-slice over the cached
@@ -169,10 +225,31 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			opts.ApiRef.Name, &ra, opts.PerPage, opts.Page, opts.Extras, resolveRA); serr != nil {
 			return map[string]any{}, serr
 		} else if ok {
+			storeMemo(served)
 			return served, nil
 		}
 		// served=false, no error — fall through to the page-keyed resolve.
 	}
 
-	return resolveRA(ctx, opts.PerPage, opts.Page)
+	out, err := resolveRA(ctx, opts.PerPage, opts.Page)
+	if err != nil {
+		return map[string]any{}, err
+	}
+	storeMemo(out)
+	return out, nil
+}
+
+// identityForMemo reads the RBAC-determining identity (username + groups) off
+// ctx — the SAME xcontext.UserInfo the RESTAction resolver reads to RBAC-filter
+// the list (refilter.go / cluster_list.go / ra_full_list.go). On the seed path
+// withCohortSeedContext installs it via xcontext.WithUserInfo(cohort.Username,
+// cohort.Groups). A UserInfo-err (no identity on ctx) yields ("", nil) — a
+// distinct, non-colliding identity segment; the memo simply never cross-serves
+// an identity-less body to an identity-bearing one.
+func identityForMemo(ctx context.Context) (string, []string) {
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		return "", nil
+	}
+	return ui.Username, ui.Groups
 }
