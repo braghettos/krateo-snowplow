@@ -55,6 +55,8 @@ package dispatchers
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -135,54 +137,49 @@ func TestFirstNavLatch_SegmentIdentity_RestactionOnlyRank0_FiresOnWidgetSegment(
 	}
 
 	latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
-	// The two RootIndex==0 U1 widgets seed under identity group:u1.
-	dashAIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.label == "dash-a" && e.identity == "group:u1" })
-	dashBIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.label == "dash-b" && e.identity == "group:u1" })
-	tailIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.label == "tail-w" })
 	raIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "restaction" })
 
 	if latchIdx == len(ev) {
 		t.Fatalf("§5 GREEN: latch never fired; events=%+v", ev)
 	}
-	// Fire AFTER both U1 RootIndex==0 widgets seed (segment complete)...
-	lastSegIdx := dashAIdx
-	if dashBIdx > lastSegIdx {
-		lastSegIdx = dashBIdx
+	// F3b-r2: the class-boundary latch fires AFTER ALL nav widgets (dash-a,
+	// dash-b AND the RootIndex==1 tail-w — every nav widget is now part of the
+	// nav-widget class, no RootIndex partition) and BEFORE the RA-only M tail.
+	lastWidgetIdx := -1
+	for i, e := range ev {
+		if e.class == "widget" {
+			lastWidgetIdx = i
+		}
 	}
-	if latchIdx < lastSegIdx {
-		t.Fatalf("§5 GREEN: latch fired at idx %d BEFORE the U1 first-nav segment completed (last U1 widget at idx %d) — ARM-COLD; events=%+v", latchIdx, lastSegIdx, ev)
+	if lastWidgetIdx < 0 {
+		t.Fatalf("§5 setup: no widgets seeded; events=%+v", ev)
 	}
-	// ...and BEFORE the RootIndex==1 NON-first-nav tail widget (U2, rank 2) —
-	// the segment identity's own tail. ARM-TAIL: readyz must not wait on it.
-	if tailIdx < len(ev) && latchIdx > tailIdx {
-		t.Fatalf("§5 GREEN/ARM-TAIL: latch fired at idx %d AFTER the RootIndex==1 tail widget (U2, rank 2) at idx %d — readyz would wait on non-first-nav tail; events=%+v", latchIdx, tailIdx, ev)
+	if latchIdx < lastWidgetIdx {
+		t.Fatalf("F3b-r2: latch fired at idx %d BEFORE the last nav widget at idx %d — the class-boundary latch must wait for ALL nav widgets (incl. the RootIndex==1 tail-w); events=%+v", latchIdx, lastWidgetIdx, ev)
 	}
-	// Post-FIX-3 the M restaction is ranked[2] (widgetMax 0) and legitimately
-	// seeds LAST under the rank-major loop — it is NOT the segment (U1 rank 0),
-	// so the latch fires at U1's segment before M's RA tail ever runs. ARM-TAIL:
-	// readyz must not wait on the RA-only tail. Assert the latch fired at or
-	// before the RA (M) seed to pin the segment-before-tail order under FIX-3.
+	// ARM-TAIL: the M restaction (widget-less, ranked last) seeds in the RA tail
+	// AFTER the latch — readyz must not wait on the RA-only tail.
 	if raIdx < len(ev) && latchIdx > raIdx {
-		t.Fatalf("§5 GREEN/ARM-TAIL: latch fired at idx %d AFTER the RA-only tail (M, rank 2) at idx %d — post-FIX-3 M is the widget-less tail, readyz must not wait on it; events=%+v", latchIdx, raIdx, ev)
+		t.Fatalf("F3b-r2 ARM-TAIL: latch fired at idx %d AFTER the RA-only tail (M) at idx %d — readyz must not wait on it; events=%+v", latchIdx, raIdx, ev)
 	}
 }
 
-// ── COND-2 (FIX-3 mandatory): MULTI-ROOT segKey scan stays discriminating ───
-// Post-FIX-3, ranked[0] is widget-capable by construction — but "widget-capable"
-// means >=1 widget target ANYWHERE, not >=1 RootIndex==0 (first-nav) target. On
-// a MULTI-ROOT config an identity whose ONLY widget targets live in a non-first
-// root can take ranked[0] yet have ZERO first-nav targets. The #99b segKey scan
-// is the guard that walks past it to the first identity with a genuine
-// RootIndex==0 widget. This arm re-covers the retired #99b "scan walks past
-// ranked[0]" property under FIX-3:
-//   (i) ranked[0] = W (widgetMax 9) but ALL W's widgets are RootIndex==1;
-//   (ii) V (widgetMax 2) has a RootIndex==0 widget → segKey==V, segRank>0;
-//   (iii) the latch fires reason=segment-complete on V's FIRST-NAV segment.
-// RED (captured to /tmp/r3/ empirically): neuter the scan (segRank hard-bound
-// to 0) → the latch counts 0 first-nav targets on W → fires
-// "zero-first-nav-targets" BEFORE V's RootIndex==0 widget → the fire-after-V's-
-// widget + reason=segment-complete asserts below both fail.
-func TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget(t *testing.T) {
+// ── F3b-r2: MULTI-ROOT — latch is RootIndex-INDEPENDENT (supersedes the #99b
+// segKey scan). ──
+// The #99b segKey scan (walk `ranked` to the first identity with a RootIndex==0
+// widget) is DELETED under F3b-r2: the latch no longer keys on any RootIndex
+// partition, so a multi-root topology where ranked[0]=W has only a RootIndex==1
+// widget and V has the RootIndex==0 widget needs NO scan — the class-boundary
+// latch fires after BOTH nav widgets seed, regardless of which cohort/RootIndex
+// they belong to. This arm re-expresses the multi-root property for F3b-r2:
+//   (i) ranked[0] = W (widgetMax 9), widget RootIndex==1;
+//   (ii) V (widgetMax 2) has a RootIndex==0 widget;
+//   (iii) the latch fires reason=segment-complete AFTER BOTH widgets — never
+//         early on W's widget alone, never via a RootIndex partition.
+// RED (C-r2-2, captured to /tmp/f3b-r2-falsifiers/ by source-revert): the old
+// RootIndex latch would fire when the RootIndex==0 widget (V's) seeds, leaving
+// W's RootIndex==1 nav widget cold — the early-fire flagged by the last-widget guard.
+func TestFirstNavLatch_MultiRoot_LatchIsRootIndexIndependent(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
@@ -190,15 +187,20 @@ func TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget(t *test
 
 	resetFirstNavLatchForTest()
 	ensureFirstNavLatch()
+	t.Cleanup(func() {
+		resetFirstNavLatchForTest()
+		firstNavFireObserver = nil
+		zeroCustomerInFlight()
+	})
 
 	// W (widgetMax 9) is ranked[0], widget lives in RootIndex==1 only. V
-	// (widgetMax 2) has a RootIndex==0 widget → the segment identity, segRank>0.
+	// (widgetMax 2) has a RootIndex==0 widget.
 	w := eID{name: "w", group: true, collapsed: 9}
 	v := eID{name: "v", group: true, collapsed: 2}
 
 	h := newNavWidgetHarvester()
-	firstNavW := latchWidgetGVR("flexes")     // RootIndex 0 — V's first-nav widget
-	nonFirstNavW := latchWidgetGVR("tailwid") // RootIndex 1 — W's only widget
+	firstNavW := latchWidgetGVR("flexes")     // RootIndex 0 — V's widget
+	nonFirstNavW := latchWidgetGVR("tailwid") // RootIndex 1 — W's widget
 	harvestWidgetAtRoot(h, "first-nav", firstNavW, 0)
 	harvestWidgetAtRoot(h, "non-first-nav", nonFirstNavW, 1)
 	widgets := h.snapshot()
@@ -208,9 +210,9 @@ func TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget(t *test
 		func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
 			switch gvr {
 			case firstNavW:
-				return latchTargets(gvr, v) // V, RootIndex 0 → segment
+				return latchTargets(gvr, v) // V, RootIndex 0
 			case nonFirstNavW:
-				return latchTargets(gvr, w) // W, RootIndex 1 → ranked[0], not first-nav
+				return latchTargets(gvr, w) // W, RootIndex 1 → ranked[0]
 			}
 			return nil
 		},
@@ -230,24 +232,28 @@ func TestFirstNavLatch_SegmentIdentity_MultiRoot_ScanFindsFirstNavWidget(t *test
 	}
 	ev := rec.snapshot()
 
-	// (iii) fired segment-complete — NOT zero-first-nav-targets (the neutered-
-	// scan RED reason: W has no first-nav widget so a segRank-hard-0 impl would
-	// find nothing and fire the provably-zero path).
+	// (iii) fired segment-complete (both nav widgets are ordinary nav widgets;
+	// no provably-empty path).
 	if fireReason != "segment-complete" {
-		t.Fatalf("COND-2: latch fired reason=%q; want \"segment-complete\" — with the #99b scan neutered (segRank hard-bound to ranked[0]=W, which has zero RootIndex==0 widgets) the latch would fire \"zero-first-nav-targets\"; events=%+v", fireReason, ev)
+		t.Fatalf("F3b-r2 multi-root: latch fired reason=%q; want \"segment-complete\"; events=%+v", fireReason, ev)
 	}
-	// (ii)+(iii) the latch fired AFTER V's RootIndex==0 widget seeded — i.e. it
-	// keyed on the true first-nav segment (segRank>0, segKey==V), not ranked[0].
+	// The latch fired AFTER BOTH nav widgets seeded (V's RootIndex==0 AND W's
+	// RootIndex==1) — RootIndex-independent, no scan.
 	latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
-	vWidgetIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.identity == "group:v" && e.rootIdx == 0 })
+	lastWidgetIdx := -1
+	for i, e := range ev {
+		if e.class == "widget" {
+			lastWidgetIdx = i
+		}
+	}
 	if latchIdx == len(ev) {
-		t.Fatalf("COND-2: latch never fired; events=%+v", ev)
+		t.Fatalf("F3b-r2 multi-root: latch never fired; events=%+v", ev)
 	}
-	if vWidgetIdx == len(ev) {
-		t.Fatalf("COND-2 setup: V's RootIndex==0 widget never seeded; events=%+v", ev)
+	if lastWidgetIdx < 0 {
+		t.Fatalf("F3b-r2 multi-root setup: no widgets seeded; events=%+v", ev)
 	}
-	if latchIdx < vWidgetIdx {
-		t.Fatalf("COND-2: latch fired at idx %d BEFORE V's first-nav (RootIndex==0) widget at idx %d — the scan did NOT walk past ranked[0]=W to the real first-nav segment; events=%+v", latchIdx, vWidgetIdx, ev)
+	if latchIdx < lastWidgetIdx {
+		t.Fatalf("F3b-r2 multi-root: latch fired at idx %d BEFORE the last nav widget at idx %d — it must wait for ALL nav widgets regardless of RootIndex/rank; events=%+v", latchIdx, lastWidgetIdx, ev)
 	}
 }
 
@@ -373,5 +379,116 @@ func TestKeepwarmSweep_WidgetCapablePrefix_SeedsBothNotSegmentOnly(t *testing.T)
 	}
 	if !seededV {
 		t.Fatalf("c2 keepwarm ruling: sweep did NOT seed V (widgetMax 2, widget-capable) — c2 WIDENS coverage to the whole widget-capable prefix, not ranked[0] only; the #99b property (bound is the widgetMax tier, NOT segRank) must still seed V; events=%+v", ev)
+	}
+}
+
+// countingHandler is a minimal slog.Handler that counts records whose msg matches
+// a target, capturing the "identity" attr of each — for asserting the keepwarm
+// per-cohort cohort_summary emission (#130 F3b-r2 cond 3).
+type countingHandler struct {
+	target     string
+	identities *[]string
+}
+
+func (h countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h countingHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.target {
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "identity" {
+				*h.identities = append(*h.identities, a.Value.String())
+			}
+			return true
+		})
+	}
+	return nil
+}
+func (h countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h countingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestF3bR2_C_r2_3_KeepwarmUnchanged_PrefixBoundAndCohortSummary is the #130
+// F3b-r2 cond-3 arm (arch-required for mode-ruling B): the keepwarm sweep's TWO
+// load-bearing concerns are UNCHANGED by the boot-mode NavOrder-flat refactor —
+//   (1) the widgetMax==0 PREFIX BOUND: the sweep breaks at the first widgetMax==0
+//       (RA-only, widget-less) cohort → that cohort is NOT swept.
+//   (2) the per-cohort cohort_summary: EXACTLY ONE prewarm.keepwarm.cohort_summary
+//       INFO line per SWEPT (widget-capable) cohort.
+// RED = a "flatten all modes" impl (apply the NavOrder-flat pass to keepwarm too):
+// it has no per-rank cohort boundary, so it would emit ZERO cohort_summary lines
+// AND would not break at widgetMax==0 (it would seed the widget-less tail cohort's
+// RA targets in NavOrder order with the rest). Either divergence fails the asserts.
+func TestF3bR2_C_r2_3_KeepwarmUnchanged_PrefixBoundAndCohortSummary(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	zeroCustomerInFlight()
+
+	// Capture prewarm.keepwarm.cohort_summary INFO lines (their identity attr).
+	var summaries []string
+	prev := slog.Default()
+	slog.SetDefault(slog.New(countingHandler{target: "prewarm.keepwarm.cohort_summary", identities: &summaries}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Latch already fired at boot (keepwarm runs post-boot).
+	resetFirstNavLatchForTest()
+	latch := ensureFirstNavLatch()
+	latch.fire("boot-already-fired", 0, 0, "", -1, 0)
+	t.Cleanup(func() { resetFirstNavLatchForTest(); zeroCustomerInFlight() })
+
+	// Two WIDGET-CAPABLE cohorts (devs widgetMax high, ops lower) both on a widget
+	// GVR, PLUS a widget-less cohort (machineSA) present ONLY on an RA target GVR
+	// (widgetMax==0 → the prefix-bound tail that must NOT be swept).
+	devs := eID{name: "devs", group: true, collapsed: 442}
+	ops := eID{name: "ops", group: true, collapsed: 5}
+	machineSA := eID{name: "machine", group: true, collapsed: 3} // widget_max 0 (RA-only)
+
+	h := newNavWidgetHarvester()
+	wGVR := latchWidgetGVR("flexes")
+	harvestWidgetAtRoot(h, "w", wGVR, 0)
+	widgets := h.snapshot()
+	raGVR := eFanoutRAGVR
+	ras := []templatesv1.ObjectReference{latchRA("machine-ra")}
+
+	rec := &latchRecorder{}
+	installLatchSeams(t, rec,
+		func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
+			switch gvr {
+			case wGVR:
+				return latchTargets(gvr, devs, ops) // widget-capable cohorts
+			case raGVR:
+				return latchTargets(gvr, machineSA) // widget-LESS cohort (RA only)
+			}
+			return nil
+		},
+		func(_ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+			return raGVR, true
+		})
+
+	if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeKeepwarm); err != nil {
+		t.Fatalf("keepwarm seedScopeYielding: %v", err)
+	}
+
+	// (1) PREFIX BOUND: the widget-less machineSA cohort must NOT be swept — no
+	// cohort_summary for it (the break at widgetMax==0 stops before it).
+	for _, id := range summaries {
+		if strings.Contains(id, "machine") {
+			t.Fatalf("cond-3 PREFIX BOUND broken: widget-less cohort 'machine' (widgetMax==0) was swept "+
+				"(got a cohort_summary) — the keepwarm prefix-break at widgetMax==0 is gone. summaries=%v", summaries)
+		}
+	}
+	// (2) COHORT SUMMARY: exactly one per SWEPT (widget-capable) cohort = 2 (devs, ops).
+	if len(summaries) != 2 {
+		t.Fatalf("cond-3 COHORT SUMMARY broken: want exactly 2 cohort_summary lines (devs, ops — the "+
+			"widget-capable prefix), got %d: %v. A flatten-all-modes impl emits ZERO (no per-cohort boundary).", len(summaries), summaries)
+	}
+	devsSeen, opsSeen := false, false
+	for _, id := range summaries {
+		if strings.Contains(id, "devs") {
+			devsSeen = true
+		}
+		if strings.Contains(id, "ops") {
+			opsSeen = true
+		}
+	}
+	if !devsSeen || !opsSeen {
+		t.Fatalf("cond-3: both widget-capable cohorts must get a summary; devs=%v ops=%v (summaries=%v)", devsSeen, opsSeen, summaries)
 	}
 }

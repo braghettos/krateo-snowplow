@@ -719,14 +719,6 @@ func seedScopeYielding(ctx context.Context,
 		key       string
 		widgetMax int
 		allMax    int
-		// firstNavReachable (#130 F3 Lever 1) — the identity has >=1 RootIndex==0
-		// (first-nav) widget target. PRIMARY rank tier: frontend-reachable cohorts
-		// sort above any cohort with only non-first-nav widget targets, so every
-		// login cohort's dashboard segment seeds before the non-first-nav tail.
-		// Derived from the SAME RootIndex==0 widget-target data the Lever-2 latch
-		// arms on (uniform discriminator, no static list). Post-SA-exclusion the
-		// seed set is login cohorts only, so this orders WITHIN the login tier.
-		firstNavReachable bool
 	}
 	rankOf := map[string]rankedIdentity{}
 	noteIdentity := func(c seedTarget, isWidget bool) {
@@ -751,33 +743,18 @@ func seedScopeYielding(ctx context.Context,
 			noteIdentity(c, false)
 		}
 	}
-	// #130 F3 Lever 1: compute the first-nav-reachable set — identities with
-	// >=1 RootIndex==0 widget target. This is the SAME RootIndex==0 scan the
-	// Lever-2 latch does (below); computed once here so it can be a rank tier.
-	// Uniform data-derived discriminator, no static cohort list.
-	firstNavReachableSet := map[string]bool{}
-	for _, ws := range widgetSeeds {
-		if ws.e.RootIndex != 0 {
-			continue
-		}
-		for _, c := range ws.targets {
-			firstNavReachableSet[identityKey(c)] = true
-		}
-	}
+	// #130 F3b-r2 — the RootIndex==0 firstNavReachable rank tier is DELETED. The
+	// seed ORDER is now a NavOrder total order (below), not a rank tier keyed on
+	// the config-root==0 boolean partition (Diego's no-special-case ruling: a
+	// data-order, never a page/route/dashboard concept). `ranked` keeps its
+	// (widgetMax DESC, allMax DESC, key ASC) order — it survives ONLY as the
+	// NavOrder tie-break (cohortRankIndex) so devs still slightly precede admins
+	// at equal NavOrder, and as the keepwarm widget-capable-prefix loop bound.
 	ranked := make([]rankedIdentity, 0, len(rankOf))
 	for _, ri := range rankOf {
-		ri.firstNavReachable = firstNavReachableSet[ri.key]
 		ranked = append(ranked, ri)
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
-		// #130 F3 Lever 1 — PRIMARY tier: frontend-reachable (has a first-nav
-		// widget) cohorts sort first, so every login cohort's dashboard segment
-		// seeds before any cohort whose widgets are all non-first-nav. PURE
-		// ORDERING — the ranked SET is unchanged (SA-only cohorts are already
-		// removed upstream at enumeration); this only reorders the survivors.
-		if ranked[i].firstNavReachable != ranked[j].firstNavReachable {
-			return ranked[i].firstNavReachable // true sorts before false
-		}
 		if ranked[i].widgetMax != ranked[j].widgetMax {
 			return ranked[i].widgetMax > ranked[j].widgetMax
 		}
@@ -801,9 +778,11 @@ func seedScopeYielding(ctx context.Context,
 		}
 	}
 
-	// Emit per-unit target-count telemetry ONCE up front (the seed loop below is
-	// rank-major, so the *_targets line no longer pairs 1:1 with a contiguous
-	// per-unit block).
+	// Emit per-unit target-count telemetry ONCE up front (the boot/gvr-discovered
+	// seed loop below is NavOrder-flat and the keepwarm loop is rank-major, so the
+	// *_targets line no longer pairs 1:1 with a contiguous per-unit block). The
+	// root_index field is retained as a dead-stamp observability field only — no
+	// seed-ordering or latch branch keys on it after F3b-r2 (design C-r2-6).
 	for _, ws := range widgetSeeds {
 		log.Info("prewarm.engine.seed.widget_targets",
 			slog.String("subsystem", "cache"),
@@ -877,211 +856,93 @@ func seedScopeYielding(ctx context.Context,
 		return false
 	}
 
-	// ── #99 FIX-F: FIRST-NAV LATCH ARMING (segment-scoped, F-C2). ──
-	// The readyz gate flips when the FIRST-NAV WIDGET SEGMENT has seeded — NOT
-	// the whole rank pass, NOT the full seed (prewarm_first_nav_latch.go).
+	// ── #99 FIX-F / #130 F3b-r2: FIRST-NAV READYZ LATCH ARMING. ──
+	// The readyz gate flips when EVERY cohort's NAV WIDGETS have seeded — NOT the
+	// whole seed (the RA content tail is excluded), NOT just the config-root==0
+	// (dashboard) subtree (the deleted RootIndex latch). F3b-r2 replaces the
+	// RootIndex==0 partition with the widget-vs-RA CLASS boundary — a structural
+	// fact (a target either IS or ISN'T a nav widget), never a page/route/
+	// dashboard concept (Diego's no-special-case ruling applied to the latch too,
+	// design §3 "the latch"). Post-Fix-2 every nav widget is cheap (whale LISTs
+	// serve from the synced informer), so waiting for ALL of them (not just
+	// root-0) costs little and removes the special-case: it is a STRICT
+	// GENERALIZATION of the old latch.
 	//
-	// #99b: the segment identity is NOT hard-wired to ranked[0], and the scan
-	// stays live as a SAFETY NET after FIX-3. Post-FIX-3, widgetMax DESC makes
-	// ranked[0] widget-capable by construction in a single-root topology, so the
-	// old "machine SA out-ranks the widget floor" pollution is gone at the RANK
-	// level. But "widget-capable" means >=1 widget target ANYWHERE, not >=1
-	// RootIndex==0 widget target: on a MULTI-ROOT config an identity whose ONLY
-	// widget targets live in a non-first root (RootIndex!=0) can still take
-	// ranked[0]. Then rank1==ranked[0] arming would count 0 FIRST-NAV targets
-	// and the latch would zero-fire with the first-root dashboard COLD. So we
-	// still scan ranked in order and pick the FIRST identity that actually has
-	// >=1 RootIndex==0 widget target as the segment (segKey at rank segRank). The
-	// segment is that identity's RootIndex==0 widget-target PAIRS; the latch
-	// fires the instant the LAST one seeds (mid-segRank pass, before the
-	// RootIndex>0 widgets and before ANY of that rank's restactions — the
-	// heavy NON-first-nav tail is still mid-seed, ARM-TAIL). Seed ORDER is
-	// UNTOUCHED: this is a pure gate fix; the rank-major loop below is
-	// unchanged, so a higher-ranked identity with only RootIndex!=0 widgets
-	// remains a cheap non-first-nav prefix — the latch simply keys its readiness
-	// on the first identity that renders the first-nav page.
+	// navWidgetRemaining = the total count of (widget × cohort) units in the flat
+	// NavOrder seed list (== len(flat) built below). The latch fires the instant
+	// the LAST nav-widget unit of ANY cohort seeds (remaining==0) — i.e. "every
+	// cohort's nav widgets are warm; the RA-backed content tail warms in
+	// background." The MarkPhase1Done / PHASE1_TIMEOUT backstop is UNCHANGED (C2
+	// liveness — a pathological widget cannot hang readiness forever).
 	//
-	// RootIndex is stamped on widgets only (phase1_pip_seed.go
-	// BeginRoot/RootIndex); restactions carry no first-nav marker, so the
-	// segment is the widget subset — the RA cells warm through FIX-E's
-	// ascending-len ordering (cheap dashboard RAs before the fanout whale) as
-	// background tail after the flip. The latch is nil under the pure-unit
-	// seed tests that call seedScopeYielding directly (no engineSeed wrapper
-	// built it) → all fire() calls are nil-safe no-ops, so those tests are
-	// unchanged.
+	// BOOT-ONLY. The latch singleton is armed only at boot (built by engineSeed
+	// before the boot enqueue). In keepwarm/gvr-discovered re-walks currentFirstNav
+	// Latch() returns the already-fired singleton, so every fire() call is a
+	// sync.Once no-op with zero readiness value — and the keepwarm mode keeps its
+	// own rank-major loop below, which never touches this latch. The latch is nil
+	// under the pure-unit seed tests that call seedScopeYielding directly (no
+	// engineSeed wrapper built it) → all fireFirstNav calls are nil-safe no-ops.
 	latch := currentFirstNavLatch()
 	latchStart := time.Now()
-	firstNavRemaining := 0
-	firstNavWidgets := 0
-	// ── #130 F3 Lever 2: latch waits for EVERY reachable cohort's first-nav
-	// segment, not just the first (rank-0) one. ──
-	//
-	// PRE-F3 (segment-scoped): the latch armed on the FIRST ranked identity with
-	// a RootIndex==0 widget target (segKey at segRank) and fired the instant THAT
-	// ONE identity's first-nav segment completed — so /readyz flipped with every
-	// OTHER login cohort's dashboard still cold (the admins-starved defect: Ready
-	// fired on devs while admins' cells were never seeded).
-	//
-	// F3: arm firstNavRemaining as the SUM over ALL first-nav-reachable
-	// identities' RootIndex==0 widget targets, and record that set in
-	// reachableFirstNav. Ready fires only when the LAST first-nav target of ANY
-	// reachable cohort seeds (firstNavRemaining==0) — i.e. "every login cohort's
-	// dashboard is warm," which IS the milestone. The MarkPhase1Done /
-	// PHASE1_TIMEOUT backstop is UNCHANGED (C2 liveness — a pathological cohort
-	// cannot hang readiness forever; it goes Ready-degraded for that cohort, the
-	// exception not the rule).
-	//
-	// reachableFirstNav is the membership set the fire-decrement below keys on
-	// (an identity is "reachable" iff it has >=1 RootIndex==0 widget target).
-	// segKey/segRank retain their PRE-F3 meaning (the FIRST reachable identity +
-	// its rank) purely for the fire-log fields + the segRank<0 provably-empty
-	// boundary (F-C3) — segRank stays -1 when NO ranked identity has any
-	// RootIndex==0 widget target, preserving the zero-fire semantics.
-	reachableFirstNav := map[string]bool{}
-	segKey := ""
-	segRank := -1
-	if latch != nil {
-		for r := range ranked {
-			candidate := ranked[r].key
-			count := 0
-			widgetsWith := 0
-			for _, ws := range widgetSeeds {
-				if ws.e.RootIndex != 0 {
-					continue
-				}
-				hits := 0
-				for _, c := range ws.targets {
-					if identityKey(c) == candidate {
-						hits++
-					}
-				}
-				if hits > 0 {
-					count += hits
-					widgetsWith++
-				}
-			}
-			if count > 0 {
-				// F3: accumulate EVERY reachable cohort (do NOT break at the first).
-				reachableFirstNav[candidate] = true
-				firstNavRemaining += count
-				firstNavWidgets += widgetsWith
-				if segRank < 0 {
-					// First reachable identity — retain for the log fields + the
-					// provably-empty boundary (unchanged semantics).
-					segKey = candidate
-					segRank = r
-				}
-			}
-		}
-	}
-	// firstNavTotal is the segment target count; firstNavRemaining decrements
-	// toward zero as each first-nav target seeds. Captured before the loop so
-	// the fire-log reports the count actually waited on.
-	firstNavTotal := firstNavRemaining
-	// fireFirstNav closes the latch once the segment is complete. reason
-	// discriminates the segment-complete path from the provably-zero path.
-	// segSeeded = the first-nav targets seeded by fire time (= total minus
-	// whatever remains; the zero-targets path reports 0). Nil-safe.
-	fireFirstNav := func(reason string) {
+	fireFirstNav := func(reason string, navWidgets, unitsSeeded int) {
 		if latch != nil {
-			latch.fire(reason, firstNavWidgets, firstNavTotal-firstNavRemaining, segKey, segRank, time.Since(latchStart))
+			// segIdentity/segRank are no longer segment-scoped (the latch keys on
+			// the whole nav-widget class, not one cohort's RootIndex==0 subtree):
+			// segRank=-1 marks "not segment-scoped". navWidgets = the distinct nav
+			// widgets across all cohorts; unitsSeeded = the total (widget × cohort)
+			// units seeded when the latch fired.
+			latch.fire(reason, navWidgets, unitsSeeded, "", -1, time.Since(latchStart))
 		}
 	}
 
-	// (4) RANK-MAJOR, CLASS-INTERLEAVED seed: per rank → widgets(r) in NavOrder,
-	// then restactions(r). FIX-F SEAM (F-C1): the rank-1 first-nav segment
-	// boundary is a clean, well-defined point; the latch fires the instant the
-	// rank-1 RootIndex==0 widget count reaches zero (below), NOT at the rank-1
-	// boundary (which would pull the RA tail into the readyz gate). The seam is
-	// KEPT unobscured — single rank-1 iteration, widgets-then-restactions, no
-	// interleaving of later ranks.
-	for ri := range ranked {
-		// keepwarm c2 (design §4.1): the keepwarm sweep set is the WIDGET-CAPABLE
-		// PREFIX of `ranked` — every identity with widgetMax>=1 (i.e. that renders
-		// at least one widget somewhere), on ALL pages. Because widgetMax DESC is
-		// the primary rank key (Fix-3), the widget-capable identities are a
-		// CONTIGUOUS PREFIX, so the sweep set is a pure LOOP BOUND: break at the
-		// first widgetMax==0 entry (the widget-less tail — RA-only machine SAs,
-		// which the keepwarm sweep does not cover; their cells warm on-demand /
-		// via the refresher). This SUPERSEDES the c1 rank-1 bound: the admin +
-		// narrow login cohorts (widget-capable but rank>=1) are now swept, closing
-		// the c1 cohort-coverage gap. Boot / gvr-discovered sweep every rank (no
-		// break). The age-skip (§4.2) + F.4 requeue stagger this prefix across
-		// chunks so a full sweep completes cost-proportionally.
-		if mode == seedModeKeepwarm && ranked[ri].widgetMax == 0 {
-			break
-		}
-		rankKey := ranked[ri].key
-		// keepwarm cohort_summary (PM probe (b), design §9): snapshot the
-		// age-skip counter + attempted count at this cohort's start so the
-		// per-cohort delta is exact. The keepwarm seed loop is the SOLE
-		// keepwarm-mode caller and runs SERIALLY (one resolve in flight,
-		// WithPrewarmIterSerial), so keepwarmAgeSkipTotal's delta across this
-		// cohort's targets is precisely this cohort's age-skips — no other
-		// keepwarm writer races it. (Boot/gvr-discovered never age-skip, so this
-		// bookkeeping is inert outside keepwarm; emitted only for keepwarm below.)
-		cohortAgeSkipStart := keepwarmAgeSkipTotal.Load()
-		cohortAttempted = 0
-		for _, ws := range widgetSeeds {
-			e := ws.e
-			for _, c := range ws.targets {
-				if identityKey(c) != rankKey {
-					continue
-				}
-				if seedWidgetTarget(e, c) {
-					return ctx.Err()
-				}
-				// F-C2 / #130 F3 Lever 2: fire the latch the instant the LAST
-				// FIRST-NAV target of ANY reachable cohort has been PROCESSED. The
-				// decrement now keys on reachableFirstNav MEMBERSHIP (every login
-				// cohort with a RootIndex==0 widget target), NOT the single segKey
-				// identity — so /readyz waits for EVERY reachable cohort's dashboard
-				// segment, not just rank-0's (the admins-starved fix). RootIndex>0
-				// widgets and non-reachable (SA-tail) identities never touch
-				// firstNavRemaining, so this cannot fire early on a RootIndex>0-only
-				// or non-first-nav seed (F-C3). segRank<0 (reachableFirstNav empty)
-				// means no ranked identity has a first-nav widget → this branch never
-				// matches → the provably-empty fire below is the only path.
-				//
-				// PROCESSED, NOT SUCCEEDED (deliberate, C2 liveness). We reach
-				// this line whenever seedWidgetTarget did not abort on ctx-cancel;
-				// a per-target seed FAILURE is classified + swallowed inside
-				// seedWidgetTarget (classifyEngineSeedErr), so the count still
-				// decrements. This is intentional: a permanently-failing dashboard
-				// target must NOT hang /readyz to the PHASE1_TIMEOUT backstop
-				// (that is the exact cold-cell degeneration FIX-F removes). The
-				// real guard that the dashboard is genuinely warm is the
-				// on-cluster post-Ready /dashboard nav#1 l1:HIT content check, not
-				// this counter.
-				if latch != nil && e.RootIndex == 0 && reachableFirstNav[identityKey(c)] {
-					firstNavRemaining--
-					if firstNavRemaining == 0 {
-						fireFirstNav("segment-complete")
+	if mode == seedModeKeepwarm {
+		// ── keepwarm: UNCHANGED rank-major loop (arch ruling B). ──
+		// The keepwarm sweep set is the WIDGET-CAPABLE PREFIX of `ranked` (every
+		// identity with widgetMax>=1). widgetMax DESC is the primary rank key
+		// (Fix-3), so the widget-capable identities are a CONTIGUOUS PREFIX and the
+		// sweep set is a pure LOOP BOUND: break at the first widgetMax==0 entry (the
+		// widget-less RA-only tail, not covered by keepwarm). This break is
+		// RootIndex-INDEPENDENT and load-bearing; the per-cohort cohort_summary
+		// emission is a PM probe keyed on the cohort-rank boundary. Both are kept
+		// verbatim. The latch is already fired at boot, so keepwarm arms/fires
+		// nothing here.
+		for ri := range ranked {
+			if ranked[ri].widgetMax == 0 {
+				break
+			}
+			rankKey := ranked[ri].key
+			// keepwarm cohort_summary (PM probe (b), design §9): snapshot the
+			// age-skip counter + attempted count at this cohort's start so the
+			// per-cohort delta is exact. The keepwarm seed loop is the SOLE
+			// keepwarm-mode caller and runs SERIALLY (one resolve in flight,
+			// WithPrewarmIterSerial), so keepwarmAgeSkipTotal's delta across this
+			// cohort's targets is precisely this cohort's age-skips.
+			cohortAgeSkipStart := keepwarmAgeSkipTotal.Load()
+			cohortAttempted = 0
+			for _, ws := range widgetSeeds {
+				e := ws.e
+				for _, c := range ws.targets {
+					if identityKey(c) != rankKey {
+						continue
+					}
+					if seedWidgetTarget(e, c) {
+						return ctx.Err()
 					}
 				}
 			}
-		}
-		for _, rs := range restactionSeeds {
-			ref := rs.ref
-			for _, c := range rs.targets {
-				if identityKey(c) != rankKey {
-					continue
-				}
-				if seedRestactionTarget(ref, c) {
-					return ctx.Err()
+			for _, rs := range restactionSeeds {
+				ref := rs.ref
+				for _, c := range rs.targets {
+					if identityKey(c) != rankKey {
+						continue
+					}
+					if seedRestactionTarget(ref, c) {
+						return ctx.Err()
+					}
 				}
 			}
-		}
-		// keepwarm cohort_summary (PM probe (b), design §9): ONE INFO line per
-		// SWEPT cohort per sweep cycle — {identity, reseeds, age_skips}. age_skips
-		// = the per-cohort delta of keepwarmAgeSkipTotal; reseeds = attempted −
-		// age_skips (a re-resolve+Put, OR a declined/failed re-resolve — all
-		// non-skip work). Emitted at the cohort boundary (bounded by cohort count
-		// per cycle — no per-cell noise) so a PRETTY_LOG:false deployment can grep
-		// ONE line to confirm "admin + narrow cohorts re-seeded, not devs-only".
-		// Keepwarm-only: boot/gvr-discovered would flood this with per-boot ranks
-		// and never age-skip, so it is scoped to the cadence sweep.
-		if mode == seedModeKeepwarm {
+			// keepwarm cohort_summary (PM probe (b), design §9): ONE INFO line per
+			// SWEPT cohort per sweep cycle — {identity, reseeds, age_skips}.
 			ageSkips := keepwarmAgeSkipTotal.Load() - cohortAgeSkipStart
 			reseeds := int64(cohortAttempted) - int64(ageSkips)
 			if reseeds < 0 {
@@ -1098,19 +959,113 @@ func seedScopeYielding(ctx context.Context,
 					"young/churny cells (age_skips); one line per swept cohort per cycle (probe b)"),
 			)
 		}
+		return nil
 	}
-	// ── FIX-F SEAM: provably-empty first-nav boundary (F-C3, #99b). ──
-	// segRank<0 means NO ranked identity had a RootIndex==0 widget target —
-	// an all-tail topology, or prewarm reached no dashboard widget, or ranked
-	// was empty (no identities enumerated at all). There is provably nothing
-	// to warm on the first-nav path → fire so the latch never hangs (the
-	// PHASE1_TIMEOUT backstop would otherwise be the only escape). A non-empty
-	// segment already fired "segment-complete" mid-loop (segRank>=0), so this
-	// close is a no-op then (idempotent once). Firing AFTER the seed loop (not
-	// at a per-rank boundary) means the RootIndex>0-only tail is fully
-	// processed first — F-C3 never fires early mid-tail. Nil-safe.
-	if latch != nil && segRank < 0 {
-		fireFirstNav("zero-first-nav-targets")
+
+	// ── boot / gvr-discovered: NavOrder-FLAT seed (arch ruling B). ──
+	// A SINGLE flat pass over ALL (widget × cohort) units, sorted by NavOrder ASC
+	// (walk-discovery order = nearest-to-nav-entry first; the dashboard is the
+	// low-NavOrder prefix by DATA, not by branch). PURE ORDERING (FIX-E
+	// invariant): the seeded (unit × identity) SET is unchanged vs the old
+	// rank-major loop; only the SEQUENCE changes from rank-major to NavOrder-major.
+	// No caps/skips/static lists; no RootIndex.
+	//
+	// cohortRankIndex maps each ranked cohort's key → its index in `ranked`
+	// (widgetMax DESC, allMax DESC, key ASC). It is the NavOrder tie-break so
+	// equal-NavOrder widgets across cohorts interleave in the existing rank order
+	// (devs before admins before masters), preserving largest-cohort-first WITHIN
+	// a nav position without any special-case. A cohort that is NOT in `ranked`
+	// (widget-less RA-only identity) has no widget units, so it never enters the
+	// flat list; its RA seeds land in the RA tail below (unchanged).
+	cohortRankIndex := make(map[string]int, len(ranked))
+	for r := range ranked {
+		cohortRankIndex[ranked[r].key] = r
+	}
+	type seedUnit struct {
+		navOrder  int
+		rankIndex int
+		wsNSName  string
+		e         navWidgetEntry
+		target    seedTarget
+	}
+	flat := make([]seedUnit, 0)
+	for _, ws := range widgetSeeds {
+		nsName := ws.e.W.GetNamespace() + "/" + ws.e.W.GetName()
+		for _, c := range ws.targets {
+			ri, ok := cohortRankIndex[identityKey(c)]
+			if !ok {
+				// Not a ranked cohort — cannot happen for a widget target (every
+				// widget target's identity is noted into rankOf above), but guard
+				// so an unranked identity is never silently dropped from the SET.
+				ri = len(ranked)
+			}
+			flat = append(flat, seedUnit{
+				navOrder:  ws.e.NavOrder,
+				rankIndex: ri,
+				wsNSName:  nsName,
+				e:         ws.e,
+				target:    c,
+			})
+		}
+	}
+	sort.SliceStable(flat, func(i, j int) bool {
+		if flat[i].navOrder != flat[j].navOrder {
+			return flat[i].navOrder < flat[j].navOrder // (1) NavOrder ASC
+		}
+		if flat[i].rankIndex != flat[j].rankIndex {
+			return flat[i].rankIndex < flat[j].rankIndex // (2) cohort rank ASC
+		}
+		return flat[i].wsNSName < flat[j].wsNSName // (3) ns/name ASC (determinism)
+	})
+
+	// Arm the all-nav-widget latch on the flat unit count. distinctNavWidgets is
+	// the number of distinct nav widgets (for the fire-log observability field).
+	navWidgetRemaining := len(flat)
+	distinctNavWidgets := len(widgetSeeds)
+	navUnitsTotal := navWidgetRemaining
+	if navWidgetRemaining == 0 {
+		// Provably-empty: no nav-widget units at all (all-tail topology, or the
+		// walk reached no widget). There is nothing to warm on the nav-widget
+		// path → fire so the latch never hangs to the PHASE1_TIMEOUT backstop.
+		fireFirstNav("zero-nav-widgets", 0, 0)
+	}
+
+	// Seed the flat list in NavOrder order. SAME primitive (seedWidgetTarget),
+	// SAME abort/yield semantics (return ctx.Err() on abort). Fire the latch the
+	// instant the LAST nav-widget unit is PROCESSED (remaining==0) — before the
+	// RA content tail runs, so readyz does not wait on the RA whale-fanout.
+	// PROCESSED, NOT SUCCEEDED (C2 liveness, unchanged): a per-target failure is
+	// classified+swallowed inside seedWidgetTarget, so the count still decrements
+	// — a permanently-failing widget must not hang /readyz to the backstop.
+	for i := range flat {
+		if seedWidgetTarget(flat[i].e, flat[i].target) {
+			return ctx.Err()
+		}
+		navWidgetRemaining--
+		if navWidgetRemaining == 0 {
+			fireFirstNav("segment-complete", distinctNavWidgets, navUnitsTotal)
+		}
+	}
+
+	// RA tail — RAs carry no NavOrder (they are the background content layer, not
+	// nav widgets); they seed AFTER the whole widget list in their existing
+	// ascending-len order (restactionSeeds was sorted ascending-len above). The
+	// tail is explicitly excluded from readiness (the latch already fired). Seed
+	// rank-major across `ranked` so a lower-ranked cohort's RAs never precede a
+	// higher-ranked cohort's — the RA within-class rank order is preserved.
+	for ri := range ranked {
+		rankKey := ranked[ri].key
+		for _, rs := range restactionSeeds {
+			ref := rs.ref
+			for _, c := range rs.targets {
+				if identityKey(c) != rankKey {
+					continue
+				}
+				if seedRestactionTarget(ref, c) {
+					return ctx.Err()
+				}
+			}
+		}
 	}
 	return nil
 }

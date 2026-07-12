@@ -1,28 +1,28 @@
-// prewarm_first_nav_latch_test.go — #99 FIX-F: the first-nav readyz latch
-// falsifier set (PM conditions F-C1..F-C4, docs/seed-tail-restactions-budget-
-// and-16mb-serve-trace-2026-07-04.md §F.2).
+// prewarm_first_nav_latch_test.go — #130 F3b-r2: the ALL-NAV-WIDGET readyz
+// latch falsifier set. SUPERSEDES the #99 FIX-F RootIndex==0 segment latch.
 //
-// The latch fires when the rank-1 (ri==0) RootIndex==0 first-nav WIDGET
-// segment has seeded (or provably has none). engineSeed's select waits on it
-// so /readyz flips WITH the dashboard warm, NOT at the PHASE1_TIMEOUT backstop
-// with cold cells (the fix3r degeneration §F.0). These arms discriminate the
-// fire-POINT, not merely eventual firing:
+// F3b-r2: the latch keys on the widget-vs-RA CLASS boundary, NOT RootIndex. It
+// fires when EVERY cohort's NAV WIDGETS have seeded (navWidgetRemaining==0),
+// independent of RootIndex — then before ANY RA (the RA content tail is
+// excluded from readiness). The old "fires after the reachable-cohort dashboards
+// (RootIndex==0)" invariant is SUPERSEDED by "fires after ALL nav widgets across
+// all cohorts." These arms discriminate the fire-POINT, not merely eventual
+// firing:
 //
-//   ARM-GREEN (§F.2 ARM-TAIL, F-C1): rank-1 first-nav widgets + a heavy
-//     NON-first-nav tail (RootIndex>0 widget + a fanout restaction). The latch
-//     MUST fire BEFORE any tail seed runs. Asserts ORDERING (latch-fire index
-//     < first tail-seed index), not just that it fired.
-//   ARM-RED-i (mutation → §F.2 mutation (i)): neuter the segment decrement so
-//     the latch can only fire via the zero-targets / rank-boundary path (=
-//     "moved to full-scope completion"). Under the SAME fixture the latch then
-//     fires only AFTER the whole rank-1 pass incl. the tail → RED.
-//   ARM-C3 (§F.2 ARM-COLD / F-C3): a RootIndex>0-ONLY rank-1 (no dashboard
-//     widget authorised for rank-1). firstNavRemaining stays 0, so the latch
-//     must NOT fire via the segment path early; it fires ONLY through the
-//     provably-zero path AFTER the rank-1 seed (never spuriously mid-tail).
-//   ARM-BACKSTOP (§F.2 / C2, F-C4): engineSeed's select composition — the
-//     latch never firing must fall through to the pctx.Done() backstop, so
-//     readiness is never withheld forever. Driven at the select level.
+//   ARM-GREEN (F3b-r2 all-nav-widget): a low-NavOrder widget (RootIndex 0) AND a
+//     high-NavOrder widget (RootIndex 1) across 2 cohorts + a fanout restaction.
+//     The latch MUST fire AFTER the LAST nav widget of ANY cohort (incl. the
+//     RootIndex!=0 one) and BEFORE any RA. Asserts ORDERING.
+//   ARM-RED-earlyfire (C-r2-2 RED): simulate the OLD RootIndex latch — fire the
+//     latch the instant the RootIndex==0 widgets are done, leaving the
+//     RootIndex!=0 nav widget still cold. Under the GREEN guard (fire AFTER the
+//     last nav widget) this is RED. Proves the RootIndex latch is GONE, not
+//     dormant.
+//   ARM-ZERO (provably-empty): an all-RA topology (no nav widget) fires
+//     "zero-nav-widgets" so the latch never hangs to the backstop.
+//   ARM-BACKSTOP (C2, F-C4): engineSeed's select composition — the latch never
+//     firing must fall through to the pctx.Done() backstop, so readiness is
+//     never withheld forever. Driven at the select level.
 //
 // Hermetic, -race, seams only (no cluster / apiserver / informer). Serializes
 // on engineLatchTestMu (shares the process latch singleton + seed counters +
@@ -162,28 +162,34 @@ func firstIndexOf(ev []latchSeedEvent, pred func(latchSeedEvent) bool) int {
 	return len(ev)
 }
 
-// ── ARM-GREEN + ARM-RED-i (F-C1 / §F.2 ARM-TAIL + mutation (i)) ─────────────
-// Fixture: rank-1 (devs, collapsed=442) has a RootIndex==0 dashboard widget
-// (first-nav) AND a RootIndex==1 tail widget; plus a rank-1 fanout restaction.
-// rank-2 (ops) has targets on both widgets. The latch MUST fire after the
-// dashboard widget and BEFORE the tail widget + the restaction.
-func TestFirstNavLatch_FiresBeforeTail_GreenAndMutationRed(t *testing.T) {
+// ── ARM-GREEN + ARM-RED-earlyfire (C-r2-2) ─────────────────────────────────
+// Fixture: 2 cohorts (devs collapsed=442, ops collapsed=5), a low-NavOrder
+// widget dashboard-flex (RootIndex 0) AND a high-NavOrder widget estate-graph
+// (RootIndex 1), each carrying BOTH cohorts; plus a fanout restaction. The
+// all-nav-widget latch MUST fire AFTER the LAST nav widget of ANY cohort (incl.
+// estate-graph, which the OLD RootIndex latch would have left cold) and BEFORE
+// any RA.
+//
+// ARM-RED-earlyfire simulates the OLD RootIndex latch: it fires the latch the
+// instant the RootIndex==0 (dashboard-flex) widgets are done, leaving the
+// RootIndex!=0 nav widget (estate-graph) still cold. The GREEN guard "fire AFTER
+// the last nav widget" flags that as RED — proving the class-boundary latch
+// waits for ALL nav widgets, not just the RootIndex==0 ones.
+func TestFirstNavLatch_AllNavWidgets_GreenAndEarlyFireRed(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
 	quietLoggingE(t)
 
-	run := func(t *testing.T, mutateNeuterSegment bool) []latchSeedEvent {
+	// simulateOldRootIndexLatch, when true, installs a fire observer that fires
+	// the latch early — at the moment the RootIndex==0 dashboard-flex widget of
+	// the LAST cohort seeds — mirroring the deleted RootIndex latch. This is the
+	// C-r2-2 RED mutation, expressed hermetically (no source revert needed for
+	// the arm to RUN; the source-revert RED artifact is captured separately to
+	// /tmp/f3b-r2-falsifiers/).
+	run := func(t *testing.T, simulateOldRootIndexLatch bool) []latchSeedEvent {
 		resetFirstNavLatchForTest()
-		ensureFirstNavLatch() // build the process latch so seedScopeYielding can fire it
-		// #130 F3 cascade-harden (arch point 5): a FAILED arm previously left the
-		// process-global first-nav latch singleton armed/fired + the fire observer
-		// installed, poisoning the NEXT test in the package (the observed
-		// TestF5_RealCheckDispatchRBAC cascade). Reset the process-global seed
-		// state in t.Cleanup so a mid-seed Fatalf cannot leak it forward. (The
-		// observer is also cleared by installLatchFireObserver's own Cleanup; this
-		// is belt-and-suspenders + the latch/customer-in-flight reset the prior
-		// code only did at the NEXT run's start.)
+		latch := ensureFirstNavLatch() // build the process latch so seedScopeYielding can fire it
 		t.Cleanup(func() {
 			resetFirstNavLatchForTest()
 			firstNavFireObserver = nil
@@ -196,14 +202,18 @@ func TestFirstNavLatch_FiresBeforeTail_GreenAndMutationRed(t *testing.T) {
 		h := newNavWidgetHarvester()
 		dashGVR := latchWidgetGVR("flexes")
 		tailGVR := latchWidgetGVR("estategraphs")
-		harvestWidgetAtRoot(h, "dashboard-flex", dashGVR, 0) // RootIndex 0 — first-nav
-		harvestWidgetAtRoot(h, "estate-graph", tailGVR, 1)   // RootIndex 1 — tail
+		harvestWidgetAtRoot(h, "dashboard-flex", dashGVR, 0) // NavOrder 0, RootIndex 0
+		harvestWidgetAtRoot(h, "estate-graph", tailGVR, 1)   // NavOrder 1, RootIndex 1
 		widgets := h.snapshot()
 
 		fanoutRA := latchRA("fanout-ra")
 		ras := []templatesv1.ObjectReference{fanoutRA}
 
 		rec := &latchRecorder{}
+
+		// Wire the seams. For the RED simulation we override seedOneWidgetFn to
+		// fire the latch early (after the RootIndex==0 dashboard widgets, before
+		// the RootIndex!=0 nav widget) — the old-RootIndex-latch behaviour.
 		installLatchSeams(t, rec,
 			func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
 				switch gvr {
@@ -218,130 +228,138 @@ func TestFirstNavLatch_FiresBeforeTail_GreenAndMutationRed(t *testing.T) {
 				return eFanoutRAGVR, true
 			})
 
-		// Mutation (i): neuter the segment decrement so the latch can only fire
-		// via the rank-boundary / zero-targets path — the "latch moved to
-		// full-scope completion" defect. We simulate by pre-firing NOTHING and
-		// instead force firstNavRemaining to never reach zero: the cleanest
-		// hermetic neuter is to make the RootIndex==0 widget look like a tail
-		// (RootIndex forced >0) via a seam on the harvested entries.
-		if mutateNeuterSegment {
-			for i := range widgets {
-				if widgets[i].RootIndex == 0 {
-					widgets[i].RootIndex = 99 // no widget is first-nav anymore → segment count 0
+		installLatchFireObserver(t, rec)
+
+		if simulateOldRootIndexLatch {
+			// Override the widget seam to fire the latch the instant the LAST
+			// RootIndex==0 (dashboard-flex) widget seeds — the deleted behaviour.
+			prevW := seedOneWidgetFn
+			rootZeroSeeded := 0
+			seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, ns string, m seedScopeMode) error {
+				rec.rec(latchSeedEvent{class: "widget", label: e.W.GetName(), rootIdx: e.RootIndex, identity: eIdentityLabel(ctx)})
+				if e.RootIndex == 0 {
+					rootZeroSeeded++
+					if rootZeroSeeded == 2 { // both cohorts' dashboard-flex done
+						latch.fire("old-rootindex-latch", 1, 2, "", -1, 0)
+					}
 				}
+				return nil
 			}
+			t.Cleanup(func() { seedOneWidgetFn = prevW })
 		}
 
-		installLatchFireObserver(t, rec)
 		if err := seedScopeYielding(context.Background(), ras, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 			t.Fatalf("seedScopeYielding returned %v; want nil", err)
 		}
 		return rec.snapshot()
 	}
 
-	t.Run("green_fires_after_all_reachable_dashboards_before_last_tail", func(t *testing.T) {
-		// #130 F3 Lever 2 — the latch now waits for EVERY first-nav-reachable
-		// cohort's dashboard segment (devs AND ops), not just rank-0's. The
-		// invariant is re-expressed for the multi-cohort case (arch-ruled: the
-		// single-cohort "fire before ANY tail" is genuinely incompatible with
-		// "wait for all cohorts' dashboards" under the rank-major loop — reaching
-		// ops' dashboard requires traversing devs' full rank first, including devs'
-		// tail widget + devs' fanout RA. That interleaving is intended and
-		// unavoidable without a larger dashboard-first seed reorder, which is out
-		// of F3 scope). The load-bearing readyz-correctness properties that SURVIVE:
-		//   (1) fire AFTER both reachable cohorts' RootIndex==0 dashboards (Ready
-		//       does not flip until every login cohort's dashboard is warm), and
-		//   (2) fire BEFORE the LAST reachable cohort's (ops') tail widget + RA,
-		//       and before the filler-only RA (readyz does not wait on the LAST
-		//       cohort's non-dashboard tail — the whale-fanout the latch removes).
+	t.Run("green_fires_after_all_nav_widgets_before_any_ra", func(t *testing.T) {
 		ev := run(t, false)
 		latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
-		devsDashIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
-			return e.class == "widget" && e.label == "dashboard-flex" && e.identity == "group:devs"
-		})
-		opsDashIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
-			return e.class == "widget" && e.label == "dashboard-flex" && e.identity == "group:ops"
-		})
-		opsTailWidgetIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
-			return e.class == "widget" && e.label == "estate-graph" && e.identity == "group:ops"
-		})
-		opsRAIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
-			return e.class == "restaction" && e.identity == "group:ops"
-		})
-		fillerRAIdx := firstIndexOf(ev, func(e latchSeedEvent) bool {
-			return e.class == "restaction" && e.identity == "user:filler"
-		})
-
 		if latchIdx == len(ev) {
-			t.Fatalf("F-C1: latch never fired; events=%+v", ev)
+			t.Fatalf("F3b-r2: latch never fired; events=%+v", ev)
 		}
-		// (1) fire AFTER BOTH reachable cohorts' dashboards — the Lever-2 core.
-		if devsDashIdx == len(ev) || opsDashIdx == len(ev) {
-			t.Fatalf("F3 Lever2 setup: both devs+ops dashboards must seed; devsDash=%d opsDash=%d events=%+v", devsDashIdx, opsDashIdx, ev)
+		// (1) fire AFTER the LAST nav widget of ANY cohort — including the
+		//     RootIndex!=0 estate-graph. Find the last widget seed index.
+		lastWidgetIdx := -1
+		for i, e := range ev {
+			if e.class == "widget" {
+				lastWidgetIdx = i
+			}
 		}
-		if latchIdx < devsDashIdx || latchIdx < opsDashIdx {
-			t.Fatalf("F3 Lever2 ARM-COLD: latch fired at idx %d BEFORE a reachable cohort's dashboard "+
-				"(devsDash=%d opsDash=%d) — readyz would flip with a login cohort's dashboard cold; events=%+v",
-				latchIdx, devsDashIdx, opsDashIdx, ev)
+		if lastWidgetIdx < 0 {
+			t.Fatalf("F3b-r2 setup: no widgets seeded; events=%+v", ev)
 		}
-		// (2) fire BEFORE the LAST cohort's (ops') tail widget + ops' RA + the
-		//     filler-only RA — readyz does not wait on the last cohort's tail whale.
-		if opsTailWidgetIdx < len(ev) && latchIdx > opsTailWidgetIdx {
-			t.Fatalf("F3 Lever2 ARM-TAIL: latch fired at idx %d AFTER ops' NON-first-nav tail widget at idx %d "+
-				"— readyz would wait on the last cohort's tail; events=%+v", latchIdx, opsTailWidgetIdx, ev)
+		if latchIdx < lastWidgetIdx {
+			t.Fatalf("F3b-r2 ARM-COLD: latch fired at idx %d BEFORE the last nav widget at idx %d — "+
+				"readyz would flip with a nav widget (e.g. the RootIndex!=0 estate-graph) still cold; events=%+v",
+				latchIdx, lastWidgetIdx, ev)
 		}
-		if opsRAIdx < len(ev) && latchIdx > opsRAIdx {
-			t.Fatalf("F3 Lever2 ARM-TAIL: latch fired at idx %d AFTER ops' fanout restaction at idx %d; events=%+v", latchIdx, opsRAIdx, ev)
+		// (2) fire BEFORE any RA — the RA content tail is excluded from readiness.
+		firstRAIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "restaction" })
+		if firstRAIdx == len(ev) {
+			t.Fatalf("F3b-r2 setup: no RA seeded; events=%+v", ev)
 		}
-		if fillerRAIdx < len(ev) && latchIdx > fillerRAIdx {
-			t.Fatalf("F3 Lever2 ARM-TAIL: latch fired at idx %d AFTER the filler-only restaction at idx %d "+
-				"— readyz would wait on the RA-only tail; events=%+v", latchIdx, fillerRAIdx, ev)
+		if latchIdx > firstRAIdx {
+			t.Fatalf("F3b-r2 ARM-TAIL: latch fired at idx %d AFTER the first RA at idx %d — "+
+				"readyz must not wait on the RA content tail; events=%+v", latchIdx, firstRAIdx, ev)
+		}
+		// Both RootIndex==0 AND RootIndex!=0 nav widgets are covered: the latch
+		// fired after a RootIndex==1 widget seeded (the discriminator vs the old latch).
+		sawRootOneWidgetBeforeLatch := false
+		for i, e := range ev {
+			if e.class == "widget" && e.rootIdx == 1 && i < latchIdx {
+				sawRootOneWidgetBeforeLatch = true
+			}
+		}
+		if !sawRootOneWidgetBeforeLatch {
+			t.Fatalf("F3b-r2: no RootIndex!=0 nav widget seeded before the latch fired — the class-boundary latch must wait for the RootIndex!=0 nav widgets too; events=%+v", ev)
 		}
 	})
 
-	t.Run("mutation_i_full_scope_completion_red", func(t *testing.T) {
+	t.Run("red_old_rootindex_latch_fires_leaving_nonroot_nav_cold", func(t *testing.T) {
 		ev := run(t, true)
+		// The FIRST LATCH event is the simulated old-RootIndex early fire.
 		latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
-		tailWidgetIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.label == "estate-graph" })
-		raIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "restaction" })
-
 		if latchIdx == len(ev) {
-			t.Fatalf("mutation setup: latch never fired at all; events=%+v", ev)
+			t.Fatalf("RED setup: latch never fired; events=%+v", ev)
 		}
-		// With the segment neutered, the ONLY fire path is the rank-boundary
-		// zero-targets check (fires after the rank-1 loop → after ALL tail work).
-		// PROVE the mutation is RED against the GREEN property: the latch now
-		// fires AFTER the tail, i.e. it does NOT fire before tail work.
-		firedBeforeTail := (tailWidgetIdx == len(ev) || latchIdx < tailWidgetIdx) &&
-			(raIdx == len(ev) || latchIdx < raIdx)
-		if firedBeforeTail {
-			t.Fatalf("mutation (i) NOT RED: with the first-nav segment neutered, the latch STILL fired before the tail (idx %d; tailWidget=%d ra=%d) — the ordering assert does not discriminate; events=%+v",
-				latchIdx, tailWidgetIdx, raIdx, ev)
+		lastWidgetIdx := -1
+		for i, e := range ev {
+			if e.class == "widget" {
+				lastWidgetIdx = i
+			}
+		}
+		// PROVE the RED against the GREEN property: the simulated old-RootIndex
+		// latch fires BEFORE the last (RootIndex!=0) nav widget → the GREEN guard
+		// "latch >= lastWidget" is violated.
+		if !(latchIdx < lastWidgetIdx) {
+			t.Fatalf("C-r2-2 NOT RED: the simulated old-RootIndex latch did NOT fire before the last nav widget (latch=%d lastWidget=%d) — the GREEN guard would not discriminate it; events=%+v",
+				latchIdx, lastWidgetIdx, ev)
+		}
+		// And specifically it fired while a RootIndex!=0 nav widget was still cold.
+		rootOneAfterLatch := false
+		for i, e := range ev {
+			if e.class == "widget" && e.rootIdx == 1 && i > latchIdx {
+				rootOneAfterLatch = true
+			}
+		}
+		if !rootOneAfterLatch {
+			t.Fatalf("C-r2-2 RED shape degenerate: no RootIndex!=0 nav widget seeded AFTER the early fire; events=%+v", ev)
 		}
 	})
 }
 
-// ── ARM-C3 (§F.2 ARM-COLD / F-C3): RootIndex>0-only rank-1 ─────────────────
-// No RootIndex==0 widget is authorised for the rank-1 identity → the segment
-// count is 0 → the latch must NOT fire via the segment decrement mid-tail; it
-// fires ONLY through the provably-zero path AFTER the rank-1 seed. Guards
-// against a false-ready when the dashboard segment was never reached.
-func TestFirstNavLatch_RootIndexGtZeroOnly_NoEarlySegmentFire(t *testing.T) {
+// ── ARM-NONROOT (F3b-r2): RootIndex!=0-only topology still fires on all-nav ──
+// No RootIndex==0 widget exists at all (every nav widget is RootIndex!=0). Under
+// F3b-r2 these are ORDINARY nav widgets (no special first-nav segment); the
+// latch fires AFTER the LAST nav widget seeds — NOT via a provably-empty path.
+// This is the exact inverse of the deleted F-C3 semantics: the old latch treated
+// a RootIndex>0-only topology as "zero first-nav" and fired the provably-empty
+// path; the class-boundary latch treats them as nav widgets and waits for them.
+func TestFirstNavLatch_NonRootWidgetsOnly_FiresAfterAllNavWidgets(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
 	quietLoggingE(t)
 
 	resetFirstNavLatchForTest()
-	ensureFirstNavLatch() // build the process latch so seedScopeYielding can fire it
+	ensureFirstNavLatch()
+	t.Cleanup(func() {
+		resetFirstNavLatchForTest()
+		firstNavFireObserver = nil
+		zeroCustomerInFlight()
+	})
 
 	devs := eID{name: "devs", group: true, collapsed: 442}
+	ops := eID{name: "ops", group: true, collapsed: 5}
 
 	h := newNavWidgetHarvester()
 	tailA := latchWidgetGVR("tailas")
 	tailB := latchWidgetGVR("tailbs")
-	harvestWidgetAtRoot(h, "tail-a", tailA, 1) // RootIndex 1 — no first-nav segment
-	harvestWidgetAtRoot(h, "tail-b", tailB, 2)
+	harvestWidgetAtRoot(h, "tail-a", tailA, 1) // NavOrder 0, RootIndex 1
+	harvestWidgetAtRoot(h, "tail-b", tailB, 2) // NavOrder 1, RootIndex 2
 	widgets := h.snapshot()
 
 	rec := &latchRecorder{}
@@ -349,7 +367,7 @@ func TestFirstNavLatch_RootIndexGtZeroOnly_NoEarlySegmentFire(t *testing.T) {
 		func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
 			switch gvr {
 			case tailA, tailB:
-				return latchTargets(gvr, devs)
+				return latchTargets(gvr, devs, ops)
 			}
 			return nil
 		},
@@ -357,7 +375,13 @@ func TestFirstNavLatch_RootIndexGtZeroOnly_NoEarlySegmentFire(t *testing.T) {
 			return schema.GroupVersionResource{}, false
 		})
 
-	installLatchFireObserver(t, rec)
+	var fireReason string
+	firstNavFireObserver = func(reason string) {
+		fireReason = reason
+		rec.rec(latchSeedEvent{class: "LATCH", label: reason, rootIdx: -1})
+	}
+	t.Cleanup(func() { firstNavFireObserver = nil })
+
 	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
@@ -365,23 +389,86 @@ func TestFirstNavLatch_RootIndexGtZeroOnly_NoEarlySegmentFire(t *testing.T) {
 
 	latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
 	if latchIdx == len(ev) {
-		t.Fatalf("F-C3: latch never fired for a zero-first-nav rank-1 — readyz would hang to the backstop; events=%+v", ev)
+		t.Fatalf("F3b-r2: latch never fired for a RootIndex!=0-only topology — readyz would hang to the backstop; events=%+v", ev)
 	}
-	// It MUST NOT fire before both tail widgets have seeded — a segment-path
-	// early fire on a RootIndex>0-only rank-1 is the F-C3 false-ready defect.
-	// The provably-zero path fires at the rank-1 boundary, i.e. AFTER both
-	// tail widgets.
-	lastTailIdx := -1
+	// F3b-r2: these are ORDINARY nav widgets → the latch waits for them all and
+	// fires "segment-complete", NOT "zero-nav-widgets".
+	if fireReason != "segment-complete" {
+		t.Fatalf("F3b-r2: latch fired reason=%q; want \"segment-complete\" — RootIndex!=0 widgets are ordinary nav widgets, not a provably-empty first-nav set; events=%+v", fireReason, ev)
+	}
+	lastWidgetIdx := -1
 	for i, e := range ev {
 		if e.class == "widget" {
-			lastTailIdx = i
+			lastWidgetIdx = i
 		}
 	}
-	if lastTailIdx < 0 {
-		t.Fatalf("F-C3 setup: no tail widgets seeded; events=%+v", ev)
+	if lastWidgetIdx < 0 {
+		t.Fatalf("F3b-r2 setup: no widgets seeded; events=%+v", ev)
 	}
-	if latchIdx < lastTailIdx {
-		t.Fatalf("F-C3: latch fired at idx %d BEFORE the last tail widget seeded at idx %d — false-ready on a RootIndex>0-only rank-1 (segment path fired spuriously); events=%+v", latchIdx, lastTailIdx, ev)
+	if latchIdx < lastWidgetIdx {
+		t.Fatalf("F3b-r2: latch fired at idx %d BEFORE the last nav widget at idx %d — the class-boundary latch must wait for ALL nav widgets (RootIndex-independent); events=%+v", latchIdx, lastWidgetIdx, ev)
+	}
+}
+
+// ── ARM-ZERO (F3b-r2 provably-empty): no nav widget at all → zero-nav-widgets ─
+// An all-RA topology (or a walk that reached no widget) has navWidgetRemaining==0
+// at arm time → the latch fires "zero-nav-widgets" immediately so it never hangs
+// to the PHASE1_TIMEOUT backstop, and fires BEFORE any RA seeds.
+func TestFirstNavLatch_ZeroNavWidgets_FiresImmediatelyBeforeRA(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	zeroCustomerInFlight()
+	quietLoggingE(t)
+
+	resetFirstNavLatchForTest()
+	ensureFirstNavLatch()
+	t.Cleanup(func() {
+		resetFirstNavLatchForTest()
+		firstNavFireObserver = nil
+		zeroCustomerInFlight()
+	})
+
+	devs := eID{name: "devs", group: true, collapsed: 442}
+
+	fanoutRA := latchRA("fanout-ra")
+	ras := []templatesv1.ObjectReference{fanoutRA}
+
+	rec := &latchRecorder{}
+	installLatchSeams(t, rec,
+		func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
+			if gvr == eFanoutRAGVR {
+				return latchTargets(eFanoutRAGVR, devs)
+			}
+			return nil
+		},
+		func(_ templatesv1.ObjectReference) (schema.GroupVersionResource, bool) {
+			return eFanoutRAGVR, true
+		})
+
+	var fireReason string
+	firstNavFireObserver = func(reason string) {
+		fireReason = reason
+		rec.rec(latchSeedEvent{class: "LATCH", label: reason, rootIdx: -1})
+	}
+	t.Cleanup(func() { firstNavFireObserver = nil })
+
+	// NO widgets — only an RA.
+	if err := seedScopeYielding(context.Background(), ras, nil, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
+		t.Fatalf("seedScopeYielding returned %v; want nil", err)
+	}
+	ev := rec.snapshot()
+
+	latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
+	if latchIdx == len(ev) {
+		t.Fatalf("F3b-r2: latch never fired for a zero-nav-widget topology — readyz would hang to the backstop; events=%+v", ev)
+	}
+	if fireReason != "zero-nav-widgets" {
+		t.Fatalf("F3b-r2: latch fired reason=%q; want \"zero-nav-widgets\" (no nav widget to warm); events=%+v", fireReason, ev)
+	}
+	// Fired BEFORE any RA (the RA tail is excluded from readiness).
+	firstRAIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "restaction" })
+	if firstRAIdx < len(ev) && latchIdx > firstRAIdx {
+		t.Fatalf("F3b-r2: zero-nav-widgets latch fired at idx %d AFTER an RA at idx %d — it must fire immediately at arm time; events=%+v", latchIdx, firstRAIdx, ev)
 	}
 }
 
@@ -494,13 +581,12 @@ func TestFirstNavLatch_BackstopUnblocksWhenLatchNeverFires(t *testing.T) {
 	}
 }
 
-// ── mutation (ii) proof (§F.2): fire-before-segment-complete → ARM-COLD RED ─
-// Directly exercises the ARM-COLD assert from the GREEN arm by FORCING an
-// early fire (mutation (ii): "latch fired before the segment completes") and
-// showing the GREEN arm's dashIdx guard flags it. We fire the latch before
-// seeding anything, then run the same fixture; the recorded LATCH lands before
-// the dashboard widget → the GREEN arm's `latchIdx < dashIdx` guard is RED.
-func TestFirstNavLatch_MutationII_FireBeforeSegment_IsRedUnderGreenGuard(t *testing.T) {
+// ── mutation (ii): fire-before-any-nav-widget → ARM-COLD RED ────────────────
+// Directly exercises the GREEN arm's ARM-COLD assert by FORCING an early fire
+// (before any seed) and showing the GREEN guard `latchIdx < lastWidget` flags
+// it. We fire the latch before seeding anything; the recorded LATCH lands before
+// every widget → RED under the all-nav-widget guard.
+func TestFirstNavLatch_MutationII_FireBeforeAnyNavWidget_IsRedUnderGreenGuard(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
@@ -508,17 +594,25 @@ func TestFirstNavLatch_MutationII_FireBeforeSegment_IsRedUnderGreenGuard(t *test
 
 	resetFirstNavLatchForTest()
 	latch := ensureFirstNavLatch()
+	t.Cleanup(func() {
+		resetFirstNavLatchForTest()
+		firstNavFireObserver = nil
+		zeroCustomerInFlight()
+	})
 
 	devs := eID{name: "devs", group: true, collapsed: 442}
 	h := newNavWidgetHarvester()
 	dashGVR := latchWidgetGVR("flexes")
+	tailGVR := latchWidgetGVR("estategraphs")
 	harvestWidgetAtRoot(h, "dashboard-flex", dashGVR, 0)
+	harvestWidgetAtRoot(h, "estate-graph", tailGVR, 1)
 	widgets := h.snapshot()
 
 	rec := &latchRecorder{}
 	installLatchSeams(t, rec,
 		func(gvr schema.GroupVersionResource) []cache.PrewarmTarget {
-			if gvr == dashGVR {
+			switch gvr {
+			case dashGVR, tailGVR:
 				return latchTargets(gvr, devs)
 			}
 			return nil
@@ -528,7 +622,7 @@ func TestFirstNavLatch_MutationII_FireBeforeSegment_IsRedUnderGreenGuard(t *test
 		})
 
 	installLatchFireObserver(t, rec)
-	// MUTATION (ii): fire BEFORE the segment completes (before any seed).
+	// MUTATION (ii): fire BEFORE any nav widget seeds.
 	latch.fire("mutation-ii-premature", 0, 0, "", -1, 0)
 	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
@@ -536,12 +630,16 @@ func TestFirstNavLatch_MutationII_FireBeforeSegment_IsRedUnderGreenGuard(t *test
 	ev := rec.snapshot()
 
 	latchIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "LATCH" })
-	dashIdx := firstIndexOf(ev, func(e latchSeedEvent) bool { return e.class == "widget" && e.label == "dashboard-flex" })
-	// The GREEN arm's ARM-COLD guard is `latchIdx < dashIdx → FAIL`. Prove that
-	// a premature fire triggers exactly that condition (i.e. the guard
-	// discriminates mutation (ii)).
-	if !(latchIdx < dashIdx) {
-		t.Fatalf("mutation (ii) NOT caught: premature fire did not land before the dashboard-widget seed (latch=%d dash=%d) — the GREEN ARM-COLD guard would not flag it; events=%+v", latchIdx, dashIdx, ev)
+	lastWidgetIdx := -1
+	for i, e := range ev {
+		if e.class == "widget" {
+			lastWidgetIdx = i
+		}
+	}
+	// The GREEN arm's ARM-COLD guard is `latchIdx < lastWidget → FAIL`. Prove a
+	// premature fire triggers exactly that condition.
+	if !(latchIdx < lastWidgetIdx) {
+		t.Fatalf("mutation (ii) NOT caught: premature fire did not land before the last nav-widget seed (latch=%d lastWidget=%d) — the GREEN ARM-COLD guard would not flag it; events=%+v", latchIdx, lastWidgetIdx, ev)
 	}
 }
 
