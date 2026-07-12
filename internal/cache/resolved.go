@@ -721,6 +721,29 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// HashExtras returns a stable, order-independent hash of a JSON-native extras
+// map — the SAME canonicalisation ComputeKey folds into the L1 key (single
+// derivation site via canonicaliseExtras, so the F4 seed-resolve memo's notion
+// of "same effective extras" cannot drift from the L1 key's). Empty/nil map →
+// the fixed sentinel "e0" (never empty, so an empty-extras key segment is
+// unambiguous). Used by the apiref seam to build the SeedResolveMemo key's
+// extras component; keeping the canonicalisation here means a future extras
+// schema change updates memo + L1 key together.
+func HashExtras(m map[string]any) string {
+	if len(m) == 0 {
+		return "e0"
+	}
+	buf, err := canonicaliseExtras(m)
+	if err != nil {
+		// Deterministic-but-pessimistic fallback — mirrors ComputeKey's
+		// marshal-failure branch so a cyclic/non-JSON value still varies the
+		// key rather than colliding.
+		buf = []byte(fmt.Sprintf("%v", m))
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:])
+}
+
 // canonicaliseExtras emits a sorted-key JSON encoding of m. Nested
 // maps are recursively canonicalised; everything else round-trips
 // through json.Marshal as-is.

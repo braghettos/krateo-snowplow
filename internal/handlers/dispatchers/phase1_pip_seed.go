@@ -980,6 +980,29 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// raFullListServe — G2-A), reading the cohort identity from resCtx. No
 	// bindingUID is threaded (the eg1 defect was threading the WIDGET-coordinate
 	// bindingUID, which key-diverged from the RA-CR verdict → G inert).
+	//
+	// #130 F4 Option 2 — SKIP the 4a full-list pin when THIS widget resolves
+	// UNPAGINATED (apiref.IsPaginatedResolve(e.PerPage, e.Page) false). The 4a
+	// pin exists to warm a sliceable full-list for a subsequent PAGINATED /call
+	// (shouldServeRAFullList engages only when perPage>0 && page>0). An
+	// unpaginated-consuming widget (a Statistic/Tag widget counting `list:`
+	// wholesale) resolves at (0,0)/(−1,−1), so its own /call never engages the
+	// slice serve — the pin's second full ~18s benchapps materialization is pure
+	// waste. Reuses the EXACT serve-gate pagination predicate (one derivation
+	// site, no drift) and is DATA-DERIVED (reads the resolve tuple, never
+	// widget-kind — feedback_no_special_cases / C-F4-7). A paginated widget is
+	// byte-unchanged (still pins). Emits a greppable skip line for the falsifier.
+	if !apiref.IsPaginatedResolve(e.PerPage, e.Page) {
+		slog.Default().Info("phase1.seed.rafulllist.skip_unpaginated",
+			slog.String("subsystem", "cache"),
+			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+			slog.Int("perpage", e.PerPage),
+			slog.Int("page", e.Page),
+			slog.String("effect", "F4 Option 2 — widget consumes the list unpaginated; the 4a full-list "+
+				"pin would never be slice-served on its own /call, so the redundant unpaginated re-resolve is skipped"),
+		)
+		return nil
+	}
 	seedRAFullListForWidget(resCtx, in, authnNS, e.W.GetNamespace(), e.W.GetName())
 	return nil
 }
