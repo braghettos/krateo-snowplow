@@ -386,6 +386,25 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "body served (200); not persisted — external API re-fetched live on every /call"),
 		)
+	} else if !requestExtrasFullyDeclared(got.Unstructured.Object, extras) {
+		// F6 SELF-QUARANTINE (arch-ruled 2026-07-13, docs/f6-chrome-route-key-
+		// design-2026-07-12.md §4). This request carries request-extras the widget
+		// did NOT declare in spec.keyExtras. Post-F6 those undeclared extras DROP
+		// from the per-cohort key, so this request's key == a co-cohort clean
+		// request's key — but this request's RAW extras reached widgets.Resolve, so
+		// the rendered body is extras-influenced. Writing it into the shared cohort
+		// cell would serve THIS request's extras-shaped body to a co-cohort user who
+		// sent none (the leak F6 would otherwise open, since dropping the extras from
+		// the key removed the pre-F6 self-quarantine). SYMMETRIC with the
+		// extTouchedSink decline above: serve THIS request's correct body (already
+		// written below the if-chain), bump the counter, decline the Put + dep-Record
+		// + publishIfSubscribed. The declared corpus + chrome widgets never reach here
+		// (their supplied extras are all declared, or they send none). Placed BEFORE
+		// the genuine-Put branch so a polluting request cannot fall into it.
+		bumpWidgetSkippedUndeclaredExtrasPut()
+		log.Warn("Widget request carried extras not declared in spec.keyExtras; declining to cache (would pollute the shared per-cohort cell post-F6)",
+			slog.String("effect", "body served (200) under this request's own extras; not persisted — a co-cohort request without these extras must not be served this extras-shaped body"),
+		)
 	} else if cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
 		// #95 SECURITY (A4 populate side, customer path) — the single-mechanism
 		// closure. A re-derived BindingUID of "" collapses to the shared

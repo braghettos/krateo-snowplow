@@ -181,11 +181,20 @@ func TestFARCH2_DeclaredWidget_CrossUserKeysDiffer(t *testing.T) {
 func TestFARCH3_Boundary_And_SpoofQuarantine(t *testing.T) {
 	ctx := ctxAsIdentity("alice", "devs")
 
-	// (a) undeclared + client identity extras → folded (passive compat).
+	// (a) F6 RECONCILIATION (arch-ruled 2026-07-13): an UNDECLARED widget DROPS
+	// client-supplied request extras from the KEY. PRE-F6 this folded them verbatim
+	// ("passive compat"); F6 reversed it — undeclared request extras (identity or
+	// route params) do NOT partition the key (they still reach the resolve input).
+	// This is a STRONGER spoof posture: a client-supplied extras.username on an
+	// undeclared widget cannot even fold into the key. The DECLARED injection-wins
+	// path (c)/(c2) below is UNCHANGED — F6 only affects UNdeclared request extras.
 	undeclared := map[string]any{"spec": map[string]any{}}
 	_, aExtras := keyFor(t, ctx, undeclared, map[string]any{"username": "client-supplied"})
-	if aExtras["username"] != "client-supplied" {
-		t.Fatalf("F-ARCH-3(a): an UNDECLARED widget must fold client-supplied extras verbatim (passive compat); got %#v", aExtras)
+	if _, present := aExtras["username"]; present {
+		t.Fatalf("F-ARCH-3(a) F6: an UNDECLARED widget must DROP client-supplied request extras from the key; got %#v — the client 'username' must NOT partition the key (F6 fold-nothing)", aExtras)
+	}
+	if len(aExtras) != 0 {
+		t.Fatalf("F-ARCH-3(a) F6: an undeclared widget with only client request extras must fold EMPTY key extras; got %#v", aExtras)
 	}
 
 	// (b) undeclared + no request extras → empty effective extras (== seed key).

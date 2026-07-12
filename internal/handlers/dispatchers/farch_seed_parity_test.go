@@ -103,47 +103,65 @@ func TestFARCH1_SeedParity_NonDeclaredWidget_PortalShapedHIT(t *testing.T) {
 	}
 }
 
-// TestFARCH1_RED_OldFrontendRequest_Misses — the F-ARCH-1 RED arm. Re-adding the
-// unconditional identity extras to the SERVE request (the old-frontend / shipped
-// 1.6.5 wire shape) makes the serve key fold {username,groups} while the seed key
-// (identity-free) folds nothing → the keys DIVERGE → the seeded cell is MISSED. This
-// documents exactly what the pre-contract wire shape did (the #107 0/N divergence):
-// this arm is GREEN (asserts the MISS) precisely because the defect shape must miss.
-func TestFARCH1_RED_OldFrontendRequest_Misses(t *testing.T) {
+// TestFARCH1_F6_OldFrontendRequest_NowHits — F6 RECONCILIATION of the former
+// F-ARCH-1 RED arm (arch-ruled 2026-07-13). PRE-F6 this arm asserted the OPPOSITE:
+// the old-frontend / 1.6.5 wire shape folded unconditional identity extras
+// ({username,groups}) VERBATIM into an undeclared widget's key (the "passive
+// compat" property), so the serve key DIVERGED from the extras-less seed key and
+// MISSED — the #107 0/N seed-miss divergence.
+//
+// F6 STRUCTURALLY ELIMINATES that miss class for undeclared widgets: request
+// extras (identity or route params) that the widget does NOT declare in
+// spec.keyExtras fold NOTHING into the key. So the old-frontend request now folds
+// EMPTY key extras (same as the seed) → the serve key EQUALS the seed key → the
+// seeded cell is now HIT, not missed. This is a STRICT IMPROVEMENT: the very
+// divergence #107 documented cannot recur for the identity-free corpus — F6
+// closes it by construction. (Identity that a widget genuinely depends on is
+// folded via the A2 spec.identityContext declaration + DeclaredIdentity injection,
+// still exercised by TestFARCH2 / TestFARCH3(c). F6 only drops UNDECLARED request
+// extras.) The arm stays permanent, flipped GREEN-on-HIT, as the pin that F6
+// keeps the #107 class closed.
+func TestFARCH1_F6_OldFrontendRequest_NowHits(t *testing.T) {
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity()
 	const (
 		g, v, r, ns, name = "widgets.templates.krateo.io", "v1beta1", "buttons", "demo-system", "btn-107-red"
 		perPage, page     = 10, 1
 	)
-	cr := map[string]any{"spec": map[string]any{}} // non-declared
+	cr := map[string]any{"spec": map[string]any{}} // non-declared — F6 folds nothing
 
 	seedExtras := effectiveKeyExtras(ctx, cr, nil)
 	seedKey, seedHandle, seedInputs := dispatchCacheLookupKey(ctx, "widgets",
 		g, v, r, ns, name, perPage, page, seedExtras)
 	if seedHandle == nil || seedKey == "" {
-		t.Fatal("F-ARCH-1 RED: expected a live seed handle + key")
+		t.Fatal("F-ARCH-1 F6: expected a live seed handle + key")
 	}
-	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: []byte(`{"x":1}`), Inputs: seedInputs})
+	body := []byte(`{"x":1}`)
+	seedHandle.Put(seedKey, &cache.ResolvedEntry{RawJSON: body, Inputs: seedInputs})
 
-	// OLD-FRONTEND serve request: unconditional identity extras on the wire.
+	// OLD-FRONTEND serve request: unconditional identity extras on the wire. Under
+	// F6 the undeclared widget DROPS them from the key.
 	serveExtras := effectiveKeyExtras(ctx, cr, oldFrontendRequest())
 	serveKey, serveHandle, _ := dispatchCacheLookupKey(ctx, "widgets",
 		g, v, r, ns, name, perPage, page, serveExtras)
 	if serveHandle == nil || serveKey == "" {
-		t.Fatal("F-ARCH-1 RED: expected a live serve handle + key")
+		t.Fatal("F-ARCH-1 F6: expected a live serve handle + key")
 	}
 
-	// The old-frontend request folds identity extras (a non-declared widget passes
-	// them through, passive compat) → the serve key MUST diverge from the seed key.
-	if serveExtras["username"] != "cyberjoker" {
-		t.Fatalf("F-ARCH-1 RED setup: the old-frontend request must fold identity extras (passive compat); got %#v", serveExtras)
+	// F6: the old-frontend identity extras are UNDECLARED → dropped from the key →
+	// the effective key extras are EMPTY on both sides.
+	if len(serveExtras) != 0 {
+		t.Fatalf("F-ARCH-1 F6: an undeclared widget must DROP the old-frontend identity extras from the key; got %#v — F6 must not fold undeclared request extras", serveExtras)
 	}
-	if seedKey == serveKey {
-		t.Fatalf("F-ARCH-1 RED: seed key == old-frontend serve key %q — the arm is not discriminating; the old wire shape MUST miss the identity-free seed cell (the #107 divergence)", serveKey)
+	if seedKey != serveKey {
+		t.Fatalf("F-ARCH-1 F6: seed key %q != old-frontend serve key %q — F6 must collapse the undeclared-request divergence so the #107 seed-miss cannot recur", seedKey, serveKey)
 	}
-	if _, hit := serveHandle.Get(serveKey); hit {
-		t.Fatal("F-ARCH-1 RED: old-frontend serve unexpectedly HIT the seed cell — the #107 seed-miss should reproduce here")
+	got, hit := serveHandle.Get(serveKey)
+	if !hit {
+		t.Fatal("F-ARCH-1 F6: old-frontend serve MISSED the seed cell — F6 should make it HIT (the #107 class is eliminated for undeclared widgets)")
+	}
+	if string(got.RawJSON) != string(body) {
+		t.Fatalf("F-ARCH-1 F6: served the wrong body; got %q want %q", got.RawJSON, body)
 	}
 }
 

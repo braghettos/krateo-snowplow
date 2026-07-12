@@ -53,6 +53,24 @@ func bumpWidgetContentSkippedRBACSensitive() {
 	widgetContentSkippedRBACSensitiveTotal.Add(1)
 }
 
+// widgetSkippedUndeclaredExtrasPutTotal is the process-wide count of per-cohort
+// `widgets` Puts the F6 self-quarantine guard declined (arch-ruled 2026-07-13).
+// A request carrying request-extras the widget did NOT declare in spec.keyExtras
+// would, post-F6, key onto the SAME shared cohort cell as a clean request (the
+// undeclared extras drop from the key) — so its extras-influenced body must NOT
+// write the cohort cell (it would be served to a co-cohort user who did not send
+// those extras). The request still gets its own correct per-request 200; it just
+// declines the Put. A non-zero value = at least one polluting request was
+// quarantined; the declared corpus + chrome widgets never trip it.
+var widgetSkippedUndeclaredExtrasPutTotal atomic.Uint64
+
+// bumpWidgetSkippedUndeclaredExtrasPut increments the F6 quarantine counter.
+// Called by the widgets dispatcher when requestExtrasFullyDeclared is false at
+// the genuine per-cohort Put gate.
+func bumpWidgetSkippedUndeclaredExtrasPut() {
+	widgetSkippedUndeclaredExtrasPutTotal.Add(1)
+}
+
 // widgetContentMetricsOnce guards expvar.Publish against the double-
 // publish panic (mirrors phase1WalkMetricsOnce).
 var widgetContentMetricsOnce sync.Once
@@ -76,6 +94,9 @@ func registerWidgetContentMetrics() {
 		}))
 		expvar.Publish("snowplow_widget_content_skipped_rbac_sensitive_total", expvar.Func(func() any {
 			return widgetContentSkippedRBACSensitiveTotal.Load()
+		}))
+		expvar.Publish("snowplow_widget_skipped_undeclared_extras_put_total", expvar.Func(func() any {
+			return widgetSkippedUndeclaredExtrasPutTotal.Load()
 		}))
 	})
 }
