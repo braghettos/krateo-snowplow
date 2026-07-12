@@ -429,6 +429,10 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			authnNS:   authnNS,
 		}
 		engineSeed = func(pctx context.Context) error {
+			// F5 (#131): anchor the backstop-elapsed clock. Used only to
+			// attribute the readyz.backstop.fired ERROR when the flip takes the
+			// C2 backstop arm rather than the firstNav-complete happy path.
+			engineSeedStart := time.Now()
 			// bootDone is closed by the engine's scopeDone callback the
 			// instant the BOOT scope finishes — so this goroutine returns at
 			// ACTUAL completion (S2), not after the full pipGlobalTimeout.
@@ -513,10 +517,24 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			//     withheld forever; on backstop the pod goes Ready-degraded.
 			select {
 			case <-firstNav.wait():
+				// Happy path — every cohort's nav widgets seeded. NOT a backstop.
 				return nil
 			case <-bootDone:
+				// The boot scope finished before the latch could fire. If the
+				// latch DID fire (e.g. a tie ordering) this is the happy path;
+				// otherwise the boot ended early (roots_list_failed / re-walk
+				// error) with nav widgets unseeded → F5 backstop alert (#131).
+				if !firstNav.fired() {
+					recordReadinessBackstop("boot_error", time.Since(engineSeedStart), -1)
+				}
 				return bootErr
 			case <-pctx.Done():
+				// PHASE1_TIMEOUT / pipGlobalTimeout backstop. If the latch never
+				// fired, readiness flips Ready-DEGRADED with nav widgets unseeded
+				// — the FAILED-but-serving boot #130/#131 requires be surfaced.
+				if !firstNav.fired() {
+					recordReadinessBackstop("phase1_timeout", time.Since(engineSeedStart), -1)
+				}
 				return pctx.Err()
 			}
 		}
@@ -807,6 +825,10 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// flips at min(seed-complete, pipGlobalTimeout).
 	if pipSeed != nil {
 		func() {
+			// F5 (#131): anchor the panic-path backstop clock BEFORE the defers,
+			// so the recover block can attribute elapsed (seedStart below is not
+			// yet in scope at defer-declaration time).
+			panicStart := time.Now()
 			// C2: guaranteed flip — runs on normal return, error, timeout, AND
 			// after a panic-recover. Innermost so it is the LAST deferred to run.
 			defer cache.MarkPhase1Done()
@@ -818,6 +840,12 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 						slog.String("effect", "per-cohort SYNC seed aborted; readiness flips to "+
 							"Ready-DEGRADED (backstop) — first /call per cohort falls back to per-user resolve"),
 					)
+					// F5 (#131): a panicking seed is the WORST failure mode —
+					// readiness flips Ready-DEGRADED via the MarkPhase1Done defer
+					// with the seed aborted mid-flight. Count + alert it like the
+					// other backstop paths, never silent. elapsed is best-effort
+					// from panicStart (anchored before the defers below).
+					recordReadinessBackstop("seed_panic", time.Since(panicStart), -1)
 				}
 			}()
 			// Bound the SYNC seed by pipGlobalTimeout (its own existing budget,
@@ -836,6 +864,11 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 						"cohort falls back to per-user resolve"),
 					slog.Int64("elapsed_ms", time.Since(seedStart).Milliseconds()),
 				)
+				// F5 (#131): a seed error means readiness flips Ready-DEGRADED via
+				// the C2 backstop with an incomplete seed — a FAILED-but-serving
+				// boot per #130. Surface it loud (ERROR + expvar) on top of the
+				// existing WARN, which stays as the human-readable per-cohort note.
+				recordReadinessBackstop("seed_incomplete", time.Since(seedStart), -1)
 			}
 		}()
 	} else {
@@ -979,6 +1012,7 @@ const phase1MaxWalkDepth = 32
 //     (objects.Get, resourcesrefs.Resolve) use it verbatim via
 //     cache.ClientConfigFor instead of rebuilding a client from saEP
 //     through kubeconfig.NewClientConfig.
+//
 // withPhase1SAContext builds the SA-credentialed context Phase 1
 // resolution runs under. It is the SINGLE place the SA identity +
 // internal-dispatch markers are installed, shared by the navigation-root
