@@ -1,45 +1,40 @@
-// prewarm_engine_seed_order_test.go — #42 FIX-E: the rank-major, class-
-// interleaved, first-nav-ordered seed falsifier.
+// prewarm_engine_seed_order_test.go — #130 F3b-r2: the NavOrder-FLAT (total
+// order), class-tail seed falsifier. SUPERSEDES the #42 FIX-E rank-major /
+// class-interleaved model for the boot/gvr-discovered path.
 //
-// ── FALSIFIER-SET MIGRATION (2026-07-04, TL-approved delete-with-migration) ──
-// FIX-E replaced the class-major seedScopeYielding (whole-widgets-class then
-// whole-restactions-class, dispatched by the seedClassOrderFn seam) with a
-// UNIFIED rank-major, class-INTERLEAVED, first-nav-ordered loop (per identity
-// rank r → widgets(r) in NavOrder → restactions(r)). The seedClassOrderFn seam
-// was removed. THREE falsifiers that guarded the superseded model were DELETED;
-// their properties are re-covered as follows (PM property-coverage map):
+// ── ORDER MODEL CHANGE (2026-07-12, arch ruling B) ──
+// F3b-r2 replaced the rank-major widget loop (per identity rank r → widgets(r)
+// in NavOrder → restactions(r)) with a SINGLE FLAT PASS over all (widget ×
+// cohort) units sorted by (NavOrder ASC, cohortRankIndex ASC, ns/name ASC),
+// followed by the RA tail. The dashboard seeds first because it is the
+// low-NavOrder prefix in the DATA — no RootIndex/rank branch. Cohort interleave:
+// because NavOrder is the PRIMARY key, every cohort's NavOrder-0 widget seeds
+// before ANY cohort's NavOrder-1 widget (the "reachable cohorts' dashboards
+// complete early" property, now by data order not a phase).
 //
-//   (a) TestSeedScopeYielding_FirstNavFirst_OrderingFalsifier
-//       GUARDED: "widgets seed before restactions (restactions not starved by
-//       widget work)". SUPERSEDED by per-rank interleave — restactions now seed
-//       WITHIN each rank right after that rank's widgets, not after ALL widget
-//       ranks. The underlying #42 property ("restactions must not be starved")
-//       is now guarded by THIS file's rank-major assert (a lower-rank seed
-//       before rank-1 completes → RED) + the revert-interleave mutation.
-//   (b) TestSeedScopeYielding_CheapCohortFirst_SortFalsifier
-//       GUARDED: "restactions in ascending len(targets) order (cheap RA before
-//       the fan-out tail)". RETAINED — the RA within-rank ascending-len tiebreak
-//       survives FIX-E; asserted EXPLICITLY here (property (b) block).
-//   (c) TestSeedScopeYielding_CheapCohortFirst_WidgetsSortFalsifier
-//       GUARDED: "cheap/critical widgets not starved by a whale (A2 widget
-//       len-sort)". SUPERSEDED by NavOrder (count≠cost, proven twice — A2 seeded
-//       a cheap late-nav widget before the dashboard's own widgets). The "cheap/
-//       critical widget seeds first" property is now guarded by first-nav
-//       (NavOrder) order + the sequence assert here.
+// This inverts the old FIX-E rank-major invariant (which required ALL of rank-1
+// devs before ANY rank-2 ops). Under NavOrder-major, ops' NavOrder-0 widget
+// seeds before devs' NavOrder-1 widget. The properties RE-EXPRESSED here:
+//   (nav)  NavOrder-major: every cohort's widget at NavOrder N seeds before any
+//          cohort's widget at NavOrder N+1 (the load-bearing F3b-r2 property).
+//   (rank) within a NavOrder tie, cohorts interleave by rank (devs before ops)
+//          — the cohortRankIndex tie-break (largest-cohort-first per nav slot).
+//   (tail) RAs seed AFTER the whole widget list (RA content tail), and within
+//          the tail in ascending len(targets) order (cheap RA before fan-out).
 //
-// Condition 3: the E fixture derives NavOrder via the REAL harvest-stamping
+// Condition 3: NavOrder is derived via the REAL harvest-stamping
 // (newNavWidgetHarvester + harvestNavWidget in walk order), NOT hand-assigned —
 // so it fails if the harvest-order stamping breaks, not only the seed loop.
 //
 // Hermetic, -race, seams only (no cluster). TestFixD_IdentityRankMajorSeedOrder
-// (rank-major skeleton) stays GREEN unmodified in its own file.
+// (all widgets at NavOrder 0 → the flat sort degenerates to rank-major via the
+// cohortRankIndex tie-break) stays GREEN unmodified in its own file.
 
 package dispatchers
 
 import (
 	"context"
 	"log/slog"
-	"strings"
 	"sync"
 	"testing"
 
@@ -165,13 +160,13 @@ func eRA(name string) templatesv1.ObjectReference {
 	}
 }
 
-// TestFixE_RankMajorClassInterleaveFirstNavOrder — the #42 FIX-E falsifier.
+// TestF3bR2_NavOrderFlatSeedOrder — the #130 F3b-r2 NavOrder-flat falsifier.
 //
-// Fixture: 2 identity ranks (devs collapsed=442 = rank 1; ops collapsed=5 =
-// rank 2), 3 widgets harvested in a deliberate NAV ORDER (dashboard-flex first,
+// Fixture: 2 identity ranks (devs collapsed=442 = rank 0; ops collapsed=5 =
+// rank 1), 3 widgets harvested in a deliberate NAV ORDER (dashboard-flex first,
 // then obs-panel, then settings-card), each widget carrying BOTH identities; 2
 // restactions (cheap 1-target, fanout 3-target) each carrying devs.
-func TestFixE_RankMajorClassInterleaveFirstNavOrder(t *testing.T) {
+func TestF3bR2_NavOrderFlatSeedOrder(t *testing.T) {
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
@@ -237,67 +232,224 @@ func TestFixE_RankMajorClassInterleaveFirstNavOrder(t *testing.T) {
 		t.Fatalf("seedScopeYielding returned %v; want nil", err)
 	}
 
-	assertFixESequence(t, rec.snapshot())
+	assertF3bR2Sequence(t, rec.snapshot())
 }
 
-// assertFixESequence verifies rank-major / class-interleave / nav-order /
-// RA-tiebreak on the recorded event sequence.
-func assertFixESequence(t *testing.T, ev []eSeedEvent) {
+// assertF3bR2Sequence verifies NavOrder-major total order / rank tie-break /
+// RA-tail / RA-tiebreak on the recorded event sequence.
+func assertF3bR2Sequence(t *testing.T, ev []eSeedEvent) {
 	t.Helper()
 
-	// (a) RANK-MAJOR + INTERLEAVE: last rank-1 (devs) event < first rank-2 (ops)
-	// event, across BOTH classes.
-	lastDevs, firstOps := -1, len(ev)
-	for i, e := range ev {
-		switch e.identity {
-		case "group:devs":
-			lastDevs = i
-		case "group:ops":
-			if i < firstOps {
-				firstOps = i
-			}
-		}
-	}
-	if lastDevs < 0 || firstOps == len(ev) {
-		t.Fatalf("FIX-E: expected both devs (rank1) and ops (rank2) seeds; events=%+v", ev)
-	}
-	if lastDevs >= firstOps {
-		t.Fatalf("FIX-E rank-major VIOLATED: a rank-2 (ops) seed at idx %d ran BEFORE the last rank-1 (devs) seed at idx %d — "+
-			"a lower rank must not interleave before rank-1 completes; events=%+v", firstOps, lastDevs, ev)
-	}
-
-	// Within rank-1 (devs): (c) widgets in NavOrder; widgets-before-restactions
-	// (per-rank + FIX-F segment shape); (b) RAs ascending-len tiebreak.
-	var r1widgets, r1ras []string
+	// (nav) NavOrder-MAJOR: recover each widget's NavOrder from its harvest name
+	// (dashboard-flex=0, obs-panel=1, settings-card=2) and assert the WIDGET seed
+	// stream is non-decreasing in NavOrder — i.e. every cohort's NavOrder-N widget
+	// seeds before ANY cohort's NavOrder-(N+1) widget. This is the load-bearing
+	// F3b-r2 property and is the exact INVERSE of the old rank-major invariant
+	// (which required all devs before any ops; under NavOrder-major, ops'
+	// dashboard-flex seeds before devs' obs-panel — see the (rank) block).
+	navOrderOf := map[string]int{"dashboard-flex": 0, "obs-panel": 1, "settings-card": 2}
+	lastNav := -1
+	var widgetSeq []eSeedEvent
 	for _, e := range ev {
-		if e.identity != "group:devs" {
+		if e.class != "widget" {
 			continue
 		}
-		if e.class == "widget" {
-			if len(r1ras) > 0 {
-				t.Fatalf("FIX-E: rank-1 widget %q seeded AFTER a rank-1 restaction — per-rank shape is widgets-then-restactions; events=%+v", e.label, ev)
+		widgetSeq = append(widgetSeq, e)
+		n, ok := navOrderOf[e.label]
+		if !ok {
+			t.Fatalf("F3b-r2 setup: unexpected widget %q; events=%+v", e.label, ev)
+		}
+		if n < lastNav {
+			t.Fatalf("F3b-r2 (nav) NavOrder-MAJOR VIOLATED: widget %q (NavOrder %d) seeded AFTER a NavOrder-%d widget — "+
+				"the flat pass must seed ALL cohorts' NavOrder-N widgets before ANY cohort's NavOrder-(N+1) widget; widget stream=%+v",
+				e.label, n, lastNav, widgetSeq)
+		}
+		lastNav = n
+	}
+	if len(widgetSeq) != 6 {
+		t.Fatalf("F3b-r2 setup: expected 6 widget seeds (3 widgets × 2 cohorts), got %d; events=%+v", len(widgetSeq), ev)
+	}
+
+	// (rank) within a NavOrder tie, cohorts interleave by rank (devs rank 0 before
+	// ops rank 1). At NavOrder 0 the two dashboard-flex seeds are {devs, ops} in
+	// that order; assert devs precedes ops for the SAME widget label.
+	for _, label := range []string{"dashboard-flex", "obs-panel", "settings-card"} {
+		devsIdx, opsIdx := -1, -1
+		for i, e := range widgetSeq {
+			if e.label != label {
+				continue
 			}
-			r1widgets = append(r1widgets, e.label)
-		} else {
-			r1ras = append(r1ras, e.label)
+			if e.identity == "group:devs" {
+				devsIdx = i
+			} else if e.identity == "group:ops" {
+				opsIdx = i
+			}
+		}
+		if devsIdx < 0 || opsIdx < 0 {
+			t.Fatalf("F3b-r2 (rank) setup: widget %q missing a cohort seed (devs=%d ops=%d); widget stream=%+v", label, devsIdx, opsIdx, widgetSeq)
+		}
+		if devsIdx > opsIdx {
+			t.Fatalf("F3b-r2 (rank) tie-break VIOLATED: for widget %q the rank-1 ops seed (idx %d) preceded the rank-0 devs seed (idx %d) — "+
+				"at equal NavOrder the cohortRankIndex tie-break must seed the larger cohort (devs) first; widget stream=%+v", label, opsIdx, devsIdx, widgetSeq)
 		}
 	}
-	// (c) NavOrder: dashboard-flex(0) → obs-panel(1) → settings-card(2).
-	if got, want := strings.Join(r1widgets, ","), "dashboard-flex,obs-panel,settings-card"; got != want {
-		t.Fatalf("FIX-E property (c) NavOrder VIOLATED: rank-1 widget order = %q; want first-nav %q "+
-			"(harvest-stamped NavOrder, NOT A2 count-sort)", got, want)
+
+	// (tail) EVERY widget seeds before EVERY restaction (the RA content tail is
+	// excluded from the nav-widget readiness class).
+	lastWidget, firstRA := -1, len(ev)
+	for i, e := range ev {
+		if e.class == "widget" {
+			lastWidget = i
+		} else if e.class == "restaction" && i < firstRA {
+			firstRA = i
+		}
 	}
-	// (b) RA ascending-len tiebreak: cheap-ra (1 target) before fanout-ra (3).
+	if firstRA == len(ev) {
+		t.Fatalf("F3b-r2 (tail): expected restaction seeds; events=%+v", ev)
+	}
+	if lastWidget > firstRA {
+		t.Fatalf("F3b-r2 (tail) VIOLATED: a restaction at idx %d seeded BEFORE the last widget at idx %d — "+
+			"RAs must seed AFTER the whole widget list; events=%+v", firstRA, lastWidget, ev)
+	}
+
+	// (tail) RA ascending-len tiebreak WITHIN the rank-0 (devs) tail: cheap-ra
+	// (1 target) before fanout-ra (3 targets).
+	var devsRAs []string
+	for _, e := range ev {
+		if e.class == "restaction" && e.identity == "group:devs" {
+			devsRAs = append(devsRAs, e.label)
+		}
+	}
 	seenCheap := false
-	for _, ra := range r1ras {
+	for _, ra := range devsRAs {
 		if ra == "fanout-ra" && !seenCheap {
-			t.Fatalf("FIX-E property (b) RA ascending-len tiebreak VIOLATED: fanout-ra (3 targets) seeded before cheap-ra (1 target); rank-1 RA order=%v", r1ras)
+			t.Fatalf("F3b-r2 (tail) RA ascending-len tiebreak VIOLATED: fanout-ra (3 targets) seeded before cheap-ra (1 target); devs RA order=%v", devsRAs)
 		}
 		if ra == "cheap-ra" {
 			seenCheap = true
 		}
 	}
 	if !seenCheap {
-		t.Fatalf("FIX-E: cheap-ra was not seeded under rank-1; RA order=%v events=%+v", r1ras, ev)
+		t.Fatalf("F3b-r2 (tail): cheap-ra was not seeded under devs; RA order=%v events=%+v", devsRAs, ev)
+	}
+}
+
+// ── C-r2-1 (LOAD-BEARING): NavOrder total order, RootIndex INVERTED ─────────
+// The design's headline falsifier: build widgetSeeds NavOrder 0..M-1 across K>=2
+// cohorts, with the LOW-NavOrder widgets carrying a NON-zero (HIGH) RootIndex and
+// the HIGH-NavOrder widget carrying RootIndex 0 — an INVERSION vs NavOrder. Assert
+// the seed order follows NavOrder ASC regardless of RootIndex; EVERY cohort's
+// low-NavOrder widget seeds before ANY cohort's high-NavOrder widget.
+//
+// RED (captured to /tmp/f3b-r2-falsifiers/ by source-revert of the flat-sort +
+// firstNavReachable-rank-tier deletion): the F3 RootIndex-keyed order would sort
+// the RootIndex==0 (HIGH-NavOrder) widget's cohort FIRST (firstNavReachable rank
+// tier), seeding a RootIndex==0 high-NavOrder widget before the RootIndex!=0
+// low-NavOrder one → the NavOrder-ASC assert diverges. This RED specifically
+// proves the RootIndex branch is GONE, not dormant: if any code still consulted
+// RootIndex==0 for ordering, this inverted fixture would seed high-NavOrder first.
+//
+// K=3 cohorts × M=3 widgets (>1×>1, feedback_falsifier_shape_must_discriminate).
+func TestF3bR2_C_r2_1_NavOrderTotalOrder_RootIndexInverted(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	zeroCustomerInFlight()
+	quietLoggingE(t)
+
+	devs := eID{name: "devs", group: true, collapsed: 442}
+	ops := eID{name: "ops", group: true, collapsed: 50}
+	sre := eID{name: "sre", group: true, collapsed: 5}
+
+	// REAL harvest-stamping gives NavOrder 0,1,2 in harvest order.
+	h := newNavWidgetHarvester()
+	wLow, wMid, wHigh := eWidgetGVR("low"), eWidgetGVR("mid"), eWidgetGVR("high")
+	eHarvestWidget(h, "w-navorder-0", wLow)  // NavOrder 0
+	eHarvestWidget(h, "w-navorder-1", wMid)  // NavOrder 1
+	eHarvestWidget(h, "w-navorder-2", wHigh) // NavOrder 2
+	widgets := h.snapshot()
+	if len(widgets) != 3 {
+		t.Fatalf("harvest setup: want 3 widgets, got %d", len(widgets))
+	}
+	// INVERT RootIndex vs NavOrder: the LOWEST-NavOrder widget gets the HIGHEST
+	// RootIndex, the HIGHEST-NavOrder widget gets RootIndex 0. A sort that keyed on
+	// RootIndex==0 would seed w-navorder-2 FIRST; a NavOrder sort seeds
+	// w-navorder-0 first. (widgets are snapshot copies; NavOrder is the real
+	// harvest stamp, only RootIndex is overridden to build the inversion.)
+	for i := range widgets {
+		switch widgets[i].NavOrder {
+		case 0:
+			widgets[i].RootIndex = 2 // low NavOrder, HIGH RootIndex
+		case 1:
+			widgets[i].RootIndex = 1
+		case 2:
+			widgets[i].RootIndex = 0 // high NavOrder, RootIndex 0 (the "dashboard" bait)
+		}
+	}
+
+	rec := &eSeedRecorder{}
+	prevEnum := enumeratePrewarmTargetsForGVRFn
+	enumeratePrewarmTargetsForGVRFn = func(gvr schema.GroupVersionResource, _ string) []cache.PrewarmTarget {
+		switch gvr {
+		case wLow, wMid, wHigh:
+			return eIdentityTargets(gvr, devs, ops, sre)
+		}
+		return nil
+	}
+	t.Cleanup(func() { enumeratePrewarmTargetsForGVRFn = prevEnum })
+
+	prevW := seedOneWidgetFn
+	seedOneWidgetFn = func(ctx context.Context, e navWidgetEntry, _ string, _ seedScopeMode) error {
+		rec.record("widget", e.W.GetName(), eIdentityLabel(ctx))
+		return nil
+	}
+	t.Cleanup(func() { seedOneWidgetFn = prevW })
+
+	if err := seedScopeYielding(context.Background(), nil, widgets, endpoints.Endpoint{}, nil, "authn-ns", seedModeBoot); err != nil {
+		t.Fatalf("seedScopeYielding returned %v; want nil", err)
+	}
+	ev := rec.snapshot()
+
+	// Map widget name → NavOrder for the assert.
+	navOf := map[string]int{"w-navorder-0": 0, "w-navorder-1": 1, "w-navorder-2": 2}
+
+	// (1) The seed stream is non-decreasing in NavOrder (RootIndex ignored).
+	lastNav := -1
+	for _, e := range ev {
+		n := navOf[e.label]
+		if n < lastNav {
+			t.Fatalf("C-r2-1 VIOLATED: widget %q (NavOrder %d, RootIndex-inverted) seeded AFTER a NavOrder-%d widget — "+
+				"the sort must follow NavOrder ASC, NOT RootIndex (a RootIndex==0 sort would seed w-navorder-2 first); events=%+v",
+				e.label, n, lastNav, ev)
+		}
+		lastNav = n
+	}
+
+	// (2) Every cohort's low-NavOrder widget seeds before ANY cohort's
+	// high-NavOrder widget. The LAST NavOrder-0 seed index < the FIRST NavOrder-2
+	// seed index.
+	lastNav0, firstNav2 := -1, len(ev)
+	for i, e := range ev {
+		switch navOf[e.label] {
+		case 0:
+			lastNav0 = i
+		case 2:
+			if i < firstNav2 {
+				firstNav2 = i
+			}
+		}
+	}
+	if lastNav0 < 0 || firstNav2 == len(ev) {
+		t.Fatalf("C-r2-1 setup: expected both NavOrder-0 and NavOrder-2 seeds; events=%+v", ev)
+	}
+	if lastNav0 >= firstNav2 {
+		t.Fatalf("C-r2-1 VIOLATED: a NavOrder-2 widget (RootIndex 0) seeded at idx %d BEFORE the last NavOrder-0 "+
+			"widget (RootIndex 2) at idx %d — the RootIndex==0 'dashboard' bait was seeded first, so RootIndex is "+
+			"STILL consulted for ordering (the branch is dormant, not gone); events=%+v", firstNav2, lastNav0, ev)
+	}
+
+	// (3) Set completeness: 3 widgets × 3 cohorts = 9 seeds (PURE ORDERING — no
+	// unit dropped by the RootIndex inversion).
+	if len(ev) != 9 {
+		t.Fatalf("C-r2-1 set: expected 9 (widget × cohort) seeds, got %d; events=%+v", len(ev), ev)
 	}
 }

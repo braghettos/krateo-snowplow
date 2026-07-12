@@ -8,37 +8,38 @@
 // PHASE1_TIMEOUT the gate degenerates to a TIME gate and the pod goes Ready
 // with COLD cells (the fix3r reality — seed 388s+ >> the 180s chart budget).
 //
-// FIX-F re-spec §F.1: /readyz should flip when {WaitAllInformersSynced
-// good-enough barrier (unchanged) ∧ the FIX-E rank-1 × FIRST-NAV SEGMENT is
-// seeded} — the walk-derived default-route/dashboard (RootIndex==0) widgets
-// under the rank-1 identity — NOT the full seed (tail excluded by
+// FIX-F re-spec §F.1 (as amended by #130 F3b-r2): /readyz should flip when
+// {WaitAllInformersSynced good-enough barrier (unchanged) ∧ EVERY cohort's NAV
+// WIDGETS are seeded} — NOT the full seed (the RA content tail is excluded by
 // construction), NOT nothing (cells, not just substrate).
 //
-// MECHANISM (§F.1): seedScopeYielding closes firstNavDone the moment the
-// rank-1 RootIndex==0 widget segment completes (or provably has zero
-// targets). engineSeed's select waits on <-firstNavDone instead of
+// MECHANISM (§F.1): seedScopeYielding closes firstNavDone the moment the LAST
+// nav-widget unit (widget × cohort) completes (or provably has zero nav
+// widgets). engineSeed's select waits on <-firstNavDone instead of
 // <-bootDone; bootDone / scopeDone stay untouched (the boot scope keeps
 // running to completion in background — S2 worker-release + engine semantics
 // unchanged). The deferred MarkPhase1Done (phase1_walk.go) then fires at
-// min(first-nav-complete, PHASE1_TIMEOUT backstop, pipGlobalTimeout child) —
+// min(nav-widgets-complete, PHASE1_TIMEOUT backstop, pipGlobalTimeout child) —
 // the C2 "Ready-degraded, never not-Ready-forever" backstop is preserved
 // verbatim (the pctx.Done() arm of engineSeed's select is untouched).
 //
-// SEGMENT-SCOPED, NOT RANK-SCOPED (§F-C2). The segment is the RootIndex==0
-// widget set (stamped by the harvester's BeginRoot/RootIndex, phase1_pip_seed.go),
-// NOT the whole rank-1 pass. The heavy NON-first-nav tail (RootIndex>0 widgets
-// + the rank-1 fanout-tail restactions, ascending-len-sorted LAST by FIX-E) is
-// still mid-seed when the latch fires — §F-C2/ARM-TAIL. And a RootIndex>0-only
-// rank-1 (no dashboard widget seeded) must NOT fire the latch early via the
-// segment path (§F-C3): the completion signal keys on "the RootIndex==0 target
-// COUNT was reached", so an empty first-nav set fires ONLY through the
-// zero-targets guard below (provably-nothing-to-warm), never spuriously.
+// CLASS-SCOPED, NOT ROOTINDEX-SCOPED (#130 F3b-r2). The old FIX-F latch keyed
+// on the RootIndex==0 (config-root/dashboard) widget SEGMENT — a frontend-page
+// concept Diego rejected. F3b-r2 replaced that partition with the widget-vs-RA
+// CLASS boundary: the latch waits for ALL nav widgets across ALL cohorts
+// (navWidgetRemaining == len(flat) → 0), then fires BEFORE the RA content tail.
+// A target either IS or ISN'T a nav widget (a structural fact), never a
+// page/route/dashboard concept. Post-Fix-2 every nav widget is cheap (whale
+// LISTs serve from the synced informer), so waiting for all of them costs little
+// — a STRICT GENERALIZATION of the old latch. A topology with no nav widget
+// (all-RA) fires ONLY through the zero-nav-widgets guard (provably-nothing-to-
+// warm), never spuriously.
 //
-// NO STATIC LIST / NO MAGIC NUMBER: the segment is 100% walk-derived
-// (RootIndex, config.json root order). The latch carries no cap and no env
-// knob — the PHASE1_TIMEOUT / pipGlobalTimeout backstops it composes with are
-// the EXISTING budget config (§F.4: PREWARM_BOOT_BUDGET_SECONDS bounds the
-// ENGINE boot scope only, never the readyz gate).
+// NO STATIC LIST / NO MAGIC NUMBER: the class boundary is 100% structural. The
+// latch carries no cap and no env knob — the PHASE1_TIMEOUT / pipGlobalTimeout
+// backstops it composes with are the EXISTING budget config (§F.4:
+// PREWARM_BOOT_BUDGET_SECONDS bounds the ENGINE boot scope only, never the
+// readyz gate).
 
 package dispatchers
 
@@ -48,8 +49,9 @@ import (
 	"time"
 )
 
-// firstNavLatch is the fire-once readiness signal for the rank-1 first-nav
-// (RootIndex==0) segment. Closed at most once by seedScopeYielding on the
+// firstNavLatch is the fire-once readiness signal for the all-nav-widget class
+// (#130 F3b-r2; formerly the rank-1 RootIndex==0 first-nav segment). Closed at
+// most once by seedScopeYielding on the
 // boot pass; awaited by engineSeed's select. A process has exactly one
 // (firstNavLatchSingleton); post-boot GVR-discovered re-walks reuse the same
 // already-fired latch (close is idempotent via sync.Once), so a re-walk never
@@ -63,16 +65,17 @@ func newFirstNavLatch() *firstNavLatch {
 	return &firstNavLatch{done: make(chan struct{})}
 }
 
-// fire closes the latch exactly once and logs the transition with the
-// segment counts + elapsed the caller measured. reason distinguishes the
-// segment-complete path from the provably-zero-targets path (both are
-// legitimate "first-nav is warm / there is no first-nav to warm" states);
-// segWidgets/segTargets are the RootIndex==0 widget + per-target counts the
-// latch waited on (0/0 on the zero-targets path). segIdentity/segRank name the
-// segment identity + its position in the dedup rank (#99b): the identity the
-// latch keyed readiness on — NOT necessarily ranked[0], since ranked[0] can be
-// a restaction-only identity with zero first-nav widgets. Empty/-1 on the
-// zero-targets path (no ranked identity had a first-nav widget).
+// fire closes the latch exactly once and logs the transition with the nav-widget
+// counts + elapsed the caller measured. reason distinguishes the
+// segment-complete path (all nav widgets seeded) from the zero-nav-widgets path
+// (there is no nav widget to warm) — both legitimate "nav widgets warm / none to
+// warm" states. #130 F3b-r2: segWidgets/segTargets are now the ALL-NAV-WIDGET
+// counts — the distinct nav widgets across all cohorts + the total
+// (widget × cohort) units the latch waited on (0/0 on the zero path), NOT the
+// old RootIndex==0 subset. segIdentity/segRank are RETAINED in the signature for
+// log-field back-compat but are no longer segment-scoped: the caller passes
+// ""/-1 (the latch keys on the widget-vs-RA class boundary, not one cohort's
+// config-root subtree).
 func (l *firstNavLatch) fire(reason string, segWidgets, segTargets int, segIdentity string, segRank int, elapsed time.Duration) {
 	l.once.Do(func() {
 		if firstNavFireObserver != nil {
@@ -92,9 +95,9 @@ func (l *firstNavLatch) fire(reason string, segWidgets, segTargets int, segIdent
 			slog.String("segment_identity", segIdentity),
 			slog.Int("segment_rank", segRank),
 			slog.Int64("elapsed_ms", elapsed.Milliseconds()),
-			slog.String("effect", "rank-1 RootIndex==0 first-nav segment seeded (or provably empty); "+
-				"engineSeed unblocks → /readyz flips Ready with the dashboard warm. The boot scope "+
-				"keeps seeding the tail in background (bootDone unaffected)."),
+			slog.String("effect", "all cohorts' nav widgets seeded (or provably no nav widget); "+
+				"engineSeed unblocks → /readyz flips Ready with every cohort's nav widgets warm. The "+
+				"boot scope keeps seeding the RA content tail in background (bootDone unaffected)."),
 		)
 	})
 }

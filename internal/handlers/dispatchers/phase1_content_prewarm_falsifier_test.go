@@ -203,6 +203,70 @@ func TestFAL_F2_ContentPrewarmSAContext_AttachesServeWatcher(t *testing.T) {
 	}
 }
 
+// TestF3bR2_C_r2_3_CohortSeedContext_AttachesServeWatcher is the #130 F3b Fix 2
+// (C-r2-3) hermetic falsifier — the cohort-seed analog of the content-prewarm
+// arm above. withCohortSeedContext MUST attach cache.WithServeWatcher(rctx,
+// cache.Global()) so the cohort seed's inner widget LIST calls
+// (dispatchViaInternalRESTConfig) serve a servable GVR's LIST from the synced
+// informer indexer instead of a live ~20s/60K paged apiserver LIST — the cost
+// that blew the seed budget on 1.7.7 and makes any NavOrder pass fit budget.
+//
+// RED (remove the `rctx = cache.WithServeWatcher(rctx, cache.Global())` line in
+// withCohortSeedContext): ServeWatcherFromContext(cohortCtx) returns
+// haveRW=false → the cohort seed's LIST takes the live paged LIST (pre-Fix-2
+// behavior). Positive control: the discovery walk ctx has ALWAYS carried the
+// watcher — this arm asserts the cohort ctx now MATCHES it (the Fix-2 parity).
+func TestF3bR2_C_r2_3_CohortSeedContext_AttachesServeWatcher(t *testing.T) {
+	rw := phase1TestWatcher(t)
+	cache.SetGlobal(rw)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	saEP := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc"}
+	cohort := seedTarget{Username: "system:serviceaccount:krateo-system:dev", Groups: []string{"devs"}}
+	cohortCtx := withCohortSeedContext(context.Background(), cohort, saEP, nil)
+
+	gotRW, haveRW := cache.ServeWatcherFromContext(cohortCtx)
+	if !haveRW {
+		t.Fatalf("F3b Fix 2 (C-r2-3): cohort-seed ctx MUST carry a serve-watcher " +
+			"(cache.WithServeWatcher) — without it the internal-dispatch informer-serve branch is " +
+			"never entered and every whale-widget cohort seed takes the live paged apiserver LIST " +
+			"(~20s/target, the 1.7.7 budget blow-up). This is the RED signature of removing the " +
+			"WithServeWatcher line from withCohortSeedContext.")
+	}
+	if gotRW != rw {
+		t.Fatalf("F3b Fix 2: cohort-seed ctx carries a DIFFERENT watcher than cache.Global() "+
+			"— must attach cache.Global() exactly; got %p want %p", gotRW, rw)
+	}
+	// Parity control: the discovery-walk ctx has always carried the watcher; the
+	// cohort ctx now matches it.
+	walkCtx := withPhase1SAContext(context.Background(), saEP, nil)
+	if _, walkHasRW := cache.ServeWatcherFromContext(walkCtx); !walkHasRW {
+		t.Fatalf("F3b Fix 2 parity control: the discovery-walk ctx (withPhase1SAContext) must carry " +
+			"the serve-watcher — Fix 2 brings the cohort ctx to the SAME state")
+	}
+}
+
+// TestF3bR2_C_r2_3_CohortSeedContext_NilGlobalIsSafe — flag-off path: with
+// cache.Global()==nil the cohort ctx is built WITHOUT a serve-watcher
+// (WithServeWatcher no-ops on nil rw) and does not panic (byte-identical to
+// pre-Fix-2 flag-off: the live LIST runs as today).
+func TestF3bR2_C_r2_3_CohortSeedContext_NilGlobalIsSafe(t *testing.T) {
+	cache.SetGlobal(nil)
+	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	saEP := endpoints.Endpoint{ServerURL: "https://kubernetes.default.svc"}
+	cohort := seedTarget{Username: "system:serviceaccount:krateo-system:dev", Groups: []string{"devs"}}
+	cohortCtx := withCohortSeedContext(context.Background(), cohort, saEP, nil)
+
+	if _, haveRW := cache.ServeWatcherFromContext(cohortCtx); haveRW {
+		t.Fatalf("F3b Fix 2 nil-safe: with cache.Global()==nil the cohort ctx must NOT carry a " +
+			"serve-watcher (WithServeWatcher no-ops on nil rw) — flag-off byte-identical to pre-Fix-2")
+	}
+	if !cache.PrewarmIterSerialFromContext(cohortCtx) {
+		t.Fatalf("F3b Fix 2 nil-safe: the PrewarmIterSerial marker must survive the nil-global path")
+	}
+}
+
 // TestFAL_F2_ContentPrewarmSAContext_NilGlobalIsSafe proves the flag-off / no-
 // consumer path: with cache.Global()==nil (CACHE_ENABLED=false) the content ctx
 // is built WITHOUT a serve-watcher (WithServeWatcher no-ops on nil rw) and does

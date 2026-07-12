@@ -190,16 +190,23 @@ type navWidgetEntry struct {
 	// literal (the ORDERING is the signal, not any hardcoded name).
 	NavOrder int
 
-	// #42 FIX-F seam (STAMP-ONLY — no consumer here). RootIndex is the
-	// zero-based index of the config-root subtree this widget was FIRST
-	// harvested under (BeginRoot increments it as the walk moves to the next
-	// root). Roots iterate in config.json order (phase1_roots.go), so
-	// RootIndex==0 is the default-route/dashboard subtree — the rank-1
-	// first-nav SEGMENT. FIX-F's readyz latch will consume this to flip ready
-	// once the RootIndex==0 segment is seeded (segment-scoped, NOT rank-scoped
-	// — PM condition F-C2). This field is written and never read in this
-	// change; the latch is built in the FIX-F ship (#99). Walk-derived, no
-	// literal — the INDEX is the signal.
+	// RootIndex is the zero-based index of the config-root subtree this widget
+	// was FIRST harvested under (BeginRoot increments it as the walk moves to
+	// the next root). Roots iterate in config.json order (phase1_roots.go).
+	//
+	// #130 F3b-r2 (2026-07-12): RootIndex is now a DEAD-STAMP — no seed-ordering
+	// or readyz-latch branch keys on `RootIndex==0` any longer. The old FIX-F
+	// latch (fire when the RootIndex==0 dashboard segment seeded) and the F3
+	// Lever-1 rank tier (RootIndex==0 cohorts sort first) were BOTH deleted:
+	// keying on `==0` as a partition hardcoded "the first config root is the
+	// dashboard / is first-nav," a frontend-page concept Diego rejected. The
+	// seed order is now a NavOrder total order and the latch keys on the
+	// widget-vs-RA CLASS boundary (design §5). The field is RETAINED because
+	// (a) the redrive-walk stamp-correctness regression test
+	// (TestNavWidgetHarvester_RedriveWalk_StampsRootIndexZeroForRootZero, #99b
+	// Fix 2) still asserts BeginWalk/BeginRoot stamp it right per pass, and
+	// (b) it is emitted as a diagnostic-only `root_index` field in the
+	// widget_targets telemetry. Walk-derived, no literal.
 	RootIndex int
 }
 
@@ -437,6 +444,20 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 	rctx := xcontext.BuildContext(ctx, opts...)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
+	// #130 F3b Fix 2 — attach the shared watcher so the cohort seed's inner LIST
+	// calls (dispatchViaInternalRESTConfig, resolve.go) serve a servable GVR's
+	// LIST from the synced informer indexer instead of a live ~20s/60K paged
+	// apiserver LIST. BYTE-IDENTICAL to the discovery walk's withPhase1SAContext
+	// (phase1_walk.go:1029) and the F2 content-prewarm attach: without it the
+	// internal-dispatch informer-serve branch (internal_dispatch.go, `ServeWatcher
+	// FromContext(ctx); haveRW`) is never entered, so every whale-widget cohort
+	// seed pays the live LIST — the ~20s/target cost that blew the seed budget on
+	// 1.7.7. This is what makes the whale LISTs cheap so the NavOrder pass fits
+	// budget. PREWARM-SCOPED (only this SA cohort context carries it; per-user
+	// /call never does). nil-safe (cache.Global() may be nil under
+	// CACHE_ENABLED=false → WithServeWatcher returns ctx unchanged → live LIST as
+	// today).
+	rctx = cache.WithServeWatcher(rctx, cache.Global())
 	rctx = cache.WithPrewarmIterSerial(rctx)
 	// #42 Option-2 — OVERRIDE the inherited discovery-walk scope with the SEED
 	// scope. rePrewarmBootScoped passes seedScopeYielding the SAME walk-scoped

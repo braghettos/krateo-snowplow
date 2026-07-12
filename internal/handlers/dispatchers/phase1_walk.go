@@ -436,15 +436,16 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 			var bootErr error
 			var closeOnce sync.Once
 
-			// #99 FIX-F: build the process first-nav latch BEFORE enqueuing the
-			// boot scope so seedScopeYielding (deep inside the engine worker)
-			// can reach the SAME latch this select awaits. The latch fires the
-			// instant the rank-1 RootIndex==0 first-nav segment seeds (or
-			// provably has none); this select waits on it instead of the whole
-			// boot scope, so /readyz flips WITH the dashboard warm (§F.1) rather
-			// than at the PHASE1_TIMEOUT backstop with cold cells. bootDone and
-			// the scopeDone callback are UNTOUCHED — the boot scope keeps
-			// seeding the tail in background after the flip.
+			// #99 FIX-F / #130 F3b-r2: build the process first-nav latch BEFORE
+			// enqueuing the boot scope so seedScopeYielding (deep inside the engine
+			// worker) can reach the SAME latch this select awaits. The latch fires
+			// the instant EVERY cohort's NAV WIDGETS have seeded (the widget-vs-RA
+			// class boundary — F3b-r2 replaced the old RootIndex==0 dashboard
+			// segment), or provably has none; this select waits on it instead of
+			// the whole boot scope, so /readyz flips WITH every cohort's nav widgets
+			// warm rather than at the PHASE1_TIMEOUT backstop with cold cells.
+			// bootDone and the scopeDone callback are UNTOUCHED — the boot scope
+			// keeps seeding the RA content tail in background after the flip.
 			firstNav := ensureFirstNavLatch()
 
 			// Fix v2 / 0.30.248: the engine worker MUST use a process-
