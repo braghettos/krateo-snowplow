@@ -22,10 +22,19 @@ import (
 )
 
 // TestA1_EffectiveKeyExtras_ByteIdenticalToInlineFold — the A1 nothing-moved
-// golden across the corpus-representative extras shapes: no-extras, apiRef-inline
-// only, rrt-inline only, both inline maps, request-extras only, and inline+request
-// with a COLLISION (request must win — the pre-A1 precedence). At each shape the
-// shared helper must deep-equal the pre-A1 inline fold.
+// golden across the INLINE (CR-fixed) extras shapes: no-extras, apiRef-inline
+// only, rrt-inline only, both inline maps. At each shape the shared helper must
+// deep-equal the pre-A1 inline fold.
+//
+// F6 RECONCILIATION (docs/f6-chrome-route-key-design-2026-07-12.md, arch-ruled
+// 2026-07-13): the pre-A1 fold (keyExtrasFor / unionForKey) folded the per-REQUEST
+// extras VERBATIM. F6 intentionally reversed that — an UNDECLARED widget folds
+// NOTHING from request extras into the KEY (they still reach the resolve input).
+// So the byte-identical-to-unionForKey golden holds ONLY for the INLINE maps
+// (apiRef.extras + resourcesRefsTemplateExtras) — CR-fixed, which F6 does NOT
+// filter. The former "request-extras only" + "inline+request collision" cases
+// moved to TestF6_UndeclaredRequestExtras_DropFromKey, asserting the NEW contract.
+// The A2 identity slot stays inert here (no identityContext declared → nil).
 func TestA1_EffectiveKeyExtras_ByteIdenticalToInlineFold(t *testing.T) {
 	ctx := ctxWithIdentity()
 
@@ -39,19 +48,14 @@ func TestA1_EffectiveKeyExtras_ByteIdenticalToInlineFold(t *testing.T) {
 		{name: "apiRef-inline only", apiRefJSON: `{"tenant":"acme"}`},
 		{name: "rrt-inline only", rrtJSON: `{"region":"eu"}`},
 		{name: "both inline maps", apiRefJSON: `{"tenant":"acme"}`, rrtJSON: `{"region":"eu"}`},
-		{name: "request-extras only", request: map[string]any{"page": "detail"}},
-		{
-			name:       "inline + request, request wins on collision",
-			apiRefJSON: `{"tenant":"acme","shared":"inline"}`,
-			rrtJSON:    `{"region":"eu"}`,
-			request:    map[string]any{"shared": "request", "q": "x"},
-		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cr := widgetCRWithExtras(t, tc.apiRefJSON, tc.rrtJSON)
 
+			// No request extras in these cases, so the pre-A1 inline fold and the
+			// F6-filtered fold coincide (F6 only filters the REQUEST half).
 			want := keyExtrasFor(cr, tc.request)           // the pre-A1 inline fold
 			got := effectiveKeyExtras(ctx, cr, tc.request) // the A1 shared helper
 
@@ -60,6 +64,35 @@ func TestA1_EffectiveKeyExtras_ByteIdenticalToInlineFold(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestF6_UndeclaredRequestExtras_DropFromKey — the F6 reconciliation of the A1
+// golden's former request-extras cases (arch-ruled 2026-07-13). Under F6 an
+// UNDECLARED widget (no spec.keyExtras) folds NOTHING from the per-request extras
+// into the KEY — the reversal of the pre-A1 "fold request verbatim" property. The
+// INLINE maps still fold (CR-fixed, unfiltered); request extras still reach the
+// RESOLVE input (asserted in the resolver tests); only the KEY drops them.
+func TestF6_UndeclaredRequestExtras_DropFromKey(t *testing.T) {
+	ctx := ctxWithIdentity()
+
+	t.Run("request-extras only → EMPTY key fold (was: folded verbatim)", func(t *testing.T) {
+		cr := widgetCRWithExtras(t, "", "") // undeclared, no inline
+		got := effectiveKeyExtras(ctx, cr, map[string]any{"page": "detail"})
+		if len(got) != 0 {
+			t.Fatalf("F6: an undeclared widget must fold EMPTY key extras from a request; got %#v — the 'page' request extra must NOT partition the key", got)
+		}
+	})
+
+	t.Run("inline + request → only INLINE folds, request drops", func(t *testing.T) {
+		cr := widgetCRWithExtras(t, `{"tenant":"acme","shared":"inline"}`, `{"region":"eu"}`)
+		got := effectiveKeyExtras(ctx, cr, map[string]any{"shared": "request", "q": "x"})
+		// Inline maps fold unchanged; the request "q" AND the request "shared"
+		// override BOTH drop (undeclared) → the inline "shared" survives.
+		want := map[string]any{"tenant": "acme", "shared": "inline", "region": "eu"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("F6: only the CR-fixed inline maps may fold for an undeclared widget; the request extras (incl the 'shared' collision override) must drop\n  got  = %#v\n  want = %#v", got, want)
+		}
+	})
 }
 
 // TestA2_DeclaredIdentityForKey_WiresInjection — the A1 inert-slot guard,

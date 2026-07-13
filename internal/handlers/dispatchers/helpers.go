@@ -337,6 +337,85 @@ func unionForKey(apiRefInline, rrtInline, request map[string]any) map[string]any
 	return out
 }
 
+// filterDeclaredKeyExtras is the F6 request-extras allowlist
+// (docs/f6-chrome-route-key-design-2026-07-12.md §4 Option A-declare). It returns
+// the subset of the per-request extras whose keys the widget author DECLARED in
+// spec.keyExtras (widgets.GetKeyExtras) — the only request extras allowed to
+// PARTITION the cache key. An undeclared / empty spec.keyExtras yields the empty
+// map ⇒ NO request extra folds into the key (the chrome-widget fold-nothing
+// default: route params {namespace,name} no longer partition the cell, so one
+// seeded cell serves every route — closing the #130 F6 first-nav miss).
+//
+// This is the KEY-SIDE analogue of the A2 identity contract: DeclaredIdentity
+// picks which principal keys fold; this picks which request-extras keys fold. It
+// runs INSIDE the single shared effectiveKeyExtras (the only site request extras
+// meet the key), so the filter cannot drift across the four key consumers.
+//
+// It touches ONLY key derivation — the caller still hands the RAW, unfiltered
+// request extras to widgets.Resolve's jq dict (widgets.go), so a widget that reads
+// extras.namespace in its jq WITHOUT declaring it still RESOLVES correctly; it
+// merely stops partitioning the cache (the design's deliberate SPURIOUS-over-keying
+// removal, with the RED-arm audit proving a widget that genuinely varies on a
+// param MUST declare it or serve a wrong shared body).
+//
+// The result is a fresh map (never aliases requestExtras); nil/empty request or
+// nil/empty declaration ⇒ a fresh empty map ⇒ unionForKey's fold degenerates to
+// the inline maps only ⇒ ComputeKey's len>0 guard skips the extras fold on an
+// all-empty result (backward-compat). Mechanism-uniform (feedback_no_special_cases):
+// no widget-name / route / GVR table — every widget folds exactly what it declares.
+func filterDeclaredKeyExtras(cr map[string]any, requestExtras map[string]any) map[string]any {
+	declared := widgets.GetKeyExtras(cr)
+	if len(declared) == 0 || len(requestExtras) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(declared))
+	for _, k := range declared {
+		if v, ok := requestExtras[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// requestExtrasFullyDeclared is the F6 self-quarantine predicate (arch-ruled
+// 2026-07-13, docs/f6-chrome-route-key-design-2026-07-12.md §4). It reports
+// whether EVERY per-request extra key the client supplied is DECLARED in the
+// widget's spec.keyExtras — i.e. filterDeclaredKeyExtras dropped NOTHING.
+//
+// WHY IT EXISTS (the leak F6 would otherwise open). Dropping undeclared request
+// extras from the KEY removes the pre-F6 self-quarantine: two users A,B in the
+// SAME BindingUID cohort, an UNDECLARED widget whose OWN widgetDataTemplate reads
+// extras.foo. A sends ?extras={"foo":"evil"}; F6 drops foo → A's effective key
+// extras == {} == B's → IDENTICAL per-cohort ComputeKey. But A's RAW extras still
+// reach widgets.Resolve, so A's rendered body embeds foo=evil. Pre-F6 the foo
+// fold partitioned A's cell away from B's; post-F6 A's evil body would be Put into
+// the SHARED cohort cell (widgets.go genuine-Put) and B would hit it. The guard
+// makes the polluting request DECLINE that Put: A still gets its correct
+// per-request 200, but never writes the shared cell, so B misses and resolves
+// clean. Clean requests (no undeclared extras) and the declared corpus pay
+// nothing — only a request carrying extras the widget did NOT declare is quarantined.
+//
+// Returns TRUE (fully declared → safe to Put) when the request carries no extras,
+// or when every supplied key survives the filter. Returns FALSE (decline the Put)
+// when at least one supplied key was dropped. Reuses widgets.GetKeyExtras — no new
+// mechanism, no widget-name/route table (feedback_no_special_cases).
+func requestExtrasFullyDeclared(cr map[string]any, requestExtras map[string]any) bool {
+	if len(requestExtras) == 0 {
+		return true // nothing supplied → nothing to quarantine
+	}
+	declared := widgets.GetKeyExtras(cr)
+	declaredSet := make(map[string]struct{}, len(declared))
+	for _, k := range declared {
+		declaredSet[k] = struct{}{}
+	}
+	for k := range requestExtras {
+		if _, ok := declaredSet[k]; !ok {
+			return false // an undeclared request extra would collapse into the shared cell
+		}
+	}
+	return true
+}
+
 // effectiveKeyExtras is the SINGLE shared derivation of the "effective key
 // extras" the definitive cache-identity architecture (§2.2,
 // docs/definitive-cache-identity-architecture-2026-07-07.md) mandates for ALL
@@ -369,7 +448,20 @@ func effectiveKeyExtras(ctx context.Context, cr map[string]any, requestExtras ma
 	base := unionForKey(
 		widgets.GetApiRefExtras(cr),
 		widgets.GetResourcesRefsExtras(cr),
-		requestExtras,
+		// F6 (docs/f6-chrome-route-key-design-2026-07-12.md §4 Option A-declare):
+		// filter the per-REQUEST extras to ONLY the keys the widget author declared
+		// in spec.keyExtras BEFORE the union folds them into the key. Absent/empty
+		// declaration ⇒ fold NOTHING (the chrome-widget default — route params like
+		// {namespace,name} stop partitioning the cell, so one seeded cell serves all
+		// routes). The inline maps above (apiRef.extras + resourcesRefsTemplateExtras)
+		// are CR-FIXED, not request extras — they are NOT filtered (they cannot vary
+		// request-to-request, and dropping them would change the resolved body's key).
+		// KEY-ONLY: undeclared request extras still reach widgets.Resolve's jq dict
+		// unchanged (widgets.go passes the RAW extras to the resolver; only this KEY
+		// derivation filters). Single-site by construction — the same filtered union
+		// feeds all four key consumers (dispatch, widgetContent, subscription, seed),
+		// so parity holds (the A1 anti-drift guarantee).
+		filterDeclaredKeyExtras(cr, requestExtras),
 	)
 	// A2 identity injection (§2.2): server-declared identity wins on collision.
 	// declaredIdentityForKey → widgets.DeclaredIdentity reads the parent CR's OWN

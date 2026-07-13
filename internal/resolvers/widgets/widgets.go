@@ -33,6 +33,19 @@ const (
 	// default; per-binding-shareable + seedable). Read off the unstructured spec
 	// (same absence-tolerant pattern as the extras accessors).
 	identityContextKey = "identityContext"
+
+	// keyExtrasKey — the F6 author-declared request-extras-dependence field
+	// (docs/f6-chrome-route-key-design-2026-07-12.md §4 Option A-declare):
+	// spec.keyExtras is an OPTIONAL []string enumerating which REQUEST-extras
+	// keys (the ?extras= JSON the frontend folds route params / query into) this
+	// widget's rendered output depends on. Only the declared keys PARTITION the
+	// cache key; undeclared request extras still reach the RESOLVE input (the jq
+	// dict) but do NOT vary the key. Absent/empty = fold NOTHING from request
+	// extras (the identity-free chrome-widget default: one seeded cell serves all
+	// routes). This is the exact identityContext shape one dimension over —
+	// author declaration of key-dependence — so it is read the same absence-
+	// tolerant way and filters at the SINGLE shared effectiveKeyExtras site.
+	keyExtrasKey = "keyExtras"
 )
 
 // identityContextEnumUsername / identityContextEnumGroups are the ONLY enum
@@ -71,6 +84,44 @@ func GetIdentityContext(obj map[string]any) []string {
 		}
 		// D1 enum filter IN CODE: honor only username/groups.
 		if s != identityContextEnumUsername && s != identityContextEnumGroups {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// GetKeyExtras reads spec.keyExtras off the unstructured widget CR and returns
+// the DECLARED request-extras key names — the F6 declaration accessor
+// (docs/f6-chrome-route-key-design-2026-07-12.md §4 Option A-declare). It is the
+// request-extras twin of GetIdentityContext, one dimension over: instead of
+// enumerating which authenticated-principal keys the output depends on, it
+// enumerates which REQUEST-extras keys (route params / query the frontend folds
+// into ?extras=) the widget's resolution depends on. Only these keys are allowed
+// to PARTITION the cache key (filterDeclaredKeyExtras applies the allowlist);
+// undeclared request extras are still passed to the RESOLVE input untouched.
+//
+// UNLIKE GetIdentityContext there is NO enum filter: request-extras key names are
+// author-defined and open-ended (namespace, name, and any custom route/query
+// param), so the accessor honors every declared string. Absence-tolerant: absent
+// / wrong-type / empty ⇒ nil (the fold-nothing chrome-widget default,
+// byte-identical to pre-F6 for the identity-free corpus). Order is preserved and
+// duplicates collapsed for determinism. Reads via maps.NestedSlice (deep copy →
+// no CR aliasing), mirroring GetIdentityContext / GetResourcesRefsExtras.
+func GetKeyExtras(obj map[string]any) []string {
+	raw, ok, err := maps.NestedSlice(obj, "spec", keyExtrasKey)
+	if !ok || err != nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, v := range raw {
+		s, isStr := v.(string)
+		if !isStr {
 			continue
 		}
 		if _, dup := seen[s]; dup {

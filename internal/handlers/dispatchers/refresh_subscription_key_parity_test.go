@@ -13,19 +13,19 @@
 // BindingUID fold) AND the widget CR (so objects.Get serves it from the
 // informer — the C64-6 informer-served read). NO remote go-test, NO apiserver.
 //
-//   ARM 1 (C64-4 DISCRIMINATOR): widget CR has inline spec.apiRef.extras=
-//          {region:eu}; coords.Extras={name:demo-vpc} — DISJOINT (coords does
-//          NOT pre-contain the inline; that disjointness is what the old golden
-//          lacked). DeriveSubscriptionKey(coords) MUST == the emit key folding
-//          unionForKey(inline,{name}) = {region,name}. RED on the old code
-//          (folds {name} only), GREEN on the fix.
-//   ARM 2 (C64-5 backward-compat): empty inline → DeriveSubscriptionKey == the
-//          request-only emit key (no regression for inline-free widgets).
-//   ARM 3: widgetContent class, same disjoint inline shape — RED/GREEN.
-//   ARM 4: restactions class — request-only on BOTH sides (branch UNCHANGED).
-//   ARM 5 (C64-1 fail-closed): the widget CR is NOT gettable (absent) →
-//          DeriveSubscriptionKey returns ("", false) — the coord is SKIPPED,
-//          NOT armed with a request-only key.
+//	ARM 1 (C64-4 DISCRIMINATOR): widget CR has inline spec.apiRef.extras=
+//	       {region:eu}; coords.Extras={name:demo-vpc} — DISJOINT (coords does
+//	       NOT pre-contain the inline; that disjointness is what the old golden
+//	       lacked). DeriveSubscriptionKey(coords) MUST == the emit key folding
+//	       unionForKey(inline,{name}) = {region,name}. RED on the old code
+//	       (folds {name} only), GREEN on the fix.
+//	ARM 2 (C64-5 backward-compat): empty inline → DeriveSubscriptionKey == the
+//	       request-only emit key (no regression for inline-free widgets).
+//	ARM 3: widgetContent class, same disjoint inline shape — RED/GREEN.
+//	ARM 4: restactions class — request-only on BOTH sides (branch UNCHANGED).
+//	ARM 5 (C64-1 fail-closed): the widget CR is NOT gettable (absent) →
+//	       DeriveSubscriptionKey returns ("", false) — the coord is SKIPPED,
+//	       NOT armed with a request-only key.
 package dispatchers
 
 import (
@@ -38,7 +38,6 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -163,7 +162,14 @@ func TestFalsifier64_ARM1_WidgetsInlineExtrasUnion(t *testing.T) {
 		t.Fatalf("DeriveSubscriptionKey failed (ok=%v key=%q) — RBAC/objects.Get setup wrong?", ok, subKey)
 	}
 
-	// The emit key: the resolver folds unionForKey(GetApiRefExtras, GetResourcesRefsExtras, request).
+	// The emit key: driven through the REAL prod fold effectiveKeyExtras (NOT a
+	// hand-built unionForKey). F6 (docs/f6-chrome-route-key-design-2026-07-12.md,
+	// arch-ruled 2026-07-13): the prod emit path (widgets.go:152) AND the
+	// subscription path (subscriptionKeyExtras) BOTH call effectiveKeyExtras, so
+	// building the golden's emit key any other way is a SHADOW that can drift (the
+	// #66 lesson). The inline {region:eu} (apiRef.extras) is CR-fixed → F6 does NOT
+	// filter it; the request {name:demo-vpc} is UNDECLARED → F6 drops it from the
+	// key on BOTH sides identically. So the sub key still == the emit key.
 	got := objects.Get(ctx, templatesv1.ObjectReference{
 		Reference:  templatesv1.Reference{Name: "panel-1", Namespace: "demo"},
 		APIVersion: "widgets.templates.krateo.io/v1beta1",
@@ -172,11 +178,7 @@ func TestFalsifier64_ARM1_WidgetsInlineExtrasUnion(t *testing.T) {
 	if got.Err != nil || got.Unstructured == nil {
 		t.Fatalf("objects.Get(panel-1) failed in setup: err=%v", got.Err)
 	}
-	emitExtras := unionForKey(
-		widgets.GetApiRefExtras(got.Unstructured.Object),
-		widgets.GetResourcesRefsExtras(got.Unstructured.Object),
-		map[string]any{"name": "demo-vpc"},
-	)
+	emitExtras := effectiveKeyExtras(ctx, got.Unstructured.Object, map[string]any{"name": "demo-vpc"})
 	emitKey, handle, _ := dispatchCacheLookupKey(ctx, classWidgets,
 		coords.Group, coords.Version, coords.Resource, coords.Namespace, coords.Name,
 		coords.PerPage, coords.Page, emitExtras)
@@ -184,13 +186,18 @@ func TestFalsifier64_ARM1_WidgetsInlineExtrasUnion(t *testing.T) {
 		t.Fatalf("emit key derivation failed")
 	}
 
-	// Sanity: the union actually changed the key vs request-only (else the test
-	// can't discriminate — the inline must be load-bearing).
-	reqOnlyKey, _, _ := dispatchCacheLookupKey(ctx, classWidgets,
+	// Sanity: the inline {region:eu} actually changed the emit key vs a widget with
+	// NO inline (else the test can't discriminate — the inline must be load-bearing).
+	// (Comparing against request-only would be a no-op under F6: the undeclared
+	// {name} request extra drops from the key, so request-only == no-extras. The
+	// discriminant is the CR-fixed INLINE map, which F6 preserves.)
+	noInline := map[string]any{"spec": map[string]any{}}
+	bareExtras := effectiveKeyExtras(ctx, noInline, map[string]any{"name": "demo-vpc"})
+	bareKey, _, _ := dispatchCacheLookupKey(ctx, classWidgets,
 		coords.Group, coords.Version, coords.Resource, coords.Namespace, coords.Name,
-		coords.PerPage, coords.Page, map[string]any{"name": "demo-vpc"})
-	if emitKey == reqOnlyKey {
-		t.Fatalf("ARM1 setup: inline {region:eu} did not change the emit key — not discriminating")
+		coords.PerPage, coords.Page, bareExtras)
+	if emitKey == bareKey {
+		t.Fatalf("ARM1 setup: inline {region:eu} did not change the emit key vs a no-inline widget — not discriminating")
 	}
 
 	if subKey != emitKey {
@@ -212,12 +219,25 @@ func TestFalsifier64_ARM2_WidgetsNoInlineBackwardCompat(t *testing.T) {
 	if !ok {
 		t.Fatalf("DeriveSubscriptionKey failed for inline-free widget")
 	}
-	reqOnlyKey, _, _ := dispatchCacheLookupKey(ctx, classWidgets,
+	// F6 (arch-ruled 2026-07-13): the emit-side comparison must go through the REAL
+	// effectiveKeyExtras (not a raw {name} fold) — for an inline-free UNDECLARED
+	// widget the request {name} drops from the key on BOTH sides, so the sub key
+	// equals the emit key with an EMPTY effective fold. (Hand-building {name} would
+	// be a pre-F6 shadow that no longer matches the filtered prod path.)
+	got := objects.Get(ctx, templatesv1.ObjectReference{
+		Reference:  templatesv1.Reference{Name: "panel-1", Namespace: "demo"},
+		APIVersion: "widgets.templates.krateo.io/v1beta1", Resource: "panels",
+	})
+	if got.Err != nil || got.Unstructured == nil {
+		t.Fatalf("objects.Get(panel-1) failed in setup: err=%v", got.Err)
+	}
+	emitExtras := effectiveKeyExtras(ctx, got.Unstructured.Object, map[string]any{"name": "demo-vpc"})
+	emitKey, _, _ := dispatchCacheLookupKey(ctx, classWidgets,
 		coords.Group, coords.Version, coords.Resource, coords.Namespace, coords.Name,
-		coords.PerPage, coords.Page, map[string]any{"name": "demo-vpc"})
-	if subKey != reqOnlyKey {
-		t.Fatalf("ARM2 C64-5: inline-free widget subscription key %q != request-only key %q — backward-compat regression",
-			subKey, reqOnlyKey)
+		coords.PerPage, coords.Page, emitExtras)
+	if subKey != emitKey {
+		t.Fatalf("ARM2 C64-5: inline-free widget subscription key %q != emit key %q — backward-compat/parity regression",
+			subKey, emitKey)
 	}
 }
 
@@ -237,15 +257,15 @@ func TestFalsifier64_ARM3_WidgetContentInlineExtrasUnion(t *testing.T) {
 		Reference:  templatesv1.Reference{Name: "panel-1", Namespace: "demo"},
 		APIVersion: "widgets.templates.krateo.io/v1beta1", Resource: "panels",
 	})
-	emitExtras := unionForKey(
-		widgets.GetApiRefExtras(got.Unstructured.Object),
-		widgets.GetResourcesRefsExtras(got.Unstructured.Object),
-		map[string]any{"name": "demo-vpc"})
+	// F6 (arch-ruled 2026-07-13): emit key via the REAL effectiveKeyExtras (not a
+	// hand-built unionForKey shadow). Inline {region:eu} folds (CR-fixed); the
+	// undeclared {name} request extra drops on both sides → sub key == emit key.
+	emitExtras := effectiveKeyExtras(ctx, got.Unstructured.Object, map[string]any{"name": "demo-vpc"})
 	emitKey, _, _ := dispatchWidgetContentKey(ctx,
 		coords.Group, coords.Version, coords.Resource, coords.Namespace, coords.Name,
 		coords.PerPage, coords.Page, emitExtras)
 	if subKey != emitKey {
-		t.Fatalf("ARM3 RED: widgetContent subscription key %q != emit key %q (inline-extras union missing)", subKey, emitKey)
+		t.Fatalf("ARM3: widgetContent subscription key %q != emit key %q (inline-extras union parity broken)", subKey, emitKey)
 	}
 }
 
