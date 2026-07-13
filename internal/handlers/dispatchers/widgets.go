@@ -241,7 +241,16 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		if entry, ok := cacheHandle.Get(cacheKey); ok {
 			emitResolvedCacheLookup(log, "widgets", got.GVR.String(), cacheKey, true, entry.SeededAtBoot, len(entry.RawJSON))
 			pcs.l1Hit = "hit"
-			setRefreshKeyHeader(wri, cacheKey, "widgets")
+			// External-widget bounded-TTL cache (Option A, 2026-07-10) — C2
+			// arming kill on the HIT branch. The entry may have been Put under
+			// the external-TTL path (no dep edges, never publishes); a HIT does
+			// NO resolve, so there is no context ExternalTouchedSink to read —
+			// the PERSISTED entry.ExternalTTL marker is the only available
+			// signal. Suppress the refresh-key header for such an entry so the
+			// browser never arms a /refreshes subscription for a key that can
+			// never fire. entry.ExternalTTL is false for every normal entry →
+			// byte-identical header behavior when the feature is off (C4).
+			setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", entry.ExternalTTL)
 			writeResolvedJSON(wri, entry.RawJSON)
 			log.Info("Widget successfully resolved",
 				slog.String("duration", util.ETA(start)),
@@ -357,6 +366,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		response.InternalError(wri, err)
 		return
 	}
+	// External-widget bounded-TTL cache (Option A, 2026-07-10) — declared
+	// BEFORE the if/else-if Put-gate chain so the cold-Put tail (below) can
+	// read it on ALL paths. Set true ONLY by the external-TTL else-if; every
+	// other branch leaves it false → byte-identical refresh-key header
+	// behavior on the tail for them (C4).
+	servedExternalTTL := false
+
 	// Ship 0.30.257 (#313) Cache-A — skip the Put on ANY per-item stage
 	// error (symmetric with restactions.go + the refresher gate). The
 	// partial-with-errors widget body is SERVED below; it is just not
@@ -376,11 +392,51 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("partial_ttl_s", partialResultTTL().String()),
 			slog.String("effect", "partial body served (200); not persisted under the full TTL — transient item failures self-heal on next resolve (D bounded-stale window if enabled)"),
 		)
+	} else if extTTL := externalCacheTTLFromAnnotations(got.Unstructured); extTouchedSink.Count() > 0 && extTTL > 0 &&
+		cacheHandle != nil && cacheKey != "" && serveFromCacheEligible(cacheInputs) {
+		// External-widget bounded-TTL cache (Option A, 2026-07-10) — the
+		// widget's resolve touched a genuine external endpoint AND the widget
+		// CR opted in via the `krateo.io/external-cache-ttl-seconds` annotation
+		// (extTTL>0, capped). INVERT the decline below: Put the external result
+		// under the UNCHANGED per-binding `widgets` cacheKey with a short
+		// TTLOverride so it serves from L1 for at most the TTL, then TTL-evicts
+		// and re-fetches live. Correctness basis = time-bounded staleness, NOT
+		// dep-edge invalidation (design §2) — so we deliberately SKIP the
+		// dep-Record and the publish (an external entry has no dep edges and
+		// must never enter the /refreshes path, design §6.3).
+		//
+		// serveFromCacheEligible gates the same #95 "" BindingUID collapse as
+		// the genuine-Put branch: a ""-derived key never populates the shared
+		// empty-identity cell. The per-binding key is UNCHANGED — per-user
+		// isolation rides on the existing BindingUID fold (ComputeKey), NEVER an
+		// identity-free cell (design §4.1).
+		//
+		// ExternalTTL:true persists the C2 marker so the HIT-serve branch and
+		// this branch's cold tail both suppress the refresh-key header (the
+		// arming kill, §6). No BumpExternalSkippedPut here — the Put was ALLOWED.
+		emitDispatchCacheKeyDiag(log, "external_ttl_put", req.Context(),
+			cacheKey, cacheInputs, "widgets",
+			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+			perPage, page, keyExtras)
+		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
+			RawJSON:     encoded,
+			Inputs:      cacheInputs,
+			TTLOverride: extTTL,
+			ExternalTTL: true,
+		})
+		servedExternalTTL = true
+		log.Info("Widget touched an external endpoint; caching with bounded external TTL (opt-in annotation)",
+			slog.Int64("external_touches", extTouchedSink.Count()),
+			slog.String("external_ttl", extTTL.String()),
+			slog.String("effect", "body served (200) + persisted under the per-binding widgets key with TTLOverride; served from L1 for <=TTL then re-fetched live; NO dep-Record, NO publish, NO /refreshes arm"),
+		)
 	} else if extTouchedSink.Count() > 0 {
 		// External-no-cache (proposal 2026-06-22) — the widget's resolve
-		// touched a genuine external endpoint (e.g. an external apiRef RA).
-		// Serve the envelope but DECLINE the Put + the dep Record (no informer
-		// edge can invalidate external data). Re-fetched live on every /call.
+		// touched a genuine external endpoint (e.g. an external apiRef RA) and
+		// did NOT opt in (default OFF). Serve the envelope but DECLINE the Put +
+		// the dep Record (no informer edge can invalidate external data).
+		// Re-fetched live on every /call. Byte-identical to pre-Option-A.
 		cache.BumpExternalSkippedPut()
 		log.Warn("Widget touched an external endpoint; declining to cache (external data has no dep edge to invalidate)",
 			slog.Int64("external_touches", extTouchedSink.Count()),
@@ -437,6 +493,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		slog.String("l1", "miss"),
 	)
 
-	setRefreshKeyHeader(wri, cacheKey, "widgets")
+	// External-widget bounded-TTL cache (Option A, 2026-07-10) — C2 arming
+	// kill on the cold tail. This line serves ALL non-HIT paths (genuine Put,
+	// stage-error decline, external-skip decline, AND the new external-TTL
+	// Put). Suppress the refresh-key header ONLY for the external-TTL Put
+	// (servedExternalTTL==true); every other branch left it false → byte-
+	// identical header behavior for them (C4).
+	setRefreshKeyHeaderUnlessExternal(wri, cacheKey, "widgets", servedExternalTTL)
 	writeResolvedJSON(wri, encoded)
 }
