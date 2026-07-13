@@ -108,6 +108,21 @@ func (l *firstNavLatch) wait() <-chan struct{} {
 	return l.done
 }
 
+// fired reports whether the latch has already fired (its done channel is
+// closed). F5 (#131) reads this on engineSeed's backstop arms to distinguish a
+// backstop-Ready flip (latch NOT fired → nav widgets unseeded → alert) from a
+// benign tie where the latch fired just as bootDone closed. Race-safe: a
+// non-blocking receive on a closed channel returns immediately; close happens-
+// before every fired() call that observes it (the sync.Once in fire()).
+func (l *firstNavLatch) fired() bool {
+	select {
+	case <-l.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // firstNavLatchSingleton is the process latch. Built once (set-once at the
 // first engineSeed invocation via ensureFirstNavLatch); the boot pass fires
 // it, and engineSeed waits on it. Package-level so seedScopeYielding (invoked
@@ -117,7 +132,7 @@ func (l *firstNavLatch) wait() <-chan struct{} {
 // wait).
 var (
 	firstNavLatchSingleton *firstNavLatch
-	firstNavLatchOnce       sync.Once
+	firstNavLatchOnce      sync.Once
 )
 
 // ensureFirstNavLatch returns the process first-nav latch, building it once.
