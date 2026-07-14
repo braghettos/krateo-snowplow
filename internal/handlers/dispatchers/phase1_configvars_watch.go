@@ -189,7 +189,7 @@ func enqueueBootReDrive(reason string) {
 	// widget cold-forever). A plain F.4 deadline-cut requeue does NOT come through
 	// here (it AddRateLimited's inside processScope and keeps the set) — only a
 	// genuine config change clears.
-	prewarmEngineSingleton().clearDeclinedExternalSet(bootScope.key())
+	prewarmEngineSingleton().clearDeclinedExternalSet(bootScope.key(), "config-vars-redrive")
 	prewarmEngineSingleton().enqueueScope(bootScope)
 	slog.Info("prewarm.configvars.boot_redrive_enqueued",
 		slog.String("subsystem", "cache"),

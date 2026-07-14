@@ -521,27 +521,14 @@ func seedScopeYielding(ctx context.Context,
 	// never break — the 2dc46ae inert-rework the arch caught. Instead the engine
 	// holds one set per boot-scope-key, created once and REUSED across the scope's
 	// requeues, installed onto ctx in processScope (prewarm_engine.go), cleared on
-	// genuine boot completion + config-vars redrive. Here we only OBSERVE it off
-	// ctx for the per-pass summary line; seedSkipDecision + declineSeedPutOnError
-	// read/write it via cache.SeedDeclinedExternalSetFromContext. Nil off the boot
-	// path (keepwarm/gvr-discovered/cache-off never carry one → strict no-op).
-	if mode == seedModeBoot {
-		if declinedExt := cache.SeedDeclinedExternalSetFromContext(ctx); declinedExt != nil {
-			defer func() {
-				if n := declinedExt.Marks(); n > 0 {
-					log.Info("phase1.seed.declined_external.summary",
-						slog.String("subsystem", "cache"),
-						slog.String("mode", mode.String()),
-						slog.Uint64("declined_external_keys", n),
-						slog.String("effect", "F4b Lever A — distinct (widget,cohort) keys resolved-and-declined "+
-							"external this boot scope (engine-lived, cumulative across resume passes); a resume "+
-							"pass skips re-resolving them (breaks the §3 external-whale loop; cell stays "+
-							"intentionally cold, /call re-resolves it live)"),
-					)
-				}
-			}()
-		}
-	}
+	// genuine boot completion + config-vars redrive. seedSkipDecision +
+	// declineSeedPutOnError read/write it via cache.SeedDeclinedExternalSetFromContext;
+	// it is nil off the boot path (keepwarm/gvr-discovered/cache-off never carry
+	// one → strict no-op). The phase1.seed.declined_external.summary line is
+	// intentionally NOT emitted here per-pass (that would report a partial
+	// per-seedScopeYielding-pass count); it is emitted ONCE at teardown in
+	// clearDeclinedExternalSet, reading the WHOLE-BOOT cumulative Marks() off the
+	// engine-lived set (R4 cross-pass counter semantics).
 
 	// CTX-CANCEL ABORT OBSERVABILITY (fold 2026-07-03, §4.3b — migrated from the
 	// deleted seedCohort's 0.30.191 Fix-C `phase1.cohort.abort` reporter). The

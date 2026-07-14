@@ -41,12 +41,17 @@
 package dispatchers
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // getRecordingHandle is a cacheHandle double that records every key passed to
@@ -357,7 +362,7 @@ func TestF4bLeverA_ConfigVarsRedrive_ClearsSet_WhaleReResolvesUnderNewTopology(t
 
 	// CONFIG-VARS REDRIVE (new topology): the SAME clear the enqueueBootReDrive
 	// path makes. After it, the engine hands out a FRESH set for the boot key.
-	e.clearDeclinedExternalSet(bootKey)
+	e.clearDeclinedExternalSet(bootKey, "config-vars-redrive")
 
 	// The next boot pass over the (new-topology) whale must RE-RESOLVE it once:
 	// the fresh set has no mark → seedSkipDecision falls through to handle.Get.
@@ -374,6 +379,244 @@ func TestF4bLeverA_ConfigVarsRedrive_ClearsSet_WhaleReResolvesUnderNewTopology(t
 		t.Fatal("post-redrive: the boot key must map to a FRESH empty set, not the cleared one")
 	}
 	_ = bootKey
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARM R2 (load-bearing) — mark under boot scope → fire config-vars redrive →
+// next invocation Marked()==false. RED = OMIT the clear (stale skip persists
+// across the topology change). This drives the REAL enqueueBootReDrive clear via
+// clearDeclinedExternalSet with the exact redrive reason.
+func TestF4bLeverA_R2_RedriveClearsStaleSkip_OmitClearIsRED(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+
+	bootKey := prewarmScope{kind: scopeKindBoot}.key()
+	const widget = "krateo-system/obs-errors-card"
+	whaleKey := "widgets|obs-errors-card|u=|g=group:admins"
+
+	// run models: mark under boot scope, optionally clear (redrive), then a next
+	// invocation checks Marked(). Returns whether the next invocation still skips.
+	run := func(fireRedriveClear bool) (nextInvocationSkips bool) {
+		e := newTestEngine()
+		// Boot pass marks the whale.
+		markCtx := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
+		if !declineExternalOnce(markCtx, "widgets", widget, whaleKey) {
+			t.Fatal("setup: whale must decline+mark")
+		}
+		// GREEN drives the REAL redrive clear; RED omits it (the mutation).
+		if fireRedriveClear {
+			e.clearDeclinedExternalSet(bootKey, "config-vars-redrive")
+		}
+		// Next invocation over the same key: does it skip?
+		h := &getRecordingHandle{}
+		nextCtx := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
+		return seedSkipDecision(nextCtx, seedModeBoot, h, whaleKey, "widgets", widget, "")
+	}
+
+	// GREEN: redrive fired → next invocation does NOT skip (Marked()==false).
+	if run(true) {
+		t.Fatal("R2 GREEN VIOLATED: after a config-vars redrive the next invocation still SKIPPED the whale — a stale suppression survived the topology change (the redrive clear did not take)")
+	}
+	// RED: omit the clear → the stale mark persists → next invocation skips. This
+	// is exactly the bug the R2 clear prevents; if omitting the clear did NOT
+	// cause a stale skip, the clear wouldn't be load-bearing.
+	if !run(false) {
+		t.Fatal("R2 RED arm broke: omitting the redrive clear must leave a STALE skip (Marked()==true across the topology change) — if it doesn't, the clear isn't what's providing the topology-change correctness")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARM R3 (teardown ≠ clear) — genuine completion TEARS DOWN the map entry (not
+// just empties it), so the engine map cannot ACCUMULATE entries across unrelated
+// boots. Drives the REAL processScope completion path; asserts the map has no
+// entry for the boot key after a genuine boot completes.
+func TestF4bLeverA_R3_TeardownNotClear_NoAccumulationAcrossBoots(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+
+	e := newTestEngine()
+	bootKey := prewarmScope{kind: scopeKindBoot}.key()
+	const widget = "krateo-system/obs-resource-card"
+	whaleKey := "widgets|obs-resource-card|u=|g=group:admins"
+
+	// Boot 1: mark a whale, then genuine completion (return nil once skipped).
+	pass := 0
+	e.scopeHandler = func(scopeCtx context.Context, s prewarmScope) error {
+		if s.kind != scopeKindBoot {
+			return nil
+		}
+		pass++
+		h := &getRecordingHandle{}
+		if seedSkipDecision(scopeCtx, seedModeBoot, h, whaleKey, "widgets", widget, "") {
+			return nil // converged
+		}
+		if !declineExternalOnce(scopeCtx, "widgets", widget, whaleKey) {
+			t.Fatal("whale must decline")
+		}
+		return context.DeadlineExceeded // cut → requeue (reuse set)
+	}
+	driveProcessScopeUntilQuiet(t, e, 6)
+
+	// TEARDOWN: after genuine boot completion the map must have NO entry for the
+	// boot key — not a retained-but-emptied set (which would pin one map entry per
+	// scope key forever = accumulation across unrelated boots).
+	e.declinedExtMu.Lock()
+	nEntries := len(e.declinedExtSets)
+	_, present := e.declinedExtSets[bootKey]
+	e.declinedExtMu.Unlock()
+	if present {
+		t.Fatal("R3 teardown VIOLATED: the boot key still maps to a set after genuine completion — clearDeclinedExternalSet must DELETE the entry (teardown), not empty-in-place")
+	}
+	if nEntries != 0 {
+		t.Fatalf("R3 accumulation VIOLATED: the engine map retained %d entries after all boots completed — it must not accumulate across unrelated boots", nEntries)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARM R3 (nil-off-boot EARNED) — the engine holds the set as a FIELD, so
+// off-boot ctx nil-ness is not free (unlike the old ctx-only version). It is
+// EARNED by installing onto ctx ONLY in the boot-scope processScope path. Prove:
+// (a) a non-boot scope (gvr-discovered) driven through the REAL processScope
+// carries NO set on the handler ctx; (b) the /call + keepwarm paths never install
+// one (grep-asserted by TestF4bLeverA_NoInstallOffBootPath below).
+func TestF4bLeverA_R3_NilOffBoot_NonBootScopeCarriesNoSet(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+
+	e := newTestEngine()
+	var sawSetOnBoot, sawSetOnGVR bool
+	e.scopeHandler = func(scopeCtx context.Context, s prewarmScope) error {
+		set := cache.SeedDeclinedExternalSetFromContext(scopeCtx)
+		switch s.kind {
+		case scopeKindBoot:
+			sawSetOnBoot = set != nil
+		case scopeKindGVRDiscovered:
+			sawSetOnGVR = set != nil
+		}
+		return nil // genuine completion (no requeue) for both
+	}
+	prevTO := prewarmScopeTimeoutFn
+	prewarmScopeTimeoutFn = func(prewarmScope) time.Duration { return time.Hour }
+	t.Cleanup(func() { prewarmScopeTimeoutFn = prevTO })
+
+	ctx := context.Background()
+	// Drive a BOOT scope and a GVR-discovered scope through the REAL processScope.
+	e.enqueueScope(prewarmScope{kind: scopeKindBoot})
+	bs, _ := e.queue.Get()
+	e.processScope(ctx, bs)
+	e.enqueueScope(prewarmScope{kind: scopeKindGVRDiscovered, gvr: schema.GroupVersionResource{Group: "g", Version: "v", Resource: "r"}})
+	gs, _ := e.queue.Get()
+	e.processScope(ctx, gs)
+
+	if !sawSetOnBoot {
+		t.Fatal("R3: the BOOT scope handler ctx MUST carry the engine-installed set (earned install)")
+	}
+	if sawSetOnGVR {
+		t.Fatal("R3 nil-off-boot VIOLATED: a NON-boot (gvr-discovered) scope handler ctx carried a declined-external set — the install must be gated to the boot scope ONLY (an engine-held field does not get off-boot nil-ness for free)")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARM R3 (nil-off-boot EARNED, grep) — the ONLY WithSeedDeclinedExternalSet
+// install in prod dispatcher code is the boot-scope-gated processScope site.
+// Neither the /call dispatch path nor the keepwarm/gvr paths install one. This is
+// the source-level guard that the field-held set can't leak onto a request ctx.
+func TestF4bLeverA_NoInstallOffBootPath(t *testing.T) {
+	// Every prod .go in the package: WithSeedDeclinedExternalSet must appear ONLY
+	// in prewarm_engine.go, and there ONLY inside the s.kind==scopeKindBoot guard.
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	installSites := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		s := string(src)
+		n := strings.Count(s, "cache.WithSeedDeclinedExternalSet(")
+		if n == 0 {
+			continue
+		}
+		installSites += n
+		if name != "prewarm_engine.go" {
+			t.Fatalf("R3 nil-off-boot VIOLATED: cache.WithSeedDeclinedExternalSet install found in %s — the set must be installed ONLY in the boot-scope processScope path (prewarm_engine.go), never on a /call or keepwarm path", name)
+		}
+		// In prewarm_engine.go the install must be guarded by the boot-scope check.
+		if !strings.Contains(s, "if s.kind == scopeKindBoot {") {
+			t.Fatal("R3: the prewarm_engine.go install must be gated on `if s.kind == scopeKindBoot`")
+		}
+	}
+	if installSites != 1 {
+		t.Fatalf("R3: expected exactly ONE WithSeedDeclinedExternalSet install site (boot-scope processScope); found %d", installSites)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARM R4 (whole-boot cross-pass counter) — the phase1.seed.declined_external
+// .summary line reflects marks across the WHOLE boot (cumulative over resume
+// passes), NOT a per-pass count, and is emitted ONCE at teardown. Drive TWO real
+// passes each marking a DISTINCT whale, then genuine completion → assert the
+// single summary line reports declined_external_keys=2 (the cumulative total).
+func TestF4bLeverA_R4_SummaryIsWholeBootCumulative(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	e := newTestEngine()
+	const widget = "krateo-system/obs-perf-p50"
+	// Two DISTINCT whale keys, one marked per pass, so a per-pass counter would
+	// report 1 (last pass) while the whole-boot cumulative is 2.
+	whaleP1 := "widgets|obs-perf-p50|u=|g=group:admins"
+	whaleP2 := "widgets|obs-perf-p50|u=|g=group:devs"
+	pass := 0
+	e.scopeHandler = func(scopeCtx context.Context, s prewarmScope) error {
+		if s.kind != scopeKindBoot {
+			return nil
+		}
+		pass++
+		switch pass {
+		case 1:
+			if !declineExternalOnce(scopeCtx, "widgets", widget, whaleP1) {
+				t.Fatal("pass1 whale must decline")
+			}
+			return context.DeadlineExceeded // requeue (reuse set)
+		case 2:
+			// pass-1 whale already marked (skipped); mark a SECOND distinct whale.
+			if !declineExternalOnce(scopeCtx, "widgets", widget, whaleP2) {
+				t.Fatal("pass2 whale must decline")
+			}
+			return context.DeadlineExceeded // requeue again
+		default:
+			return nil // converged → genuine completion → summary emitted at teardown
+		}
+	}
+	driveProcessScopeUntilQuiet(t, e, 6)
+
+	// Exactly ONE summary line, reporting the WHOLE-BOOT cumulative count = 2.
+	logText := buf.String()
+	if got := strings.Count(logText, "phase1.seed.declined_external.summary"); got != 1 {
+		t.Fatalf("R4: expected EXACTLY ONE declined_external summary line (emitted once at teardown); found %d\n%s", got, logText)
+	}
+	if !strings.Contains(logText, "\"declined_external_keys\":2") {
+		t.Fatalf("R4 VIOLATED: the summary must report the WHOLE-BOOT cumulative mark count (2 distinct whales across 2 passes), NOT a per-pass partial. Log:\n%s", logText)
+	}
+	if !strings.Contains(logText, "\"reason\":\"boot-complete\"") {
+		t.Fatalf("R4: the teardown summary must carry reason=boot-complete. Log:\n%s", logText)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────
