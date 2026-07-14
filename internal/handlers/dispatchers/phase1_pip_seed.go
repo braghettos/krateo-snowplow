@@ -524,9 +524,32 @@ func withCohortSeedContext(ctx context.Context, cohort seedTarget,
 // effectiveTTL logic the serve path uses (resolved.go Get, strict `>` expiry).
 // For the age-skip, the entry's CreatedAt (Put-time-stamped, resolved.go Put)
 // is read directly off the returned live entry — no cache-side accessor needed.
-func seedSkipDecision(mode seedScopeMode, handle cacheHandle, key, class, target, cohortLabel string) bool {
+func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandle, key, class, target, cohortLabel string) bool {
 	switch mode {
 	case seedModeBoot:
+		// #132 F4b Lever A — BEFORE the liveness Get: if this EXACT key was
+		// already resolved-and-declined-external THIS boot scope, skip re-
+		// resolving it. The cell is intentionally cold (the #102 decline was
+		// correct — an external-touch cell has no dep edge), so a resume pass's
+		// handle.Get would MISS (never Put) and re-resolve the whale from scratch,
+		// paying its full external round-trip for zero forward progress (§3 loop).
+		// The set is keyed by the full dispatchCacheLookupKey (encodes cohort
+		// identity) and is nil off the boot seed path, so this is a strict no-op
+		// on /call, keepwarm, gvr-discovered, and cache-off (nil-receiver Marked =
+		// false). C-F4B-1/-2/-3.
+		if cache.SeedDeclinedExternalSetFromContext(ctx).Marked(key) {
+			pipSeedFreshSkipTotal.Add(1)
+			slog.Default().Debug("phase1.seed.skip.declined_external",
+				slog.String("subsystem", "cache"),
+				slog.String("class", class),
+				slog.String("target", target),
+				slog.String("cohort", cohortLabel),
+				slog.String("effect", "boot-scope Lever A skip: this (widget,cohort) key was resolved-and-"+
+					"declined external earlier THIS boot; re-resolving it every resume pass makes zero forward "+
+					"progress (Put stays declined) — skipping breaks the §3 external-whale loop"),
+			)
+			return true
+		}
 		entry, live := handle.Get(key)
 		if !live || entry == nil {
 			return false
@@ -638,7 +661,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// enterSeedUnit so a skipped target never consumes the #46 memory admission.
 	// The mode selects the predicate: boot = bare liveness (F.4), keepwarm =
 	// age-skip (c2 §4.2), gvr-discovered = never skip (F4-C3 boundary).
-	if seedSkipDecision(mode, handle, key, "restactions", ref.Namespace+"/"+ref.Name, cohortLabel) {
+	if seedSkipDecision(ctx, mode, handle, key, "restactions", ref.Namespace+"/"+ref.Name, cohortLabel) {
 		return nil
 	}
 
@@ -736,7 +759,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// unaffected and readyz never hangs) when the resolve observed a stage
 	// error or touched an external endpoint. Keeps the prior good entry (if
 	// any); TTL is the outer net.
-	if declineSeedPutOnError(ctx, "restactions", ref.Namespace+"/"+ref.Name, stageErrSink, extTouchedSink) {
+	if declineSeedPutOnError(ctx, "restactions", ref.Namespace+"/"+ref.Name, key, stageErrSink, extTouchedSink) {
 		return nil
 	}
 
@@ -867,7 +890,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// accelerator is skipped along with the widget resolve — correct, because a
 	// live widget cell implies its first paginated /call already found (or will
 	// lazily rebuild) the pinned full-list.
-	if seedSkipDecision(mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), "") {
+	if seedSkipDecision(ctx, mode, handle, key, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), "") {
 		return nil
 	}
 
@@ -947,7 +970,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 
 	// #102 GTTL-1: decline the Put (best-effort, return nil) on a stage error
 	// or external touch — keeps any prior good entry; TTL is the outer net.
-	if declineSeedPutOnError(ctx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), stageErrSink, extTouchedSink) {
+	if declineSeedPutOnError(ctx, "widgets", e.W.GetNamespace()+"/"+e.W.GetName(), key, stageErrSink, extTouchedSink) {
 		return nil
 	}
 
@@ -1152,7 +1175,7 @@ func seedRAFullListForWidget(ctx context.Context, w *unstructured.Unstructured, 
 //
 // The identity for the log is read from ctx (withCohortSeedContext installs
 // WithUserInfo) so both primitives share one helper without threading a label.
-func declineSeedPutOnError(ctx context.Context, class, target string,
+func declineSeedPutOnError(ctx context.Context, class, target, key string,
 	stageErrSink *cache.StageErrorSink, extTouchedSink *cache.ExternalTouchedSink) bool {
 
 	if stageErrSink.Count() > 0 {
@@ -1178,6 +1201,18 @@ func declineSeedPutOnError(ctx context.Context, class, target string,
 	if extTouchedSink.Count() > 0 {
 		pipSeedSkippedStageErrorTotal.Add(1)
 		cache.BumpExternalSkippedPut()
+		// #132 F4b Lever A — mark this EXACT key resolved-and-declined-external for
+		// the boot scope, so a resume pass's seedSkipDecision skips re-resolving it
+		// (breaks the §3 loop). ONLY the external branch marks (NOT stage_error): a
+		// stage error is transient/operational and SHOULD be retried on resume,
+		// whereas an external touch is the structural "will decline every time"
+		// case with no dep edge to ever warm it. Set is nil off the boot seed ctx
+		// (keepwarm/gvr-discovered/user-/call never install one), so Mark is a
+		// nil-receiver no-op there — this can never make a keepwarm sweep or a
+		// /call skip a resolve (C-F4B-3). Keyed by the full dispatchCacheLookupKey
+		// the Put/Get pair uses (C-F4B-2). If #129 later gives external widgets a
+		// warmable TTL cell, this decline stops firing and the marker self-retires.
+		cache.SeedDeclinedExternalSetFromContext(ctx).Mark(key)
 		slog.Default().Info("phase1.seed.skip.external_touch",
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),

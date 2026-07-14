@@ -513,6 +513,34 @@ func seedScopeYielding(ctx context.Context,
 		)
 	}()
 
+	// #132 F4b Lever A — install ONE boot-scope "resolved-but-declined-external"
+	// marker set on ctx, alongside the F4 memo (same context-carried, cohort-
+	// inherited idiom). BOOT MODE ONLY: the marker exists to break the boot
+	// RESUME loop (§3) where an external whale the seed already resolved-and-
+	// declined this boot is re-resolved from scratch every requeue pass (Put
+	// declined → handle.Get MISS → re-resolve, forever). seedSkipDecision consults
+	// it before its handle.Get; declineSeedPutOnError's external branch marks the
+	// key. Keepwarm/gvr-discovered never install one (they carry their own skip
+	// semantics; a keepwarm sweep must re-touch external cells on its TTL cadence,
+	// NOT skip them for the whole sweep), so the set is a strict no-op off boot.
+	// Inert under Disabled() (WithSeedDeclinedExternalSet returns ctx unchanged).
+	if mode == seedModeBoot {
+		declinedExt := cache.NewSeedDeclinedExternalSet()
+		ctx = cache.WithSeedDeclinedExternalSet(ctx, declinedExt)
+		defer func() {
+			if n := declinedExt.Marks(); n > 0 {
+				log.Info("phase1.seed.declined_external.summary",
+					slog.String("subsystem", "cache"),
+					slog.String("mode", mode.String()),
+					slog.Uint64("declined_external_keys", n),
+					slog.String("effect", "F4b Lever A — distinct (widget,cohort) keys resolved-and-declined "+
+						"external this boot; a resume pass skips re-resolving them (breaks the §3 external-whale "+
+						"re-resolve loop; the cell stays intentionally cold, /call re-resolves it live)"),
+				)
+			}
+		}()
+	}
+
 	// CTX-CANCEL ABORT OBSERVABILITY (fold 2026-07-03, §4.3b — migrated from the
 	// deleted seedCohort's 0.30.191 Fix-C `phase1.cohort.abort` reporter). The
 	// engine seed's ctx-cancel exits (boot budget / pipCohortTimeout / process
