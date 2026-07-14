@@ -180,11 +180,22 @@ func configVarsDataChanged(oldObj, newObj interface{}) bool {
 // HOOK-MUST-NOT-BLOCK: no walk work here — enqueueScope is O(1).
 func enqueueBootReDrive(reason string) {
 	configVarsEnqueuedTotal.Add(1)
-	prewarmEngineSingleton().enqueueScope(prewarmScope{kind: scopeKindBoot})
+	bootScope := prewarmScope{kind: scopeKindBoot}
+	// #132 F4b Lever A — a config-vars redrive is a NEW TOPOLOGY (the frontend
+	// config.json / nav set changed). CLEAR the engine-lived declined-external
+	// marker set for the boot scope so the redrive re-resolves each external
+	// whale ONCE under the new nav set, rather than staying suppressed across the
+	// topology change (a stale suppression would leave a now-navigable external
+	// widget cold-forever). A plain F.4 deadline-cut requeue does NOT come through
+	// here (it AddRateLimited's inside processScope and keeps the set) — only a
+	// genuine config change clears.
+	prewarmEngineSingleton().clearDeclinedExternalSet(bootScope.key())
+	prewarmEngineSingleton().enqueueScope(bootScope)
 	slog.Info("prewarm.configvars.boot_redrive_enqueued",
 		slog.String("subsystem", "cache"),
 		slog.String("reason", reason),
-		slog.String("effect", "config-vars ConfigMap event drove a scopeKindBoot re-walk (coalesces on the boot key)"),
+		slog.String("effect", "config-vars ConfigMap event drove a scopeKindBoot re-walk (coalesces on the boot key); "+
+			"F4b declined-external set cleared so whales re-resolve once under the new topology"),
 	)
 }
 

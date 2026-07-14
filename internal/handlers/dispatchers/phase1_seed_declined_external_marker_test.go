@@ -44,6 +44,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
 )
@@ -97,57 +98,282 @@ func declineExternalOnce(ctx context.Context, class, target, key string) bool {
 
 // ─────────────────────────────────────────────────────────────────────────
 // ARM C-F4B-1 — MULTI-COHORT (K=2) × 2 seed passes. The discriminating arm.
+// multiCohortWidget is the shared external whale + the two cohort keys the
+// real-engine-path arms drive (distinct RBAC identity → distinct
+// dispatchCacheLookupKey → distinct marker keys, C-F4B-1 K=2).
+const multiCohortWidget = "krateo-system/search-results"
+
+var multiCohortKeys = []string{
+	"widgets|search-results|u=|g=group:admins", // cohort A
+	"widgets|search-results|u=|g=group:devs",   // cohort B
+}
+
+// bootSeedPassBehavior models ONE boot seed pass over the two-cohort whale set,
+// consuming the ENGINE-INSTALLED set off scopeCtx (NOT a hand-threaded one) via
+// the REAL seedSkipDecision + declineSeedPutOnError. It records, per cohort key,
+// whether this pass RE-RESOLVED the whale (i.e. the skip did NOT fire and the
+// resolve+decline ran). Returns the number of re-resolves this pass and whether
+// handle.Get was consulted for any already-marked key (must be 0 on a resume
+// pass — the marker short-circuits before Get). newSetPerPass models the
+// reworked-away 2dc46ae (pass-lived set) for the RED arm.
+func makeBootSeedHandler(t *testing.T, reResolvedThisPass *int, sawGetOnMarked *bool, newSetPerPass bool) func(context.Context, prewarmScope) error {
+	return func(scopeCtx context.Context, s prewarmScope) error {
+		if s.kind != scopeKindBoot {
+			return nil
+		}
+		// RED variant: ignore the engine-installed set and new a pass-lived one
+		// (the inert 2dc46ae behavior). GREEN: consume the engine-lived set the
+		// processScope wiring installed on scopeCtx.
+		ctx := scopeCtx
+		if newSetPerPass {
+			ctx = cache.WithSeedDeclinedExternalSet(context.Background(), cache.NewSeedDeclinedExternalSet())
+		}
+		anyReResolved := false
+		for _, k := range multiCohortKeys {
+			h := &getRecordingHandle{}
+			// The REAL boot skip predicate — consults the declined-external set
+			// (engine-lived on scopeCtx) BEFORE handle.Get.
+			if seedSkipDecision(ctx, seedModeBoot, h, k, "widgets", multiCohortWidget, "") {
+				// Skipped: the whale was already resolved-and-declined this boot
+				// scope. No re-resolve, no external round-trip. This is the fix.
+				if h.getCount() != 0 {
+					*sawGetOnMarked = true
+				}
+				continue
+			}
+			// Not skipped → the seed RE-RESOLVES the whale, touches external, and
+			// declineSeedPutOnError declines the Put + Marks the key (the REAL
+			// prod path). This is the wasted work Lever A must eliminate on resume.
+			anyReResolved = true
+			*reResolvedThisPass++
+			if !declineExternalOnce(ctx, "widgets", multiCohortWidget, k) {
+				t.Fatalf("seed pass: external whale %q must decline the Put", k)
+			}
+		}
+		// A pass that re-resolved anything models the deadline-cut before the boot
+		// truly converges → return an error so processScope requeues (the F.4
+		// resume). Once a pass re-resolves NOTHING (all skipped), the boot has
+		// converged → return nil → processScope Forgets + clears the set.
+		if anyReResolved {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+}
+
+// driveProcessScopeUntilQuiet drives the REAL e.processScope lifecycle
+// (Get→handler→Forget/AddRateLimited requeue) — the actual prod chain that
+// news/reuses/clears the engine-lived declined-external set — until the boot
+// scope genuinely completes (no requeue) or maxIters is hit. Deterministic: no
+// worker goroutine; the rate-limited requeue is pulled forward by a short poll.
+func driveProcessScopeUntilQuiet(t *testing.T, e *prewarmEngine, maxIters int) (passes int) {
+	prevTO := prewarmScopeTimeoutFn
+	prewarmScopeTimeoutFn = func(prewarmScope) time.Duration { return time.Hour } // never a real deadline
+	t.Cleanup(func() { prewarmScopeTimeoutFn = prevTO })
+
+	ctx := context.Background()
+	e.enqueueScope(prewarmScope{kind: scopeKindBoot})
+	for iter := 0; iter < maxIters && e.queue.Len() > 0; iter++ {
+		s, shutdown := e.queue.Get()
+		if shutdown {
+			break
+		}
+		// Drive the REAL prod lifecycle: processScope installs the engine-lived
+		// declined-external set on scopeCtx (for boot), runs the handler, then
+		// Done()s + Forget/AddRateLimited-requeues + clears-on-genuine-completion.
+		// It owns Done for the item we just Got.
+		e.processScope(ctx, s)
+		passes++
+		// Pull a rate-limited requeue forward (stock backoff base ~5ms).
+		if e.queue.Len() == 0 && e.requeuedTotal.Load() > 0 {
+			deadline := time.Now().Add(2 * time.Second)
+			for e.queue.Len() == 0 && time.Now().Before(deadline) {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}
+	return passes
+}
+
+// TestF4bLeverA_MultiCohort_ResumeSkipsDeclinedExternal — C-F4B-1, the
+// discriminating arm, driving TWO REAL processScope invocations sharing the
+// ENGINE-LIVED set. GREEN: pass 1 re-resolves both cohort whales (K=2) and
+// requeues; pass 2 (the REAL requeue) skips BOTH (the reused set) → zero
+// re-resolves → boot converges. RED: new the set per pass (2dc46ae) → pass 2
+// re-resolves again → never converges within the cap.
 func TestF4bLeverA_MultiCohort_ResumeSkipsDeclinedExternal(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
 	t.Setenv("CACHE_ENABLED", "true") // else WithSeedDeclinedExternalSet no-ops (Disabled())
 
-	// The boot scope installs ONE set, inherited by every cohort ctx (mirrors
-	// seedScopeYielding installing it alongside the F4 memo, gated on boot mode).
-	bootCtx := cache.WithSeedDeclinedExternalSet(context.Background(), cache.NewSeedDeclinedExternalSet())
-	if cache.SeedDeclinedExternalSetFromContext(bootCtx) == nil {
-		t.Fatal("setup: WithSeedDeclinedExternalSet must install a set on the boot ctx under CACHE_ENABLED")
-	}
-
-	// TWO cohorts (distinct RBAC identity → distinct dispatchCacheLookupKey) for
-	// the SAME external widget W. Distinct keys stand in for the identity fold.
-	const widget = "krateo-system/search-results"
-	keyA := "widgets|search-results|u=|g=group:admins"        // cohort A's full key
-	keyB := "widgets|search-results|u=|g=group:devs"          // cohort B's full key
-
-	// ── PASS 1 (first boot pass): each cohort resolves W, touches external →
-	// declineSeedPutOnError declines the Put AND marks the cohort's key.
-	for _, k := range []string{keyA, keyB} {
-		if !declineExternalOnce(bootCtx, "widgets", widget, k) {
-			t.Fatalf("pass-1: declineSeedPutOnError must decline the external Put for key %q", k)
+	run := func(newSetPerPass bool) (pass1ReResolves, pass2ReResolves, totalPasses int, sawGetOnMarked bool, converged bool) {
+		e := newTestEngine()
+		reResolves := 0
+		perPassReResolves := []int{}
+		wrapReResolves := 0
+		e.scopeHandler = func(ctx context.Context, s prewarmScope) error {
+			before := reResolves
+			h := makeBootSeedHandler(t, &reResolves, &sawGetOnMarked, newSetPerPass)
+			err := h(ctx, s)
+			perPassReResolves = append(perPassReResolves, reResolves-before)
+			wrapReResolves = reResolves
+			return err
 		}
-	}
-	if got := cache.SeedDeclinedExternalSetFromContext(bootCtx).Marks(); got != 2 {
-		t.Fatalf("pass-1: both cohort keys must be marked declined-external; Marks()=%d want 2", got)
-	}
-
-	// ── PASS 2 (resume pass): seedSkipDecision(seedModeBoot) for each cohort's key
-	// must SKIP (Marked→true) WITHOUT consulting handle.Get (the re-resolve site).
-	h := &getRecordingHandle{}
-	for _, k := range []string{keyA, keyB} {
-		if !seedSkipDecision(bootCtx, seedModeBoot, h, k, "widgets", widget, "") {
-			t.Fatalf("pass-2 GREEN VIOLATED: resume pass did NOT skip declined-external key %q — the §3 whale re-resolve loop is still open", k)
+		passes := driveProcessScopeUntilQuiet(t, e, 6)
+		_ = wrapReResolves
+		p1, p2 := 0, 0
+		if len(perPassReResolves) >= 1 {
+			p1 = perPassReResolves[0]
 		}
-	}
-	if h.getCount() != 0 {
-		t.Fatalf("pass-2: seedSkipDecision consulted handle.Get %d× for a MARKED key — the marker must short-circuit BEFORE the Get (the re-resolve site); getKeys=%v", h.getCount(), h.getKeys)
+		if len(perPassReResolves) >= 2 {
+			p2 = perPassReResolves[1]
+		}
+		// Converged = the last processed pass re-resolved nothing (all skipped) AND
+		// the queue drained (no pending requeue).
+		converged = e.queue.Len() == 0 && len(perPassReResolves) > 0 && perPassReResolves[len(perPassReResolves)-1] == 0
+		return p1, p2, passes, sawGetOnMarked, converged
 	}
 
-	// ── RED arm (pre-fix world): NO marker set on ctx → the consult is a
-	// nil-receiver no-op → seedSkipDecision falls through to handle.Get → MISS →
-	// returns false (re-resolve). This is the loop the fix breaks; if this arm
-	// ever returned true, the skip would be firing without the marker (wrong).
-	noSetCtx := context.Background()
-	hRed := &getRecordingHandle{}
-	if seedSkipDecision(noSetCtx, seedModeBoot, hRed, keyA, "widgets", widget, "") {
-		t.Fatal("RED arm broke: with NO declined-external set installed, the resume pass must NOT skip (it re-resolves — the pre-fix §3 loop). A skip here means the mechanism isn't the marker.")
+	// GREEN (engine-lived set): pass 1 re-resolves K=2 whales; pass 2 (real
+	// requeue, reused set) skips both → 0 re-resolves → converges.
+	p1, p2, _, sawGet, converged := run(false /*engine-lived*/)
+	if p1 != 2 {
+		t.Fatalf("GREEN pass-1: both K=2 cohort whales must be re-resolved on the FIRST boot pass; got %d want 2", p1)
 	}
-	if !hRed.sawGet(keyA) {
-		t.Fatal("RED arm: with no marker set, seedSkipDecision MUST fall through to handle.Get (the re-resolve liveness check) — it did not")
+	if p2 != 0 {
+		t.Fatalf("GREEN pass-2 VIOLATED: the resume pass re-resolved %d whale(s) — the engine-lived set must make the resume skip ALL already-declined whales (the §3 loop is still open)", p2)
 	}
+	if sawGet {
+		t.Fatal("GREEN: seedSkipDecision consulted handle.Get for a MARKED key — the marker must short-circuit BEFORE the Get (the re-resolve site)")
+	}
+	if !converged {
+		t.Fatal("GREEN: the boot scope must CONVERGE (a resume pass re-resolves nothing → Forget, queue drains) — it did not")
+	}
+
+	// RED (pass-lived set — the inert 2dc46ae the arch caught): each pass news a
+	// fresh empty set → pass 2 re-resolves the SAME whales again → the §3 loop
+	// never breaks → never converges within the cap.
+	rp1, rp2, _, _, redConverged := run(true /*new-set-per-pass*/)
+	if rp1 != 2 {
+		t.Fatalf("RED setup: pass-1 must still re-resolve K=2 whales; got %d", rp1)
+	}
+	if rp2 != 2 {
+		t.Fatalf("RED arm broke: pass-lived set must RE-RESOLVE both whales again on pass 2 (proving the mechanism is the ENGINE-LIVED persistence, not a pass-local set); got %d want 2", rp2)
+	}
+	if redConverged {
+		t.Fatal("RED arm broke: a pass-lived set must NOT converge (each resume re-resolves the whales) — if it converged the persistence isn't what's doing the work")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARM — ENGINE lifetime: the set is CREATED on first processScope, REUSED across
+// the boot scope's AddRateLimited requeues, and CLEARED when the scope GENUINELY
+// completes (err==nil → Forget). After genuine completion a fresh boot of the
+// same key starts empty and re-resolves each whale once. Drives REAL processScope.
+func TestF4bLeverA_EngineLived_ReusedAcrossRequeues_ClearedOnCompletion(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+
+	e := newTestEngine()
+
+	// The boot scope key + a single whale for clarity.
+	bootKey := prewarmScope{kind: scopeKindBoot}.key()
+	const widget = "krateo-system/obs-log-stream"
+	whaleKey := "widgets|obs-log-stream|u=|g=group:admins"
+
+	// pass counter drives: pass 1 declines+marks (returns error → requeue);
+	// pass 2 (resume, reused set) skips → returns nil → GENUINE completion.
+	reResolves := 0
+	sawGet := false
+	e.scopeHandler = func(scopeCtx context.Context, s prewarmScope) error {
+		if s.kind != scopeKindBoot {
+			return nil
+		}
+		h := &getRecordingHandle{}
+		if seedSkipDecision(scopeCtx, seedModeBoot, h, whaleKey, "widgets", widget, "") {
+			if h.getCount() != 0 {
+				sawGet = true
+			}
+			return nil // converged: nothing to re-resolve
+		}
+		reResolves++
+		if !declineExternalOnce(scopeCtx, "widgets", widget, whaleKey) {
+			t.Fatal("external whale must decline")
+		}
+		return context.DeadlineExceeded // cut → requeue (reuse the set)
+	}
+
+	driveProcessScopeUntilQuiet(t, e, 6)
+
+	// The whale was re-resolved EXACTLY ONCE across the whole boot (pass 1);
+	// the reused set skipped it on the resume pass.
+	if reResolves != 1 {
+		t.Fatalf("engine-lived set: whale must be re-resolved EXACTLY ONCE across the boot (pass 1 only); got %d", reResolves)
+	}
+	if sawGet {
+		t.Fatal("marker must short-circuit before handle.Get on the resume pass")
+	}
+	// GENUINE completion cleared the set: the engine map has no entry for the boot key.
+	e.declinedExtMu.Lock()
+	_, stillPresent := e.declinedExtSets[bootKey]
+	e.declinedExtMu.Unlock()
+	if stillPresent {
+		t.Fatal("engine-lived set must be CLEARED on genuine boot completion (err==nil → Forget) so a later fresh boot starts empty")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ARM — config-vars redrive (NEW TOPOLOGY) clears the set: a whale marked
+// declined this boot is re-resolved ONCE under the new nav set after a redrive,
+// never suppressed across the topology change. Drives the REAL clear path
+// (clearDeclinedExternalSet, the same call enqueueBootReDrive makes).
+func TestF4bLeverA_ConfigVarsRedrive_ClearsSet_WhaleReResolvesUnderNewTopology(t *testing.T) {
+	engineLatchTestMu.Lock()
+	defer engineLatchTestMu.Unlock()
+	t.Setenv("CACHE_ENABLED", "true")
+
+	e := newTestEngine()
+	bootKey := prewarmScope{kind: scopeKindBoot}.key()
+	const widget = "krateo-system/marketplace-source-toggle"
+	whaleKey := "widgets|marketplace-source-toggle|u=|g=group:admins"
+
+	// Seed the engine-lived set as if a boot pass already declined+marked the whale.
+	set := e.declinedExternalSetFor(bootKey)
+	set2 := cache.WithSeedDeclinedExternalSet(context.Background(), set)
+	if !declineExternalOnce(set2, "widgets", widget, whaleKey) {
+		t.Fatal("setup: whale must decline+mark")
+	}
+	if !set.Marked(whaleKey) {
+		t.Fatal("setup: whale key must be marked in the engine-lived set")
+	}
+
+	// A resume pass BEFORE any redrive skips the whale (reused set).
+	hBefore := &getRecordingHandle{}
+	ctxBefore := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
+	if !seedSkipDecision(ctxBefore, seedModeBoot, hBefore, whaleKey, "widgets", widget, "") {
+		t.Fatal("pre-redrive: reused set must skip the already-declined whale")
+	}
+
+	// CONFIG-VARS REDRIVE (new topology): the SAME clear the enqueueBootReDrive
+	// path makes. After it, the engine hands out a FRESH set for the boot key.
+	e.clearDeclinedExternalSet(bootKey)
+
+	// The next boot pass over the (new-topology) whale must RE-RESOLVE it once:
+	// the fresh set has no mark → seedSkipDecision falls through to handle.Get.
+	hAfter := &getRecordingHandle{}
+	ctxAfter := cache.WithSeedDeclinedExternalSet(context.Background(), e.declinedExternalSetFor(bootKey))
+	if seedSkipDecision(ctxAfter, seedModeBoot, hAfter, whaleKey, "widgets", widget, "") {
+		t.Fatal("post-redrive VIOLATED: a whale stayed suppressed ACROSS a topology change — the redrive must clear the set so the whale re-resolves once under the new nav set")
+	}
+	if !hAfter.sawGet(whaleKey) {
+		t.Fatal("post-redrive: the (unmarked) whale must fall through to handle.Get — it did not")
+	}
+	// And the fresh set is genuinely a different (empty) instance.
+	if e.declinedExternalSetFor(bootKey).Marked(whaleKey) {
+		t.Fatal("post-redrive: the boot key must map to a FRESH empty set, not the cleared one")
+	}
+	_ = bootKey
 }
 
 // ─────────────────────────────────────────────────────────────────────────
