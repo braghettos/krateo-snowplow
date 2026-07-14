@@ -296,6 +296,19 @@ type prewarmEngine struct {
 
 	startedOnce sync.Once
 
+	// #132 F4b Lever A — the boot-scope "resolved-but-declined-external" marker
+	// sets, ENGINE-LIVED per boot-scope-key (NOT per seedScopeYielding pass). A
+	// boot RESUME is a FRESH seedScopeYielding call (AddRateLimited requeue →
+	// processScope → rePrewarmBoot → rePrewarmBootScoped → seedScopeYielding), so
+	// a pass-lived set would start empty every resume and the §3 whale loop (a
+	// CROSS-PASS defect) would never be broken. The engine holds one set per
+	// scope key, created on the scope's first processScope, REUSED across the
+	// scope's AddRateLimited requeues, and CLEARED when the scope genuinely
+	// completes (err==nil → Forget) OR on a config-vars redrive (new topology).
+	// Keyed by s.key() ("boot" for the boot scope). Guarded by declinedExtMu.
+	declinedExtMu   sync.Mutex
+	declinedExtSets map[string]*cache.SeedDeclinedExternalSet
+
 	// customer-priority yield knobs.
 	yieldPoll time.Duration // how long a worker parks while a customer call is in flight
 
@@ -343,6 +356,64 @@ func prewarmEngineSingleton() *prewarmEngine {
 func (e *prewarmEngine) enqueueScope(s prewarmScope) {
 	e.queue.Add(s)
 	e.enqueuedTotal.Add(1)
+}
+
+// declinedExternalSetFor returns the engine-lived declined-external marker set
+// for scope key, creating it on first use. REUSED across the scope's
+// AddRateLimited requeues (so a boot resume pass consults the SAME set the prior
+// pass populated — the whole point of Lever A being engine-lived, not
+// pass-lived). Concurrency-safe. Only the boot scope calls this today (the only
+// scope whose seedSkipDecision consults the set); other scope kinds never
+// install one, so it stays a strict no-op off the boot path.
+func (e *prewarmEngine) declinedExternalSetFor(key string) *cache.SeedDeclinedExternalSet {
+	e.declinedExtMu.Lock()
+	defer e.declinedExtMu.Unlock()
+	if e.declinedExtSets == nil {
+		e.declinedExtSets = make(map[string]*cache.SeedDeclinedExternalSet)
+	}
+	set, ok := e.declinedExtSets[key]
+	if !ok {
+		set = cache.NewSeedDeclinedExternalSet()
+		e.declinedExtSets[key] = set
+	}
+	return set
+}
+
+// clearDeclinedExternalSet TEARS DOWN (deletes, not just empties) the
+// engine-lived declined-external set for scope key, so the NEXT time that scope
+// key is processed it starts from a fresh instance and the map cannot accumulate
+// entries across unrelated boots (R3 teardown≠clear: a retained-but-emptied set
+// would still pin one map entry per scope key forever; delete drops it). Called
+// on a scope's GENUINE completion (err==nil → Forget: the boot converged, a
+// later fresh boot should re-resolve whales once) AND on a config-vars redrive
+// (new topology → whales must be re-resolved under the new nav set, never
+// suppressed across a topology change). NOT called on an AddRateLimited requeue
+// (the resume must REUSE the set). Concurrency-safe; no-op if absent.
+//
+// R4 whole-boot counter: BEFORE deleting, emit the phase1.seed.declined_external
+// .summary line reading Marks() off the engine-lived set — this is the
+// CUMULATIVE cross-pass total for the whole boot scope (every resume pass marked
+// into the SAME set), NOT a per-seedScopeYielding-pass partial. reason
+// distinguishes the teardown trigger (boot-complete vs config-vars-redrive).
+func (e *prewarmEngine) clearDeclinedExternalSet(key, reason string) {
+	e.declinedExtMu.Lock()
+	set, ok := e.declinedExtSets[key]
+	delete(e.declinedExtSets, key)
+	e.declinedExtMu.Unlock()
+	if ok {
+		if n := set.Marks(); n > 0 {
+			slog.Info("phase1.seed.declined_external.summary",
+				slog.String("subsystem", "cache"),
+				slog.String("scope", key),
+				slog.String("reason", reason),
+				slog.Uint64("declined_external_keys", n),
+				slog.String("effect", "F4b Lever A — distinct (widget,cohort) keys resolved-and-declined "+
+					"external across the WHOLE boot scope (engine-lived set, cumulative over all resume "+
+					"passes); each was skipped on resume instead of re-resolved (breaks the §3 external-whale "+
+					"loop; cell stays intentionally cold, /call re-resolves it live). Set now torn down."),
+			)
+		}
+	}
 }
 
 // StartPrewarmEngine starts the engine worker(s) bound to the given scope
@@ -519,6 +590,18 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// the straddle falsifier can shrink the budget without a live cluster;
 	// production ALWAYS uses prewarmScopeTimeout (8m, unchanged).
 	scopeCtx, scopeCancel := context.WithTimeout(ctx, prewarmScopeTimeoutFn(s))
+	// #132 F4b Lever A — install the ENGINE-LIVED declined-external marker set for
+	// the boot scope onto scopeCtx. It is created once (first processScope for
+	// this key) and REUSED across the scope's AddRateLimited requeues, so a boot
+	// resume pass's seedSkipDecision consults the SAME set the prior pass
+	// populated — breaking the CROSS-PASS §3 whale re-resolve loop that a
+	// pass-lived set (the reworked-away 2dc46ae) could never break. Boot scope
+	// ONLY (the only scope whose seed consults the set); seedScopeYielding reads
+	// it off ctx via cache.SeedDeclinedExternalSetFromContext. Inert under
+	// Disabled() (WithSeedDeclinedExternalSet returns ctx unchanged).
+	if s.kind == scopeKindBoot {
+		scopeCtx = cache.WithSeedDeclinedExternalSet(scopeCtx, e.declinedExternalSetFor(s.key()))
+	}
 	err := e.scopeHandler(scopeCtx, s)
 	scopeCancel()
 	e.processedTotal.Add(1)
@@ -552,6 +635,13 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 		// so a later transient failure starts from zero backoff, not the tail
 		// of an old streak).
 		e.queue.Forget(s)
+		// #132 F4b Lever A — the scope GENUINELY completed (no requeue). Drop its
+		// engine-lived declined-external set so a later fresh boot of the same key
+		// starts empty and re-resolves each external whale once (its first-paint
+		// resolve). A requeue (the err!=nil branch above) deliberately does NOT
+		// clear — the resume must reuse the set to skip the already-declined
+		// whales. Keyed by s.key() (boot scope only populates a set).
+		e.clearDeclinedExternalSet(s.key(), "boot-complete")
 	}
 
 	if e.scopeDone != nil {
