@@ -211,3 +211,28 @@ shippable as a known-corner and A-declare lands as a fast-follow.
    on the `widgets` layer shows `extras_len:0`; compositions first-nav hit-rate → ~100% (was 83.3%).
 4. CI invariant (#67 generalization): the emit/sub/seed parity test asserts the declared-keyExtras
    filter is applied identically on all three paths (guards the anti-drift property).
+
+## Addendum (1.7.11) — the Put-guard judges the SAME two axes the folder partitions
+
+The F6 self-quarantine Put-guard (`requestExtrasFullyDeclared`) originally checked
+request extras against ONLY `spec.keyExtras`, but the folder `effectiveKeyExtras`
+partitions on TWO axes: `spec.keyExtras` AND the A2/A6 identity axis
+(`declaredIdentityForKey`). The frontend's `buildExtrasParam` sends identity keys
+(`username`, `displayName`) on the wire whenever `SNOWPLOW_IDENTITY_INJECTION` is
+off, so a declared widget with empty `identityContext` received those keys and was
+spuriously declined — declared widgets never cached, revisit always cold (tester
+falsifier, west4 2026-07-14). Fix: the guard EXEMPTS identity-dimension keys
+(`{username, groups, displayName}`) — they never pollute a shared cell (the
+per-cohort cell is BindingUID-keyed; the identity-free widgetContent cell is
+walk-only-written and per-user re-gated at serve). The quarantine still fires for a
+genuinely-undeclared, body-affecting non-identity key.
+
+**Contract note (arch, 1.7.11):** the identity exemption assumes wire-identity is
+body-INERT for an UNDECLARED widget. A widget whose server-side
+`widgetDataTemplate`/`resourcesRefsTemplate` READS `.extras.username` /
+`.displayName` / `.groups` MUST declare `spec.identityContext` — which folds
+identity into the key AND triggers injection-wins (resolve.go). Declaring it is the
+existing contract; the current corpus honors it (`greeting-title` resolves
+`{displayName}` client-side, not server-side). An undeclared server-side identity
+read would put a representative's identity value into the BindingUID-shared cell —
+the same latent surface F6's design already pushes toward declaration.

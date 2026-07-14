@@ -395,10 +395,42 @@ func filterDeclaredKeyExtras(cr map[string]any, requestExtras map[string]any) ma
 // clean. Clean requests (no undeclared extras) and the declared corpus pay
 // nothing — only a request carrying extras the widget did NOT declare is quarantined.
 //
+// IDENTITY-DIMENSION EXEMPTION (1.7.11 fix — tester falsifier, west4 2026-07-14):
+// the guard must judge the SAME dimension the folder filters. The folder
+// (effectiveKeyExtras) partitions request extras on TWO independent axes — the
+// author-declared keyExtras (filterDeclaredKeyExtras) AND the A2/A6 IDENTITY axis
+// (declaredIdentityForKey: username/groups declared via spec.identityContext).
+// The guard originally checked ONLY keyExtras, so a widget carrying identity
+// extras on the wire — which the frontend's buildExtrasParam sends (username,
+// displayName) whenever SNOWPLOW_IDENTITY_INJECTION is off — was declined even
+// when its keyExtras request keys were all declared. That is spurious: identity
+// keys are NEVER a shared-cell body-pollution risk. The per-cohort `widgets` cell
+// is already BindingUID-keyed (per RBAC-identity cohort), and the identity-free
+// widgetContent cell is re-gated per-user at serve (gateWidgetEnvelope). A request
+// carrying username/displayName/groups cannot leak one user's body to another via
+// a shared cell — that is exactly what the identity dimension already guarantees.
+// So identity keys are EXEMPT from the quarantine: they may reach the Put without
+// declining, mirroring how the folder treats them (folded-if-declared, dropped-as-
+// identity otherwise). The quarantine still fires for a genuinely-undeclared,
+// BODY-affecting request key (the F6-6 `foo` case) — that is the only shared-cell
+// pollution the guard exists to stop.
+//
+// identityDimensionKeys is the closed set the frontend can put on the wire as
+// identity (audit §1: buildExtrasParam sends username + displayName when not
+// injecting) plus groups (the other A2 identityContext enum value). Not a
+// widget-name/route table (feedback_no_special_cases) — a fixed, mechanism-level
+// identity vocabulary, the same axis DeclaredIdentity honors.
+var identityDimensionKeys = map[string]struct{}{
+	"username":    {},
+	"groups":      {},
+	"displayName": {},
+}
+
 // Returns TRUE (fully declared → safe to Put) when the request carries no extras,
-// or when every supplied key survives the filter. Returns FALSE (decline the Put)
-// when at least one supplied key was dropped. Reuses widgets.GetKeyExtras — no new
-// mechanism, no widget-name/route table (feedback_no_special_cases).
+// or when every supplied key is EITHER declared in spec.keyExtras OR is an
+// identity-dimension key. Returns FALSE (decline the Put) when at least one
+// supplied key is a genuinely-undeclared, non-identity request key. Reuses
+// widgets.GetKeyExtras — no new mechanism, no widget-name/route table.
 func requestExtrasFullyDeclared(cr map[string]any, requestExtras map[string]any) bool {
 	if len(requestExtras) == 0 {
 		return true // nothing supplied → nothing to quarantine
@@ -409,9 +441,13 @@ func requestExtrasFullyDeclared(cr map[string]any, requestExtras map[string]any)
 		declaredSet[k] = struct{}{}
 	}
 	for k := range requestExtras {
-		if _, ok := declaredSet[k]; !ok {
-			return false // an undeclared request extra would collapse into the shared cell
+		if _, ok := declaredSet[k]; ok {
+			continue // author-declared keyExtras key — partitions the key, safe
 		}
+		if _, ok := identityDimensionKeys[k]; ok {
+			continue // A2/A6 identity axis — folder handles it, never shared-cell pollution
+		}
+		return false // a genuinely-undeclared body-affecting request extra → quarantine
 	}
 	return true
 }

@@ -525,3 +525,95 @@ func TestFARCH_F6_6_DeclaredCounterpart_GuardInert(t *testing.T) {
 		t.Fatal("F6-6 declared: B's distinct-key cell must be a MISS after A's Put (partitioned, not shared)")
 	}
 }
+
+// TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt — the 1.7.11 revisit-HIT arm
+// (tester falsifier, west4 2026-07-14). This is the dimension the DeclaredCounterpart
+// unit arm was BLIND to: identity extras on the wire. When SNOWPLOW_IDENTITY_INJECTION
+// is off, the frontend's buildExtrasParam folds IDENTITY keys (username, displayName)
+// into ?extras= alongside the route params. A declared widget (keyExtras:[name,namespace],
+// NO identityContext) then receives {name, namespace, username, displayName}. The folder
+// keeps {name,namespace} (extras_len=2, correct key) and drops the identity keys; but the
+// pre-fix guard saw username/displayName as "undeclared" → declined EVERY Put → the
+// widget's content was never cached → revisit always MISS (the exact 14/14-same-key /
+// 0/14-hit west4 failure).
+//
+// GREEN (the fix): the guard exempts identity-dimension keys → the Put is ALLOWED → a
+// second identical request HITs the extras_len>0 key. RED = remove the identity
+// exemption (re-introduce the divergence) → the guard declines → revisit MISS returns.
+func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
+	enableWidgetContentL1(t)
+	ctx := ctxWithIdentity() // cyberjoker / [devs]
+	const (
+		g, v, r, ns, name = "widgets.templates.krateo.io", "v1beta1", "paragraphs", "krateo-system", "composition-detail-header"
+		perPage, page     = -1, -1
+	)
+	// A DECLARED widget: keyExtras:[name,namespace], NO identityContext (the exact
+	// composition-detail-header shape that broke on west4).
+	cr := declaredKeyExtrasCR("name", "namespace")
+
+	// The browser's wire shape with injection OFF: route params + identity keys.
+	req := map[string]any{
+		"namespace":   "team-a",
+		"name":        "demo-1",
+		"username":    "cyberjoker",
+		"displayName": "Cyber Joker",
+	}
+
+	// FOLDER: keeps only the declared keyExtras subset → extras_len=2 (identity dropped).
+	keyExtras := effectiveKeyExtras(ctx, cr, req)
+	if len(keyExtras) != 2 || keyExtras["name"] != "demo-1" || keyExtras["namespace"] != "team-a" {
+		t.Fatalf("F6-7: the folder must keep ONLY the declared [name,namespace] (identity dropped); got %#v", keyExtras)
+	}
+
+	// GUARD: must NOT decline — name/namespace are declared, username/displayName are
+	// identity-dimension keys (exempt). This is the fix's core assertion.
+	if !requestExtrasFullyDeclared(cr, req) {
+		t.Fatal("F6-7 REGRESSION: the guard declined a declared widget carrying identity extras (username/displayName) — identity keys must be EXEMPT (they never pollute a shared cell); this is the west4 revisit-miss bug")
+	}
+
+	// End-to-end: first request Puts at the extras_len>0 key; second identical request HITs.
+	key1, handle1, inputs1 := dispatchCacheLookupKey(ctx, "widgets", g, v, r, ns, name, perPage, page, keyExtras)
+	if handle1 == nil || key1 == "" {
+		t.Fatal("F6-7: expected a live handle + key")
+	}
+	body := []byte(`{"status":{"widgetData":{"detail":"header"}}}`)
+	// The Put only happens because the guard allowed it (mirrors widgets.go's
+	// genuine-Put gate: the F6 decline branch is skipped when requestExtrasFullyDeclared).
+	if requestExtrasFullyDeclared(cr, req) {
+		handle1.Put(key1, &cache.ResolvedEntry{RawJSON: body, Inputs: inputs1})
+	}
+
+	// REVISIT: same widget, same request → same key → HIT (was 0/14 on west4).
+	keyExtras2 := effectiveKeyExtras(ctx, cr, req)
+	key2, handle2, _ := dispatchCacheLookupKey(ctx, "widgets", g, v, r, ns, name, perPage, page, keyExtras2)
+	if key2 != key1 {
+		t.Fatalf("F6-7: revisit must derive the SAME extras_len>0 key; key1=%q key2=%q", key1, key2)
+	}
+	got, hit := handle2.Get(key2)
+	if !hit {
+		t.Fatal("F6-7 REVISIT: declared widget MISSED on revisit at the identical key — the Put was declined (the west4 bug); the identity exemption must allow it to cache")
+	}
+	if string(got.RawJSON) != string(body) {
+		t.Fatalf("F6-7: revisit served the wrong body; got %q want %q", got.RawJSON, body)
+	}
+}
+
+// TestFARCH_F6_7b_GenuinelyUndeclaredStillDeclines — the paired no-over-fix arm.
+// The identity exemption must NOT weaken the quarantine for a genuinely-undeclared,
+// BODY-affecting request key. A declared[name,namespace] widget receiving a NON-identity
+// undeclared key (foo) must STILL decline — otherwise the F6-6 self-quarantine leak
+// reopens. Discriminates the exemption from an over-broad "allow everything".
+func TestFARCH_F6_7b_GenuinelyUndeclaredStillDeclines(t *testing.T) {
+	cr := declaredKeyExtrasCR("name", "namespace")
+	// Identity keys exempt, declared keys fine — but foo is a genuinely-undeclared
+	// non-identity body-affecting key → MUST still decline.
+	req := map[string]any{"name": "demo-1", "namespace": "team-a", "username": "cyberjoker", "foo": "evil"}
+	if requestExtrasFullyDeclared(cr, req) {
+		t.Fatal("F6-7b OVER-FIX GUARD: a genuinely-undeclared non-identity key (foo) must STILL be quarantined even alongside declared+identity keys — the exemption must not allow body-affecting undeclared extras (F6-6 leak would reopen)")
+	}
+	// Sanity: without foo, the same request is fully-declared (identity exempt).
+	req2 := map[string]any{"name": "demo-1", "namespace": "team-a", "username": "cyberjoker"}
+	if !requestExtrasFullyDeclared(cr, req2) {
+		t.Fatal("F6-7b: declared keys + identity keys only must be fully-declared")
+	}
+}
