@@ -16,6 +16,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,7 +25,9 @@ import (
 	"github.com/krateoplatformops/plumbing/env"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
+	"github.com/krateoplatformops/plumbing/jqutil"
 	"github.com/krateoplatformops/plumbing/jwtutil"
+	"github.com/krateoplatformops/plumbing/kubeutil"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
@@ -384,13 +387,68 @@ func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uaf
 		}
 		return *saEP, stageProceed
 	}
-	resolved, err := r.mapper.resolveOne(r.ctx, apiCall.EndpointRef)
+	// #113 — template endpointRef.name through the SAME jq/extras evaluator that
+	// already renders this stage's path/payload/headers (evalJQ over r.dict, the
+	// exact ds createRequestOptions is handed at :405), so `.name` resolves
+	// identically to how `path` resolves it. ONLY the templated (MaybeQuery-shaped)
+	// named-ref path is touched; a nil ref (internal/clientconfig synthesis) and a
+	// literal ref pass through byte-identically (§1.3, guardrail (a): namespace
+	// stays literal, never templated). Returns templated=true so resolveOne applies
+	// the guardrail (b) defense-in-depth layer.
+	ref, templated, guardErr := r.evalEndpointRef(apiCall.EndpointRef)
+	if guardErr != nil {
+		// Guardrail (b) refusal at the eval site (fail-fast, before any Secret
+		// lookup): a templated name resolved to the reserved `-clientconfig`
+		// internal-identity class. Same truncating posture as any endpoint-resolve
+		// failure (R-2 stageReturn) — the Secret is never dialed.
+		r.log.Error("templated endpoint reference refused",
+			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", guardErr))
+		return endpoints.Endpoint{}, stageReturn
+	}
+	resolved, err := r.mapper.resolveOne(r.ctx, ref, templated)
 	if err != nil {
 		r.log.Error("unable to resolve api endpoint reference",
-			slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
+			slog.String("name", id), slog.Any("ref", ref), slog.Any("error", err))
 		return endpoints.Endpoint{}, stageReturn
 	}
 	return resolved, stageProceed
+}
+
+// evalEndpointRef renders a templated endpointRef.name (#113). For a nil ref or
+// a non-templated (literal) name it returns the ref UNCHANGED with templated=false
+// (byte-identical to pre-#113 — the internal nil-ref synthesis and static author
+// refs are untouched). For a MaybeQuery-shaped name it evaluates the name through
+// evalJQ against r.dict (the SAME per-stage dict path/payload/headers see, so
+// `.name` resolves identically), RFC1123-sanitizes the result, applies guardrail
+// (a) (namespace stays the author-literal — NEVER templated) and guardrail (b)
+// (a resolved `-clientconfig` name is REFUSED here, fail-fast, so the Secret
+// lookup never fires), and returns templated=true so resolveOne applies its
+// defense-in-depth reserved-suffix refusal too. A jq error yields evalJQ's
+// error-string, which is sanitized like any other miss and resolves to a Secret
+// miss downstream (§1.2 honest-error posture) — not a new error class.
+func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Reference, bool, error) {
+	if ref == nil {
+		return ref, false, nil
+	}
+	if _, isTemplate := jqutil.MaybeQuery(ref.Name); !isTemplate {
+		// Static/literal name (incl a literal `-clientconfig` internal ref, which
+		// is the author's own business): pass through, NOT templated, NOT gated.
+		return ref, false, nil
+	}
+	name := kubeutil.MakeDNS1123Compatible(evalJQ(ref.Name, r.dict))
+	// Guardrail (b), layer 1 (fail-fast): a request-templated name may never
+	// resolve to the reserved `<user>-clientconfig` internal-identity class.
+	if strings.HasSuffix(name, clientConfigSuffix) {
+		return nil, true, fmt.Errorf(
+			"templated endpointRef.name %q resolved to %q, which carries the reserved internal-identity suffix %q; refusing at the template-eval site (#113 guardrail b) — user query-extras may not select a per-user credential Secret",
+			ref.Name, name, clientConfigSuffix)
+	}
+	// Guardrail (a): namespace is NEVER templated in V1 — it stays the
+	// author-authored literal, so a templated name can only ever select WITHIN
+	// the namespace the RA author already chose (the credential-store trust
+	// boundary). templated=true so resolveOne applies guardrail (b) again (§2
+	// two-layer defense).
+	return &templates.Reference{Name: name, Namespace: ref.Namespace}, true, nil
 }
 
 // collapseOrFanoutPlan builds the per-stage RequestOptions slice (the call
