@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -20,8 +21,41 @@ type endpointReferenceMapper struct {
 	rc       *rest.Config
 }
 
-func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference) (endpoints.Endpoint, error) {
+// clientConfigSuffix is snowplow's OWN reserved internal-identity suffix: the
+// per-user credential Secret name resolveOne synthesizes for the nil-ref
+// internal path (`<user>-clientconfig`, endpoints.go). #113 guardrail (b) keys
+// on THIS single literal — a request-templated endpointRef may never resolve to
+// a name ending in it (that would let user query-extras select another user's
+// apiserver credentials — the credential-selection escalation). Single source so
+// the guardrail and the synthesis can never drift onto different strings
+// (feedback_consultation_mutation_is_not_key_correctness). It is a general
+// boundary on the reserved suffix, NOT a per-resource carve-out
+// (feedback_no_special_cases).
+const clientConfigSuffix = "-clientconfig"
+
+// resolveOne resolves a named/nil endpoint Reference to an Endpoint. templated
+// reports whether ref was produced by REQUEST-DRIVEN jq templating of
+// endpointRef.name (#113): the eval site in resolveStageEndpoint passes true so
+// this choke point can apply guardrail (b) — the defense-in-depth reserved-suffix
+// refusal — WITHOUT refusing resolveOne's OWN internal nil-ref synthesis (which
+// legitimately produces a `<user>-clientconfig` name and MUST still resolve).
+// Every non-templated caller (internal nil-ref, static author-literal refs)
+// passes false and is byte-identical to pre-#113.
+func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates.Reference, templated bool) (endpoints.Endpoint, error) {
 	isInternal := false
+	// #113 guardrail (b) — defense-in-depth. A REQUEST-TEMPLATED ref may never
+	// resolve to the reserved `<user>-clientconfig` internal-identity class. This
+	// is the SECOND layer (the eval site refuses first); it lives here because
+	// resolveOne is the single choke point EVERY ref lookup passes AND where the
+	// internal `-clientconfig` name is itself constructed — so a FUTURE templating
+	// call site that forgets the eval-site check still cannot dial a per-user
+	// credential Secret. Gated on templated so the internal nil-ref synthesis
+	// below (which DOES build a `-clientconfig` name) is never refused.
+	if templated && ref != nil && strings.HasSuffix(ref.Name, clientConfigSuffix) {
+		return endpoints.Endpoint{}, fmt.Errorf(
+			"templated endpointRef resolved to the reserved internal-identity name %q (suffix %q); refusing — a request-driven endpointRef may not select a per-user credential Secret (#113 guardrail b)",
+			ref.Name, clientConfigSuffix)
+	}
 	if ref == nil {
 		// 0.30.102 Tag B: when the request is driven by an internal /
 		// startup path (Phase 1's SA-credentialed resolution walk) the
@@ -51,7 +85,7 @@ func (m *endpointReferenceMapper) resolveOne(ctx context.Context, ref *templates
 		}
 		ref = &templates.Reference{
 			Namespace: m.authnNS,
-			Name:      fmt.Sprintf("%s-clientconfig", kubeutil.MakeDNS1123Compatible(m.username)),
+			Name:      kubeutil.MakeDNS1123Compatible(m.username) + clientConfigSuffix,
 		}
 		isInternal = true
 	}

@@ -85,6 +85,7 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateoplatformops/plumbing/jqutil"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/snowplow/apis"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
@@ -593,6 +594,29 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 	}
 }
 
+// hasTemplatedEndpointRef reports whether any api-step of cr carries a
+// TEMPLATED endpointRef.name — a jq template (${...}-shaped, jqutil.MaybeQuery)
+// that the resolver evaluates against REQUEST extras to select the dispatch
+// endpoint (#113 hub-spoke). Such a RESTAction cannot be seeded (the boot seed
+// has no request extras → the endpoint resolve misses → a truncated body would
+// be Put under the no-extras key without either GTTL-1 sink bumping, the §4
+// poisoning nuance). Each api-step and its *Reference EndpointRef is nil-guarded
+// (API is a *API, EndpointRef a *templates.Reference; either may be nil).
+func hasTemplatedEndpointRef(cr *templatesv1.RESTAction) bool {
+	if cr == nil {
+		return false
+	}
+	for _, step := range cr.Spec.API {
+		if step == nil || step.EndpointRef == nil {
+			continue
+		}
+		if _, isTemplate := jqutil.MaybeQuery(step.EndpointRef.Name); isTemplate {
+			return true
+		}
+	}
+	return false
+}
+
 func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
 	got := objects.Get(ctx, ref)
 	if got.Err != nil {
@@ -685,6 +709,33 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(
 		got.Unstructured.Object, &cr); err != nil {
 		return fmt.Errorf("unstructured -> RESTAction %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	// #113 seed-skip — a RESTAction with a TEMPLATED api-step endpointRef.name
+	// (a jq template that selects the dispatch endpoint from REQUEST extras, e.g.
+	// hub-spoke) cannot be meaningfully seeded: the boot seed carries NO request
+	// extras, so evalJQ(ref.Name, dict) yields an empty/error name → the endpoint
+	// resolve MISSES → the stage TRUNCATES. Crucially that miss bumps NEITHER the
+	// stageErrSink NOR the extTouchedSink (the external bump is downstream of a
+	// SUCCESSFUL endpoint resolve), so declineSeedPutOnError would NOT decline —
+	// the seed would Put a TRUNCATED/degraded body under the no-extras key, which
+	// then serves cold on the first real /call until TTL (the §4 poisoning
+	// nuance). Skip is provably NON-LOSSY: a templated-endpointRef RA dials a
+	// spoke apiserver (external) → the spoke read-back is external-touch-declined
+	// (§3.2) → never cached anyway, so the seed was never going to warm a servable
+	// cell for it. Greppable skip line mirrors the Class-5 refHasUnresolvedTemplateToken
+	// idiom. Every api-step EndpointRef is nil-guarded (*Reference, may be nil).
+	if hasTemplatedEndpointRef(&cr) {
+		slog.Default().Info("phase1.seed.skip.templated_endpointref",
+			slog.String("subsystem", "cache"),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.String("cohort", cohortLabel),
+			slog.String("effect", "RESTAction has a templated api-step endpointRef.name (request-extras-driven "+
+				"endpoint selection, e.g. hub-spoke); the boot seed has no request extras to resolve it → skipping "+
+				"to avoid Putting a truncated body under the no-extras key (#113 §4). Spoke reads are external → "+
+				"never cached; skip is non-lossy."),
+		)
+		return nil
 	}
 
 	// Ship 0.30.192 — pure-additive per-stage timing sink for cost
