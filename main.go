@@ -35,6 +35,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateoplatformops/snowplow/internal/logging"
 	"github.com/krateoplatformops/snowplow/internal/metrics"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	crdschema "github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
@@ -225,14 +226,35 @@ func main() {
 	}
 	defer func() { _ = metricShutdown(context.Background()) }()
 
+	// D19a — audit logs pipeline. Build the OTLP/HTTP LoggerProvider (same
+	// OTEL_ENABLED gate + endpoint contract, same service.name=snowplow
+	// Resource as the TracerProvider) so every AuditEvent is a first-class,
+	// trace-correlated OTLP LogRecord on the shared otel_logs plane — NOT a
+	// stdout JSON blob and NOT a bespoke correlation header. When the gate is
+	// off, logging.Setup returns a nil provider and the audit emitter stays a
+	// no-op (off-path byte-identical). This is a SEPARATE signal from the
+	// existing stdout->otel-daemonset per-call diagnostic log, which is
+	// untouched.
+	logProvider, logShutdown, err := logging.Setup(otelCtx, build)
+	if err != nil {
+		log.Error("otel logs setup failed", slog.Any("err", err))
+	}
+	defer func() { _ = logShutdown(context.Background()) }()
+	if logProvider != nil {
+		audit.SetDefault(audit.New(
+			logProvider.Logger("github.com/krateoplatformops/snowplow/audit"),
+		))
+	}
+
 	chain := use.NewChain(
 		use.TraceId(),
 		use.Logger(log),
-		// Audit correlation: accept/mint the caller-owned
-		// X-Krateo-Correlation-Id, carry it on the request context, echo
-		// it on the response and propagate it into downstream api-step
-		// calls (internal/support/audit). ADDITIVE — coexists with the
-		// shortid X-Krateo-TraceId and the OTel traceparent.
+		// Audit correlation (D19a): mint/accept the business session id and
+		// write it into W3C baggage (session.id), carried on the request
+		// context and serialized downstream by the Baggage propagator. The
+		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
+		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
+		// traceparent; no bespoke correlation header any more.
 		audit.Middleware(),
 	)
 
@@ -1126,20 +1148,17 @@ func main() {
 				"Content-Type",
 				"X-Auth-Code",
 				"X-Krateo-TraceId",
-				// Audit correlation — the portal injects the
-				// correlation id from the browser, so CORS must admit it.
-				"X-Krateo-Correlation-Id",
 				// W3C trace-context + baggage headers — REQUIRED so the
 				// browser frontend can propagate traceparent/tracestate/
-				// baggage into snowplow (cross-repo CORS dependency).
+				// baggage into snowplow (cross-repo CORS dependency). D19a:
+				// the audit session correlation id now rides `baggage`
+				// (session.id), REPLACING the old X-Krateo-Correlation-Id
+				// header, which is removed here.
 				"traceparent",
 				"tracestate",
 				"baggage",
 			},
-			ExposedHeaders: []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class",
-				// Expose the echoed correlation id so the portal can
-				// persist/link it across the requests of one logical action.
-				"X-Krateo-Correlation-Id"},
+			ExposedHeaders: []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
 			AllowCredentials: true,
 			MaxAge:           300, // Maximum value not ignored by any of major browsers
 		})(rootHandler),

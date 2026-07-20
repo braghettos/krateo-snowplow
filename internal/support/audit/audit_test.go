@@ -1,16 +1,15 @@
 package audit
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/logtest"
 )
 
 func TestSanitizeID(t *testing.T) {
@@ -35,29 +34,31 @@ func TestSanitizeID(t *testing.T) {
 	}
 }
 
-func TestMiddlewarePropagatesInboundID(t *testing.T) {
+// TestMiddlewareSeedsBaggageFromInbound verifies an inbound baggage
+// session.id is preserved on the request context (no bespoke header).
+func TestMiddlewareSeedsBaggageFromInbound(t *testing.T) {
 	var seen string
 	h := Middleware()(http.HandlerFunc(func(wri http.ResponseWriter, req *http.Request) {
-		seen = CorrelationID(req.Context())
+		seen = SessionID(req.Context())
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/call", nil)
-	req.Header.Set(HeaderCorrelationID, "portal-abc-123")
+	// Simulate the propagator having already extracted the inbound baggage.
+	req = req.WithContext(WithSessionID(req.Context(), "portal-abc-123"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
 	if seen != "portal-abc-123" {
-		t.Errorf("context correlation id = %q, want %q", seen, "portal-abc-123")
-	}
-	if got := rec.Header().Get(HeaderCorrelationID); got != "portal-abc-123" {
-		t.Errorf("echoed header = %q, want %q", got, "portal-abc-123")
+		t.Errorf("baggage session.id = %q, want %q", seen, "portal-abc-123")
 	}
 }
 
+// TestMiddlewareMintsWhenAbsent verifies a session id is minted into baggage
+// when nothing inbound provides one.
 func TestMiddlewareMintsWhenAbsent(t *testing.T) {
 	var seen string
 	h := Middleware()(http.HandlerFunc(func(wri http.ResponseWriter, req *http.Request) {
-		seen = CorrelationID(req.Context())
+		seen = SessionID(req.Context())
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/call", nil)
@@ -65,37 +66,45 @@ func TestMiddlewareMintsWhenAbsent(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	if seen == "" {
-		t.Fatal("expected a minted correlation id, got empty")
-	}
-	if got := rec.Header().Get(HeaderCorrelationID); got != seen {
-		t.Errorf("echoed header %q != context id %q", got, seen)
+		t.Fatal("expected a minted session id in baggage, got empty")
 	}
 }
 
+// TestMiddlewareRejectsHostileID verifies a non-token inbound id is replaced
+// rather than propagated.
 func TestMiddlewareRejectsHostileID(t *testing.T) {
 	var seen string
 	h := Middleware()(http.HandlerFunc(func(wri http.ResponseWriter, req *http.Request) {
-		seen = CorrelationID(req.Context())
+		seen = SessionID(req.Context())
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/call", nil)
-	req.Header.Set(HeaderCorrelationID, `evil" injection`)
+	// A hostile value that survives baggage encoding but not SanitizeID.
+	req = req.WithContext(WithSessionID(req.Context(), "evil-injection"))
+	// Overwrite with something SanitizeID rejects via raw baggage member.
+	if m, err := baggage.NewMember(BaggageSessionKey, "evil%20injection"); err == nil {
+		if bag, err := baggage.FromContext(req.Context()).SetMember(m); err == nil {
+			req = req.WithContext(baggage.ContextWithBaggage(req.Context(), bag))
+		}
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	if seen == `evil" injection` || seen == "" {
+	if seen == "evil%20injection" || seen == "" {
 		t.Errorf("hostile id must be replaced, got %q", seen)
 	}
 }
 
-func TestEmitStructuredRecord(t *testing.T) {
-	buf := &bytes.Buffer{}
-	log := slog.New(slog.NewJSONHandler(buf, nil))
+// TestEmitOTLPRecord verifies Emit produces one OTLP LogRecord with
+// event.name=audit, INFO severity on success, the semconv attributes, and
+// the session.id read from baggage.
+func TestEmitOTLPRecord(t *testing.T) {
+	rec := logtest.NewRecorder()
+	e := New(rec.Logger("test"))
 
-	ctx := xcontext.BuildContext(context.Background(), xcontext.WithLogger(log))
-	ctx = WithCorrelationID(ctx, "corr-42")
+	ctx := WithSessionID(context.Background(), "corr-42")
 
-	Emit(ctx, Event{
+	e.Emit(ctx, Event{
 		Action:    "call",
 		Verb:      "POST",
 		Group:     "composition.krateo.io",
@@ -107,22 +116,63 @@ func TestEmitStructuredRecord(t *testing.T) {
 		Code:      200,
 	})
 
-	var rec map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
-		t.Fatalf("emitted record is not JSON: %v (%s)", err, buf.String())
+	got := rec.Result()
+	if len(got) != 1 || len(got[0].Records) != 1 {
+		t.Fatalf("expected exactly one emitted record, got %+v", got)
+	}
+	r := got[0].Records[0]
+
+	if r.Severity() != log.SeverityInfo {
+		t.Errorf("severity = %v, want Info", r.Severity())
 	}
 
-	audit, ok := rec["audit"].(map[string]any)
-	if !ok {
-		t.Fatalf("missing audit group in record: %s", buf.String())
+	attrs := map[string]log.Value{}
+	r.WalkAttributes(func(kv log.KeyValue) bool {
+		attrs[kv.Key] = kv.Value
+		return true
+	})
+	if v, ok := attrs["event.name"]; !ok || v.AsString() != EventName {
+		t.Errorf("event.name = %v, want %q", attrs["event.name"], EventName)
 	}
-	if audit["kind"] != EventKind {
-		t.Errorf("kind = %v, want %q", audit["kind"], EventKind)
+	if v, ok := attrs["krateo.action"]; !ok || v.AsString() != "call" {
+		t.Errorf("krateo.action = %v, want call", attrs["krateo.action"])
 	}
-	if audit["correlationId"] != "corr-42" {
-		t.Errorf("correlationId = %v, want corr-42", audit["correlationId"])
+	if v, ok := attrs["k8s.resource.resource"]; !ok || v.AsString() != "fireworksapps" {
+		t.Errorf("k8s.resource.resource = %v, want fireworksapps", attrs["k8s.resource.resource"])
 	}
-	if audit["resource"] != "fireworksapps" || audit["outcome"] != "success" {
-		t.Errorf("unexpected audit payload: %v", audit)
+	if v, ok := attrs["outcome"]; !ok || v.AsString() != "success" {
+		t.Errorf("outcome = %v, want success", attrs["outcome"])
 	}
+	if v, ok := attrs["session.id"]; !ok || v.AsString() != "corr-42" {
+		t.Errorf("session.id = %v, want corr-42", attrs["session.id"])
+	}
+	if v, ok := attrs["http.request.method"]; !ok || v.AsString() != "POST" {
+		t.Errorf("http.request.method = %v, want POST", attrs["http.request.method"])
+	}
+	if v, ok := attrs["http.response.status_code"]; !ok || v.AsInt64() != 200 {
+		t.Errorf("http.response.status_code = %v, want 200", attrs["http.response.status_code"])
+	}
+}
+
+// TestEmitFailureSeverity verifies a non-success outcome maps to Error.
+func TestEmitFailureSeverity(t *testing.T) {
+	rec := logtest.NewRecorder()
+	e := New(rec.Logger("test"))
+	e.Emit(context.Background(), Event{Action: "call", Outcome: "failure", Code: 500})
+
+	got := rec.Result()
+	if len(got) != 1 || len(got[0].Records) != 1 {
+		t.Fatalf("expected one record, got %+v", got)
+	}
+	if s := got[0].Records[0].Severity(); s != log.SeverityError {
+		t.Errorf("severity = %v, want Error", s)
+	}
+}
+
+// TestPackageEmitNoOpWhenUnset verifies the package-level Emit is a no-op
+// when no default emitter is installed (default-off path).
+func TestPackageEmitNoOpWhenUnset(t *testing.T) {
+	defaultEmitter.Store(nil)
+	// Must not panic.
+	Emit(context.Background(), Event{Action: "call", Outcome: "success"})
 }
