@@ -39,6 +39,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	crdschema "github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateoplatformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	"github.com/krateoplatformops/snowplow/internal/tracing"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -227,6 +228,12 @@ func main() {
 	chain := use.NewChain(
 		use.TraceId(),
 		use.Logger(log),
+		// Audit correlation: accept/mint the caller-owned
+		// X-Krateo-Correlation-Id, carry it on the request context, echo
+		// it on the response and propagate it into downstream api-step
+		// calls (internal/support/audit). ADDITIVE — coexists with the
+		// shortid X-Krateo-TraceId and the OTel traceparent.
+		audit.Middleware(),
 	)
 
 	// Wire the in-process RA/widget resolver seam (introduced Ship 0.30.123
@@ -915,6 +922,22 @@ func main() {
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
 
+	// GET /export — GENERIC export: any /call-resolvable list
+	// (RESTAction or list/table Widget) serialized as a CSV/JSON
+	// attachment. The handler re-dispatches IN-PROCESS through the same
+	// dispatcher lane the GET /call route uses (identical auth, RBAC gate
+	// and serve-time user-aware filtering — export can never see more
+	// than the caller's own /call), then serializes the extracted rows.
+	// The route shares the /call middleware chain, so the scope
+	// classification and the read-path invariant hold; a scheduled
+	// export is just a CronJob curling this route (see howto/export.md).
+	mux.Handle("GET /export", chain.Append(
+		middleware.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
+		Then(handlers.Export(
+			handlers.Dispatcher(dispatchers.All())(handlers.Call()))))
+	cache.RegisterScopedRoute("GET /export", cache.ScopeCallGeneric)
+
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
 	// (cookie-or-header JWT -> UserInfo) instead of middleware.UserConfig,
@@ -1103,6 +1126,9 @@ func main() {
 				"Content-Type",
 				"X-Auth-Code",
 				"X-Krateo-TraceId",
+				// Audit correlation — the portal injects the
+				// correlation id from the browser, so CORS must admit it.
+				"X-Krateo-Correlation-Id",
 				// W3C trace-context + baggage headers — REQUIRED so the
 				// browser frontend can propagate traceparent/tracestate/
 				// baggage into snowplow (cross-repo CORS dependency).
@@ -1110,7 +1136,10 @@ func main() {
 				"tracestate",
 				"baggage",
 			},
-			ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
+			ExposedHeaders: []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class",
+				// Expose the echoed correlation id so the portal can
+				// persist/link it across the requests of one logical action.
+				"X-Krateo-Correlation-Id"},
 			AllowCredentials: true,
 			MaxAge:           300, // Maximum value not ignored by any of major browsers
 		})(rootHandler),

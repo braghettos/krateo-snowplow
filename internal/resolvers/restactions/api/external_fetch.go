@@ -15,6 +15,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/http/util"
 	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateoplatformops/snowplow/internal/support/audit"
 	"github.com/krateoplatformops/snowplow/internal/tracing"
 	"sigs.k8s.io/yaml"
 )
@@ -100,6 +101,13 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		headers, _, _, _, _, _ := httpcall.ComputeAwsHeaders(opts.Endpoint, &opts.RequestInfo)
 		opts.Headers = append(opts.Headers, headers...)
 		opts.Headers = append(opts.Headers, xcontext.LabelKrateoTraceId+":"+xcontext.TraceId(ctx, true))
+		// Audit correlation: propagate the caller-owned correlation id
+		// into every downstream call so an adapter can link its own
+		// AuditEvents back to the originating portal action. ADDITIVE —
+		// rides next to the existing shortid X-Krateo-TraceId header.
+		if cid := audit.CorrelationID(ctx); cid != "" {
+			opts.Headers = append(opts.Headers, audit.HeaderCorrelationID+":"+cid)
+		}
 		// Set all headers to lower case for AWS signature
 		for i := range opts.Headers {
 			hParts := strings.Split(opts.Headers[i], ":")
@@ -108,6 +116,10 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		sort.Strings(opts.Headers)
 	} else {
 		call.Header.Set(xcontext.LabelKrateoTraceId, xcontext.TraceId(ctx, true))
+		// Audit correlation — same propagation as the AWS arm above.
+		if cid := audit.CorrelationID(ctx); cid != "" {
+			call.Header.Set(audit.HeaderCorrelationID, cid)
+		}
 	}
 
 	if len(opts.Headers) > 0 {
