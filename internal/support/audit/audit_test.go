@@ -12,6 +12,17 @@ import (
 	"go.opentelemetry.io/otel/log/logtest"
 )
 
+// flattenRecords collapses the scope-grouped Recording returned by
+// logtest.Recorder.Result() (v0.20.0: map[Scope][]Record) into a flat slice
+// of the emitted records across all instrumentation scopes.
+func flattenRecords(rec logtest.Recording) []logtest.Record {
+	out := make([]logtest.Record, 0, len(rec))
+	for _, recs := range rec {
+		out = append(out, recs...)
+	}
+	return out
+}
+
 func TestSanitizeID(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -116,21 +127,20 @@ func TestEmitOTLPRecord(t *testing.T) {
 		Code:      200,
 	})
 
-	got := rec.Result()
-	if len(got) != 1 || len(got[0].Records) != 1 {
+	got := flattenRecords(rec.Result())
+	if len(got) != 1 {
 		t.Fatalf("expected exactly one emitted record, got %+v", got)
 	}
-	r := got[0].Records[0]
+	r := got[0]
 
-	if r.Severity() != log.SeverityInfo {
-		t.Errorf("severity = %v, want Info", r.Severity())
+	if r.Severity != log.SeverityInfo {
+		t.Errorf("severity = %v, want Info", r.Severity)
 	}
 
 	attrs := map[string]log.Value{}
-	r.WalkAttributes(func(kv log.KeyValue) bool {
+	for _, kv := range r.Attributes {
 		attrs[kv.Key] = kv.Value
-		return true
-	})
+	}
 	if v, ok := attrs["event.name"]; !ok || v.AsString() != EventName {
 		t.Errorf("event.name = %v, want %q", attrs["event.name"], EventName)
 	}
@@ -160,11 +170,11 @@ func TestEmitFailureSeverity(t *testing.T) {
 	e := New(rec.Logger("test"))
 	e.Emit(context.Background(), Event{Action: "call", Outcome: "failure", Code: 500})
 
-	got := rec.Result()
-	if len(got) != 1 || len(got[0].Records) != 1 {
+	got := flattenRecords(rec.Result())
+	if len(got) != 1 {
 		t.Fatalf("expected one record, got %+v", got)
 	}
-	if s := got[0].Records[0].Severity(); s != log.SeverityError {
+	if s := got[0].Severity; s != log.SeverityError {
 		t.Errorf("severity = %v, want Error", s)
 	}
 }
