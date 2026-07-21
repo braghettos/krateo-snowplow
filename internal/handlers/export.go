@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,28 @@ import (
 // exportParams are the /export-specific query parameters, stripped from
 // the query before the request is re-dispatched through the /call lane.
 var exportParams = []string{"format", "path", "fields", "filename"}
+
+// Internal full-list pagination for an /export request that carries NO
+// page/perPage of its own (the scheduled-export shape). A single bare
+// /call re-dispatch would leave pagination to the target's own defaults —
+// silently truncating the export to whatever default page size the
+// RESTAction/widget applies. Instead the handler paginates-and-concats:
+// it loops the /call lane at perPage=exportPageSize and concatenates the
+// extracted rows until a short page signals exhaustion, bounded at
+// exportMaxPages pages.
+//
+// DOCUMENTED CAP: exportPageSize*exportMaxPages rows (500*100 = 50000).
+// An export that hits the bound is truncated and the response carries
+// `X-Export-Truncated: true` so a consumer can tell a complete export
+// from a capped one. Package vars (not consts) so tests can shrink them.
+var (
+	exportPageSize = 500
+	exportMaxPages = 100
+)
+
+// exportTruncatedHeader flags an export that hit the exportMaxPages
+// bound: the row set is a prefix of the full list, not the whole of it.
+const exportTruncatedHeader = "X-Export-Truncated"
 
 // Export returns the GET /export handler: a GENERIC serializer layered on
 // top of the /call resolve lane. It re-dispatches the request through the
@@ -41,6 +64,13 @@ var exportParams = []string{"format", "path", "fields", "filename"}
 //   - fields:   optional comma-separated list of dot-paths selecting and
 //     ordering the CSV columns (default: union of flattened keys)
 //   - filename: optional attachment filename (sanitized; extension added)
+//
+// Pagination semantics: a caller that supplies page/perPage exports
+// exactly that /call window (single dispatch). A caller that omits BOTH
+// gets the FULL list: the handler paginates the /call lane internally
+// (perPage=exportPageSize) and concatenates the pages until exhaustion,
+// bounded at exportMaxPages pages (exportPageSize*exportMaxPages rows);
+// hitting the bound sets `X-Export-Truncated: true`. See collectAllPages.
 //
 // Every export emits an AuditEvent (action=export) so data egress is
 // correlated end-to-end like any other action.
@@ -67,6 +97,8 @@ type exportHandler struct {
 // @Param  path        query  string  false  "JQ expression selecting the rows in the resolved envelope"
 // @Param  fields      query  string  false  "Comma separated list of column dot-paths"
 // @Param  filename    query  string  false  "Attachment file name"
+// @Param  page        query  int     false  "Explicit /call page to export; omit (with perPage) to export the FULL list via internal pagination (capped, see X-Export-Truncated)"
+// @Param  perPage     query  int     false  "Explicit /call page size; omit (with page) to export the FULL list via internal pagination"
 // @Produce  text/csv
 // @Produce  json
 // @Success 200 {string} string
@@ -91,48 +123,57 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	rowsPath := req.URL.Query().Get("path")
 	fields := parseFields(req.URL.Query().Get("fields"))
 
-	// Re-dispatch through the /call lane in-process: identical auth,
-	// RBAC and resolve semantics — export can never see more than the
-	// caller's own /call would return.
-	inner := req.Clone(req.Context())
-	q := inner.URL.Query()
-	for _, p := range exportParams {
-		q.Del(p)
-	}
-	inner.URL.RawQuery = q.Encode()
+	// Pagination (review fix — silent truncation): an /export carrying an
+	// explicit page/perPage exports exactly that /call window, unchanged.
+	// An /export carrying NEITHER used to re-dispatch a single bare /call
+	// and inherit the target's own default page size — silently truncating
+	// the export. Now the bare shape paginates-and-concats the full list
+	// (bounded; see collectAllPages).
+	callerPaginated := req.URL.Query().Get("perPage") != "" ||
+		req.URL.Query().Get("page") != ""
 
-	rec := newExportRecorder()
-	r.call.ServeHTTP(rec, inner)
-
-	if rec.status != http.StatusOK {
-		// Pass the /call failure envelope through untouched.
-		for k, vv := range rec.header {
-			for _, v := range vv {
-				wri.Header().Add(k, v)
-			}
+	var (
+		rows      []any
+		pages     int
+		truncated bool
+	)
+	if callerPaginated {
+		rec := r.dispatchCall(req, 0, 0)
+		if rec.status != http.StatusOK {
+			passThroughCallFailure(wri, rec)
+			return
 		}
-		wri.WriteHeader(rec.status)
-		_, _ = wri.Write(rec.body.Bytes())
-		return
-	}
-
-	var doc any
-	if err := json.Unmarshal(rec.body.Bytes(), &doc); err != nil {
-		writeExportError(wri, http.StatusInternalServerError,
-			fmt.Errorf("resolved envelope is not JSON: %w", err))
-		return
-	}
-
-	rows, err := extractRows(req.Context(), doc, rowsPath)
-	if err != nil {
-		writeExportError(wri, http.StatusBadRequest, err)
-		return
+		var code int
+		var err error
+		rows, code, err = extractFromEnvelope(req.Context(), rec.body.Bytes(), rowsPath)
+		if err != nil {
+			writeExportError(wri, code, err)
+			return
+		}
+		pages = 1
+	} else {
+		var failed *exportRecorder
+		var code int
+		var err error
+		rows, pages, truncated, failed, code, err = r.collectAllPages(req, rowsPath)
+		if failed != nil {
+			passThroughCallFailure(wri, failed)
+			return
+		}
+		if err != nil {
+			writeExportError(wri, code, err)
+			return
+		}
 	}
 
 	name := req.URL.Query().Get("name")
 	filename := attachmentName(req.URL.Query().Get("filename"), name, format)
 	wri.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	if truncated {
+		wri.Header().Set(exportTruncatedHeader, "true")
+	}
 
+	var err error
 	switch format {
 	case "json":
 		wri.Header().Set("Content-Type", "application/json")
@@ -161,8 +202,119 @@ func (r *exportHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		Namespace: req.URL.Query().Get("namespace"),
 		Outcome:   outcome,
 		Code:      http.StatusOK,
-		Message:   fmt.Sprintf("format=%s rows=%d", format, len(rows)),
+		Message: fmt.Sprintf("format=%s rows=%d pages=%d truncated=%t",
+			format, len(rows), pages, truncated),
 	})
+}
+
+// dispatchCall re-dispatches the request through the /call lane
+// in-process: identical auth, RBAC and resolve semantics — export can
+// never see more than the caller's own /call would return. The
+// export-specific params are stripped; a page > 0 OVERRIDES the inner
+// pagination with the given (page, perPage) window (the
+// paginate-and-concat loop), otherwise the caller's own pagination
+// params pass through untouched.
+func (r *exportHandler) dispatchCall(req *http.Request, page, perPage int) *exportRecorder {
+	inner := req.Clone(req.Context())
+	q := inner.URL.Query()
+	for _, p := range exportParams {
+		q.Del(p)
+	}
+	if page > 0 {
+		q.Set("page", strconv.Itoa(page))
+		q.Set("perPage", strconv.Itoa(perPage))
+	}
+	inner.URL.RawQuery = q.Encode()
+
+	rec := newExportRecorder()
+	r.call.ServeHTTP(rec, inner)
+	return rec
+}
+
+// collectAllPages is the paginate-and-concat lane for an unpaginated
+// /export (the scheduled-export shape): it walks the /call lane page by
+// page at perPage=exportPageSize and concatenates the extracted rows.
+//
+// Stop conditions:
+//   - a page with a row count OTHER than exportPageSize — a short page
+//     means the target sliced the window and this is the last page; an
+//     overfull page means it ignored the slice and returned the full set
+//     in one shot; either way the set is exhausted;
+//   - a page identical to the previous one (fingerprint) — the target
+//     ignores pagination but happens to return exactly exportPageSize
+//     rows; the duplicate page is discarded, guarding against unbounded
+//     duplication;
+//   - the exportMaxPages bound (documented cap of
+//     exportPageSize*exportMaxPages rows) — the export is truncated and
+//     flagged via exportTruncatedHeader.
+//
+// A non-200 inner page aborts the export; the /call failure envelope is
+// returned via failed for pass-through. On extraction errors code is the
+// HTTP status to respond with.
+func (r *exportHandler) collectAllPages(req *http.Request, rowsPath string) (rows []any, pages int, truncated bool, failed *exportRecorder, code int, err error) {
+	prevFP := ""
+	for page := 1; page <= exportMaxPages; page++ {
+		rec := r.dispatchCall(req, page, exportPageSize)
+		if rec.status != http.StatusOK {
+			return nil, 0, false, rec, 0, nil
+		}
+		pageRows, pcode, perr := extractFromEnvelope(req.Context(), rec.body.Bytes(), rowsPath)
+		if perr != nil {
+			return nil, 0, false, nil, pcode, perr
+		}
+		fp := rowsFingerprint(pageRows)
+		if page > 1 && fp == prevFP {
+			// The target ignores the injected pagination: every page is
+			// the same set. Keep the single copy already accumulated.
+			break
+		}
+		prevFP = fp
+		rows = append(rows, pageRows...)
+		pages = page
+		if len(pageRows) != exportPageSize {
+			break // last (short) page, or a slice-ignoring full set
+		}
+		if page == exportMaxPages {
+			truncated = true // full last-allowed page: more may exist
+		}
+	}
+	return rows, pages, truncated, nil, 0, nil
+}
+
+// extractFromEnvelope decodes a /call response body and extracts the row
+// set (explicit jq path or auto-detect). The int return is the HTTP
+// status to respond with when err != nil.
+func extractFromEnvelope(ctx context.Context, body []byte, rowsPath string) ([]any, int, error) {
+	var doc any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, http.StatusInternalServerError,
+			fmt.Errorf("resolved envelope is not JSON: %w", err)
+	}
+	rows, err := extractRows(ctx, doc, rowsPath)
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	return rows, 0, nil
+}
+
+// rowsFingerprint is the page-identity fingerprint the
+// paginate-and-concat loop uses to detect a pagination-ignoring target.
+// rows always round-trip json.Unmarshal → json.Marshal, so the error is
+// structurally impossible here.
+func rowsFingerprint(rows []any) string {
+	dat, _ := json.Marshal(rows)
+	return string(dat)
+}
+
+// passThroughCallFailure relays a non-200 /call envelope untouched.
+func passThroughCallFailure(wri http.ResponseWriter, rec *exportRecorder) {
+	for k, vv := range rec.header {
+		for _, v := range vv {
+			wri.Header().Add(k, v)
+		}
+	}
+	wri.WriteHeader(rec.status)
+	_, _ = wri.Write(rec.body.Bytes())
 }
 
 // extractRows locates the row set inside the resolved envelope: an
