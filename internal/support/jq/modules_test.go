@@ -44,11 +44,56 @@ func TestBuiltinHealthNormalize(t *testing.T) {
 		{false, "Critical"},
 		{nil, "Unknown"},
 		{"something-else", "Unknown"},
+		// Numeric signals: the module's own severity codes (the inverse
+		// of health_severity) — 0=OK, 1=Unknown, 2=Warning, 3=Critical;
+		// anything unmapped degrades to Unknown.
+		{float64(0), "OK"},
+		{float64(1), "Unknown"},
+		{float64(2), "Warning"},
+		{float64(3), "Critical"},
+		{float64(4), "Unknown"},
+		{float64(-1), "Unknown"},
+		{float64(2.5), "Unknown"},
 	}
 	for _, c := range cases {
 		got := eval(t, `include "health"; normalize_health`, c.in)
 		if got != c.want {
 			t.Errorf("normalize_health(%v) = %v, want %s", c.in, got, c.want)
+		}
+	}
+}
+
+// TestBuiltinHealthNumericRoundTrip pins the documented invariant that
+// numeric normalization is the exact inverse of health_severity:
+// (health_severity | normalize_health) == normalize_health for any input.
+func TestBuiltinHealthNumericRoundTrip(t *testing.T) {
+	for _, in := range []any{"healthy", "degraded", "failed", nil, "weird",
+		true, false, float64(0), float64(3)} {
+		direct := eval(t, `include "health"; normalize_health`, in)
+		roundTrip := eval(t, `include "health"; health_severity | normalize_health`, in)
+		if direct != roundTrip {
+			t.Errorf("round-trip broken for %v: normalize=%v, severity|normalize=%v",
+				in, direct, roundTrip)
+		}
+	}
+}
+
+// TestBuiltinWorstHealthNumericMix proves heterogeneous string+numeric
+// signals aggregate under one vocabulary.
+func TestBuiltinWorstHealthNumericMix(t *testing.T) {
+	cases := []struct {
+		in   []any
+		want string
+	}{
+		{[]any{float64(0), "healthy"}, "OK"},
+		{[]any{float64(0), float64(2), "healthy"}, "Warning"},
+		{[]any{"degraded", float64(3)}, "Critical"},
+		{[]any{float64(0), float64(9)}, "Unknown"},
+	}
+	for _, c := range cases {
+		got := eval(t, `include "health"; worst_health`, c.in)
+		if got != c.want {
+			t.Errorf("worst_health(%v) = %v, want %s", c.in, got, c.want)
 		}
 	}
 }

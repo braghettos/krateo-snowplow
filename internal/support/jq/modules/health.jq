@@ -10,23 +10,44 @@
 
 # normalize_health — map an arbitrary raw health value (string, bool,
 # number, null) onto OK / Warning / Critical / Unknown.
+#
+# Numbers are interpreted as this module's own severity codes — the exact
+# inverse of health_severity below, so a value round-trips:
+# (health_severity | normalize_health) == normalize_health.
+#
+#   0 = OK, 1 = Unknown, 2 = Warning, 3 = Critical
+#
+# Any other number is Unknown: an unmapped signal must degrade the
+# rollup, never silently pass as healthy. Note this is NOT the
+# Nagios/Icinga plugin exit-code convention (0/1/2/3 =
+# OK/Warning/Critical/Unknown there) — a Nagios-shaped source should
+# translate its codes before aggregation.
 def normalize_health:
-  (if . == null then ""
-   elif type == "boolean" then (if . then "true" else "false" end)
-   else (tostring | ascii_downcase)
-   end) as $s
-  | if $s == "" then "Unknown"
-    elif (["ok","healthy","health_ok","ready","running","up","green",
-           "active","available","succeeded","success","passing","normal",
-           "online","bound","synced","true"] | index($s)) then "OK"
-    elif (["warning","warn","degraded","yellow","progressing","pending",
-           "provisioning","updating","scaling","suspended","partial",
-           "minor","paused"] | index($s)) then "Warning"
-    elif (["critical","crit","error","failed","failure","red","down",
-           "unavailable","offline","lost","crashloopbackoff","outofsync",
-           "notready","false","major","fatal","unhealthy"] | index($s)) then "Critical"
-    else "Unknown"
-    end;
+  if type == "number" then
+    (if . == 0 then "OK"
+     elif . == 1 then "Unknown"
+     elif . == 2 then "Warning"
+     elif . == 3 then "Critical"
+     else "Unknown"
+     end)
+  else
+    (if . == null then ""
+     elif type == "boolean" then (if . then "true" else "false" end)
+     else (tostring | ascii_downcase)
+     end) as $s
+    | if $s == "" then "Unknown"
+      elif (["ok","healthy","health_ok","ready","running","up","green",
+             "active","available","succeeded","success","passing","normal",
+             "online","bound","synced","true"] | index($s)) then "OK"
+      elif (["warning","warn","degraded","yellow","progressing","pending",
+             "provisioning","updating","scaling","suspended","partial",
+             "minor","paused"] | index($s)) then "Warning"
+      elif (["critical","crit","error","failed","failure","red","down",
+             "unavailable","offline","lost","crashloopbackoff","outofsync",
+             "notready","false","major","fatal","unhealthy"] | index($s)) then "Critical"
+      else "Unknown"
+      end
+  end;
 
 # health_severity — numeric severity of a raw health value (for sorting).
 def health_severity:
