@@ -306,13 +306,22 @@ func rowsFingerprint(rows []any) string {
 	return string(dat)
 }
 
-// passThroughCallFailure relays a non-200 /call envelope untouched.
+// passThroughCallFailure relays a non-200 /call envelope. The /call lane
+// always emits a JSON Status object (see call.go), so the relayed body is
+// pinned to application/json and marked nosniff: it can never be
+// interpreted as HTML by a browser, closing the reflected-XSS sink a taint
+// analyzer sees on the body write.
 func passThroughCallFailure(wri http.ResponseWriter, rec *exportRecorder) {
 	for k, vv := range rec.header {
+		if strings.EqualFold(k, "Content-Type") {
+			continue // pinned below; never relay a text/html content-type
+		}
 		for _, v := range vv {
 			wri.Header().Add(k, v)
 		}
 	}
+	wri.Header().Set("Content-Type", "application/json")
+	wri.Header().Set("X-Content-Type-Options", "nosniff")
 	wri.WriteHeader(rec.status)
 	_, _ = wri.Write(rec.body.Bytes())
 }
