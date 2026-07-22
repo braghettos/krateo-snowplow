@@ -21,20 +21,26 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 )
 
-// TestUAF_C118_6_BothPutSitesWired is the SOURCE-LEVEL guard that the short UAF
-// override is stamped at BOTH prod Put sites (C-118-6). The refresher re-Put
-// (resolve_populate.go) is the load-bearing one — it slides CreatedAt forward on
-// every data-plane refresh, so dropping the stamp there defeats the cap on a hot
-// cell. Guards against a future edit removing either TTLOverride stamp (which
-// would silently re-open the CreatedAt-slide defeat).
-func TestUAF_C118_6_BothPutSitesWired(t *testing.T) {
-	for _, f := range []string{"restactions.go", "resolve_populate.go"} {
+// TestUAF_C118_6_AllThreePutSitesWired is the SOURCE-LEVEL guard that the short
+// UAF override is stamped at ALL THREE prod Put sites of a restactions
+// ResolvedEntry (C-118-6, extended by the arch gate on 3783e65 which caught the
+// missing seed site):
+//   - restactions.go — the customer dispatch Put;
+//   - resolve_populate.go — the refresher re-Put (slides CreatedAt forward on
+//     every data-plane refresh → dropping the stamp defeats the cap on a hot
+//     cell);
+//   - phase1_pip_seed.go — the BOOT-SEED Put (seeds UAF cells under a cohort
+//     representative identity; uncapped until a customer /call overwrites it).
+// Guards against a future edit removing any TTLOverride stamp (silently
+// re-opening the uncapped-cell hole for that population).
+func TestUAF_C118_6_AllThreePutSitesWired(t *testing.T) {
+	for _, f := range []string{"restactions.go", "resolve_populate.go", "phase1_pip_seed.go"} {
 		src, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
 		}
 		if !strings.Contains(string(src), "uafTTLOverrideForEntry(") {
-			t.Fatalf("C-118-6 wiring: %s must stamp the UAF TTLOverride via uafTTLOverrideForEntry(...) — the override MUST be stamped at BOTH the customer Put (restactions.go) AND the refresher re-Put (resolve_populate.go), else a hot UAF cell's CreatedAt-slide defeats the cap", f)
+			t.Fatalf("C-118-6 wiring: %s must stamp the UAF TTLOverride via uafTTLOverrideForEntry(...) — the override MUST be stamped at ALL THREE restactions ResolvedEntry Put sites (customer dispatch restactions.go, refresher re-Put resolve_populate.go, boot-seed phase1_pip_seed.go), else that population's UAF cells are uncapped", f)
 		}
 	}
 }
@@ -129,6 +135,34 @@ func TestUAF_C118_6_OverrideDerivedIdenticallyAtBothPutSites(t *testing.T) {
 	strippedInputs := &cache.ResolvedKeyInputs{CacheEntryClass: "restactions" /* HasUAF: false */}
 	if uafTTLOverrideForEntry(strippedInputs) != 0 {
 		t.Fatal("C-118-6 RED-control broke: an inputs without HasUAF must derive a 0 cap (proving HasUAF must be CARRIED to the refresher, else the CreatedAt-slide defeats the cap)")
+	}
+}
+
+// C-118-6 SEED PATH — a boot-seeded UAF cell carries the cap. The seed Put
+// (phase1_pip_seed.go) mirrors the customer path: set inputs.HasUAF from the
+// typed CR, then stamp TTLOverride via uafTTLOverrideForEntry. This arm drives
+// that exact derivation and asserts a seeded UAF cell gets the short cap while a
+// seeded NON-UAF cell does not. RED (the gap the arch caught on 3783e65): an
+// un-stamped seed Put → the seeded UAF cell derives 0 override → governed by the
+// long store TTL → uncapped. The RED-control below (HasUAF false / no stamp → 0)
+// proves the stamp is what caps it.
+func TestUAF_C118_6_SeedPathCapsUAFCell(t *testing.T) {
+	t.Setenv("UAF_RESOLVED_TTL_SECONDS", "30")
+
+	// Seed a UAF cell: the seed sets inputs.HasUAF = restactionHasUAFStage(&cr)
+	// (cr is the typed RESTAction converted from got.Unstructured at the seed).
+	seedInputs := &cache.ResolvedKeyInputs{CacheEntryClass: "restactions"}
+	seedInputs.HasUAF = restactionHasUAFStage(uafRA())
+	if got := uafTTLOverrideForEntry(seedInputs); got != 30*time.Second {
+		t.Fatalf("C-118-6 seed: a boot-seeded UAF cell must carry the 30s cap; got %v (an un-stamped seed Put leaves it uncapped under the long store TTL — the gap the arch caught)", got)
+	}
+
+	// A seeded NON-UAF cell gets no override (standard ttl) — the seed stamp is
+	// UAF-scoped, no collateral shortening of seeded non-UAF cells.
+	plainInputs := &cache.ResolvedKeyInputs{CacheEntryClass: "restactions"}
+	plainInputs.HasUAF = restactionHasUAFStage(plainRA())
+	if got := uafTTLOverrideForEntry(plainInputs); got != 0 {
+		t.Fatalf("C-118-6 seed: a boot-seeded NON-UAF cell must get 0 override (standard ttl); got %v", got)
 	}
 }
 
