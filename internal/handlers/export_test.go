@@ -73,6 +73,92 @@ func TestExportCSVFromItems(t *testing.T) {
 	}
 }
 
+// TestExportCSVFormulaInjectionNeutralized is the PR #116 arch-blocker RED arm:
+// a /call row carrying spreadsheet-formula-trigger fields (=, +, -, @, and a
+// leading tab/CR) must be emitted as NEUTRALIZED CSV cells — each prefixed with
+// a single quote so a spreadsheet renders it as literal text, never an executable
+// formula. RED = remove neutralizeCSVCell → the raw formula is emitted → the
+// leading-quote assertions fail. Benign leading chars (a plain word, a numeric
+// string) must pass through UNCHANGED (the guard keys on the first char only).
+func TestExportCSVFormulaInjectionNeutralized(t *testing.T) {
+	// Each field's first char is a formula trigger except `safe`/`num`.
+	body := `{"items":[{` +
+		`"eq":"=1+1",` +
+		`"plus":"+cmd",` +
+		`"minus":"-2+3",` +
+		`"at":"@SUM(A1:A9)",` +
+		`"tab":"\t=evil()",` +
+		`"cr":"\r=evil()",` +
+		`"safe":"alpha",` +
+		`"num":"42"` +
+		`}]}`
+	rec := doExport(t, fakeCall(t, http.StatusOK, body),
+		"/export?resource=restactions&name=demo&format=csv&fields=eq,plus,minus,at,tab,cr,safe,num")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Parse WITHOUT the csv reader's own trimming — we assert on the raw emitted
+	// cell bytes via the csv reader (encoding/csv preserves a leading quote as a
+	// literal char inside a quoted field; the neutralization quote is DATA).
+	rows, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("invalid csv: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("row count = %d, want 2 (header + 1 data)", len(rows))
+	}
+	// Map header→value for the single data row.
+	got := map[string]string{}
+	for i, col := range rows[0] {
+		got[col] = rows[1][i]
+	}
+
+	// Every formula-trigger cell must be neutralized (leading single quote +
+	// the original text preserved after it).
+	wantNeutralized := map[string]string{
+		"eq":    "'=1+1",
+		"plus":  "'+cmd",
+		"minus": "'-2+3",
+		"at":    "'@SUM(A1:A9)",
+		"tab":   "'\t=evil()",
+		"cr":    "'\r=evil()",
+	}
+	for col, want := range wantNeutralized {
+		if got[col] != want {
+			t.Errorf("CSV-injection VIOLATED for %q: cell = %q, want %q (leading quote neutralization missing — a spreadsheet would execute the formula)", col, got[col], want)
+		}
+	}
+	// Benign cells pass through unchanged (guard keys on the first char only).
+	if got["safe"] != "alpha" {
+		t.Errorf("benign string cell mangled: %q, want %q", got["safe"], "alpha")
+	}
+	if got["num"] != "42" {
+		t.Errorf("benign numeric-string cell mangled: %q, want %q", got["num"], "42")
+	}
+}
+
+// TestNeutralizeCSVCell is the focused unit for the guard predicate.
+func TestNeutralizeCSVCell(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"=1+1", "'=1+1"},
+		{"+x", "'+x"},
+		{"-x", "'-x"},
+		{"@x", "'@x"},
+		{"\tx", "'\tx"},
+		{"\rx", "'\rx"},
+		{"alpha", "alpha"},
+		{"42", "42"},
+		{"a=b", "a=b"}, // trigger not in first position → unchanged
+	}
+	for _, c := range cases {
+		if got := neutralizeCSVCell(c.in); got != c.want {
+			t.Errorf("neutralizeCSVCell(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestExportCSVFieldSelection(t *testing.T) {
 	body := `{"items":[{"name":"alpha","health":"OK","noise":"x"}]}`
 	rec := doExport(t, fakeCall(t, http.StatusOK, body),

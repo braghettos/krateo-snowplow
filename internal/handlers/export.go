@@ -476,7 +476,15 @@ func flattenInto(out map[string]string, prefix string, v any) {
 	case nil:
 		out[keyOrRoot(prefix)] = ""
 	case string:
-		out[keyOrRoot(prefix)] = t
+		// CSV formula-injection neutralization (OWASP): a cell whose FIRST
+		// char is a formula trigger is prefixed with a single quote so a
+		// spreadsheet renders it as literal text, not an executable formula.
+		// The string case is the user-controlled-text vector (resource
+		// names/labels/status text flow here); numeric/bool cells are
+		// snowplow-produced and not attacker-shaped. CSV-only path (flattenInto
+		// is called solely by writeCSV) — JSON export is unaffected (its
+		// json.Encoder escapes). PR #116 arch blocker.
+		out[keyOrRoot(prefix)] = neutralizeCSVCell(t)
 	case bool:
 		out[keyOrRoot(prefix)] = fmt.Sprintf("%t", t)
 	case float64:
@@ -496,6 +504,29 @@ func keyOrRoot(prefix string) string {
 		return "value"
 	}
 	return prefix
+}
+
+// csvFormulaTriggers is the OWASP-standard set of leading characters a
+// spreadsheet may interpret as the start of a formula when opening a CSV.
+// A cell beginning with any of these is neutralized (prefixed with a single
+// quote) so it renders as literal text. \t and \r are included because some
+// spreadsheet importers strip leading whitespace and then re-trigger on the
+// following formula char.
+const csvFormulaTriggers = "=+-@\t\r"
+
+// neutralizeCSVCell defends against CSV formula injection: if s begins with a
+// formula-trigger char, it is prefixed with a single quote (the spreadsheet
+// then shows the literal value, e.g. `=1+1` renders as text, not the computed
+// 2). Empty strings and strings that begin with any other char are returned
+// unchanged. This is the CSV success-path guard the export lacked (PR #116).
+func neutralizeCSVCell(s string) string {
+	if s == "" {
+		return s
+	}
+	if strings.IndexByte(csvFormulaTriggers, s[0]) >= 0 {
+		return "'" + s
+	}
+	return s
 }
 
 // strconv64 renders a JSON number without a spurious trailing ".000000".

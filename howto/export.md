@@ -9,9 +9,10 @@ serve-time user-aware filtering are identical. An export can never
 contain more than the caller's own `/call` would return.
 
 Every export also emits an [`AuditEvent`](./audit-correlation.md)
-(structured log record, `action=export`) carrying the request
-correlation id (`X-Krateo-Correlation-Id`), so data egress is auditable
-end-to-end.
+(structured log record, `action=export`) carrying the request session id
+(the W3C **`baggage`** member `session.id`), so data egress is auditable
+end-to-end. (The bespoke `X-Krateo-Correlation-Id` header is retired — the
+server ignores it; correlation now rides W3C baggage.)
 
 ## Request
 
