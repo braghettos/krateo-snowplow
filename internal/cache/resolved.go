@@ -66,6 +66,21 @@ const (
 	// before). Operators set it via the chart value.
 	envCatalogUnservableTTLSeconds = "CATALOG_UNSERVABLE_TTL_SECONDS"
 
+	// envUAFResolvedTTLSeconds — #118 (d) INTERIM stopgap for the
+	// userAccessFilter RBAC stale-read (design docs/118-uaf-rbac-stale-read-
+	// design-2026-07-22.md). A resolved cell whose RESTAction declares a
+	// userAccessFilter stage is stamped this short TTLOverride so its
+	// staleness window after an out-of-band RBAC change is CAPPED at this
+	// value — even for a hot, data-plane-refreshed cell (the override is
+	// re-stamped on the refresher re-Put too, else the CreatedAt-slide would
+	// defeat it: #118 C-118-6). This does NOT fix the cache key (a within-TTL
+	// RBAC change is still served stale — that is #118 (c)'s job); it only
+	// bounds the exposure window. Default 0 = DISABLED (purely additive, the
+	// per-entry override is unset → UAF cells use the standard TTL exactly as
+	// today). Operators set it via the chart value; cleanly removable per
+	// project_caching_is_provisional.
+	envUAFResolvedTTLSeconds = "UAF_RESOLVED_TTL_SECONDS"
+
 	// envResolvedCacheMaxResidentBytes is the Ship 4a (0.30.198) byte
 	// budget for the PINNED resident region — the eviction-protected cells
 	// (expensive prewarmed RAFullList full-list caches). Resident bytes are
@@ -371,6 +386,20 @@ type ResolvedKeyInputs struct {
 	// pre-existing entry's key does not shift). The api-stage resolver
 	// builds the Stage value; ComputeKey only folds it into the hash.
 	Stage string
+
+	// HasUAF — #118 (d) interim: true when the resolved cell's RESTAction
+	// declares a userAccessFilter stage. Set by the customer dispatch (which
+	// has the resolved CR in hand) into the cacheInputs before Put, and CARRIED
+	// on ResolvedEntry.Inputs so the refresher re-Put (which only has the stored
+	// Inputs, not the CR) can re-stamp the short UAF TTLOverride too — the
+	// #118 C-118-6 both-Put-sites requirement (else the CreatedAt-slide on a hot
+	// refreshed cell defeats the cap).
+	//
+	// EXCLUDED FROM COMPUTEKEY. Like RepresentativeUsername/Groups above, this
+	// is bookkeeping carried on Inputs, NOT key material — ComputeKey does not
+	// hash it, so adding it does NOT shift the key space (no resolvedKeyVersion
+	// bump) and a UAF cell keeps the SAME key as before, only a shorter TTL.
+	HasUAF bool
 }
 
 // resolvedKeyVersion is folded into every key hash so a key-schema
@@ -1532,6 +1561,24 @@ func intFromEnv(key string, def int) int {
 // knobs since it governs per-entry expiry in this store.
 func CatalogUnservableTTL() time.Duration {
 	s := intFromEnv(envCatalogUnservableTTLSeconds, 0)
+	if s <= 0 {
+		return 0
+	}
+	return time.Duration(s) * time.Second
+}
+
+// UAFResolvedTTL returns the #118 (d) interim short-TTL stamped on resolved
+// cells whose RESTAction declares a userAccessFilter stage, or 0 when DISABLED
+// (the default — env unset/0/invalid). When > 0, a UAF-bearing entry should
+// carry this as ResolvedEntry.TTLOverride at BOTH Put sites (customer dispatch
+// AND refresher re-Put — #118 C-118-6) so its RBAC-staleness window is capped
+// even under CreatedAt-sliding data-plane refresh churn. Read at Put time
+// (cheap os.Getenv + Atoi), mirroring CatalogUnservableTTL. effectiveTTLLocked
+// already honours the SHORTER of TTLOverride and the store ttl, so a UAF TTL
+// only ever TIGHTENS the bound. INTERIM ONLY: caps the window, does not fix the
+// key (#118 (c) is the durable per-user-RBAC-subgen key fix).
+func UAFResolvedTTL() time.Duration {
+	s := intFromEnv(envUAFResolvedTTLSeconds, 0)
 	if s <= 0 {
 		return 0
 	}

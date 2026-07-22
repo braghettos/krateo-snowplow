@@ -380,9 +380,22 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, extras)
+		// #118 (d) interim — if THIS RESTAction declares a userAccessFilter stage,
+		// record it on the carried Inputs (so the refresher re-Put re-stamps the
+		// same short TTL — C-118-6) and stamp the short UAF TTLOverride on the
+		// entry, capping the RBAC-staleness window (the resolved key is blind to
+		// the per-object refilter RBAC dependency; #118 (c) is the durable key
+		// fix). uafTTLOverrideForEntry returns 0 (no override) when the knob is
+		// unset OR the RA has no UAF stage → byte-identical to today for every
+		// non-UAF cell and when disabled. HasUAF is NOT key-folded (ComputeKey
+		// skips it), so the cell keeps its existing key — only its TTL tightens.
+		if cacheInputs != nil {
+			cacheInputs.HasUAF = restactionHasUAFStage(&cr)
+		}
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
-			RawJSON: encoded,
-			Inputs:  cacheInputs,
+			RawJSON:     encoded,
+			Inputs:      cacheInputs,
+			TTLOverride: uafTTLOverrideForEntry(cacheInputs),
 		})
 		// 0.30.8: record the self-dep so a DELETE on this RestAction
 		// CR evicts the cached entry, and an UPDATE re-resolves it.

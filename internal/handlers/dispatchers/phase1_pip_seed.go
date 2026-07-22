@@ -814,12 +814,30 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		return nil
 	}
 
+	// #118 (d) interim — THE THIRD PUT SITE (arch gate on 3783e65). The boot
+	// seed Puts a UAF restactions cell under a cohort REPRESENTATIVE identity
+	// (proactive_ra_seed enumerates ALL RBAC-reachable RESTActions incl. UAF
+	// composition-list RAs), but `inputs` came from dispatchCacheLookupKey which
+	// NEVER sets HasUAF (only the customer path does). Without this stamp a
+	// boot-seeded UAF cell is governed by the LONG standard TTL AND stays
+	// un-capped across refresher re-Puts (HasUAF not carried) until a customer
+	// /call overwrites it — exactly the seeded/warm-without-a-fresh-dispatch
+	// population (d) exists to cap. Set HasUAF from the typed CR (`cr`, converted
+	// above) and stamp the short override via the SAME single-source helper the
+	// customer + refresher Puts use, so all THREE Put sites cap identically
+	// (C-118-6 extended to the seed). uafTTLOverrideForEntry returns 0 (no
+	// override) when the knob is unset or the RA has no UAF stage → byte-identical
+	// to today for a non-UAF seed cell and when disabled.
+	if inputs != nil {
+		inputs.HasUAF = restactionHasUAFStage(&cr)
+	}
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
 	handle.Put(key, &cache.ResolvedEntry{
 		RawJSON:      encoded,
 		Inputs:       inputs,
 		SeededAtBoot: true, // #130 F3 seed-attribution: this cell was warmed by the boot seed
+		TTLOverride:  uafTTLOverrideForEntry(inputs),
 	})
 	// counters-hygiene 2026-07-04: this success Put is a seed UNIT resolved +
 	// written to per-user L1 — the real meaning of
