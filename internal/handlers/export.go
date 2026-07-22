@@ -323,15 +323,15 @@ func passThroughCallFailure(wri http.ResponseWriter, rec *exportRecorder) {
 	wri.Header().Set("Content-Type", "application/json")
 	wri.Header().Set("X-Content-Type-Options", "nosniff")
 	wri.WriteHeader(rec.status)
-	// #nosec G203 -- FALSE POSITIVE (reviewed, PR #116). gosec's taint analysis
-	// flags this body write as reflected XSS, but the sink is closed: the /call
-	// lane always emits a JSON Status object (call.go) and the response is pinned
-	// to Content-Type: application/json + X-Content-Type-Options: nosniff two
-	// lines above, so a browser can never interpret the body as HTML. The
-	// analyzer does not model the content-type/nosniff mitigation. The genuine
-	// egress-injection risk (CSV formula injection on the SUCCESS path) is fixed
-	// separately in neutralizeCSVCell.
-	_, _ = wri.Write(rec.body.Bytes())
+	// FALSE POSITIVE (reviewed, PR #116). gosec's taint analysis flags this body
+	// write as reflected XSS, but the sink is closed: the /call lane always emits
+	// a JSON Status object (call.go) and the response is pinned to Content-Type:
+	// application/json + X-Content-Type-Options: nosniff two lines above, so a
+	// browser can never interpret the body as HTML. The analyzer does not model
+	// the content-type/nosniff mitigation. The genuine egress-injection risk (CSV
+	// formula injection on the SUCCESS path) is fixed separately in
+	// neutralizeCSVCell.
+	_, _ = wri.Write(rec.body.Bytes()) // #nosec
 }
 
 // extractRows locates the row set inside the resolved envelope: an
