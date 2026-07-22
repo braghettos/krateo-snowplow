@@ -179,7 +179,8 @@ func f3Scopes() []string {
 // needs: one ClusterRole granting BOTH GVRs (widgets+restactions get+list)
 // + one Role in ns-A granting the same, + 30 CRBs (one per identity) +
 // 30 RBs in ns-A (one per identity).
-func f3BuildSnapshot(idents []f3Identity, snapseq uint64) []runtime.Object {
+func f3BuildSnapshot(t *testing.T, idents []f3Identity, snapseq uint64) []runtime.Object {
+	t.Helper()
 	cr := &rbacv1.ClusterRole{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
 		ObjectMeta: metav1.ObjectMeta{Name: "f3-reader"},
@@ -211,6 +212,23 @@ func f3BuildSnapshot(idents []f3Identity, snapseq uint64) []runtime.Object {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "ns-A", Name: id.RBUID, UID: types.UID(id.RBUID)},
 			Subjects:   []rbacv1.Subject{subj},
 			RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "f3-reader"},
+		}
+		// #139 C-F3-1 — SINGLE-SUBJECT INVARIANT. The SA-exclusion exemption in
+		// f3CheckConvergence mirrors production's allSubjectsAreServiceAccountKind
+		// via `id.Kind == "ServiceAccount"`. That mirror is faithful ONLY because
+		// every F3 binding carries EXACTLY ONE subject (of id.Kind): a SA
+		// identity's binding is SA-ONLY (so production drops it), a User/Group
+		// identity's binding has a User/Group subject (so production keeps it). If
+		// the fixture ever grows a multi-subject binding, id.Kind stops being the
+		// faithful value of allSubjectsAreServiceAccountKind and the exemption
+		// becomes unsound (a mixed SA+User binding is NOT SA-only → production
+		// keeps it, but a SA-kind identity would still be exempted). This
+		// assertion converts that future silent-mask into a LOUD fail — replacing
+		// the id.Kind mirror with the real cache.AllSubjectsAreServiceAccountKind
+		// export (design §Strategic choice) then becomes necessary.
+		if len(crb.Subjects) != 1 || len(rb.Subjects) != 1 {
+			t.Fatalf("F3 single-subject invariant broken (identity %q kind %q): CRB has %d subjects, RB has %d — the id.Kind mirror of allSubjectsAreServiceAccountKind is unsound for multi-subject bindings; see #139 (switch to cache.AllSubjectsAreServiceAccountKind export)",
+				id.Username, id.Kind, len(crb.Subjects), len(rb.Subjects))
 		}
 		out = append(out, crb, rb)
 	}
@@ -244,7 +262,7 @@ func f3InitWatcher(t *testing.T, idents []f3Identity) {
 	t.Helper()
 	// Use the same newTestWatcher as evaluate_test.go — it builds the
 	// watcher + waits for cache sync + wires cache.SetGlobal.
-	newTestWatcher(t, f3BuildSnapshot(idents, 0)...)
+	newTestWatcher(t, f3BuildSnapshot(t, idents, 0)...)
 
 	// Build the BindingsByGVR index over the F3 GVR set. This is what
 	// the seed enumerator reads. Production wires this via the Phase 1
@@ -409,9 +427,28 @@ func f3CheckConvergence(ctx context.Context, id f3Identity, class f3CacheClass, 
 
 	seedTargets := f3SeedTargetsForIdentity(id, class)
 	if len(seedTargets) == 0 {
-		// Seed emits NO target for this identity on this GVR. This is
-		// a harness bug if the identity has bindings, or a real defect
-		// if the BindingsByGVR index missed enrolling them.
+		// #139 — Intended SA-exclusion, NOT a divergence. The seed enumerator
+		// drops SA-only bindings from every seed target class
+		// (internal/cache/prewarm_enumeration.go:202
+		// `if allSubjectsAreServiceAccountKind(entry.subjects) { continue }`,
+		// the #130 Diego directive cc213e9 2026-07-11: SA-only bindings are
+		// machine cohorts that never render the frontend). Every F3 binding is
+		// built with EXACTLY ONE subject of id.Kind (f3SubjectFor +
+		// f3BuildSnapshot — asserted by the single-subject invariant in
+		// f3BuildSnapshot), so `id.Kind == "ServiceAccount"` is the FAITHFUL
+		// fixture-level value of allSubjectsAreServiceAccountKind for this
+		// identity's bindings — a mirror of the SAME production rule via the
+		// fixture's construction invariant, not a divergent copy of the
+		// set-logic. The dispatcher still ALLOWS via the CRB (production serve
+		// cold-fills such a cell on first traffic); the seed legitimately emits
+		// nothing. Vacuous convergence — skip.
+		if id.Kind == "ServiceAccount" {
+			return nil
+		}
+		// A User/Group identity with an ALLOWED dispatch but empty seed is a
+		// REAL enumerator miss (the BindingsByGVR index failed to enrol a
+		// login-cohort binding) — the defect this branch exists to catch. The
+		// fall-through keeps the original harness bucket verbatim.
 		return &f3Divergence{
 			IdentityKind: id.Kind, Username: id.Username, Groups: id.Groups,
 			Class: class.Name, Namespace: ns,
@@ -820,4 +857,114 @@ func f3AddRBToSnapshot(t *testing.T, ns, rbUID string, id f3Identity) error {
 	// by this path because it goes through the same Store gate.
 	cache.PublishRBACSnapshotForTest(newSnap)
 	return nil
+}
+
+// TestF3_SAExemption_DoesNotMaskUserGroupSeedMiss is the #139 C-F3-2 RED arm:
+// the discriminating proof that the SA-exclusion exemption in f3CheckConvergence
+// is KIND-scoped, NOT a blanket "seed==[] always converges". It holds the
+// seed-empty condition FIXED and varies ONLY id.Kind:
+//
+//   - a USER identity with dispatcher-allow AND empty seed → f3CheckConvergence
+//     MUST return a non-nil divergence (Bucket=="harness") — the real enumerator-
+//     miss defect the branch exists to catch;
+//   - the SAME tuple flipped to Kind="ServiceAccount" → nil (the intended
+//     SA-exclusion).
+//
+// The seed-empty-for-a-User condition is forced WITHOUT any production seam: build
+// the BindingsByGVR index over restactions ONLY (NOT widgets), so a user-0 ×
+// widgets(get) lookup is dispatcher-ALLOWED (EvaluateRBAC reads the full RBAC
+// snapshot, which still carries crb-user-0's widgets grant) but seed-EMPTY (the
+// widgets GVR was never enrolled in the index the seed enumerator reads).
+//
+// A "make seed==[] always return nil" mis-fix FAILS the User half here — that is
+// the discriminator. If someone weakens the guard to a blanket
+// `if len(seedTargets)==0 { return nil }`, the User arm below returns nil and this
+// test FAILS.
+//
+// ISOLATED (feedback_serialize_kind_test_runs): it mutates the process-global
+// BindingsByGVR index (restactions-only), so it runs in its own fn and REBUILDS
+// the standard 2-GVR index in a defer. Do NOT interleave with the sequential /
+// concurrent / mutation F3 tests.
+func TestF3_SAExemption_DoesNotMaskUserGroupSeedMiss(t *testing.T) {
+	idents := f3BuildIdentities()
+	f3InitWatcher(t, idents) // builds the full 2-GVR index + publishes the snapshot
+
+	// Restrict the seed's BindingsByGVR index to restactions ONLY — widgets is
+	// deliberately UNENROLLED so a widgets-class seed lookup is empty. The
+	// dispatcher is unaffected (it reads the RBAC snapshot, not this index).
+	cache.ResetBindingsByGVRIndexForTest()
+	cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{
+		{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"},
+	})
+	// Restore the standard 2-GVR index so no sibling test inherits the
+	// restactions-only index (process-global).
+	defer func() {
+		cache.ResetBindingsByGVRIndexForTest()
+		cache.BuildBindingsByGVRIndex([]schema.GroupVersionResource{
+			{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "widgets"},
+			{Group: "templates.krateo.io", Version: "v1", Resource: "restactions"},
+		})
+	}()
+
+	ctx := context.Background()
+	user0 := idents[0] // Kind=="User", Username=="user-0"
+	if user0.Kind != "User" {
+		t.Fatalf("fixture drift: idents[0] must be the User identity, got kind %q", user0.Kind)
+	}
+	// widgets(get) — the class whose GVR we deliberately left out of the index.
+	widgetsClass := f3Classes()[0]
+	if widgetsClass.Name != "widgets" {
+		t.Fatalf("fixture drift: f3Classes()[0] must be widgets, got %q", widgetsClass.Name)
+	}
+
+	// Precondition — the dispatcher ALLOWS user-0 for widgets(get) cluster-wide
+	// (crb-user-0 grants it). If it didn't, the branch wouldn't be reached and the
+	// test would be vacuous.
+	allowed, dispUID, err := f3DispatcherUID(ctx, user0, widgetsClass, "")
+	if err != nil {
+		t.Fatalf("dispatcher err for user-0 × widgets: %v", err)
+	}
+	if !allowed || dispUID == "" {
+		t.Fatalf("precondition: dispatcher must ALLOW user-0 × widgets(get) (dispUID=%q allowed=%v) — the seed-empty branch is only reached under dispatch-allow", dispUID, allowed)
+	}
+	// Precondition — the seed enumerator emits NOTHING for user-0 × widgets
+	// (widgets GVR unenrolled), so we are genuinely exercising the len==0 branch.
+	if seed := f3SeedTargetsForIdentity(user0, widgetsClass); len(seed) != 0 {
+		t.Fatalf("precondition: seed must be EMPTY for user-0 × widgets under the restactions-only index; got %d targets", len(seed))
+	}
+
+	// USER arm — dispatcher-allow + seed-empty for a User is a REAL enumerator
+	// miss → MUST diverge with Bucket=="harness". (A blanket seed==[]→nil mis-fix
+	// returns nil here and FAILS the test — the discriminator.)
+	dUser := f3CheckConvergence(ctx, user0, widgetsClass, "")
+	if dUser == nil {
+		t.Fatal("C-F3-2 DISCRIMINATOR FAILED: a User identity with dispatcher-allow + empty seed converged to nil — the SA-exclusion exemption is a blanket seed==[]→nil, masking a real enumerator miss. The guard MUST be kind-scoped (id.Kind==\"ServiceAccount\" only).")
+	}
+	if dUser.Bucket != "harness" {
+		t.Fatalf("C-F3-2: User seed-miss must bucket \"harness\"; got %q (%s)", dUser.Bucket, dUser.String())
+	}
+
+	// SA arm — the SAME tuple (same empty-index, same dispatch-allow shape) but
+	// Kind flipped to ServiceAccount → the intended SA-exclusion → nil. Synthesize
+	// a SA identity that the dispatcher ALSO allows via a CRB: reuse user-0's
+	// grant coordinates but with SA kind. Simplest faithful construction: take the
+	// real SA identity (idents[20], which has crb-sa-0) and confirm it too is
+	// dispatch-allowed + seed-empty for widgets, then assert nil.
+	saID := idents[20] // first SA identity (10 User + 10 Group precede it)
+	if saID.Kind != "ServiceAccount" {
+		t.Fatalf("fixture drift: idents[20] must be the first ServiceAccount identity, got kind %q", saID.Kind)
+	}
+	allowedSA, dispUIDSA, errSA := f3DispatcherUID(ctx, saID, widgetsClass, "")
+	if errSA != nil {
+		t.Fatalf("dispatcher err for sa × widgets: %v", errSA)
+	}
+	if !allowedSA || dispUIDSA == "" {
+		t.Fatalf("precondition: dispatcher must ALLOW the SA × widgets(get) (dispUID=%q) — else the SA arm is vacuous", dispUIDSA)
+	}
+	// SA seed is empty for TWO reasons here (widgets unenrolled AND the production
+	// SA-only exclusion), but the exemption fires on id.Kind regardless.
+	dSA := f3CheckConvergence(ctx, saID, widgetsClass, "")
+	if dSA != nil {
+		t.Fatalf("C-F3-2: a ServiceAccount identity with dispatcher-allow + empty seed must be EXEMPTED (nil, intended SA-exclusion); got divergence %s", dSA.String())
+	}
 }
