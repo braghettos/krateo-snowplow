@@ -292,6 +292,16 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		// expensive cell to the transient LRU. Put honours the pin subject
 		// to the resident budget (else demotes — the safe degrade).
 		Pinned: prePinned,
+		// #118 (d) interim — C-118-6 CRUX: re-stamp the short UAF TTLOverride on
+		// the REFRESHER re-Put too. The refresher builds a FRESH entry with zero
+		// CreatedAt (Put stamps a new time.Now()), so a hot, data-plane-refreshed
+		// UAF cell would slide its CreatedAt forward every refresh and OUTLIVE the
+		// cap if the override were stamped only on the first customer Put. inputs
+		// is the STORED ResolvedKeyInputs (carrying HasUAF from the original
+		// dispatch), so uafTTLOverrideForEntry re-derives the same override here
+		// without needing the RESTAction CR. Returns 0 (no override) when the knob
+		// is unset or the cell is non-UAF → byte-identical to today.
+		TTLOverride: uafTTLOverrideForEntry(&inputs),
 	}
 	// Ship #97 (0.30.214) — restore the R3 fast-path on refresher Puts
 	// of apistage-class LIST entries. Pre-fix the refresher Put wrote
