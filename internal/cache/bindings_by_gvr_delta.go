@@ -134,11 +134,15 @@ func onBindingAdd(obj interface{}) {
 		return
 	}
 	if o, ok := asCRB(obj); ok {
-		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subjectsFromRBAC(o.Subjects))
+		subj := subjectsFromRBAC(o.Subjects)
+		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
+		BumpSubjectSubGens(subj) // #118 (c) — this binding's subjects' effective RBAC changed
 		return
 	}
 	if o, ok := asRB(obj); ok {
-		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subjectsFromRBAC(o.Subjects))
+		subj := subjectsFromRBAC(o.Subjects)
+		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
+		BumpSubjectSubGens(subj) // #118 (c)
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(add)")
@@ -155,15 +159,21 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 	}
 	if o, ok := asCRB(oldObj); ok {
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
+		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c) — OLD subjects lost this grant
 	} else if o, ok := asRB(oldObj); ok {
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
+		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c)
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-old)")
 	}
 	if o, ok := asCRB(newObj); ok {
-		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subjectsFromRBAC(o.Subjects))
+		subj := subjectsFromRBAC(o.Subjects)
+		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
+		BumpSubjectSubGens(subj) // #118 (c) — NEW subjects gained this grant (a subject in BOTH old+new bumps twice; harmless — the key only needs to change)
 	} else if o, ok := asRB(newObj); ok {
-		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subjectsFromRBAC(o.Subjects))
+		subj := subjectsFromRBAC(o.Subjects)
+		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
+		BumpSubjectSubGens(subj) // #118 (c)
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-new)")
 	}
@@ -183,10 +193,12 @@ func onBindingDelete(obj interface{}) {
 	}
 	if o, ok := asCRB(obj); ok {
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
+		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c) — subjects lost this grant (REVOKE — the security-load-bearing arm)
 		return
 	}
 	if o, ok := asRB(obj); ok {
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
+		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c)
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(delete)")

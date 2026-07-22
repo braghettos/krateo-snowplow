@@ -175,6 +175,15 @@ func assertKeyInputsFieldEqual(t *testing.T, class string, a, b *cache.ResolvedK
 	if a.Stage != b.Stage {
 		t.Fatalf("%s field Stage: %q != %q", class, a.Stage, b.Stage)
 	}
+	// #118 (c) C-118-4 — the per-user RBAC sub-generation must be pre-hash
+	// field-equal across arming↔serve (both derive it via the SAME
+	// dispatchCacheLookupKey → RBACSubGenForSubject). A divergence here means a
+	// subscription armed a different sub-gen than the emit stamped → the armed
+	// key would never match after a grant/revoke rotated one side only (the #64
+	// desync class at the RBAC-freshness dimension). Extends the #67 invariant.
+	if a.RBACSubGen != b.RBACSubGen {
+		t.Fatalf("%s field RBACSubGen: %d != %d — arming↔serve RBAC sub-gen desync (a grant/revoke would rotate one side's key only)", class, a.RBACSubGen, b.RBACSubGen)
+	}
 	if cache.ComputeKey(*a) != cache.ComputeKey(*b) {
 		t.Fatalf("%s: digests differ despite field-equal scalars — Extras canonicalisation divergence?", class)
 	}
