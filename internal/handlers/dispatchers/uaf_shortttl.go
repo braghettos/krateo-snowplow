@@ -29,6 +29,42 @@
 // TOGGLE (project_caching_is_provisional): UAF_RESOLVED_TTL_SECONDS default 0 =
 // DISABLED → uafTTLOverrideForEntry returns 0 → TTLOverride stays 0 → every UAF
 // cell uses the standard TTL, byte-identical to today. Cleanly removable.
+//
+// R-d-4 SITE MAP — the complete `ResolvedEntry{` Put enumeration and WHY each
+// site is or is not in (d)'s scope (reasoned, not missed). (d) caps the
+// identity-bound restactions cell that carries the per-user REFILTER OUTPUT.
+//
+// IN SCOPE — all three restactions ResolvedEntry Put sites stamp the UAF cap:
+//   - restactions.go       — customer dispatch Put.
+//   - resolve_populate.go  — refresher re-Put (CreatedAt-slides on every
+//                            data-plane refresh; the C-118-6 crux site).
+//   - phase1_pip_seed.go seedOneRestaction — boot-seed Put (seeds UAF cells
+//                            under a cohort representative identity; added after
+//                            the arch gate on 3783e65 caught the "counted 2,
+//                            there were 3" miss).
+//
+// OUT OF SCOPE BY DESIGN (the PM's open apistage question, resolved by tracing):
+//   - apistage.go:607 / cluster_list.go:417 — CacheEntryClassApistage, keyed by
+//     contentKeyInputs(gvr, ns, name): IDENTITY-FREE shared substrate, the raw
+//     pre-refilter apiserver envelope. Its staleness is DATA-plane (an informer
+//     dirty-mark on the watched GVR invalidates it), NOT RBAC-refilter-output
+//     staleness. It carries NO BindingUID and NO per-user refilter output, so an
+//     out-of-band RBAC change does not make IT stale — the identity-bound
+//     restactions cell (which holds the refilter output and IS capped above) is
+//     the one that goes stale. Both already self-stamp the CATALOG_UNSERVABLE
+//     data-plane override for their own degradation. Capping the substrate would
+//     be wrong-cell and would churn a shared hot cell for zero RBAC-freshness
+//     gain. (Traced + agreed with arch/PM; no disagreement to flag.)
+//   - partial_result_ttl.go:85 — self-stamps its OWN bounded TTLOverride for a
+//     partial-with-errors body; independent bounded-staleness mechanism. Untouched.
+//   - phase1_pip_seed.go seedOneWidget (~:1046) + widgets.go / widget_content.go
+//     / ra_full_list_store.go — widgets / widgetContent / RAFullList classes.
+//     UAF is a restactions-STAGE contract (API.UserAccessFilter). A widget whose
+//     apiRef resolves a UAF RA warms the RESTACTIONS cell via the apiref resolve
+//     path — which IS the seedOneRestaction / dispatch path now capped above — so
+//     the widget path is NOT a hole: the UAF refilter output only ever lands in a
+//     restactions-class cell, never a widget-class one. widgetContent is
+//     additionally identity-free (shared envelope, per-user serve-time filter).
 
 package dispatchers
 
