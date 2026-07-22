@@ -33,7 +33,18 @@ spec:
               type: RuntimeDefault
           containers:
             - name: export
-              image: quay.io/curl/curl:latest
+              # Pin a specific tag (never :latest) so the run is reproducible and
+              # a trusted, scanned image is used. Bump deliberately.
+              image: quay.io/curl/curl:8.11.1
+              # Bounded resources — a scheduled job should never be able to
+              # starve the node (Trivy/KSV: requests + limits set).
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
               command: ["/bin/sh", "-ec"]
               args:
                 - |
