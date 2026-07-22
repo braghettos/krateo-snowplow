@@ -29,6 +29,7 @@ package cache
 import (
 	"container/list"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -400,6 +401,20 @@ type ResolvedKeyInputs struct {
 	// hash it, so adding it does NOT shift the key space (no resolvedKeyVersion
 	// bump) and a UAF cell keeps the SAME key as before, only a shorter TTL.
 	HasUAF bool
+
+	// RBACSubGen — #118 (c) DURABLE fix. The requesting identity's EFFECTIVE
+	// per-subject RBAC sub-generation (RBACSubGenForSubject over the user +
+	// groups (+ SA) counters), FOLDED INTO ComputeKey for every identity-bound
+	// class (like BindingUID; EXCLUDED for widgetContent, which is identity-free).
+	// A grant/revoke that touches this user's OWN bindings bumps a subject
+	// counter → this term changes → new key → cold miss → fresh resolve → fresh
+	// UAF refilter. Blast radius = only users whose own bindings changed (herd-
+	// proportional; survives the 50K install storm that global RBACGen dies in).
+	// Stamped wherever a ResolvedKeyInputs is BUILT (dispatchCacheLookupKey for
+	// dispatch/subscription, seedOneRestaction for the seed) from the SAME
+	// RBACSubGenForSubject reader, so seed/subscription/dispatch keys agree.
+	// UNLIKE HasUAF this IS folded into ComputeKey → resolvedKeyVersion v4→v5.
+	RBACSubGen uint64
 }
 
 // resolvedKeyVersion is folded into every key hash so a key-schema
@@ -442,7 +457,13 @@ type ResolvedKeyInputs struct {
 // The cohort-gate-memo apparatus is deleted (design §3.4). Pre-v4
 // apistage entries CANNOT serve as v4 hits even under the same identity
 // because the v3 key did not encode identity.
-const resolvedKeyVersion = "v4"
+// Ship #118 (c) — BUMPED v4 → v5. ComputeKey now folds RBACSubGen (the
+// requesting identity's per-subject RBAC sub-generation) alongside BindingUID
+// for every identity-bound class. A pre-v5 cell's key did not encode the
+// sub-gen, so it is structurally different from a v5 key for the SAME access;
+// the salt rotation forces a clean rolling key break — no pre-fix (RBAC-blind)
+// entry serves as a post-fix hit across the restart (C-118-7).
+const resolvedKeyVersion = "v5"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed
@@ -711,6 +732,21 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	if in.CacheEntryClass != CacheEntryClassWidgetContent {
 		h.Write([]byte(in.BindingUID))
 		h.Write([]byte{0xff}) // identity terminator
+		// #118 (c) v4→v5: fold the requesting identity's per-subject RBAC
+		// sub-generation alongside BindingUID for every identity-bound class.
+		// The BindingUID captures WHICH binding authorised THIS layer's GET;
+		// RBACSubGen captures "did anything about this user's effective RBAC
+		// change" (incl a per-namespace grant/revoke the single dispatch-GET
+		// BindingUID is blind to — the userAccessFilter refilter dependency,
+		// #118 defect 1). A change to the user's own bindings bumps a subject
+		// counter → this fold changes → new key → cold miss → fresh refilter.
+		// widgetContent is excluded (identity-free shared envelope) exactly as
+		// for BindingUID — folding identity there would break the shared-content
+		// invariant (design §key-parity-surface). uint64 LE, then a terminator.
+		var subgen [8]byte
+		binary.LittleEndian.PutUint64(subgen[:], in.RBACSubGen)
+		h.Write(subgen[:])
+		h.Write([]byte{0xfe}) // sub-gen terminator (distinct from the 0xff identity terminator)
 	}
 
 	h.Write([]byte(strconv.Itoa(in.PerPage)))

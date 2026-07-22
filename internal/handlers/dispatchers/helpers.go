@@ -254,6 +254,15 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		Namespace:       namespace,
 		Name:            name,
 		BindingUID:      bindingUID,
+		// #118 (c) — the requesting identity's EFFECTIVE per-subject RBAC
+		// sub-generation, folded into ComputeKey (identity-bound classes) so an
+		// out-of-band grant/revoke touching THIS user's own bindings rotates the
+		// key → cold miss → fresh UAF refilter. RBACSubGenForSubject folds the
+		// user + every presented group (+ SA) counter (C-118-2 group-grant
+		// crux). ui.Username/ui.Groups are already in hand here (the same tuple
+		// EvaluateRBAC read above), so this is a handful of lock-free map reads,
+		// no extra walk.
+		RBACSubGen: cache.RBACSubGenForSubject(ui.Username, ui.Groups),
 		// Representative identity for the refresher's re-resolve.
 		// Carried on Inputs but NOT folded into ComputeKey (the cell
 		// is keyed by BindingUID, not by the literal name). The first
