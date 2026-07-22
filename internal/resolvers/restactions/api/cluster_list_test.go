@@ -438,8 +438,19 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 	// then the SINGLE explicit decodeClusterListItems call is the one and
 	// only materialisation (exactly 1 total). Timed together so the
 	// wall-clock canary observes the real call-site cost (shape + one
-	// materialise), not just the envelope decode. Median across 5 runs.
-	var total time.Duration
+	// materialise), not just the envelope decode.
+	//
+	// The canary judges the MINIMUM of the 5 runs, not the average:
+	// ambient CPU contention (a full `go test ./...` runs many package
+	// processes in parallel) only ever ADDS time, and one descheduled run
+	// used to poison the average past the budget (avg=120ms observed
+	// 2026-07-21 under full-suite load; the same test passes standalone)
+	// — a load flake, not a perf regression. The min is the standard
+	// noise-robust estimator for a lower-bound cost proxy, and it cannot
+	// mask the blowup the canary exists to catch: a gross algorithmic
+	// regression (or the red-arm injected sleep) inflates EVERY run, the
+	// min included.
+	var total, minRun time.Duration
 	const runs = 5
 	for i := 0; i < runs; i++ {
 		start := time.Now()
@@ -457,7 +468,11 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 		if decodeErr != "" {
 			t.Fatalf("run %d: decodeClusterListItems error=%q", i, decodeErr)
 		}
-		total += time.Since(start)
+		elapsed := time.Since(start)
+		total += elapsed
+		if i == 0 || elapsed < minRun {
+			minRun = elapsed
+		}
 	}
 	// After 5 (shape-check 0 + one decode) iterations the total
 	// materialisation count is EXACTLY runs — one pass per call site, never
@@ -470,7 +485,7 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 	}
 
 	avg := total / runs
-	t.Logf("validateClusterListShape AC-D5.14 call-site overhead: 2000 items, avg=%v over %d runs (raceEnabled=%v)", avg, runs, raceEnabledForTest)
+	t.Logf("validateClusterListShape AC-D5.14 call-site overhead: 2000 items, min=%v avg=%v over %d runs (raceEnabled=%v)", minRun, avg, runs, raceEnabledForTest)
 
 	// WALL-CLOCK CANARY — race-skipped (see header). The race detector's
 	// instrumentation invalidates a pure-CPU perf budget; the exactly-N
@@ -482,11 +497,14 @@ func TestValidateClusterListShape_Overhead(t *testing.T) {
 			"exactly-N materialisation-count tooth (asserted above) is the " +
 			"instrumentation-invariant regression signal.")
 	}
-	// Hard guard: a >50ms call-site latency on a 2K envelope would be a 5×
-	// budget breach — surface this as a test failure so the diff-review gate
-	// cannot miss a gross algorithmic blowup the count tooth cannot see.
-	if avg > 50*time.Millisecond {
-		t.Fatalf("AC-D5.14 overhead budget breach: avg=%v > 50ms (5× the 10ms PM-ratified budget)", avg)
+	// Hard guard: a >50ms best-of-5 call-site latency on a 2K envelope
+	// would be a 5× budget breach — surface this as a test failure so the
+	// diff-review gate cannot miss a gross algorithmic blowup the count
+	// tooth cannot see. Judged on the min (see the loop header): ambient
+	// scheduler contention inflates individual runs, a real regression
+	// inflates all of them.
+	if minRun > 50*time.Millisecond {
+		t.Fatalf("AC-D5.14 overhead budget breach: min=%v (avg=%v) > 50ms (5× the 10ms PM-ratified budget)", minRun, avg)
 	}
 }
 

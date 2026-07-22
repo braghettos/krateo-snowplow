@@ -150,6 +150,18 @@ func base64Std(b []byte) string {
 // snowplow-side workaround can be removed. That is the intended falsifier
 // behaviour: the test asserts the bug it was written to work around.
 func TestPlumbingHttpcall_TokenAuthEndpoint_DropsCA(t *testing.T) {
+	// The x509 verification failure this negative control asserts is
+	// DETERMINISTIC — retrying can never succeed. plumbing's httpcall.Do
+	// wraps every call in util.NewRetryClient, which treats the TLS
+	// handshake error as a retryable network error: with the default
+	// CLIENT_MAX_RETRIES=5 + exponential backoff (500ms base, 10s cap)
+	// and 50-100% random jitter, the test slept a jitter-dependent
+	// 8-16s per run — the package's dominant, flaky wall-clock cost.
+	// NewRetryClient reads the env per call, so scoping retries to 0
+	// here makes the test near-instant and deterministic without
+	// touching the production path.
+	t.Setenv("CLIENT_MAX_RETRIES", "0")
+
 	srv, caPEM := newTLSAPIServer(t)
 
 	// A token-auth endpoint carrying the cluster CA — the exact shape

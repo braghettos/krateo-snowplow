@@ -35,10 +35,12 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateoplatformops/snowplow/internal/logging"
 	"github.com/krateoplatformops/snowplow/internal/metrics"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	crdschema "github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
 	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateoplatformops/snowplow/internal/support/audit"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	"github.com/krateoplatformops/snowplow/internal/tracing"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -224,9 +226,36 @@ func main() {
 	}
 	defer func() { _ = metricShutdown(context.Background()) }()
 
+	// D19a — audit logs pipeline. Build the OTLP/HTTP LoggerProvider (same
+	// OTEL_ENABLED gate + endpoint contract, same service.name=snowplow
+	// Resource as the TracerProvider) so every AuditEvent is a first-class,
+	// trace-correlated OTLP LogRecord on the shared otel_logs plane — NOT a
+	// stdout JSON blob and NOT a bespoke correlation header. When the gate is
+	// off, logging.Setup returns a nil provider and the audit emitter stays a
+	// no-op (off-path byte-identical). This is a SEPARATE signal from the
+	// existing stdout->otel-daemonset per-call diagnostic log, which is
+	// untouched.
+	logProvider, logShutdown, err := logging.Setup(otelCtx, build)
+	if err != nil {
+		log.Error("otel logs setup failed", slog.Any("err", err))
+	}
+	defer func() { _ = logShutdown(context.Background()) }()
+	if logProvider != nil {
+		audit.SetDefault(audit.New(
+			logProvider.Logger("github.com/krateoplatformops/snowplow/audit"),
+		))
+	}
+
 	chain := use.NewChain(
 		use.TraceId(),
 		use.Logger(log),
+		// Audit correlation (D19a): mint/accept the business session id and
+		// write it into W3C baggage (session.id), carried on the request
+		// context and serialized downstream by the Baggage propagator. The
+		// AuditEvent itself is emitted as a trace-correlated OTLP LogRecord.
+		// ADDITIVE — coexists with the shortid X-Krateo-TraceId and the OTel
+		// traceparent; no bespoke correlation header any more.
+		audit.Middleware(),
 	)
 
 	// Wire the in-process RA/widget resolver seam (introduced Ship 0.30.123
@@ -915,6 +944,22 @@ func main() {
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("GET /call", cache.ScopeCallGeneric)
 
+	// GET /export — GENERIC export: any /call-resolvable list
+	// (RESTAction or list/table Widget) serialized as a CSV/JSON
+	// attachment. The handler re-dispatches IN-PROCESS through the same
+	// dispatcher lane the GET /call route uses (identical auth, RBAC gate
+	// and serve-time user-aware filtering — export can never see more
+	// than the caller's own /call), then serializes the extracted rows.
+	// The route shares the /call middleware chain, so the scope
+	// classification and the read-path invariant hold; a scheduled
+	// export is just a CronJob curling this route (see howto/export.md).
+	mux.Handle("GET /export", chain.Append(
+		middleware.UserConfig(*signKey, *authnNS),
+		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
+		Then(handlers.Export(
+			handlers.Dispatcher(dispatchers.All())(handlers.Call()))))
+	cache.RegisterScopedRoute("GET /export", cache.ScopeCallGeneric)
+
 	// Ship 1 (live-refresh-coherence, option A) — GET /refreshes is the
 	// per-subject live-refresh SSE stream. It uses middleware.RefreshAuth
 	// (cookie-or-header JWT -> UserInfo) instead of middleware.UserConfig,
@@ -1105,12 +1150,15 @@ func main() {
 				"X-Krateo-TraceId",
 				// W3C trace-context + baggage headers — REQUIRED so the
 				// browser frontend can propagate traceparent/tracestate/
-				// baggage into snowplow (cross-repo CORS dependency).
+				// baggage into snowplow (cross-repo CORS dependency). D19a:
+				// the audit session correlation id now rides `baggage`
+				// (session.id), REPLACING the old X-Krateo-Correlation-Id
+				// header, which is removed here.
 				"traceparent",
 				"tracestate",
 				"baggage",
 			},
-			ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
+			ExposedHeaders: []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
 			AllowCredentials: true,
 			MaxAge:           300, // Maximum value not ignored by any of major browsers
 		})(rootHandler),

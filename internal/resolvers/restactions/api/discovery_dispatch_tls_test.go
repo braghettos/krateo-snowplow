@@ -109,6 +109,14 @@ func withDiscoverySARESTConfig(t *testing.T, rc *rest.Config) {
 // honour HasCA() for token-auth endpoints, this test FAILS — flagging that
 // the Fix A1 snowplow-side branch can be removed.
 func TestPlumbingHttpcall_BareDiscoveryPath_DropsCA(t *testing.T) {
+	// The x509 failure asserted here is deterministic; plumbing's
+	// RetryClient would still retry it 5 times with jittered exponential
+	// backoff (8-16s of sleep per run — the flaky wall-clock cost). The
+	// retry budget is read from env per httpcall.Do call, so zeroing it
+	// test-scoped keeps the negative control instant and deterministic.
+	// See the sibling comment in internal_dispatch_tls_test.go.
+	t.Setenv("CLIENT_MAX_RETRIES", "0")
+
 	srv, caPEM := newTLSDiscoveryServer(t)
 
 	// A token-auth endpoint carrying the cluster CA — the exact shape the

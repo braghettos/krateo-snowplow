@@ -100,6 +100,12 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		headers, _, _, _, _, _ := httpcall.ComputeAwsHeaders(opts.Endpoint, &opts.RequestInfo)
 		opts.Headers = append(opts.Headers, headers...)
 		opts.Headers = append(opts.Headers, xcontext.LabelKrateoTraceId+":"+xcontext.TraceId(ctx, true))
+		// D19a: the audit session correlation id is NO LONGER forwarded as a
+		// bespoke X-Krateo-Correlation-Id header. It rides W3C baggage
+		// (session.id) and is serialized into the outbound `baggage` header
+		// by the global propagation.Baggage propagator on the otelhttp
+		// transport, so a downstream adapter links its own AuditEvents to the
+		// originating action via trace-context, not an ad-hoc header.
 		// Set all headers to lower case for AWS signature
 		for i := range opts.Headers {
 			hParts := strings.Split(opts.Headers[i], ":")
@@ -108,6 +114,9 @@ func httpFetchAllowingNonJSON(ctx context.Context, opts httpcall.RequestOptions)
 		sort.Strings(opts.Headers)
 	} else {
 		call.Header.Set(xcontext.LabelKrateoTraceId, xcontext.TraceId(ctx, true))
+		// D19a: audit session id rides W3C baggage (session.id) and is
+		// injected as the `baggage` header by the propagator on the otelhttp
+		// transport — no bespoke X-Krateo-Correlation-Id header here.
 	}
 
 	if len(opts.Headers) > 0 {

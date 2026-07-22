@@ -25,6 +25,7 @@ import (
 	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/support/audit"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -118,6 +119,31 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// counts (AC-D.3 ordering).
 	cache.RecordApiserverFallthrough(req.Context(), cache.ReasonClientBuild, "")
 	rt := request.Do(req.Context(), callOpts)
+
+	// Audit correlation: every WRITE through /call emits a
+	// normalized AuditEvent carrying the request correlation id (see
+	// internal/support/audit) so a portal action is linkable to the
+	// object it mutated. Reads are deliberately not audited here (volume;
+	// they are already covered by the request log + trace id).
+	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
+		outcome, code, msg := "success", http.StatusOK, ""
+		if rt.Status == response.StatusFailure {
+			outcome, code, msg = "failure", rt.Code, rt.Message
+		}
+		audit.Emit(req.Context(), audit.Event{
+			Action:    "call",
+			Verb:      strings.ToUpper(opts.verb),
+			Group:     opts.gvr.Group,
+			Version:   opts.gvr.Version,
+			Resource:  opts.gvr.Resource,
+			Name:      opts.nsn.Name,
+			Namespace: opts.nsn.Namespace,
+			Outcome:   outcome,
+			Code:      code,
+			Message:   msg,
+		})
+	}
+
 	if rt.Status == response.StatusFailure {
 		log.Error("unable to call endpoint",
 			slog.String("verb", strings.ToUpper(opts.verb)),
