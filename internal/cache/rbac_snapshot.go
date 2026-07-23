@@ -373,6 +373,18 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		return
 	}
 
+	// #118 (c)-v2 test-only barrier seam. When a test installs a barrier via
+	// SetRebuildBarrierForTest, this blocks the rebuild goroutine here —
+	// AFTER the informer event fired (so the pending bump was recorded, or
+	// under pre-fix code the synchronous bump already landed) but BEFORE the
+	// snapshot Store + flush. The falsifier's arm (ii) uses this to inject a
+	// resolve deterministically in the bump→publish window and prove no
+	// wrong-under-new-key cell is pinned. Production is unaffected: the hook
+	// is nil unless a test sets it, and the read is a single atomic load.
+	if b := rebuildBarrierForTest.Load(); b != nil {
+		(*b)()
+	}
+
 	snap := &RBACSnapshot{
 		RoleBindingsByNS:   map[string][]*rbacv1.RoleBinding{},
 		ClusterRolesByName: map[string]*rbacv1.ClusterRole{},
@@ -487,6 +499,15 @@ func rebuildRBACSnapshot(rw *ResourceWatcher) {
 		return
 	}
 	rbacSnap.Store(snap)
+
+	// #118 (c)-v2 GAP-2 — flush the deferred per-subject sub-gen bumps at the
+	// publish barrier, sequenced AFTER rbacSnap.Store. Any request that
+	// observes a bumped sub-gen (new resolved key) is thereby guaranteed to
+	// observe this snapshot (or a later one) at its EvaluateRBAC refilter —
+	// the Store is a release, the reader's Load an acquire, and this bump is
+	// sequenced-after the Store on this goroutine. This closes the
+	// bump-vs-publish race (c) v1 left open (design §GAP-2 / rbac_subgen_pending.go).
+	flushPendingSubGenBumps()
 
 	slog.Debug("cache.rbac.snapshot.published",
 		slog.String("subsystem", "cache"),

@@ -410,10 +410,13 @@ type ResolvedKeyInputs struct {
 	// counter → this term changes → new key → cold miss → fresh resolve → fresh
 	// UAF refilter. Blast radius = only users whose own bindings changed (herd-
 	// proportional; survives the 50K install storm that global RBACGen dies in).
-	// Stamped wherever a ResolvedKeyInputs is BUILT (dispatchCacheLookupKey for
-	// dispatch/subscription, seedOneRestaction for the seed) from the SAME
-	// RBACSubGenForSubject reader, so seed/subscription/dispatch keys agree.
-	// UNLIKE HasUAF this IS folded into ComputeKey → resolvedKeyVersion v4→v5.
+	// Stamped on the DISPATCH path (dispatchCacheLookupKey → helpers.go, for
+	// dispatch/subscription) from the RBACSubGenForSubject reader. The SEED does
+	// NOT stamp it (the identity-bound seed Put writes RBACSubGen==0): #118
+	// (c)-v2 GAP-3 de-scoped this as a #42-class seed-reachability perf gap
+	// (dispatch key stays correct — a warm-miss for a moved-sub-gen subject, not
+	// an authz-staleness bug), ticketed separately. UNLIKE HasUAF this IS folded
+	// into ComputeKey → resolvedKeyVersion (v4→v5→v6 across (c) and (c)-v2).
 	RBACSubGen uint64
 }
 
@@ -463,7 +466,17 @@ type ResolvedKeyInputs struct {
 // sub-gen, so it is structurally different from a v5 key for the SAME access;
 // the salt rotation forces a clean rolling key break — no pre-fix (RBAC-blind)
 // entry serves as a post-fix hit across the restart (C-118-7).
-const resolvedKeyVersion = "v5"
+//
+// Ship #118 (c)-v2 — BUMPED v5 → v6. The RBACSubGen FIELD SHAPE is unchanged
+// (still uint64), but its TIMELINE changed: (c) v1 (v5) bumped the sub-gen
+// SYNCHRONOUSLY on the RBAC delta event; (c)-v2 defers the bump to
+// snapshot-publish (rbac_subgen_pending.go, GAP-2). For a subject mid-
+// transition at the rolling-restart boundary, the SAME logical access can map
+// to a different sub-gen under the two regimes → a v5 cell could be served as
+// a v6 hit and re-pin the very staleness this fix removes. The salt rotation
+// forces every pod to treat pre-v6 cells as non-hits — a clean cross-regime
+// break, identical rationale to v3→v4 and v4→v5.
+const resolvedKeyVersion = "v6"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
 // guarded by a single mutex with a per-entry byte budget. Constructed
