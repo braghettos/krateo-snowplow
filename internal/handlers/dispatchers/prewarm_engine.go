@@ -358,6 +358,22 @@ func (e *prewarmEngine) enqueueScope(s prewarmScope) {
 	e.enqueuedTotal.Add(1)
 }
 
+// forgetScope resets the workqueue's rate-limit / requeue history for s
+// (NumRequeues(s) → 0) WITHOUT processing it. #135 F4b Lever B: a config-vars
+// redrive is a GENUINE TOPOLOGY CHANGE, so the boot scope must re-dequeue at
+// attempt==0 → rePrewarmBootScoped WALKS the new nav set instead of REUSING the
+// prior topology's harvester snapshot. enqueueScope alone is a plain queue.Add,
+// which does NOT reset NumRequeues; a redrive arriving while an F.4 deadline-cut
+// requeue streak is in flight (NumRequeues>0) would otherwise keep attempt>0 and
+// wrongly reuse the stale snapshot. enqueueBootReDrive pairs forgetScope +
+// enqueueScope so the redrive re-walks. A plain F.4 deadline-cut does NOT call
+// this — it AddRateLimited's inside processScope and keeps its NumRequeues
+// (attempt>0 → reuse, the intended fast path). Never blocks (workqueue.Forget is
+// a mutex critical section).
+func (e *prewarmEngine) forgetScope(s prewarmScope) {
+	e.queue.Forget(s)
+}
+
 // declinedExternalSetFor returns the engine-lived declined-external marker set
 // for scope key, creating it on first use. REUSED across the scope's
 // AddRateLimited requeues (so a boot resume pass consults the SAME set the prior
@@ -601,6 +617,14 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// Disabled() (WithSeedDeclinedExternalSet returns ctx unchanged).
 	if s.kind == scopeKindBoot {
 		scopeCtx = cache.WithSeedDeclinedExternalSet(scopeCtx, e.declinedExternalSetFor(s.key()))
+		// #135 F4b Lever B — carry the workqueue's per-item requeue count onto the
+		// boot scope ctx so rePrewarmBootScoped can distinguish pass 0
+		// (attempt==0 → WALK) from an F.4 deadline-cut resume (attempt>0 → REUSE
+		// the already-populated harvester snapshot, skip the ~255s re-walk). This
+		// is the SAME NumRequeues the scope_requeued log reads below; Forget-on-
+		// success (:637) + the config-vars-redrive Forget (phase1_configvars_watch.go)
+		// reset it to 0 so a genuine topology change re-walks. Boot scope ONLY.
+		scopeCtx = cache.WithBootResumeAttempt(scopeCtx, e.queue.NumRequeues(s))
 	}
 	err := e.scopeHandler(scopeCtx, s)
 	scopeCancel()

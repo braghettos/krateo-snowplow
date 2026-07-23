@@ -225,6 +225,23 @@ func rePrewarmGVRDiscoveredSeed(ctx context.Context, deps rePrewarmDeps) error {
 	return rePrewarmBootScoped(ctx, deps, seedModeGVRDiscovered)
 }
 
+// bootShouldWalk is the #135 F4b Lever B reuse predicate — the SINGLE source of
+// the walk-vs-reuse decision (rePrewarmBootScoped calls this; the falsifier calls
+// the SAME function, never a copy, so the test can't drift from prod — the #64/#66
+// anti-shadow-drift lesson). Returns true = re-walk discovery, false = reuse the
+// process-lived harvester snapshot.
+//
+//   - attempt==0  → pass 0: a fresh enqueue OR a genuine config-vars redrive that
+//     reset the requeue count via forgetScope (enqueueBootReDrive). WALK.
+//   - attempt>0   → an F.4 deadline-cut resume of the SAME topology. REUSE — UNLESS
+//     harvestedCount==0 (a resume whose pass 0 never harvested: boot-race give-up
+//     on absent config, or a cut before any harvest). An empty harvester has
+//     nothing to reuse, so it must WALK (keeps the give-up→appear self-heal path
+//     re-walking).
+func bootShouldWalk(attempt, harvestedCount int) bool {
+	return attempt == 0 || harvestedCount == 0
+}
+
 func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScopeMode) error {
 	log := slog.Default()
 	start := time.Now()
@@ -267,28 +284,72 @@ func rePrewarmBootScoped(ctx context.Context, deps rePrewarmDeps, mode seedScope
 	// cache.WithBackgroundResolve.
 	ctx = cache.WithBackgroundResolve(ctx)
 	rctx := withPhase1SAContext(ctx, deps.saEP, deps.saRC)
-	roots, listErr := deps.lister(rctx)
-	if listErr != nil {
-		log.Warn("prewarm.engine.boot.roots_list_failed",
-			slog.String("subsystem", "cache"),
-			slog.Any("err", listErr),
-			slog.String("effect", "boot re-walk has no roots; first /call per cohort falls back to per-user resolve"),
-		)
-		return listErr
-	}
 
+	// #135 F4b Lever B — SKIP the discovery re-walk on an F.4 deadline-cut RESUME
+	// pass. The navWidgetHarvester + contentPrewarmHarvester are process-lived,
+	// monotonic, first-write-wins accumulators (never cleared in prod), so on a
+	// resume pass their snapshot() already holds the UNION of every prior pass —
+	// re-walking rediscovers a set the shared harvester already has (~255s of pure
+	// waste). Gate on attempt (the workqueue requeue count carried by processScope):
+	//   - attempt==0 → pass 0 (fresh enqueue, OR a Forget-reset genuine config-vars
+	//     redrive) → WALK the current config.json roots.
+	//   - attempt>0 → deadline-cut resume of the SAME topology → REUSE the snapshot.
+	// GUARD len(snapshot)==0: a resume whose pass 0 never harvested (boot-race
+	// give-up on absent config, or a deadline-cut before ANY harvest) MUST still
+	// walk — an empty harvester has nothing to reuse. This keeps the
+	// give-up→appear→self-heal path (TestBootRace_ConfigVarsInformerDrivesReWalk)
+	// re-walking. A genuine config-vars redrive resets attempt to 0 (Forget in
+	// enqueueBootReDrive), so the NEW topology is always walked (design §3).
+	attempt := cache.BootResumeAttemptFromContext(ctx)
+	doWalk := bootShouldWalk(attempt, len(deps.navHarv.snapshot()))
+
+	var roots []navigationRoot
 	rewalked := 0
-	// #99b Fix 2 — reset the harvester's config-root index to -1 at the top of
-	// this walk PASS so the per-root BeginRoot() below stamps RootIndex 0..N-1
-	// in config.json order, exactly like the boot walk (phase1_walk.go:401).
-	// WITHOUT the reset the re-walk would resume from the boot walk's final
-	// curRoot=N-1 and a widget FIRST harvested only during this re-walk (the
-	// 50K+ common case, where the effective harvest comes from the config-vars
-	// redrive) would stamp N..2N-1, so its RootIndex would never be 0 → the
-	// first-nav latch zero-fires (multi-root). First-write-wins dedupe
-	// preserves any boot-walk stamp. Nil-safe. Inert on single-root config
-	// (curRoot pinned 0 after the first BeginRoot); required for multi-root.
-	deps.navHarv.BeginWalk()
+	if doWalk {
+		var listErr error
+		roots, listErr = deps.lister(rctx)
+		if listErr != nil {
+			log.Warn("prewarm.engine.boot.roots_list_failed",
+				slog.String("subsystem", "cache"),
+				slog.Any("err", listErr),
+				slog.String("effect", "boot re-walk has no roots; first /call per cohort falls back to per-user resolve"),
+			)
+			return listErr
+		}
+		// #99b Fix 2 — reset the harvester's config-root index to -1 at the top of
+		// this walk PASS so the per-root BeginRoot() below stamps RootIndex 0..N-1
+		// in config.json order, exactly like the boot walk (phase1_walk.go:401).
+		// WITHOUT the reset the re-walk would resume from the boot walk's final
+		// curRoot=N-1 and a widget FIRST harvested only during this re-walk (the
+		// 50K+ common case, where the effective harvest comes from the config-vars
+		// redrive) would stamp N..2N-1, so its RootIndex would never be 0 → the
+		// first-nav latch zero-fires (multi-root). First-write-wins dedupe
+		// preserves any boot-walk stamp. Nil-safe. Inert on single-root config
+		// (curRoot pinned 0 after the first BeginRoot); required for multi-root.
+		//
+		// #135 F4b Lever B — BeginWalk() lives INSIDE the walk branch: a reuse pass
+		// does no BeginRoot(), so resetting curRoot to -1 (with nothing to re-stamp)
+		// would only strand the index at -1. The existing RootIndex stamps must
+		// stand; the seed drains the already-populated snapshot unchanged.
+		deps.navHarv.BeginWalk()
+	} else {
+		// #135 F4b Lever B — F.4 RESUME pass: SKIP the ~255s discovery re-walk and
+		// REUSE the process-lived harvester snapshot (already the UNION of every
+		// prior pass — navWidgetHarvester is monotonic / first-write-wins / never
+		// cleared in prod). `roots` stays nil → the walk loop below is a no-op →
+		// step (4) seeds from deps.harvester.snapshot() + deps.navHarv.snapshot(),
+		// which hold the accumulated targets. A genuine config-vars topology change
+		// resets attempt→0 (forgetScope in enqueueBootReDrive), taking the doWalk
+		// branch above and re-walking the new set; the len(snapshot)==0 guard in
+		// doWalk keeps the boot-race give-up→appear self-heal path re-walking.
+		log.Info("prewarm.engine.boot.rewalk_reused",
+			slog.String("subsystem", "cache"),
+			slog.Int("attempt", attempt),
+			slog.Int("harvested_widgets", len(deps.navHarv.snapshot())),
+			slog.String("effect", "#135 Lever B — F.4 resume reused the harvester snapshot instead of "+
+				"re-walking discovery (~255s/pass saved); config-vars redrive resets attempt→0 to force a fresh walk"),
+		)
+	}
 	for _, root := range roots {
 		if ctx.Err() != nil {
 			return ctx.Err()
