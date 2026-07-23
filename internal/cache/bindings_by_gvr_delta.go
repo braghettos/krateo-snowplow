@@ -136,13 +136,13 @@ func onBindingAdd(obj interface{}) {
 	if o, ok := asCRB(obj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
-		BumpSubjectSubGens(subj) // #118 (c) — this binding's subjects' effective RBAC changed
+		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — defer the bump to snapshot-publish; this binding's subjects' effective RBAC changed
 		return
 	}
 	if o, ok := asRB(obj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
-		BumpSubjectSubGens(subj) // #118 (c)
+		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(add)")
@@ -159,21 +159,21 @@ func onBindingUpdate(oldObj, newObj interface{}) {
 	}
 	if o, ok := asCRB(oldObj); ok {
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
-		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c) — OLD subjects lost this grant
+		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2 — OLD subjects lost this grant
 	} else if o, ok := asRB(oldObj); ok {
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
-		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c)
+		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-old)")
 	}
 	if o, ok := asCRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd("", o.RoleRef, crbBindingID(o), subj)
-		BumpSubjectSubGens(subj) // #118 (c) — NEW subjects gained this grant (a subject in BOTH old+new bumps twice; harmless — the key only needs to change)
+		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2 — NEW subjects gained this grant (a subject in BOTH old+new is deduped by the pending set; the key only needs to change once)
 	} else if o, ok := asRB(newObj); ok {
 		subj := subjectsFromRBAC(o.Subjects)
 		idx.applyBindingAdd(o.Namespace, o.RoleRef, rbBindingID(o), subj)
-		BumpSubjectSubGens(subj) // #118 (c)
+		recordPendingSubGenBumps(subj) // #118 (c)-v2 GAP-2
 	} else {
 		deltaDropNonTyped("RoleBinding/ClusterRoleBinding(update-new)")
 	}
@@ -193,12 +193,12 @@ func onBindingDelete(obj interface{}) {
 	}
 	if o, ok := asCRB(obj); ok {
 		idx.applyBindingDelete(crbBindingID(o), roleRefKey("", o.RoleRef))
-		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c) — subjects lost this grant (REVOKE — the security-load-bearing arm)
+		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2 — subjects lost this grant (REVOKE — the security-load-bearing arm)
 		return
 	}
 	if o, ok := asRB(obj); ok {
 		idx.applyBindingDelete(rbBindingID(o), roleRefKey(o.Namespace, o.RoleRef))
-		BumpSubjectSubGens(subjectsFromRBAC(o.Subjects)) // #118 (c)
+		recordPendingSubGenBumps(subjectsFromRBAC(o.Subjects)) // #118 (c)-v2 GAP-2
 		return
 	}
 	deltaDropNonTyped("RoleBinding/ClusterRoleBinding(delete)")
@@ -265,10 +265,21 @@ func onRoleRulesChanged(roleKind, namespace, name string, rules []rbacv1.PolicyR
 	for id := range set {
 		ids = append(ids, id)
 	}
+	// #118 (c)-v2 GAP-1 — a role-rule edit changes the EFFECTIVE access of
+	// every subject bound to that role, but (c) v1 never rotated their key
+	// (this function re-routed the index but never bumped). Union the subjects
+	// across every referencing binding and record them for the deferred
+	// publish-time bump (§3.1), so a verb grant/revoke via a Role/ClusterRole
+	// rule edit rotates the key exactly like a binding change does. The set
+	// dedups a subject bound via multiple referencing bindings.
+	changed := make(map[subjectKey]struct{})
 	for _, id := range ids {
 		entry, present := idx.entries[id]
 		if !present {
 			continue
+		}
+		for _, s := range entry.subjects {
+			changed[s] = struct{}{}
 		}
 		// Unrol from GVR + wildcard buckets (keep byRole — the binding still
 		// references this role; only its bucket membership changes). Then
@@ -294,7 +305,16 @@ func onRoleRulesChanged(roleKind, namespace, name string, rules []rbacv1.PolicyR
 				b[id] = struct{}{}
 			}
 		}
-		_ = entry
+	}
+	if len(changed) > 0 {
+		subjects := make([]subjectKey, 0, len(changed))
+		for s := range changed {
+			subjects = append(subjects, s)
+		}
+		// recordPendingSubGenBumps takes a DIFFERENT lock (pendingSubGenBumps.mu)
+		// and never acquires idx.mu, so calling it while holding idx.mu here
+		// introduces no lock-ordering cycle. Deferred to publish per §3.2.
+		recordPendingSubGenBumps(subjects)
 	}
 }
 
