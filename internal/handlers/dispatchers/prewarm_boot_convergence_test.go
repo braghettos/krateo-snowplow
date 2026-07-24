@@ -32,7 +32,9 @@
 //
 // Hermetic, -race, seams only. Serializes on engineLatchTestMu (shared counters
 // + the process singleton is untouched here — every arm uses a LOCAL
-// newTestEngine()). Never touches ./internal/rbac. Artifacts to /tmp/105/.
+// newTestEngine()). Never touches ./internal/rbac. Per-arm evidence transcripts
+// go to each test's own t.TempDir() (arch Note A — no shared filesystem state
+// across a concurrent package run); the path is t.Logf'd.
 
 package dispatchers
 
@@ -148,6 +150,16 @@ func runBootConvergence(t *testing.T, targets []bootConvTarget, maxIters int, he
 	engineLatchTestMu.Lock()
 	defer engineLatchTestMu.Unlock()
 	zeroCustomerInFlight()
+
+	// Isolation (arch Note A): reset the process-global first-nav latch before
+	// every boot-driving arm — the seedScopeYielding flat-seed loop fires the
+	// latch (currentFirstNavLatch()), so a latch left FIRED by a sibling test (or
+	// a concurrent-package run) would let our passes no-op the fire and could
+	// perturb an assertion via bleed. Every sibling first-nav-latch test does
+	// this (prewarm_f4_boot_resume_test.go, prewarm_first_nav_latch_segment_test.go);
+	// centralizing it here covers ALL #105 boot-driving arms uniformly. Pure test
+	// isolation — no behavior change to the arms.
+	resetFirstNavLatchForTest()
 
 	// Cache ON — REQUIRED for the set-delta discriminator. WithBootSeededSet
 	// (and every ctx-carried seed sink) no-ops under cache.Disabled(), so with
@@ -278,10 +290,20 @@ func runBootConvergence(t *testing.T, targets []bootConvTarget, maxIters int, he
 	return obs
 }
 
+// write105Artifact writes a per-arm evidence transcript under the test's OWN
+// t.TempDir() (arch Note A hardening) — a per-test, auto-cleaned directory, so a
+// concurrent package run never shares filesystem state across arms (the shared
+// /tmp/105 could collide under -shuffle / parallel package runs). t.TempDir()
+// creates the dir + registers cleanup; the path is logged so the transcript is
+// locatable while the test binary runs.
 func write105Artifact(t *testing.T, name, body string) {
 	t.Helper()
-	_ = os.MkdirAll("/tmp/105", 0o755)
-	_ = os.WriteFile("/tmp/105/"+name, []byte(body), 0o644)
+	path := t.TempDir() + "/" + name
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Logf("write105Artifact %s: %v (non-fatal)", path, err)
+		return
+	}
+	t.Logf("#105 falsifier artifact: %s", path)
 }
 
 // ── Arm A — the shape-of-the-real-bug arm (double-RED) ───────────────────
