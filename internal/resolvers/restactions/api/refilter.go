@@ -120,9 +120,10 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 			// wrapper (cluster-scoped GET-by-name). Treat the whole
 			// map as the single object. #121 1b — compile the
 			// NamespaceFrom expression once (single item, but shares the
-			// hoisted signature).
+			// hoisted signature). #123 — compile NameFrom too.
 			nsExpr, nsCode := compileNamespaceFrom(uaf)
-			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v, nsExpr, nsCode)
+			nameExpr, nameCode := compileNameFrom(uaf)
+			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v, nsExpr, nsCode, nameExpr, nameCode)
 			res.EvaluateRBACCalls++
 			if permitted {
 				res.Kept++
@@ -207,13 +208,25 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 	// compile-error branch did per item.
 	nsExpr, nsCode := compileNamespaceFrom(uaf)
 
+	// #123 — compile the per-item NameFrom expression ONCE for the whole
+	// slice, symmetric with NamespaceFrom above. NameFrom derives each
+	// object's NAME, threaded into EvaluateOptions.Name so that a
+	// resourceNames-scoped RBAC grant (Role/ClusterRole rule with a
+	// non-empty resourceNames, valid only for name-specific verbs) is
+	// honoured. Pre-#123 the serve path passed no Name → every
+	// resourceNames-scoped grant matched nothing → all named objects were
+	// silently dropped (under-serve / fail-closed). Same hoist-once
+	// mechanism and fail-closed contract as nsCode: a compile error yields
+	// nameCode==nil → evalSingle denies the item.
+	nameExpr, nameCode := compileNameFrom(uaf)
+
 	for _, item := range items {
 		switch item.(type) {
 		case map[string]any, string:
 			// Object OR bare scalar — both reach the evaluator. evalSingle
-			// resolves NamespaceFrom against the item (jq handles a string
-			// receiver fine) and calls EvaluateRBAC.
-			permitted := evalSingle(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode)
+			// resolves NamespaceFrom + NameFrom against the item (jq handles a
+			// string receiver fine) and calls EvaluateRBAC.
+			permitted := evalSingle(ctx, log, username, groups, uaf, resources, item, nsExpr, nsCode, nameExpr, nameCode)
 			calls++
 			if permitted {
 				kept = append(kept, item)
@@ -247,7 +260,7 @@ func refilterSlice(ctx context.Context, log *slog.Logger, username string, group
 //
 // JQ-eval errors and RBAC errors both fail closed. An EMPTY `resources`
 // set denies (no resource to grant against) — never allow-all.
-func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code) bool {
+func evalSingle(ctx context.Context, log *slog.Logger, username string, groups []string, uaf *templates.UserAccessFilterSpec, resources []string, item any, nsExpr string, nsCode *gojq.Code, nameExpr string, nameCode *gojq.Code) bool {
 	// #121 1b — nsExpr + nsCode are the ONCE-compiled NamespaceFrom
 	// expression, hoisted out of the per-item loop by the caller
 	// (compileNamespaceFrom). nsExpr is kept for error/log fidelity; nsCode
@@ -270,6 +283,41 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 	}
 	namespace := ns
 
+	// #123 — derive the per-object NAME so a resourceNames-scoped grant is
+	// honoured. The name only ever matters for a NAME-SPECIFIC verb
+	// (get/update/patch/delete): the RBAC evaluator scopes resourceNames to
+	// exactly those verbs (rbac.IsNameSpecificVerb, the same predicate
+	// resourceNameMatches uses), so for a COLLECTION verb (list/watch/…) the
+	// Name is never consulted. We therefore evaluate NameFrom ONLY for
+	// name-specific verbs; for collection verbs Name stays "" — byte-identical
+	// to the pre-#123 serve path (which passed no Name), and, critically,
+	// avoids fail-closing on a NameFrom JQ error that would be IRRELEVANT to a
+	// list grant (e.g. the namespaces-stage bare-string shape where the item
+	// is a name string, not an object with .metadata.name). This is not a
+	// resource/path special-case — it is the evaluator's own verb contract.
+	name := ""
+	if rbac.IsNameSpecificVerb(uaf.Verb) {
+		// nameExpr + nameCode are the ONCE-compiled NameFrom expression,
+		// hoisted by the caller (compileNameFrom), symmetric with nsExpr/nsCode.
+		// A nil nameCode means the expression failed to compile — fail-closed
+		// (deny the item), identical to the NamespaceFrom compile-error branch.
+		if nameCode == nil {
+			log.Warn("userAccessFilter: NameFrom JQ compile failed; treating item as denied",
+				slog.String("expr", nameExpr),
+			)
+			return false
+		}
+		n, err := evalJQStringCompiled(ctx, nameCode, item)
+		if err != nil {
+			log.Warn("userAccessFilter: NameFrom JQ eval failed; treating item as denied",
+				slog.String("expr", nameExpr),
+				slog.Any("err", err),
+			)
+			return false
+		}
+		name = n
+	}
+
 	// OR semantics: keep the item iff the user is permitted on ANY
 	// resource in the set. An empty set yields no iterations -> false
 	// (fail-closed — an unresolvable / empty resource set never permits).
@@ -283,6 +331,12 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 			Group:     uaf.Group,
 			Resource:  resource,
 			Namespace: namespace,
+			// #123 — thread the per-object name so a resourceNames-scoped
+			// grant (name-specific verb only) matches the named object.
+			// Empty for collection verbs is harmless: the evaluator scopes
+			// resourceNames to name-specific verbs, so a plain list grant is
+			// evaluated identically whether or not Name is set (INERTNESS).
+			Name: name,
 			// Ship L1 (0.30.252): per-item caller discards
 			// matchedBindingUID — skip the CRB/RB stable-sort.
 			SkipBindingUID: true,
@@ -294,6 +348,7 @@ func evalSingle(ctx context.Context, log *slog.Logger, username string, groups [
 				slog.String("group", uaf.Group),
 				slog.String("resource", resource),
 				slog.String("namespace", namespace),
+				slog.String("name", name),
 				slog.Any("err", err),
 			)
 			continue // a transient evaluator error on one resource must
@@ -336,6 +391,40 @@ func compileNamespaceFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Co
 		return nsExpr, nil
 	}
 	return nsExpr, code
+}
+
+// compileNameFrom resolves the effective NameFrom expression for a UAF and
+// compiles it ONCE (#123), returning (expr, code). Symmetric with
+// compileNamespaceFrom: it centralises the default so the per-item loop and
+// the single-object branches share one derivation — the expression is
+// item-independent, so it is compiled here, before any item is evaluated,
+// and reused across every item.
+//
+// #123 — an absent/empty NameFrom defaults to ".metadata.name" (the
+// dominant K8s-object shape). The derived name is threaded into
+// EvaluateOptions.Name so a resourceNames-scoped RBAC grant (a rule with a
+// non-empty resourceNames, valid only for name-specific verbs —
+// get/update/patch/delete) is honoured. Pre-#123 the serve path passed no
+// Name → every resourceNames-scoped grant matched nothing → all named
+// objects were silently dropped (under-serve / fail-closed). The CRD-level
+// +kubebuilder:default fills this for stored RESTAction CRs; this in-code
+// default is the belt-and-suspenders for pre-default CRs and any caller
+// passing a UAF with an empty NameFrom directly. An explicit "." (the
+// namespaces-stage bare-name-string shape) still overrides verbatim.
+//
+// A compile error returns (expr, nil): evalSingle then fails closed (deny),
+// identical to the compileNamespaceFrom compile-error branch. The
+// ModuleLoader matches the NamespaceFrom compile (jqsupport.ModuleLoader()).
+func compileNameFrom(uaf *templates.UserAccessFilterSpec) (string, *gojq.Code) {
+	nameExpr := uaf.NameFrom
+	if nameExpr == "" {
+		nameExpr = ".metadata.name"
+	}
+	code, err := CompileJQ(nameExpr, jqsupport.ModuleLoader())
+	if err != nil {
+		return nameExpr, nil
+	}
+	return nameExpr, code
 }
 
 // resolveUAFResources resolves the RBAC resource-plural set for a UAF
@@ -548,8 +637,10 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		if !hasItems {
 			// Single-object shape (GET-by-name). #121 1b — compile the
 			// NamespaceFrom expression once (shares the hoisted signature).
+			// #123 — compile NameFrom too.
 			nsExpr, nsCode := compileNamespaceFrom(uaf)
-			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v, nsExpr, nsCode)
+			nameExpr, nameCode := compileNameFrom(uaf)
+			permitted := evalSingle(ctx, log, user.Username, user.Groups, uaf, resources, v, nsExpr, nsCode, nameExpr, nameCode)
 			res.EvaluateRBACCalls++
 			if permitted {
 				res.Kept++

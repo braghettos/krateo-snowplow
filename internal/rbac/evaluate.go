@@ -628,6 +628,21 @@ var nameSpecificVerbs = map[string]struct{}{
 	"delete": {},
 }
 
+// IsNameSpecificVerb reports whether verb acts on a single named object —
+// i.e. whether a resourceNames-scoped rule (and therefore the request's
+// object Name) can EVER matter for this verb. It is the exact predicate
+// resourceNameMatches uses internally, exported so callers that derive a
+// per-object Name (e.g. the userAccessFilter refilter's NameFrom, #123) can
+// skip that derivation for collection verbs — where the Name is never
+// consulted — rather than fail-closed on a Name-derivation error that would
+// be irrelevant to the grant. The "*" verb wildcard on a request is not a
+// real request verb (requests carry a concrete verb), so it is not listed;
+// resourceNameMatches handles the rule-side wildcard separately.
+func IsNameSpecificVerb(verb string) bool {
+	_, ok := nameSpecificVerbs[verb]
+	return ok
+}
+
 // resourceNameMatches implements Kubernetes `ResourceNameMatches`
 // semantics for a single PolicyRule (0.30.109, G1):
 //

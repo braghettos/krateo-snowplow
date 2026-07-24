@@ -168,6 +168,34 @@ spec:
                             Group is the API group of the checked resource. Empty string
                             = core group. Required (use "" explicitly for core).
                           type: string
+                        nameFrom:
+                          default: .metadata.name
+                          description: |-
+                            NameFrom is a JQ path expression evaluated against each returned
+                            object to derive the per-object NAME for the EvaluateRBAC call.
+                            Symmetric with NamespaceFrom (which derives the per-object
+                            namespace): NameFrom derives the per-object name so a
+                            resourceNames-scoped RBAC grant (a Role/ClusterRole rule with a
+                            non-empty resourceNames, valid only for name-specific verbs —
+                            get/update/patch/delete) is honoured. Typical values:
+                              - ".metadata.name" (the default) for a K8s object.
+                              - "." when the items are bare name strings (the namespaces-stage
+                                post-filter shape — the projected item IS the name).
+
+                            Optional with a default of ".metadata.name": when the field is
+                            ABSENT the refilter evaluates ".metadata.name" against each object.
+                            Without the derived name the EvaluateRBAC call carries an empty
+                            Name, and a resourceNames-scoped grant (which requires the request
+                            name to appear in rule.resourceNames) matches NOTHING — every named
+                            object is silently dropped (issue #123: under-serve / fail-closed).
+                            The default only fires when the field is omitted; an explicit "."
+                            still overrides it verbatim.
+
+                            Note: NameFrom has NO effect on collection verbs
+                            (list/watch/create/deletecollection): the RBAC evaluator scopes
+                            resourceNames to name-specific verbs only, so a plain list grant is
+                            evaluated identically whether or not a Name is threaded.
+                          type: string
                         namespaceFrom:
                           default: .metadata.namespace
                           description: |-
