@@ -555,18 +555,23 @@ func seedScopeYielding(ctx context.Context,
 
 	// #158 (design §1.4 + §1.5 engine path) — classify per-target seed
 	// failures instead of swallowing them. RBAC-deny → Info + rbac_deny
-	// counter (NO re-enqueue). Operational → Warn + operational counter +
-	// re-enqueue a fresh scopeKindBoot. The engine queue dedups on
-	// key()=="boot" (prewarm_engine.go:184-188,251-260) so N operational
-	// failures during one run coalesce to AT MOST ONE pending re-walk
-	// (design §3.1 storm bound); reEnqueued makes us enqueue at most once
-	// per seedScopeYielding invocation so enqueuedTotal stays honest. The
-	// re-walk re-runs seedScopeYielding, which yields to customers between
-	// every target — a target that failed on transient apiserver pressure
-	// is re-seeded after the pressure clears. The back-compat grand total
-	// pipBindingSetSeedFailuresTotal is bumped for parity with the legacy
-	// path (= rbac_deny + operational).
-	reEnqueued := false
+	// counter (NO re-enqueue). Operational → Warn + operational counter.
+	//
+	// #105 (design §5) — the RE-ENQUEUE DECISION MOVED OUT of this classifier
+	// to the END of the pass (finalizeBootReEnqueue). Instead of the old
+	// immediate `enqueueScope` on the first operational failure, an operational
+	// failure now RECORDS the failing target into this pass's failedSet
+	// (kind+"/"+label — the SAME identity the Warn logs, dedup'd across the
+	// per-cohort fan-out of one target). The tail then uses the set-delta
+	// (seededSet grew OR failedSet shrank) to bound the re-walk across passes:
+	// an UNBOUNDED per-pass re-enqueue of a DETERMINISTIC failure (a jq-eval
+	// error that fails identically every pass) starved the admin-cohort seed
+	// budget forever (the #105 marketplace-detail amplifier). Recording (not
+	// re-enqueueing) here is what lets the tail see "same failing set, no new
+	// seeded target → no progress → stop after bootMaxNoProgressPasses." The
+	// back-compat grand total pipBindingSetSeedFailuresTotal is bumped for
+	// parity (= rbac_deny + operational).
+	failedSet := map[string]struct{}{}
 	classifyEngineSeedErr := func(kind, label, target string, err error) {
 		pipBindingSetSeedFailuresTotal.Add(1)
 		if classifySeedErr(err) == seedFailRBACDeny {
@@ -580,20 +585,82 @@ func seedScopeYielding(ctx context.Context,
 			)
 			return
 		}
-		// Operational (incl. fail-loud default).
+		// Operational (incl. fail-loud default). Record the failing target into
+		// this pass's failedSet (kind+"/"+label — NOT cohort-scoped: a
+		// deterministic failure fails for every cohort, and the human-readable
+		// given_up_targets list wants one dedup'd entry per target, not N). The
+		// tail owns the re-enqueue (finalizeBootReEnqueue).
 		pipSeedOperationalFailTotal.Add(1)
+		failedSet[kind+"/"+label] = struct{}{}
 		slog.Warn("prewarm.engine.seed.operational_failure",
 			slog.String("subsystem", "cache"),
 			slog.String("kind", kind),
 			slog.String("target", target),
 			slog.String(kind, label),
 			slog.Any("err", err),
-			slog.String("effect", "operational seed failure (NOT an RBAC deny); a coalesced boot "+
-				"re-walk is enqueued (dedup on key()==\"boot\") to retry after pressure clears"),
+			slog.String("effect", "operational seed failure (NOT an RBAC deny); recorded into the boot "+
+				"failed-set — a coalesced boot re-walk is enqueued at the pass tail (dedup on key()==\"boot\") "+
+				"UNLESS the #105 set-delta bound has tripped (deterministic failer, no forward progress)"),
 		)
-		if !reEnqueued {
-			reEnqueued = true
-			prewarmEngineSingleton().enqueueScope(prewarmScope{kind: scopeKindBoot})
+	}
+
+	// finalizeBootReEnqueue is the #105 pass-tail re-enqueue decision. Called at
+	// each CLEAN (nil-return) completion of the boot / gvr-discovered / keepwarm
+	// seed loop — NEVER on a ctx-cut abort (that returns ctx.Err() → the F.4
+	// AddRateLimited resume, untouched — and the classifier never fires on a
+	// ctx-error target either, so failedSet holds only genuine operational
+	// failures). It coalesces N operational failures in one pass to AT MOST ONE
+	// boot enqueue (dedup on key()=="boot"), exactly as the old per-pass
+	// reEnqueued latch did — but the re-enqueue is now GATED by the cross-pass
+	// convergence bound when a boot-convergence state is installed:
+	//
+	//   - state != nil (BOOT scope): evaluateBootProgress applies the set-delta
+	//     bound. Re-enqueue while consecutiveNoProgressPasses < bootMaxNoProgressPasses;
+	//     once the bound trips, DO NOT re-enqueue and emit
+	//     prewarm.engine.boot.converged_with_skips (the terminal pass already ran
+	//     to completion; the caller returns nil → boot.complete→Forget, C-105-5).
+	//   - state == nil (gvr-discovered / keepwarm / cache-off / the pure-unit
+	//     seed tests): LEGACY behavior — re-enqueue a boot scope iff ≥1
+	//     operational failure this pass. Byte-identical to the pre-#105
+	//     per-pass latch for every non-boot path.
+	//
+	// The re-enqueue targets the engine that OWNS this scope: in production the
+	// process singleton (state.engine == prewarmEngineSingleton() when installed
+	// by processScope; the singleton directly off the boot path); under a
+	// falsifier's real local worker, that test engine (so N real re-invocations
+	// can be driven and the bound observed to STOP).
+	finalizeBootReEnqueue := func(ctx context.Context) {
+		st := bootConvergenceStateFromContext(ctx)
+		if st == nil {
+			// Legacy: re-enqueue once iff any operational failure this pass. Same
+			// storm-bound as before (queue dedups on key()=="boot").
+			if len(failedSet) > 0 {
+				prewarmEngineSingleton().enqueueScope(prewarmScope{kind: scopeKindBoot})
+			}
+			return
+		}
+		reEnqueue, givenUp, passes := st.evaluateBootProgress(failedSet)
+		st.reEnqueuedLastPass = reEnqueue // processScope reads this to gate teardown
+		if reEnqueue {
+			st.engine.enqueueScope(prewarmScope{kind: scopeKindBoot})
+			return
+		}
+		if len(givenUp) > 0 {
+			// The set-delta bound tripped: boot converges WITH these items given
+			// up. WARN so the operator still sees the deterministic failer (the
+			// per-target operational_failure Warn also fired every pass) — this
+			// stops the re-walk AMPLIFICATION, not the visibility (design §5 reco).
+			log.Warn("prewarm.engine.boot.converged_with_skips",
+				slog.String("subsystem", "cache"),
+				slog.Any("given_up_targets", givenUp),
+				slog.Int("passes", passes),
+				slog.String("effect", "#105 bound: after bootMaxNoProgressPasses consecutive re-walks with no "+
+					"forward set-progress (seeded-set did not grow AND failed-set did not shrink), the boot scope "+
+					"stops re-enqueueing itself. These targets are given up (a deterministic seed failure — e.g. a "+
+					"portal-RA jq error — that would fail identically forever); the terminal pass runs to "+
+					"boot.complete so the admin-cohort seed the loop was resetting finally lands. Given-up cells "+
+					"stay cold and fall back to per-user resolve at /call."),
+			)
 		}
 	}
 
@@ -1005,6 +1072,10 @@ func seedScopeYielding(ctx context.Context,
 					"young/churny cells (age_skips); one line per swept cohort per cycle (probe b)"),
 			)
 		}
+		// #105: keepwarm carries no boot-convergence state → LEGACY re-enqueue
+		// (re-enqueue a boot scope iff ≥1 operational failure this sweep). Byte-
+		// identical to the pre-#105 per-pass reEnqueued latch for keepwarm.
+		finalizeBootReEnqueue(ctx)
 		return nil
 	}
 
@@ -1113,6 +1184,13 @@ func seedScopeYielding(ctx context.Context,
 			}
 		}
 	}
+	// #105: the pass reached its CLEAN tail (no ctx-cut abort). Decide the
+	// re-enqueue via the set-delta bound (boot scope) or the legacy per-pass
+	// latch (gvr-discovered / cache-off / pure-unit tests). NIL return through
+	// the existing boot.complete→Forget path either way (C-105-5) — never an
+	// early-error-return that would divert to the scope_incomplete/AddRateLimited
+	// door and re-open the loop.
+	finalizeBootReEnqueue(ctx)
 	return nil
 }
 

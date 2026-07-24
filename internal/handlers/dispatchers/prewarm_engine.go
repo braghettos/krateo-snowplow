@@ -309,6 +309,16 @@ type prewarmEngine struct {
 	declinedExtMu   sync.Mutex
 	declinedExtSets map[string]*cache.SeedDeclinedExternalSet
 
+	// #105 — the boot-convergence bookkeeping, ENGINE-LIVED per boot-scope-key
+	// (same lifecycle discipline as declinedExtSets): created on the boot scope's
+	// first processScope, REUSED across its AddRateLimited requeues so the
+	// cross-pass set-delta (seeded-set grew / failed-set shrank) accumulates
+	// across resume passes, and TORN DOWN on genuine boot completion (err==nil →
+	// Forget) + config-vars redrive so a new nav topology re-arms with fresh
+	// empty sets. Keyed by s.key() ("boot"). Guarded by bootConvMu.
+	bootConvMu   sync.Mutex
+	bootConvSets map[string]*bootConvergenceState
+
 	// customer-priority yield knobs.
 	yieldPoll time.Duration // how long a worker parks while a customer call is in flight
 
@@ -414,6 +424,42 @@ func (e *prewarmEngine) clearDeclinedExternalSet(key, reason string) {
 			)
 		}
 	}
+}
+
+// bootConvergenceStateForKey returns the engine-lived #105 boot-convergence
+// state for scope key, creating it on first use. REUSED across the scope's
+// AddRateLimited requeues (so a resume pass's set-delta compares against the
+// cumulative prior* the earlier passes populated — the whole point of the
+// cross-pass bound). Concurrency-safe. Only the boot scope calls this (the only
+// scope whose seedScopeYielding consults a convergence state); other scope
+// kinds never install one, so the tail re-enqueue falls back to the legacy
+// per-pass latch off the boot path.
+func (e *prewarmEngine) bootConvergenceStateForKey(key string) *bootConvergenceState {
+	e.bootConvMu.Lock()
+	defer e.bootConvMu.Unlock()
+	if e.bootConvSets == nil {
+		e.bootConvSets = make(map[string]*bootConvergenceState)
+	}
+	st, ok := e.bootConvSets[key]
+	if !ok {
+		st = newBootConvergenceState(e)
+		e.bootConvSets[key] = st
+	}
+	return st
+}
+
+// clearBootConvergenceState TEARS DOWN (deletes) the engine-lived #105
+// convergence state for scope key so the NEXT time that key is processed it
+// starts from fresh empty sets (a new nav topology gets a genuine fresh attempt,
+// and the map cannot accumulate one entry per scope-key forever). Called on a
+// scope's GENUINE completion (err==nil → Forget) AND on a config-vars redrive —
+// the SAME teardown points as clearDeclinedExternalSet, so the two engine-lived
+// boot-scope states share one lifecycle. NOT called on an AddRateLimited requeue
+// (the resume must REUSE the state). Concurrency-safe; no-op if absent.
+func (e *prewarmEngine) clearBootConvergenceState(key string) {
+	e.bootConvMu.Lock()
+	defer e.bootConvMu.Unlock()
+	delete(e.bootConvSets, key)
 }
 
 // StartPrewarmEngine starts the engine worker(s) bound to the given scope
@@ -590,6 +636,10 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// the straddle falsifier can shrink the budget without a live cluster;
 	// production ALWAYS uses prewarmScopeTimeout (8m, unchanged).
 	scopeCtx, scopeCancel := context.WithTimeout(ctx, prewarmScopeTimeoutFn(s))
+	// #105 — the boot-convergence state handle (nil off the boot path), captured
+	// here so the err==nil teardown branch can read reEnqueuedLastPass and clear
+	// only on a GENUINE completion (see below).
+	var bootConv *bootConvergenceState
 	// #132 F4b Lever A — install the ENGINE-LIVED declined-external marker set for
 	// the boot scope onto scopeCtx. It is created once (first processScope for
 	// this key) and REUSED across the scope's AddRateLimited requeues, so a boot
@@ -601,6 +651,17 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 	// Disabled() (WithSeedDeclinedExternalSet returns ctx unchanged).
 	if s.kind == scopeKindBoot {
 		scopeCtx = cache.WithSeedDeclinedExternalSet(scopeCtx, e.declinedExternalSetFor(s.key()))
+		// #105 — install the ENGINE-LIVED boot-convergence state for the boot scope
+		// onto scopeCtx. Its BootSeededSet is reachable at the two seed success
+		// sites (Mark) via cache.WithBootSeededSet; the whole state is reachable at
+		// the seedScopeYielding tail (the set-delta re-enqueue decision) via
+		// withBootConvergenceState. Created once (first processScope for this key),
+		// REUSED across the scope's AddRateLimited requeues so the cross-pass
+		// set-delta accumulates. Boot scope ONLY. Inert under Disabled()
+		// (WithBootSeededSet returns ctx unchanged).
+		bootConv = e.bootConvergenceStateForKey(s.key())
+		scopeCtx = cache.WithBootSeededSet(scopeCtx, bootConv.seeded)
+		scopeCtx = withBootConvergenceState(scopeCtx, bootConv)
 	}
 	err := e.scopeHandler(scopeCtx, s)
 	scopeCancel()
@@ -642,6 +703,21 @@ func (e *prewarmEngine) processScope(ctx context.Context, s prewarmScope) {
 		// clear — the resume must reuse the set to skip the already-declined
 		// whales. Keyed by s.key() (boot scope only populates a set).
 		e.clearDeclinedExternalSet(s.key(), "boot-complete")
+		// #105 — drop the engine-lived boot-convergence state ONLY on a GENUINE
+		// completion: err==nil (this branch) AND the tail did NOT re-enqueue this
+		// pass (a clean pass with no operational failures, or the bound
+		// tripped/converged). The #105 re-enqueue is a NIL-return + plain Add (not
+		// an err!=nil AddRateLimited), so a bare err==nil clear (as the
+		// declined-external set uses) would wipe the cross-pass set-delta state on
+		// EVERY re-walk pass and the bound could never accumulate. When the tail
+		// DID re-enqueue (reEnqueuedLastPass), the boot is NOT done — keep the
+		// state so the next pass's set-delta compares against the accumulated
+		// prior*. On a fresh-boot/config-vars redrive the state is torn down via
+		// clearBootConvergenceState at those explicit teardown points. Boot scope
+		// only (bootConv nil otherwise).
+		if bootConv != nil && !bootConv.reEnqueuedLastPass {
+			e.clearBootConvergenceState(s.key())
+		}
 	}
 
 	if e.scopeDone != nil {
