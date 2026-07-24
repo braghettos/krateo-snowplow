@@ -1043,6 +1043,7 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		return nil
 	}
 
+	// scope-waiver:TTLOverride: seedOneWidget — widgets-class boot seed; UAF is a restactions-STAGE contract, so a widget's apiRef-resolved UAF RA warms the restactions cell via seedOneRestaction (capped), never this widgets cell (uaf_shortttl.go R-d-4 SITE MAP).
 	handle.Put(key, &cache.ResolvedEntry{
 		RawJSON:      encoded,
 		Inputs:       inputs,

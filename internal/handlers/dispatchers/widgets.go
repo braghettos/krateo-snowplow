@@ -430,6 +430,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, keyExtras)
+		// scope-waiver:TTLOverride: widgets-class cell — UAF refilter output only ever lands in a restactions-class cell (a widget's apiRef resolves the UAF RA via the seedOneRestaction/dispatch path, which IS capped); a widgets Put is never the UAF-stale cell (uaf_shortttl.go R-d-4 SITE MAP).
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,
