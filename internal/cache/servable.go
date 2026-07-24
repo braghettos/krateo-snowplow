@@ -29,6 +29,8 @@ package cache
 import (
 	"context"
 	"log/slog"
+	"os"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -549,6 +551,158 @@ func groupVersionString(gvr schema.GroupVersionResource) string {
 		return gvr.Version
 	}
 	return gvr.Group + "/" + gvr.Version
+}
+
+// --- #119 unserved-GROUP pre-check ----------------------------------------
+//
+// Reclassified #119 residual: an informer registered for an API GROUP the
+// apiserver does NOT serve (a dead/typo'd apiGroup in an RBAC/RESTAction ref,
+// or a group left over from an uninstalled operator) has a HasSynced that
+// never flips → conjunct 2 never true → never servable → every dispatch falls
+// through to a live apiserver 404, and the reflector's ListAndWatch churns 404
+// forever (boot latency + perpetual watch-404 churn). The pre-check skips
+// spawning that informer.
+//
+// GROUP granularity, NOT resource granularity (architect adjudication,
+// docs/followup-119): a resource-level "not served right now" skip would
+// regress the S4/stale-delete post-startup-CRD design (#50/#116), which
+// DELIBERATELY registers a GVR whose RESOURCE type the apiserver does not yet
+// serve and relies on the ~30s confirm-ticker (RefreshDiscovery) to heal it
+// once the CRD lands. A dead group and a mid-install post-startup CRD are
+// indistinguishable at a single RESOURCE-level snapshot — but a dead group is
+// entirely ABSENT from ServerGroups(), whereas a Krateo post-startup CRD lands
+// under a group that is ALREADY served (its siblings are served). So the
+// unserved-GROUP boundary skips the churniest real case while leaving the
+// register-then-confirm heal path intact for resource/version-level pending
+// CRDs. The skip is NON-TERMINAL: a brand-new group's first CRD (group briefly
+// absent from ServerGroups at first-touch) is recovered by the next dispatch's
+// EnsureResourceType re-touch, which re-checks fresh discovery and registers
+// once the group appears.
+
+// envSkipUnservedGroupInformers gates the pre-check. Default ON — flips both
+// ways (SkipUnservedGroupInformers).
+const envSkipUnservedGroupInformers = "SKIP_UNSERVED_GROUP_INFORMERS"
+
+// SkipUnservedGroupInformers reports whether the #119 unserved-group pre-check
+// is active. Default ON; set SKIP_UNSERVED_GROUP_INFORMERS to false/0/no to
+// restore the pre-#119 register-unconditionally behaviour. Read fresh per
+// registration (cheap os.Getenv) so a deployer can flip it at pod start,
+// matching the RefreshSSEEnabled string-toggle idiom.
+func SkipUnservedGroupInformers() bool {
+	switch os.Getenv(envSkipUnservedGroupInformers) {
+	case "false", "0", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+// serverGroupsLister is the NARROW discovery surface the group-absent pre-check
+// needs. It is a SEPARATE interface from ResourceTypeDiscovery (which the
+// confirm path uses) so the pre-check does NOT widen that shared interface —
+// every existing ResourceTypeDiscovery double keeps compiling untouched, and a
+// disco that does not implement ServerGroups simply fails the type assertion in
+// groupAuthoritativelyAbsent → the pre-check fails safe open (registers). The
+// production raw *discovery.DiscoveryClient (main.go) satisfies it directly.
+type serverGroupsLister interface {
+	ServerGroups() (*metav1.APIGroupList, error)
+}
+
+// servedGroupsMemoTTL bounds the freshness of the cached served-group set the
+// pre-check consults. A newly-installed group is skipped for at most this
+// window before the memo re-reads and admits it (then the dispatch re-touch
+// registers it). Mirrors the confirm-ticker cadence so the skip window matches
+// the heal window.
+const servedGroupsMemoTTL = discoveryRefreshInterval
+
+// servedGroupsMemo caches the set of group names ServerGroups() reported, with
+// a short TTL. The pre-check reads the RAW disco (never the memcache-cached
+// client — that client's event-driven global Invalidate can leave it
+// stale-ABSENT on an un-served→served transition, which for a SKIP decision is
+// a PERMANENT false-skip = data dropped forever; the confirm path tolerates
+// staleness because it only falls through to apiserver, but a skip does not).
+// This in-process memo bounds the raw round-trip cost to ~one ServerGroups per
+// TTL window across all registration misses, WITHOUT the cached client's unsafe
+// staleness semantics.
+var (
+	servedGroupsMu        sync.Mutex
+	servedGroupsSet       map[string]struct{}
+	servedGroupsFetchedAt time.Time
+)
+
+// ResetServedGroupsMemoForTest clears the served-group memo so each test reads
+// its freshly-installed discovery double. TEST-ONLY. Mirrors the exported
+// Reset*ForTest convention (ResetNavigationDiscoveredGroupsForTest et al.).
+func ResetServedGroupsMemoForTest() {
+	servedGroupsMu.Lock()
+	servedGroupsSet = nil
+	servedGroupsFetchedAt = time.Time{}
+	servedGroupsMu.Unlock()
+}
+
+// groupAuthoritativelyAbsent is the #119 pre-check's THREE-STATE predicate. It
+// returns true ONLY when a SUCCESSFUL ServerGroups() response definitively
+// lacks gvr's GROUP — the authoritative "this group is not served" signal.
+// Every form of UNCERTAINTY fails SAFE OPEN (returns false → register):
+//
+//   - the core group ("")                        → never skip (always served)
+//   - disco does not implement ServerGroups       → NOT authoritative (register)
+//   - ServerGroups() errors                        → NOT authoritative (register)
+//   - it returns a nil list                        → NOT authoritative (register)
+//   - group PRESENT in the served set              → served (register)
+//   - group ABSENT from a successful served set    → AUTHORITATIVE absent (SKIP)
+//
+// A false-skip of a genuinely-served-but-slow-to-discover group would silently
+// drop real data forever (strictly worse than churn), so uncertainty NEVER
+// skips. The served-group set is memoised with a short TTL (servedGroupsMemoTTL)
+// off the RAW disco — see servedGroupsMemo.
+func groupAuthoritativelyAbsent(disco ResourceTypeDiscovery, group string) bool {
+	if group == "" {
+		return false // core group is always served — never skip
+	}
+	lister, ok := disco.(serverGroupsLister)
+	if !ok || lister == nil {
+		return false // no ServerGroups surface — fail-safe open (register)
+	}
+	set, ok := servedGroupsSnapshot(lister)
+	if !ok {
+		return false // discovery unavailable/errored — fail-safe open (register)
+	}
+	_, present := set[group]
+	return !present // absent from a SUCCESSFUL served set → authoritative absent
+}
+
+// servedGroupsSnapshot returns the memoised served-group name set, refreshing it
+// from lister.ServerGroups() when the memo is empty or older than
+// servedGroupsMemoTTL. Returns (set, true) on success; (nil, false) when the
+// (refresh) ServerGroups() call errors or returns nil AND no prior good snapshot
+// exists — the fail-safe-open signal. A refresh error with a prior good snapshot
+// keeps serving the prior snapshot (bounded staleness beats a false-skip storm).
+func servedGroupsSnapshot(lister serverGroupsLister) (map[string]struct{}, bool) {
+	servedGroupsMu.Lock()
+	defer servedGroupsMu.Unlock()
+
+	if servedGroupsSet != nil && time.Since(servedGroupsFetchedAt) < servedGroupsMemoTTL {
+		return servedGroupsSet, true
+	}
+
+	groups, err := lister.ServerGroups()
+	if err != nil || groups == nil {
+		if servedGroupsSet != nil {
+			// Transient refresh failure — keep the prior good snapshot rather
+			// than fail-open every GVR (which would DEFEAT the pre-check for
+			// the whole window). Bounded staleness, never a false-skip.
+			return servedGroupsSet, true
+		}
+		return nil, false // no signal at all — fail-safe open
+	}
+	set := make(map[string]struct{}, len(groups.Groups))
+	for _, g := range groups.Groups {
+		set[g.Name] = struct{}{}
+	}
+	servedGroupsSet = set
+	servedGroupsFetchedAt = time.Now()
+	return set, true
 }
 
 // StartDiscoveryRefresher launches the conjunct-4 discovery-refresh

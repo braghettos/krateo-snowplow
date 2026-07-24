@@ -636,7 +636,58 @@ func (rw *ResourceWatcher) EnsureResourceType(gvr schema.GroupVersionResource) (
 		close(closed)
 		return false, closed
 	}
+	disco := rw.disco
 	rw.mu.RUnlock()
+
+	// #119 unserved-GROUP pre-check. A miss is confirmed — this call would
+	// register + spawn an informer for gvr. Before it does, consult discovery:
+	// if the apiserver AUTHORITATIVELY does not serve gvr's GROUP at all (a
+	// dead/typo'd apiGroup, or a group from an uninstalled operator), DO NOT
+	// register it. Such an informer's HasSynced never flips → conjunct 2 never
+	// true → never servable → every dispatch falls through to a live apiserver
+	// 404, and the reflector's ListAndWatch churns 404 forever (the #119
+	// boot-latency + perpetual-refresher-404 residual). This is the ONLY
+	// spawn-site funnel (all path-derived callers — resolve.go:1788,
+	// informer_dispatch.go:359, apistage.go:585, objects/get.go:113,
+	// deps_extract.go:156 — route here), so gating once here needs no
+	// per-caller special-case (feedback_no_special_cases).
+	//
+	// GROUP granularity, NOT resource granularity — this is the architect-ruled
+	// boundary that keeps the S4/stale-delete post-startup-CRD heal path
+	// intact. A post-startup CRD lands under a group that is ALREADY served, so
+	// groupAuthoritativelyAbsent is false for it → it registers and the
+	// confirm-ticker heals it once its resource type appears. Only a group
+	// entirely absent from ServerGroups() is skipped. See
+	// groupAuthoritativelyAbsent (servable.go).
+	//
+	// FAIL-SAFE OPEN ON UNCERTAINTY (the crux): groupAuthoritativelyAbsent is
+	// THREE-STATE — it returns true ONLY on a SUCCESSFUL ServerGroups() response
+	// that definitively lacks the group. disco==nil / no ServerGroups surface /
+	// a ServerGroups error / a nil list ALL register (never skip); the core
+	// group ("") never skips. A false-skip of a genuinely-served group would
+	// silently drop real data forever — strictly worse than the churn — so
+	// uncertainty NEVER skips.
+	//
+	// NON-TERMINAL: the skip does not register anything, so a brand-new group's
+	// first CRD (group briefly absent at first-touch) is recovered by the next
+	// dispatch's EnsureResourceType re-touch against fresh discovery. The
+	// dispatch still serves live via httpcall.Do apiserver fall-through
+	// meanwhile, exactly as an unregistered GVR does today.
+	//
+	// Gated by SkipUnservedGroupInformers() (default ON, flips both ways);
+	// flag-off restores register-unconditionally.
+	if SkipUnservedGroupInformers() && groupAuthoritativelyAbsent(disco, gvr.Group) {
+		closed := make(chan struct{})
+		close(closed)
+		slog.Info("cache.lazy_register.skipped_unserved_group",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("group", gvr.Group),
+			slog.String("reason", "apiserver ServerGroups() authoritatively does not serve this group"),
+			slog.String("effect", "informer NOT registered — no perpetual watch-404 churn; dispatch falls through to live apiserver; re-touch recovers if the group is later served"),
+		)
+		return false, closed
+	}
 
 	// Miss confirmed under RLock — upgrade to writer Lock. The
 	// addResourceType*Locked helpers re-check the informers map (line
