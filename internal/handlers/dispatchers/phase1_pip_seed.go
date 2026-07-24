@@ -540,6 +540,14 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 		// false). C-F4B-1/-2/-3.
 		if cache.SeedDeclinedExternalSetFromContext(ctx).Marked(key) {
 			pipSeedFreshSkipTotal.Add(1)
+			// #105 seeded-set: a declined-external key is intentionally cold (no Put)
+			// but was RESOLVED-and-reached this boot — for the boot-convergence signal
+			// it is NOT re-attemptable progress, and it is NOT a failing target either.
+			// Do NOT Mark it into the seededSet (it never warmed a servable cell), and
+			// it is not in the failedSet (it declined, not errored). It is simply inert
+			// for the progress signal — leaving it out of both sets keeps the delta
+			// honest (declined externals neither grow the seeded set nor block
+			// convergence).
 			slog.Default().Debug("phase1.seed.skip.declined_external",
 				slog.String("subsystem", "cache"),
 				slog.String("class", class),
@@ -556,6 +564,14 @@ func seedSkipDecision(ctx context.Context, mode seedScopeMode, handle cacheHandl
 			return false
 		}
 		pipSeedFreshSkipTotal.Add(1)
+		// #105 seeded-set: a fresh-skip means "this (target,cohort) cell IS warm this
+		// boot" (a live cell under the production key). It belongs in the seeded SET
+		// even though it did no Put this pass — the union "Put ∪ fresh-skip" = "warm
+		// targets reached this boot" is the set whose GROWTH is the forward-progress
+		// signal (design §5.0/§As-built). Marking here is what makes a stable
+		// re-walk (every healthy cohort fresh-skipped) read as "no growth" without
+		// false-negativing on the TTL re-Put oscillation a count would suffer.
+		cache.BootSeededSetFromContext(ctx).Mark(key)
 		slog.Default().Debug("phase1.seed.fresh_skip",
 			slog.String("subsystem", "cache"),
 			slog.String("class", class),
@@ -847,6 +863,13 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// didn't run"). Wired here + at seedOneWidget's success Put so the counter
 	// again means "seed units resolved+Put".
 	pipBindingSetSeedResolvesTotal.Add(1)
+	// #105 seeded-set: a genuine Put is the primary "warm target reached this
+	// boot" event — record it (same site as the resolves counter, §As-built).
+	// Keyed on the full per-cohort `key`, so a genuinely-new cohort reaching this
+	// target GROWS the seeded SET (forward progress); a TTL re-Put of an
+	// already-member key is a no-op Mark (no growth) so it correctly reads as "no
+	// net progress." nil-set-safe off the boot path.
+	cache.BootSeededSetFromContext(ctx).Mark(key)
 
 	// Record the self-dep + ensure the informer for the RESTAction GVR
 	// is wired (AC-PIP.5 — without this the refresher never wakes for
@@ -1053,6 +1076,9 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// a seed UNIT resolved+written; wired so snowplow_phase1_bindingset_seed_resolves_total
 	// again means "seed units resolved+Put" (was dead-at-0 post-fold).
 	pipBindingSetSeedResolvesTotal.Add(1)
+	// #105 seeded-set — mirror of seedOneRestaction: record this genuine widget
+	// Put into the boot-convergence seeded SET (keyed on the full per-cohort key).
+	cache.BootSeededSetFromContext(ctx).Mark(key)
 
 	// Record widget deps — self + apiRef + render-eligible
 	// resourcesRefs. Matches widgets.go:230. recordWidgetDeps ensures
