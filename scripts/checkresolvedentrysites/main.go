@@ -117,6 +117,7 @@ func main() {
 	var scanned, entrySites, bootScopeStamps int
 
 	for _, root := range os.Args[1:] {
+		// #nosec G304,G703 -- dev-time AST lint tool; the walked path is a filepath.WalkDir result under the CLI-arg target dir (checker's own source tree), not untrusted/network input. gosec's SSA taint analyzer flags the path→parser.ParseFile flow; the `#nosec` (not `//nosec`) form is the one gosec master honors.
 		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -206,7 +207,7 @@ func main() {
 //   - the count of ResolvedEntry Put sites seen;
 //   - the count of WithFallthroughScope(..., ScopeBootPrewarm*) stamp sites.
 func checkFile(fset *token.FileSet, path string) ([]entryFinding, int, int, error) {
-	src, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+	src, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution) //nosec G304,G703 -- dev-time AST lint tool; path is a filepath.WalkDir result under the CLI-arg target dir, not untrusted input
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("parse %s: %w", path, err)
 	}
