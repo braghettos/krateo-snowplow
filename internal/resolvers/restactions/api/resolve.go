@@ -1104,7 +1104,18 @@ func (r *resolveRun) dispatchOneCall(sc *stageCtx, i int) error {
 	// external data is re-fetched LIVE every /call and never persisted under a
 	// TTL it has no dep edge to invalidate.
 	cache.ExternalTouchedSinkFromContext(gctx).Bump()
-	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(gctx, call)
+	// Boot-readiness external-fetch wall-clock bound (external_seed_bound.go).
+	// The Bump() STAYS before the wrap so a timed-out fetch still records the
+	// external touch → the L1 Put is still declined → uniform with the
+	// refresher. On a boot readiness-critical scope (seed / discovery walk /
+	// content-prewarm pass) fctx carries a per-fetch deadline that truncates
+	// the WHOLE retry envelope (util.RetryClient honors req.Context() at every
+	// retry/backoff boundary); on /call + refresher scopes it is the parent
+	// gctx + a no-op cancel, so the fetch is byte-identical to the pre-fix
+	// path.
+	fctx, fcancel := externalSeedFetchCtx(gctx)
+	defer fcancel()
+	res, jsonBytes, _, fetchErr := httpFetchAllowingNonJSON(fctx, call)
 	if fetchErr != nil {
 		// A non-nil go error mirrors httpcall.Do's response.New(500, err)
 		// transport/build faults. res already carries the same 500 Failure
