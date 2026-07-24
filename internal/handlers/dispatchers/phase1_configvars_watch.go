@@ -190,6 +190,14 @@ func enqueueBootReDrive(reason string) {
 	// here (it AddRateLimited's inside processScope and keeps the set) — only a
 	// genuine config change clears.
 	prewarmEngineSingleton().clearDeclinedExternalSet(bootScope.key(), "config-vars-redrive")
+	// #105 — a config-vars redrive is a NEW TOPOLOGY: also clear the engine-lived
+	// boot-convergence state so the redrive re-arms with empty seeded/failed sets
+	// and a zeroed no-progress counter. A target given up under the OLD topology
+	// (converged-with-skips) gets a genuine fresh attempt under the new nav set,
+	// and the set-delta is computed against the new topology's first pass rather
+	// than a stale prior. A plain F.4 deadline-cut requeue does NOT come through
+	// here (it keeps the state) — only a genuine config change clears.
+	prewarmEngineSingleton().clearBootConvergenceState(bootScope.key())
 	prewarmEngineSingleton().enqueueScope(bootScope)
 	slog.Info("prewarm.configvars.boot_redrive_enqueued",
 		slog.String("subsystem", "cache"),
