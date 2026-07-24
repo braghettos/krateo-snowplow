@@ -235,6 +235,33 @@ func withContentPrewarmSAContext(ctx context.Context, saEP endpoints.Endpoint, s
 	// CACHE_ENABLED=false → WithServeWatcher returns ctx unchanged → the live LIST
 	// runs as today).
 	rctx = cache.WithServeWatcher(rctx, cache.Global())
+	// Boot-readiness external-fetch wall-clock bound (external_seed_bound.go /
+	// resolve.go:1106) — stamp the SAME boot-prewarm-walk scope the discovery
+	// walk carries (withPhase1SAContext, phase1_walk.go:1084). The content pass
+	// resolves the obs-* apiRef data sources (external ClickHouse widgets)
+	// SERIALLY BEFORE MarkPhase1Done, so without a scope marker the
+	// external-fetch bound would no-op on this vector and it could overrun the
+	// 480s readiness budget alone. Reusing the walk scope (rather than a new
+	// constant) is behavior-neutral for the content pass: the ONLY behavioral
+	// consumer of ScopeBootPrewarmWalk is apiref.shouldServeRAFullList
+	// (widgets/apiref/resolve.go:89), which reads the scope ONLY on a PAGINATED
+	// resolve (perPage>0 && page>0). The content pass resolves at PerPage:-1/
+	// Page:-1 (prewarmOneRESTAction, :394), and that -1/-1 pagination propagates
+	// VERBATIM down the nested-widget path it CAN reach shouldServeRAFullList
+	// through (restactions.Resolve → maybeResolveInProcess resolve_inprocess.go:174
+	// → ResolveNestedCall nested_call.go:251 → widgets.Resolve widgets/resolve.go:253
+	// → apiref.Resolve), so every resolve arrives as shouldServeRAFullList(ctx,-1,-1)
+	// → IsPaginatedResolve(-1,-1)==false → short-circuits at the FIRST conjunct
+	// BEFORE the scope is ever read. The walk-scope stamp therefore cannot alter
+	// any content-pass behavior other than engaging the external-fetch bound it
+	// is added for. (One benign non-behavioral side effect: the content pass now
+	// records apiserver-fallthrough metrics under the boot-prewarm-walk label —
+	// RecordApiserverFallthrough is "NO BEHAVIOUR CHANGE", a metrics-attribution
+	// shift onto a label the discovery walk already emits.) Structural (an
+	// existing scope constant, no host/name literal — feedback_no_special_cases).
+	// nil-safe / inert under cache-off (WithFallthroughScope returns rctx
+	// unchanged when Disabled()).
+	rctx = cache.WithFallthroughScope(rctx, cache.ScopeBootPrewarmWalk)
 	return rctx
 }
 
