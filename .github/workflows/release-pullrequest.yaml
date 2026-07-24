@@ -43,6 +43,13 @@ jobs:
       # the long coverage run so it fails fast.
       - name: ResolveOptions rc/SArc construction-site gate
         run: bash scripts/check_resolveoptions_rc.sh
+      # L-SCOPE-COMPLETENESS gate (#118d-class enumeration incompleteness): fail
+      # the PR if any ResolvedEntry Put site neither stamps the per-entry
+      # TTLOverride nor carries a //scope-waiver:TTLOverride: annotation, or if a
+      # readiness-critical boot-prewarm scope stamp was dropped. Cheap AST check,
+      # runs before the long coverage run so it fails fast.
+      - name: ResolvedEntry Put-site scope-completeness gate
+        run: bash scripts/check_resolved_entry_put_sites.sh
       - name: Run coverage
         run: go test -race -tags=unit,integration -p 1 -coverprofile=coverage.txt -covermode=atomic ./...
       - name: Upload coverage to Codecov

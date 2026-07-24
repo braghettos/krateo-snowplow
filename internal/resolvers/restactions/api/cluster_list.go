@@ -414,6 +414,7 @@ func populateClusterListCellSync(
 		return false
 	}
 
+	// scope-waiver:TTLOverride: cluster-list identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
 	newEntry := &cache.ResolvedEntry{
 		RawJSON:         rawEnvelope,
 		Inputs:          ptrTo(contentKeyInputs(gvr, "", "")),

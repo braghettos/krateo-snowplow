@@ -300,6 +300,7 @@ func populateWidgetContentL1(
 		return
 	}
 
+	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope); it holds no per-user UAF refilter output, so an out-of-band RBAC change never makes IT stale (uaf_shortttl.go R-d-4 SITE MAP).
 	c.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,

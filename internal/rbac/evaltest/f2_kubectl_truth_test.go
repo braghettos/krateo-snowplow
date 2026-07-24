@@ -26,16 +26,25 @@
 //      directly).
 //   4. For each (subject, verb, gvr, ns) triple in the curated 405:
 //      run rbac.EvaluateRBAC AND kubectl auth can-i --as <subject>
-//      --context=gke_neon-481711_us-central1-a_cluster-1
+//      --context=<f2GKEContext>
 //   5. Assert verdicts agree.
+//
+// TARGET CONTEXT (L-F2-REBIND, 2026-07-24)
+//
+//   The target kubectl context is read from SNOWPLOW_GATE_CLUSTER_CONTEXT
+//   (default the live west4-release context, f2DefaultClusterContext). The
+//   old hardcoded gke_neon-481711_us-central1-a_cluster-1 cluster was torn
+//   down 2026-06-14 — hardcoding it left this the only wire-truth RBAC gate
+//   code-bound to a DEAD cluster (it refused any other context and could
+//   never run). The env unbind re-activates it without a code edit.
 //
 // GUARDRAILS
 //
-//   - Every kubectl invocation includes --context=gke_neon-481711_us-central1-a_cluster-1
-//     explicitly (feedback_kubectl_verify_gke_context).
+//   - Every kubectl invocation includes --context=<f2GKEContext> explicitly
+//     (feedback_kubectl_verify_gke_context).
 //   - SNOWPLOW_GATE_USE_LIVE_CLUSTER=true env required to run.
-//   - kubectl current-context MUST start with "gke_neon-481711_" or
-//     the test refuses to probe.
+//   - kubectl current-context MUST EQUAL f2GKEContext (the resolved target)
+//     or the test refuses to probe.
 //   - Capture timestamp + snowplow + portal helm revs documented in
 //     test output so reproducibility audits have metadata.
 //   - Snapshot capture failure → explicit FAIL + diagnostic (never
@@ -75,7 +84,27 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
-const f2GKEContext = "gke_neon-481711_us-central1-a_cluster-1"
+// f2DefaultClusterContext is the fallback kubectl context when
+// SNOWPLOW_GATE_CLUSTER_CONTEXT is unset — the live west4-release deploy
+// target (memory reference_gke_cluster.md). The old hardcoded
+// gke_neon-481711_us-central1-a_cluster-1 cluster was torn down 2026-06-14,
+// which left this wire-truth RBAC gate code-bound to a DEAD cluster (the
+// L-F2-REBIND blind-spot). The context is now read from the environment so
+// the gate re-targets without a code edit.
+const f2DefaultClusterContext = "gke_operations-dev-krateo-io_europe-west4_krateo-installer-release"
+
+// f2ClusterContext returns the kubectl context every F2 kubectl/helm call
+// passes explicitly (--context=…), read from SNOWPLOW_GATE_CLUSTER_CONTEXT
+// (default f2DefaultClusterContext). It is a package-level var (not a const)
+// so the whole file's --context=+f2GKEContext call sites keep compiling
+// unchanged while the target becomes environment-driven; it is resolved once
+// at package init from the env.
+var f2GKEContext = func() string {
+	if c := os.Getenv("SNOWPLOW_GATE_CLUSTER_CONTEXT"); c != "" {
+		return c
+	}
+	return f2DefaultClusterContext
+}()
 
 // ──────────────────────────────────────────────────────────────────────
 // F2 — kubectl-truth equivalence
@@ -92,8 +121,10 @@ func TestF2_KubectlTruth_VerdictEquivalence(t *testing.T) {
 		t.Fatalf("F2: kubectl config current-context failed: %v", err)
 	}
 	ctxName := strings.TrimSpace(string(ctxOut))
-	if !strings.HasPrefix(ctxName, "gke_neon-481711_") {
-		t.Fatalf("F2 REFUSED: kubectl current-context=%q is NOT gke_neon-481711_* — per feedback_kubectl_verify_gke_context", ctxName)
+	if ctxName != f2GKEContext {
+		t.Fatalf("F2 REFUSED: kubectl current-context=%q != the gate target %q "+
+			"(set SNOWPLOW_GATE_CLUSTER_CONTEXT to re-target) — per feedback_kubectl_verify_gke_context",
+			ctxName, f2GKEContext)
 	}
 
 	// Capture cluster baseline metadata for reproducibility.

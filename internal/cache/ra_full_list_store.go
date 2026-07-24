@@ -60,6 +60,7 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 	}
 	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
 	in := inputs // copy onto the heap for the entry
+	// scope-waiver:TTLOverride: raFullList-class cell — the page-independent RA full-list substrate; UAF refilter output lands in the per-page restactions cell (capped), never here (uaf_shortttl.go R-d-4 SITE MAP). Pinned/TTL governed by the 4a resident-budget path.
 	c.Put(key, &ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &in,
@@ -81,6 +82,7 @@ func (c *ResolvedCacheStore) PutRAFullListPinned(key string, inputs ResolvedKeyI
 		return
 	}
 	in := inputs
+	// scope-waiver:TTLOverride: raFullList-class cell (explicit-pin path) — same class as PutRAFullList above; UAF refilter output lands in the per-page restactions cell (capped), never here (uaf_shortttl.go R-d-4 SITE MAP).
 	c.Put(key, &ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &in,
