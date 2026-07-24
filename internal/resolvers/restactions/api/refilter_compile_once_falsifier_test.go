@@ -80,15 +80,23 @@ func TestRefilter1b_CompileOncePerFilter_C3(t *testing.T) {
 		items = append(items, nsItem(deniedNS(i)))
 	}
 
-	// (a) DISCRIMINATING ARM — compile-count delta == 1 across all N items.
+	// (a) DISCRIMINATING ARM — compile-count delta == 2 across all N items.
+	// 2 hoisted per-filter compiles since #123 (ns + name); per-item recompile
+	// would be ~2*N. Both compileNamespaceFrom and compileNameFrom are hoisted
+	// ABOVE the item loop in refilterSlice, so the count is a FIXED 2
+	// independent of len(items) — the compile-once-per-filter property the
+	// #121-1b gate guards is intact. Keeping the EXACT-count assertion (== 2,
+	// not <=) means a real per-item-recompile regression still RED-fails at
+	// N=25 (delta would jump to ~2*25).
 	before := JQCompileCountForTest()
 	kept, dropped, calls := refilterSlice(ctx, discardLogger(),
 		"cyberjoker", []string{"devs"}, uaf, []string{"compositions"}, items)
 	delta := JQCompileCountForTest() - before
 
-	if delta != 1 {
-		t.Fatalf("CompileJQ delta = %d across %d items; want exactly 1 (compile-once-per-filter). "+
-			"delta==N would be the pre-1b per-item recompile RED.", delta, len(items))
+	if delta != 2 {
+		t.Fatalf("CompileJQ delta = %d across %d items; want exactly 2 (compile-once-per-filter, "+
+			"NamespaceFrom + NameFrom since #123, both hoisted). delta==~2*N would be the "+
+			"per-item recompile RED.", delta, len(items))
 	}
 
 	// (b) SECURITY-BOUNDARY ARM — the kept subset is EXACTLY the permitted set,
