@@ -18,5 +18,5 @@ keywords:
   - ai-agent
   - snowplow
 sources:
-  - https://github.com/braghettos/krateo-snowplow
+  - https://github.com/braghettos/krateo-snowplow/tree/APP_VERSION
   - https://github.com/braghettos/krateo-snowplow-chart/tree/SOURCE_REF
