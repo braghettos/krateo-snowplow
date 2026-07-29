@@ -35,7 +35,7 @@ keywords:
   - content-api
   - portal
 sources:
-  - https://github.com/braghettos/snowplow
+  - https://github.com/braghettos/krateo-snowplow/tree/APP_VERSION
 annotations:
   krateo.io/category: application
   krateo.io/maturity: stable
