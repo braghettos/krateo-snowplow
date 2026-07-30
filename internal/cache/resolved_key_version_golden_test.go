@@ -47,7 +47,8 @@ func goldenKeyInputs() ResolvedKeyInputs {
 // goldenKeyInputs() under resolvedKeyVersion "v6". Captured empirically from the
 // real implementation. A drift in the key encoding (or an unannounced version
 // bump) changes this and reds the test.
-const goldenResolvedKeyDigest = "8accc561ccc518aff43998d0f7959d0dacb2dcac728dbe988c4630e73f999031"
+// gitleaks:allow — this is a SHA-256 test golden (ComputeKey output), not a credential.
+const goldenResolvedKeyDigest = "8accc561ccc518aff43998d0f7959d0dacb2dcac728dbe988c4630e73f999031" //gitleaks:allow
 
 // TestResolvedKeyVersion_ConstantAnchor is L3 part 1: the version const is "v6".
 func TestResolvedKeyVersion_ConstantAnchor(t *testing.T) {
