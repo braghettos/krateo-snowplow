@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/kubeconfig"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	authv1 "k8s.io/api/authorization/v1"
@@ -59,6 +60,21 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 	return userCanViaSAR(ctx, opts)
 }
 
+// sarClientsetForEndpoint builds the per-user kubernetes clientset the
+// SAR baseline issues its SelfSubjectAccessReview against. It is a
+// package var (not an inline call) SOLELY so the hermetic evaltest can
+// inject a fake authorization clientset — production NEVER reassigns it,
+// so the default body is byte-for-byte the pre-seam path (build a
+// rest.Config from the user endpoint, then a real clientset). Adds zero
+// production surface: the indirection is a single func-var deref.
+var sarClientsetForEndpoint = func(ctx context.Context, ep endpoints.Endpoint) (kubernetes.Interface, error) {
+	rc, err := kubeconfig.NewClientConfig(ctx, ep)
+	if err != nil {
+		return nil, err
+	}
+	return kubernetes.NewForConfig(rc)
+}
+
 // userCanViaSAR is the upstream cache=off correctness baseline. It
 // MUST be reachable only when cache.Disabled() == true — any cache=on
 // call here is a Revision 1 binding violation (rollback trigger).
@@ -71,15 +87,9 @@ func userCanViaSAR(ctx context.Context, opts UserCanOptions) (ok bool) {
 		return false
 	}
 
-	rc, err := kubeconfig.NewClientConfig(ctx, ep)
+	clientset, err := sarClientsetForEndpoint(ctx, ep)
 	if err != nil {
-		log.Error("unable to create user client config", slog.Any("err", err))
-		return false
-	}
-
-	clientset, err := kubernetes.NewForConfig(rc)
-	if err != nil {
-		log.Error("unable to create kubernetes clientset", slog.Any("err", err))
+		log.Error("unable to create kubernetes clientset for SAR", slog.Any("err", err))
 		return false
 	}
 

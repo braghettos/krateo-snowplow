@@ -14,15 +14,18 @@ package handlers
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
@@ -389,5 +392,191 @@ func TestRefreshes_CacheOff_IdleStream(t *testing.T) {
 		// the window as benign (the stream did not emit a refresh).
 	case <-time.After(500 * time.Millisecond):
 		// No refresh frame within the window — correct (idle stream).
+	}
+}
+
+// --- M18 [SEC-adj] ----------------------------------------------------------
+
+// subParamRawURL builds the SAME coordinate array as subParam but encodes it
+// with base64.RawURLEncoding (unpadded, URL-safe alphabet) — the encoding a
+// browser EventSource URL naturally carries. It is distinct from the StdEncoding
+// form whenever the payload has padding or +// bytes.
+func subParamRawURL(t *testing.T) string {
+	t.Helper()
+	body := []map[string]any{{
+		"class":     "widgetContent",
+		"group":     "widgets.templates.krateo.io",
+		"version":   "v1beta1",
+		"resource":  "panels",
+		"namespace": "krateo-system",
+		"name":      "dashboard-piechart",
+		"perPage":   5,
+		"page":      1,
+	}}
+	raw, _ := json.Marshal(body)
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// TestRefreshes_RawURLEncodedSubReachesHandler is M18(a): a ?sub= encoded with
+// RawURLEncoding (the browser EventSource path) decodes via validateSubscription's
+// URL-safe fallback and reaches the handler → 200 + text/event-stream. Without
+// the RawURLEncoding fallback the browser payload would fail StdEncoding decode
+// and 400 — the exact regression the RED arm below reproduces.
+func TestRefreshes_RawURLEncodedSubReachesHandler(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	t.Setenv("REFRESH_SSE_ENABLED", "")
+	seedAuthTestWidget(t) // #64: the armed widget CR must be fetchable
+	base := refreshServer(t)
+
+	resp, cancel := openStream(t, base, "?sub="+subParamRawURL(t), func(req *http.Request) {
+		req.Header.Set("Authorization", "Bearer "+mintToken(t, "userA"))
+	})
+	defer cancel()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("M18(a) RawURLEncoding sub: status=%d want 200 (EventSource URL-safe base64 path)", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("M18(a): Content-Type=%q want text/event-stream", ct)
+	}
+}
+
+// TestRefreshes_RawURLEncoding_RED_StdOnlyRejectsBrowserPayload is the RED proof
+// for M18(a). It reproduces the plausible wrong impl — decode with StdEncoding
+// ONLY, no RawURLEncoding fallback — and asserts that the browser's RawURL
+// payload FAILS to decode under it. This is exactly the 400-on-browser-path
+// regression the fallback in validateSubscription prevents; the green test above
+// proves the real code does NOT regress.
+func TestRefreshes_RawURLEncoding_RED_StdOnlyRejectsBrowserPayload(t *testing.T) {
+	raw := subParamRawURL(t)
+	// Sanity: the RawURL form must actually differ from the Std form for this
+	// payload (else the arm is vacuous). The JSON has enough bytes that its
+	// base64 is padded → StdEncoding carries '=' that RawURLEncoding omits.
+	body := []map[string]any{{
+		"class": "widgetContent", "group": "widgets.templates.krateo.io", "version": "v1beta1",
+		"resource": "panels", "namespace": "krateo-system", "name": "dashboard-piechart", "perPage": 5, "page": 1,
+	}}
+	j, _ := json.Marshal(body)
+	std := base64.StdEncoding.EncodeToString(j)
+	if raw == std {
+		t.Skipf("RawURL and Std encodings coincide for this payload; RED arm not meaningful")
+	}
+
+	// Wrong impl: StdEncoding-only decode of the browser (RawURL) payload.
+	if _, err := base64.StdEncoding.DecodeString(raw); err == nil {
+		t.Fatalf("RED: StdEncoding-only decode of a RawURL payload should FAIL (proving the fallback is load-bearing); it succeeded")
+	}
+	// And the real code path (with the fallback) accepts it — proven at the HTTP
+	// level by TestRefreshes_RawURLEncodedSubReachesHandler; here we assert the
+	// in-package decode contract directly.
+	if _, err := base64.RawURLEncoding.DecodeString(raw); err != nil {
+		t.Fatalf("RED control: the RawURLEncoding fallback must decode the browser payload; got %v", err)
+	}
+}
+
+// TestRefreshes_SubEntryCountBoundary is M18(b): the refreshSubMaxEntries cap is
+// INCLUSIVE — exactly 512 entries is accepted (validateSubscription returns no
+// error), 513 is rejected. Driven through validateSubscription directly so the
+// boundary is isolated from the downstream armed==0 → 400 (a 512-entry all-skip
+// subscription would otherwise 400 at the handler for a DIFFERENT reason,
+// masking the count guard).
+func TestRefreshes_SubEntryCountBoundary(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+
+	mkSub := func(n int) string {
+		arr := make([]map[string]any, n)
+		for i := range arr {
+			// Empty object → a valid subRequest (all fields optional) that skips
+			// derivation (no class), which is NOT a validateSubscription error.
+			// Kept minimal (2 bytes each) so even cap+1 entries stay well under
+			// refreshSubParamMaxBytes — isolating the entry-COUNT guard from the
+			// byte-size guard (an unknown-class fixture would trip the byte cap
+			// first at 512 entries, masking the boundary under test).
+			arr[i] = map[string]any{}
+		}
+		raw, _ := json.Marshal(arr)
+		return base64.StdEncoding.EncodeToString(raw)
+	}
+
+	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	call := func(n int) error {
+		ctx := xcontext.BuildContext(context.Background(),
+			xcontext.WithLogger(logger),
+			xcontext.WithUserInfo(jwtutil.UserInfo{Username: "userA", Groups: []string{"devs"}}),
+		)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/refreshes?sub="+mkSub(n), nil)
+		_, err := validateSubscription(req)
+		return err
+	}
+
+	if err := call(refreshSubMaxEntries); err != nil {
+		t.Fatalf("M18(b): exactly %d entries (the cap) must be accepted; got error %v", refreshSubMaxEntries, err)
+	}
+	if err := call(refreshSubMaxEntries + 1); err == nil {
+		t.Fatalf("M18(b): %d entries (cap+1) must be rejected; got nil error", refreshSubMaxEntries+1)
+	}
+}
+
+// TestRefreshes_AbsentCoord_SkippedNoApiserverError is M18(c): a coord whose CR
+// is absent from the informer is SKIPPED (informer-miss) and reflected in the
+// subscription summary — with NO ERROR-level log line (the #101 property: the
+// informer-only ctx turns the absent-CR read into a quiet NotFound-shaped skip,
+// NOT the "unable to get user endpoint" apiserver-fallthrough ERROR storm).
+func TestRefreshes_AbsentCoord_SkippedNoApiserverError(t *testing.T) {
+	seedSummaryWidget(t) // one armable "armed-panel" CR + RBAC binding
+
+	buf := &bytes.Buffer{}
+	// Capture at DEBUG so an ERROR line, if any were emitted, is definitely seen.
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	body := []map[string]any{
+		widgetContentCoord("armed-panel"),    // present → arms
+		widgetContentCoord("absent-panel-1"), // absent → informer-miss skip
+		widgetContentCoord("absent-panel-2"), // absent → informer-miss skip
+	}
+	raw, _ := json.Marshal(body)
+	sub := base64.StdEncoding.EncodeToString(raw)
+
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithLogger(logger),
+		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "userA", Groups: []string{"devs"}}),
+	)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/refreshes?sub="+sub, nil)
+
+	armed, err := validateSubscription(req)
+	if err != nil {
+		t.Fatalf("M18(c): validateSubscription must not error on absent coords; got %v", err)
+	}
+	if len(armed) != 1 {
+		t.Fatalf("M18(c): only the present coord arms; want 1, got %d", len(armed))
+	}
+
+	// (1) The summary line reflects the two informer-miss skips.
+	sum := findSummaryLine(t, buf)
+	if sum.Requested != 3 || sum.Armed != 1 || sum.SkippedInformerMiss != 2 {
+		t.Fatalf("M18(c): summary want {requested:3 armed:1 skipped_informer_miss:2}; got %+v", sum)
+	}
+
+	// (2) NO ERROR-level log line was emitted — the #101 apiserver-fallthrough
+	// error storm is gone. Scan every captured JSON line for level==ERROR.
+	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var rec struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+		}
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		if rec.Level == "ERROR" {
+			t.Fatalf("M18(c): an absent-CR coord must NOT emit an ERROR log line (apiserver-fallthrough storm); "+
+				"saw ERROR msg=%q\nfull log:\n%s", rec.Msg, buf.String())
+		}
 	}
 }

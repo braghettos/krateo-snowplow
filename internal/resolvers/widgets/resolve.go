@@ -42,6 +42,27 @@ type ResolveOptions struct {
 	Extras  map[string]any
 }
 
+// resolveApiRefFn and validateObjectStatusFn are the two cross-boundary
+// hops Resolve makes that require a live apiserver — the apiRef RESTAction
+// fetch (apiref.Resolve, reached via resolveApiRef) and the CRD-status schema
+// validation (crdschema.ValidateObjectStatus → cache.GVRFor discovery). They
+// are exposed as package-level function VARIABLES bound to the real
+// implementations so a HERMETIC unit test can drive the orchestration of
+// Resolve (error propagation to status.error, the 400 StatusError wrap, and
+// the resourcesRefsTemplateExtras scope-isolation ordering) WITHOUT a cluster,
+// by transiently swapping the var and restoring it.
+//
+// Production behaviour is BYTE-IDENTICAL: the defaults are the exact functions
+// Resolve called before (resolveApiRef and crdschema.ValidateObjectStatus),
+// invoked with the same arguments in the same order — this is an indirection
+// seam only, not a behaviour change (test-hook per the coverage-audit plan;
+// no env flag, no special-case). Tests MUST restore the original value in a
+// defer so package-level state never leaks across tests.
+var (
+	resolveApiRefFn        = resolveApiRef
+	validateObjectStatusFn = crdschema.ValidateObjectStatus
+)
+
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
 
@@ -101,7 +122,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	}()
 
 	apirefStart := time.Now()
-	ds, err := resolveApiRef(ctx, opts)
+	ds, err := resolveApiRefFn(ctx, opts)
 	phaseApirefMs = time.Since(apirefStart).Milliseconds()
 	if err != nil {
 		log.Error("unable to resolve api reference", slog.Any("err", err))
@@ -208,7 +229,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// deployments (the seed path runs with a context-injected
 	// internal-dispatch rc, NOT in-cluster). The call site KNOWS
 	// the rc; the helper shouldn't recover it.
-	err = crdschema.ValidateObjectStatus(ctx, opts.RC, opts.In.Object)
+	err = validateObjectStatusFn(ctx, opts.RC, opts.In.Object)
 	phaseValidateMs = time.Since(validateStart).Milliseconds()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")

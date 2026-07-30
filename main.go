@@ -75,6 +75,41 @@ var (
 	build string
 )
 
+// snowplowCORSOptions returns the cors.Options the server's use.CORS wrapper is
+// built from (main's http.Server construction). It is extracted from the inline
+// literal into a named constructor so the CORS contract — in particular the
+// ExposedHeaders that let the browser frontend READ the live-refresh signalling
+// headers (X-Snowplow-Refresh-Key / X-Snowplow-Refresh-Class) plus Link — is
+// unit-testable without standing up the full server (H4). Returning a freshly
+// built value per call (no shared package-level struct) keeps the seam free of
+// mutable shared state. The returned options are byte-identical to the previous
+// inline literal.
+func snowplowCORSOptions() cors.Options {
+	return cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-Auth-Code",
+			"X-Krateo-TraceId",
+			// W3C trace-context + baggage headers — REQUIRED so the
+			// browser frontend can propagate traceparent/tracestate/
+			// baggage into snowplow (cross-repo CORS dependency). D19a:
+			// the audit session correlation id now rides `baggage`
+			// (session.id), REPLACING the old X-Krateo-Correlation-Id
+			// header, which is removed here.
+			"traceparent",
+			"tracestate",
+			"baggage",
+		},
+		ExposedHeaders:   []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
+		AllowCredentials: true,
+		MaxAge:           300, // Maximum value not ignored by any of major browsers
+	}
+}
+
 // @title SnowPlow API
 // @version 0.1.0
 // @description This the total new Krateo backend.
@@ -1138,30 +1173,8 @@ func main() {
 	)
 
 	server := &http.Server{
-		Addr: fmt.Sprintf(":%d", *port),
-		Handler: use.CORS(cors.Options{
-			AllowedOrigins: []string{"*"},
-			AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-			AllowedHeaders: []string{
-				"Accept",
-				"Authorization",
-				"Content-Type",
-				"X-Auth-Code",
-				"X-Krateo-TraceId",
-				// W3C trace-context + baggage headers — REQUIRED so the
-				// browser frontend can propagate traceparent/tracestate/
-				// baggage into snowplow (cross-repo CORS dependency). D19a:
-				// the audit session correlation id now rides `baggage`
-				// (session.id), REPLACING the old X-Krateo-Correlation-Id
-				// header, which is removed here.
-				"traceparent",
-				"tracestate",
-				"baggage",
-			},
-			ExposedHeaders: []string{"Link", "X-Snowplow-Refresh-Key", "X-Snowplow-Refresh-Class"},
-			AllowCredentials: true,
-			MaxAge:           300, // Maximum value not ignored by any of major browsers
-		})(rootHandler),
+		Addr:         fmt.Sprintf(":%d", *port),
+		Handler:      use.CORS(snowplowCORSOptions())(rootHandler),
 		ReadTimeout:  10 * time.Second, // read is fast; unchanged (#351/C2)
 		WriteTimeout: writeTimeout,     // 300s — clears cache-OFF heavy path (#351/C2)
 		IdleTimeout:  30 * time.Second, // keep-alive; unchanged (#351/C2)

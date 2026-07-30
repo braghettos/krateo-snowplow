@@ -106,6 +106,16 @@ func normalizePagination(perPage, page int) (int, int) {
 	return perPage, page
 }
 
+// evaluateRBACFn is the RBAC-evaluation seam consumed by checkDispatchRBAC
+// (M5 coverage-audit). Defaults to rbac.EvaluateRBAC; production NEVER
+// reassigns it (the compiled path is byte-identical to a direct call). Only
+// the M5 _test.go shim swaps it, to drive checkDispatchRBAC's fail-closed
+// branches (no-UserInfo / eval-error / deny / allow) AND to capture the
+// EvaluateOptions so the test can assert the load-bearing (Verb=="get",
+// SkipBindingUID==true) contract without wiring a full RBAC snapshot. Mirrors
+// the resolveOnceFn / dispatch_seams.go var-seam idiom.
+var evaluateRBACFn = rbac.EvaluateRBAC
+
 // checkDispatchRBAC is the cache=on permission gate (Revision 2
 // binding, Tag 0.30.4). Returns true iff the user identified by ctx is
 // permitted to GET the dispatched CR in namespace.
@@ -133,7 +143,7 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 	// (allowed, matchedBindingUID, err). This per-item caller ignores
 	// matchedBindingUID; cache-key callers consume it (helpers.go:202 +
 	// :306 via the per-request memo, Phase 2b).
-	allowed, _, evalErr := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+	allowed, _, evalErr := evaluateRBACFn(ctx, rbac.EvaluateOptions{
 		Username:  ui.Username,
 		Groups:    ui.Groups,
 		Verb:      "get",

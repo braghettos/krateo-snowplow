@@ -50,6 +50,20 @@ type restActionRef struct {
 	Namespace string `json:"namespace"`
 }
 
+// rbacGetObjectFn and rbacInspectReadSetFn are package-private test seams over
+// the handler's two external dependencies — the RA loader (objects.Get) and the
+// dispatch-free inspect pass (api.InspectReadSet). Production wires the real
+// functions (assigned below); the hermetic falsifier (rbac_handler_body_test.go,
+// H5) swaps them so the handler's body/status logic — 422 naming an unresolvable
+// stage, empty-readSet-as-[] not null, deduped-sorted 200 — is exercised without
+// an apiserver or informer. Mirrors the saRESTConfigForInspectFn seam pattern in
+// internal/resolvers/restactions/api/inspect.go. Behaviour is identical to a
+// direct call: the defaults ARE the real functions.
+var (
+	rbacGetObjectFn      = objects.Get
+	rbacInspectReadSetFn = api.InspectReadSet
+)
+
 // RBAC returns the GET /rbac handler. It is constructed once at mount and is
 // stateless — every request reads the RA fresh from objects.Get (informer cache
 // or apiserver), so a CR edit is reflected on the next call.
@@ -79,7 +93,7 @@ func RBAC() http.Handler {
 		// Load the referenced RESTAction CR. objects.Get serves from the
 		// informer cache when possible and falls back to a direct apiserver GET
 		// — the SAME loader /call's fetchObject uses.
-		got := objects.Get(req.Context(), templatesv1.ObjectReference{
+		got := rbacGetObjectFn(req.Context(), templatesv1.ObjectReference{
 			Reference:  templatesv1.Reference{Name: name, Namespace: namespace},
 			APIVersion: templatesv1.SchemeGroupVersion.String(),
 			Resource:   "restactions",
@@ -99,7 +113,7 @@ func RBAC() http.Handler {
 			return
 		}
 
-		readSet, unresolved, err := api.InspectReadSet(req.Context(), &cr, extras)
+		readSet, unresolved, err := rbacInspectReadSetFn(req.Context(), &cr, extras)
 		if err != nil {
 			// A structural failure (cyclic api[], SA rest.Config unavailable):
 			// the read-set cannot be trusted — fail loud.
