@@ -1324,6 +1324,20 @@ func (s ResolvedCacheStats) WidgetContentEvictPressure() float64 {
 	return float64(s.WidgetContentEvictTotal) / float64(s.WidgetContentStoreTotal)
 }
 
+// RAFullListEvictPressure is the Ship 4a (0.30.198) per-class budget signal —
+// same shape as ApistageEvictPressure/WidgetContentEvictPressure but for the
+// raFullList (RA full-list slice) layer: the ratio of raFullList entry
+// evictions to raFullList entry stores. 0 means no raFullList churn (nothing
+// stored yet, or every stored slice is still resident). A ratio approaching 1
+// means the LRU/resident budget is too small for the full-list cardinality —
+// the pinned-slice contract is being pushed out as fast as it is written.
+func (s ResolvedCacheStats) RAFullListEvictPressure() float64 {
+	if s.RAFullListStoreTotal == 0 {
+		return 0
+	}
+	return float64(s.RAFullListEvictTotal) / float64(s.RAFullListStoreTotal)
+}
+
 // HitRate computes a simple cumulative hit rate. Returns 0 when there
 // has been no traffic. Useful for the 5-min summary line and for the
 // post-deploy falsifier (<50% hit rate = STOP per plan).
@@ -1567,6 +1581,7 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				// means the resident budget overflowed or pinning is disabled.
 				slog.Uint64("ra_full_list_store_total", s.RAFullListStoreTotal),
 				slog.Uint64("ra_full_list_evict_total", s.RAFullListEvictTotal),
+				slog.Float64("ra_full_list_evict_pressure", s.RAFullListEvictPressure()),
 				slog.Int("resident_entries", s.ResidentEntries),
 				slog.Int64("resident_bytes", s.ResidentBytes),
 				slog.Int64("max_resident_bytes", s.MaxResidentBytes),

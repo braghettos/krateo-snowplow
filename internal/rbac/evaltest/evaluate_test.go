@@ -11,15 +11,21 @@ import (
 	"testing"
 	"time"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 
+	authv1 "k8s.io/api/authorization/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // rbacListKinds mirrors the helper in internal/cache/watcher_test.go.
@@ -765,5 +771,242 @@ func TestEvaluateRBAC_SubjectIndex_NegativesUnaffected(t *testing.T) {
 				t.Errorf("Subject-index path OVER-GRANTED: %+v should be denied", opts)
 			}
 		})
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// L5 [SEC] — cache=off SAR PERMIT branch, hermetic.
+//
+// The existing TestEvaluateRBAC_CacheOffFallsThroughToSAR proves the
+// DENY side of the cache=off path (no UserConfig → UserCan errors →
+// deny). L5 pins the PERMIT side hermetically: with CACHE_ENABLED=false,
+// a fake authorization clientset that answers Allowed=true makes
+// EvaluateRBAC return permit — AND the fake asserts that EvaluateRBAC
+// mapped opts.{Verb,Group,Resource,Namespace} onto the
+// SelfSubjectAccessReview's ResourceAttributes correctly.
+//
+// The clientset is injected via rbac.SetSARClientsetForTest (the minimal
+// behaviour-preserving seam added to rbac.go). No apiserver, no kind.
+// ──────────────────────────────────────────────────────────────────────
+
+// newSARFakeAllowingOnly builds a fake kubernetes clientset whose
+// SelfSubjectAccessReview create-reactor returns Allowed=true ONLY when
+// the review's ResourceAttributes match the expected mapped tuple, and
+// records the ResourceAttributes it actually observed. A mis-mapped
+// EvaluateRBAC (e.g. Group and Resource swapped) would submit attributes
+// that don't match `want`, so the reactor returns Allowed=false and the
+// permit assertion fails — that is the L5 RED.
+func newSARFakeAllowingOnly(want authv1.ResourceAttributes, gotRA **authv1.ResourceAttributes) *k8sfake.Clientset {
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("create", "selfsubjectaccessreviews",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := action.(ktesting.CreateAction)
+			if !ok {
+				return false, nil, nil
+			}
+			ssar, ok := ca.GetObject().(*authv1.SelfSubjectAccessReview)
+			if !ok || ssar.Spec.ResourceAttributes == nil {
+				return true, &authv1.SelfSubjectAccessReview{
+					Status: authv1.SubjectAccessReviewStatus{Allowed: false},
+				}, nil
+			}
+			ra := *ssar.Spec.ResourceAttributes
+			*gotRA = ssar.Spec.ResourceAttributes
+			allowed := ra.Verb == want.Verb &&
+				ra.Group == want.Group &&
+				ra.Resource == want.Resource &&
+				ra.Namespace == want.Namespace
+			return true, &authv1.SelfSubjectAccessReview{
+				Status: authv1.SubjectAccessReviewStatus{Allowed: allowed},
+			}, nil
+		})
+	return cs
+}
+
+// TestEvaluateRBAC_CacheOffSARPermit_Hermetic exercises the cache=off SAR
+// PERMIT branch with an injected fake clientset. EvaluateRBAC must return
+// (true,"",nil) and the SAR it issued must carry the correctly mapped
+// ResourceAttributes.
+//
+// RED arm: a ResourceAttributes mis-map (the fake only allows the exact
+// mapped tuple). If EvaluateRBAC/userCanViaSAR mis-populated the SAR
+// (e.g. swapped Group↔Resource or dropped Namespace), the reactor returns
+// Allowed=false and the permit assertion below fails.
+func TestEvaluateRBAC_CacheOffSARPermit_Hermetic(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+	// TEST_MODE=true so xcontext.UserConfig does not rewrite the endpoint's
+	// ServerURL to the in-cluster default (irrelevant to the fake, but keeps
+	// the resolved endpoint faithful to what we set).
+	t.Setenv("TEST_MODE", "true")
+
+	if !cache.Disabled() {
+		t.Fatalf("Disabled() should be true with CACHE_ENABLED=false")
+	}
+
+	want := authv1.ResourceAttributes{
+		Verb:      "list",
+		Group:     "apps",
+		Resource:  "deployments",
+		Namespace: "demo-system",
+	}
+	var gotRA *authv1.ResourceAttributes
+	fakeCS := newSARFakeAllowingOnly(want, &gotRA)
+
+	restore := rbac.SetSARClientsetForTest(
+		func(_ context.Context, _ endpoints.Endpoint) (kubernetes.Interface, error) {
+			return fakeCS, nil
+		})
+	t.Cleanup(restore)
+
+	// userCanViaSAR reads xcontext.UserConfig(ctx); provide an endpoint so
+	// it does not short-circuit to deny before reaching the (fake) clientset.
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: "https://sar.test"}),
+	)
+
+	ok, uid, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username:  "alice",
+		Verb:      "list",
+		Group:     "apps",
+		Resource:  "deployments",
+		Namespace: "demo-system",
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRBAC (cache=off SAR permit): %v", err)
+	}
+	if !ok {
+		t.Fatalf("L5: cache=off + fake SAR Allowed=true must PERMIT — got deny. "+
+			"If the fake observed mis-mapped ResourceAttributes it denies: observed=%+v want=%+v", raOrNil(gotRA), want)
+	}
+	// cache=off returns no BindingUID (no in-process snapshot).
+	if uid != "" {
+		t.Fatalf("L5: cache=off SAR path must return empty BindingUID; got %q", uid)
+	}
+	// The SAR must have been issued with the correctly mapped attributes.
+	if gotRA == nil {
+		t.Fatalf("L5: no SelfSubjectAccessReview reached the fake clientset — the SAR path was not exercised")
+	}
+	if *gotRA != want {
+		t.Fatalf("L5 MIS-MAP: SAR ResourceAttributes = %+v, want %+v (EvaluateRBAC mapped opts onto the SAR incorrectly)", *gotRA, want)
+	}
+}
+
+// TestEvaluateRBAC_CacheOffSAR_DenyPropagates is the negative twin: the
+// fake answers Allowed=false and EvaluateRBAC must return deny. Guards
+// against a fake/plumbing artifact that would make the permit test pass
+// vacuously (i.e. proves the verdict tracks the SAR answer, not a
+// hard-coded allow).
+func TestEvaluateRBAC_CacheOffSAR_DenyPropagates(t *testing.T) {
+	t.Setenv("CACHE_ENABLED", "false")
+	t.Setenv("TEST_MODE", "true")
+
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("create", "selfsubjectaccessreviews",
+		func(action ktesting.Action) (bool, runtime.Object, error) {
+			return true, &authv1.SelfSubjectAccessReview{
+				Status: authv1.SubjectAccessReviewStatus{Allowed: false},
+			}, nil
+		})
+	restore := rbac.SetSARClientsetForTest(
+		func(_ context.Context, _ endpoints.Endpoint) (kubernetes.Interface, error) {
+			return cs, nil
+		})
+	t.Cleanup(restore)
+
+	ctx := xcontext.BuildContext(context.Background(),
+		xcontext.WithUserConfig(endpoints.Endpoint{ServerURL: "https://sar.test"}),
+	)
+	ok, _, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username: "alice", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRBAC (cache=off SAR deny): %v", err)
+	}
+	if ok {
+		t.Fatalf("L5 negative: fake SAR Allowed=false must DENY; got permit")
+	}
+}
+
+func raOrNil(ra *authv1.ResourceAttributes) any {
+	if ra == nil {
+		return "<no SAR issued>"
+	}
+	return *ra
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// L7 — concrete-namespace ServiceAccount form: a cluster-wide grant to
+// the SA's synthetic group MUST authorize a request carrying a CONCRETE
+// (non-empty) request namespace, exactly as it does for the cluster-scoped
+// (empty) namespace form. Converts the previously non-asserting
+// ship11 PROBE-1b (which only t.Logf'd) into a hard assertion.
+//
+// RED arm: an impl that special-cases the empty request namespace (e.g.
+// only lands the SA's synthetic-group index when opts.Namespace == "")
+// would DENY the concrete-ns form. The SA's synthetic groups derive from
+// the SA's OWN namespace, not the request namespace, and a cluster-wide
+// CRB permits regardless of request namespace — so the concrete-ns form
+// MUST permit.
+// ──────────────────────────────────────────────────────────────────────
+
+// TestEvaluateRBAC_SAGroups_ConcreteNamespaceGrant asserts the concrete-ns
+// SA form permits, and that the empty-ns form permits identically (parity).
+func TestEvaluateRBAC_SAGroups_ConcreteNamespaceGrant(t *testing.T) {
+	// Cluster-wide */* grant to the synthetic group
+	// system:serviceaccounts:krateo-system — every SA in krateo-system is a
+	// member, cluster-wide.
+	newTestWatcher(t,
+		clusterRole("ns-sas", rule([]string{"*"}, []string{"*"}, []string{"get", "list", "watch"})),
+		clusterRoleBinding("ns-sas-bind", "ns-sas",
+			groupSubject("system:serviceaccounts:krateo-system"),
+		),
+	)
+
+	sa := "system:serviceaccount:krateo-system:snowplow"
+
+	cases := []struct {
+		name      string
+		namespace string
+	}{
+		{"cluster_scope_empty_ns", ""},           // the PROBE-1 form
+		{"concrete_ns_demo_system", "demo-system"}, // the PROBE-1b form (was non-asserting)
+		{"concrete_ns_other", "other"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+				Username:  sa,
+				Groups:    []string{"system:authenticated"},
+				Verb:      "list",
+				Group:     "",
+				Resource:  "namespaces",
+				Namespace: c.namespace,
+			})
+			if err != nil {
+				t.Fatalf("EvaluateRBAC(ns=%q): %v", c.namespace, err)
+			}
+			if !ok {
+				t.Fatalf("L7 INVARIANT: SA %s with cluster-wide grant to system:serviceaccounts:krateo-system MUST be permitted for request namespace=%q (concrete-ns form must NOT be special-cased against the empty-ns form)", sa, c.namespace)
+			}
+		})
+	}
+
+	// Negative guard: an SA in a DIFFERENT namespace is NOT a member of
+	// system:serviceaccounts:krateo-system and MUST be denied — for the
+	// concrete-ns form too (proves the permit above is not a blanket allow).
+	ok, _, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		Username:  "system:serviceaccount:other-ns:worker",
+		Groups:    []string{"system:authenticated"},
+		Verb:      "list",
+		Group:     "",
+		Resource:  "namespaces",
+		Namespace: "demo-system",
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRBAC(other-ns SA): %v", err)
+	}
+	if ok {
+		t.Fatalf("L7 negative: an SA in other-ns must NOT match system:serviceaccounts:krateo-system on the concrete-ns form")
 	}
 }

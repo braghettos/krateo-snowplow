@@ -72,11 +72,22 @@ func New(server, tokenPath string) *Client {
 // WithHTTPClient overrides the HTTP client (tests inject a stub transport).
 func (c *Client) WithHTTPClient(h *http.Client) *Client { c.httpClient = h; return c }
 
+// tokenLock / tokenUnlock are the (var-seam) critical-section entry/exit for
+// Token's exchange-and-cache. Production ALWAYS uses c.mu — these are never
+// reassigned outside tests; they exist only so the concurrency falsifier can
+// transiently neuter the mutual exclusion (observe >1 exchange under -race)
+// and restore it, without reflectively mutating a sync.Mutex. Repo idiom:
+// resolveOnceFn / nestedCallResolver / saRESTConfigForInspectFn.
+var (
+	tokenLock   = func(c *Client) { c.mu.Lock() }
+	tokenUnlock = func(c *Client) { c.mu.Unlock() }
+)
+
 // Token returns a valid authn JWT, exchanging the projected SA token when the
 // cache is empty or near expiry.
 func (c *Client) Token(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	tokenLock(c)
+	defer tokenUnlock(c)
 
 	if c.cached != "" && c.now().Before(c.expiry.Add(-refreshSkew)) {
 		return c.cached, nil

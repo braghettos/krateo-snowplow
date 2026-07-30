@@ -1,0 +1,9 @@
+# gitleaks false-positive allowlist (fingerprints: commit:file:rule:line).
+#
+# The resolvedKeyVersion golden anchor is a 64-char SHA-256 hex constant
+# (ComputeKey output captured empirically for the L3 key-version test). gitleaks'
+# generic-api-key rule flags it as a credential because the identifier contains
+# "Key". It is a test fixture, not a secret. The source line also carries an
+# inline //gitleaks:allow (covers the post-squash-merge scan on main, new SHA);
+# this fingerprint covers the PR-branch scan of the introducing commit's diff.
+dada1521fa9ea4bcaa7a6dd15fe313b6afe903a1:internal/cache/resolved_key_version_golden_test.go:generic-api-key:50

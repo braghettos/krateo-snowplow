@@ -453,6 +453,202 @@ func TestL2_B3_GroupsHashCollisionAndOrder(t *testing.T) {
 	}
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// H3 [SEC] — role-RULE republish invalidation (same binding/role NAME,
+// rules changed). The memo MUST NOT serve a stale allow when a
+// ClusterRole's RULES are narrowed to no longer grant the resource, and
+// MUST re-allow when the rules are widened again. This is the role-rule
+// edit dimension of the memory note
+// feedback_hermetic_keyrotation_is_not_endtoend_fix — a memo keyed only
+// on the BINDING set (ignoring that the bound Role's rules changed) would
+// serve a stale allow across a rule Update that failed to bump PublishSeq
+// OR whose bump the memo ignored.
+// ──────────────────────────────────────────────────────────────────────
+
+// TestL2_H3_RoleRuleRepublish_NarrowWiden seeds G1 where alice is allowed
+// `get configmaps` via a ClusterRole "cm-getter" whose rule grants exactly
+// that. The verdict is cached (repeat = hit). G2 republishes (PublishSeq+1)
+// the SAME binding NAME and SAME ClusterRole NAME "cm-getter" but with its
+// rule NARROWED to grant `get secrets` only — no longer configmaps. The
+// next `get configmaps` call MUST DENY (shard swapped on the generation
+// change, re-walk sees the narrowed rule) and the swap counter MUST move.
+// G3 WIDENS the rule back to grant configmaps and MUST re-allow.
+//
+// RED arm: a memo that keys on the binding set alone (or otherwise fails
+// to invalidate when only the bound Role's rules change) serves the cached
+// G1 allow at G2 — a stale allow, the forbidden SEC defect.
+func TestL2_H3_RoleRuleRepublish_NarrowWiden(t *testing.T) {
+	rbac.ResetAuthzMemoForTest()
+
+	// The binding is STABLE across all three generations — only the bound
+	// ClusterRole's RULES change. Same NAME + UID throughout.
+	crb := clusterRoleBindingWithUID("alice-cm-bind", "cm-getter", "cm-crb-uid",
+		userSubject("alice"),
+	)
+
+	// G1 — cm-getter grants `get configmaps`.
+	newTestWatcher(t,
+		clusterRole("cm-getter", rule([]string{""}, []string{"configmaps"}, []string{"get"})),
+		crb,
+	)
+
+	opts := rbac.EvaluateOptions{
+		Username: "alice", Verb: "get", Group: "", Resource: "configmaps", Namespace: "default",
+		SkipBindingUID: true,
+	}
+
+	// G1 allow + cache it (repeat = hit).
+	if a, _, err := rbac.EvaluateRBAC(context.Background(), opts); err != nil || !a {
+		t.Fatalf("H3 G1: expected allowed=true err=nil; got allowed=%v err=%v", a, err)
+	}
+	if a, _, _ := rbac.EvaluateRBAC(context.Background(), opts); !a {
+		t.Fatalf("H3 G1 repeat: expected cached allowed=true")
+	}
+	hits1, _, _, _, _ := rbac.AuthzMemoStatsForTest()
+	if hits1 == 0 {
+		t.Fatalf("H3 G1: expected a memo hit on the repeated allow tuple; got 0")
+	}
+
+	// G2 — republish the SAME binding + SAME ClusterRole NAME but with the
+	// rule NARROWED to `get secrets` (no longer configmaps). PublishSeq+1.
+	swapsBefore := func() uint64 { _, _, s, _, _ := rbac.AuthzMemoStatsForTest(); return s }()
+	narrowSnap := &cache.RBACSnapshot{
+		ClusterRolesByName: map[string]*rbacv1.ClusterRole{
+			"cm-getter": clusterRole("cm-getter", rule([]string{""}, []string{"secrets"}, []string{"get"})),
+		},
+		ClusterRoleBindings: []*rbacv1.ClusterRoleBinding{crb},
+	}
+	cache.RebuildSubjectIndexesForTest(narrowSnap)
+	narrowSnap.PublishSeq = currentPublishSeq(t) + 1
+	cache.PublishRBACSnapshotForTest(narrowSnap)
+
+	a2, _, err := rbac.EvaluateRBAC(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("H3 G2: err=%v", err)
+	}
+	if a2 {
+		t.Fatalf("H3 INVARIANT BROKEN (SEC): stale allow served across a role-RULE narrow — cm-getter no longer grants `get configmaps` at G2 (binding NAME unchanged), MUST deny. A memo keyed only on the binding set would return the cached G1 allow.")
+	}
+	swapsAfter := func() uint64 { _, _, s, _, _ := rbac.AuthzMemoStatsForTest(); return s }()
+	if swapsAfter <= swapsBefore {
+		t.Fatalf("H3 G2: expected the shard to swap on the generation change; swaps %d -> %d", swapsBefore, swapsAfter)
+	}
+
+	// G3 — WIDEN the rule back to grant configmaps. Same binding + role
+	// NAME. PublishSeq+1. MUST re-allow (bidirectional).
+	widenSnap := &cache.RBACSnapshot{
+		ClusterRolesByName: map[string]*rbacv1.ClusterRole{
+			"cm-getter": clusterRole("cm-getter", rule([]string{""}, []string{"configmaps"}, []string{"get"})),
+		},
+		ClusterRoleBindings: []*rbacv1.ClusterRoleBinding{crb},
+	}
+	cache.RebuildSubjectIndexesForTest(widenSnap)
+	widenSnap.PublishSeq = currentPublishSeq(t) + 1
+	cache.PublishRBACSnapshotForTest(widenSnap)
+
+	a3, _, err := rbac.EvaluateRBAC(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("H3 G3: err=%v", err)
+	}
+	if !a3 {
+		t.Fatalf("H3 bidirectional: G3 re-widened cm-getter to grant `get configmaps`; MUST allow again; got allowed=false")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// M8 — capacity: on cap breach the memo REFUSES to insert (never evicts),
+// and a refused tuple still returns the correct walk-fallback verdict.
+// ──────────────────────────────────────────────────────────────────────
+
+// TestL2_M8_CapRefusesNeverEvicts drives >16384 DISTINCT permit tuples in
+// ONE generation against a wildcard-admin CRB (every tuple permits). The
+// tuples vary only in the Name dimension so each produces a distinct memo
+// key. Once the shard fills to the empirical cap (snapshotAuthzMemoCap =
+// 16384) further inserts MUST be REFUSED (authzMemoRefused > 0), the entry
+// count MUST settle at EXACTLY the cap (never above — no unbounded growth;
+// never evicted below — refuse, don't LRU-evict), and a tuple whose insert
+// was refused MUST still return the correct allow (the caller always gets
+// the freshly-walked verdict; only the cache insert is skipped).
+//
+// RED arms this discriminates:
+//   - unbounded growth: entries would exceed the cap.
+//   - LRU-evict instead of refuse: authzMemoRefused would stay 0.
+//   - wrong verdict on a refused key: the refused tuple would deny.
+func TestL2_M8_CapRefusesNeverEvicts(t *testing.T) {
+	rbac.ResetAuthzMemoForTest()
+
+	// Wildcard admin — alice may do anything, so every tuple permits and
+	// therefore every tuple is a cache CANDIDATE (only permits are stored,
+	// see #301). Keeping every tuple a permit is what lets us fill the map.
+	newTestWatcher(t,
+		clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+		clusterRoleBindingWithUID("alice-bind", "admin", "uid-alice", userSubject("alice")),
+	)
+
+	const cap = 16384 // snapshotAuthzMemoCap (snapshot_authz_memo.go)
+	const overfill = cap + 500
+
+	base := rbac.EvaluateOptions{
+		Username: "alice", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
+		SkipBindingUID: true,
+	}
+
+	// Fill past the cap with DISTINCT Name values -> distinct keys.
+	// Every call MUST permit (wildcard admin); the memo silently refuses
+	// once full.
+	for i := 0; i < overfill; i++ {
+		o := base
+		o.Name = fmt.Sprintf("obj-%06d", i)
+		a, _, err := rbac.EvaluateRBAC(context.Background(), o)
+		if err != nil {
+			t.Fatalf("M8 fill i=%d: err=%v", i, err)
+		}
+		if !a {
+			t.Fatalf("M8 fill i=%d: wildcard admin must permit every tuple; got deny for Name=%q", i, o.Name)
+		}
+	}
+
+	_, _, _, refused, entries := rbac.AuthzMemoStatsForTest()
+
+	// Cap breach must have REFUSED inserts (not evicted to make room).
+	if refused == 0 {
+		t.Fatalf("M8 CAP BROKEN: filled %d distinct permit tuples (cap=%d) but authzMemoRefused==0 — the memo EVICTED instead of refusing (or the cap is not enforced)", overfill, cap)
+	}
+	// Entries must settle EXACTLY at the cap: never above (unbounded), and
+	// never below (refuse, don't evict).
+	if entries != cap {
+		t.Fatalf("M8 CAP BROKEN: entries=%d, want exactly cap=%d (>cap = unbounded growth; <cap = eviction). refused=%d", entries, cap, refused)
+	}
+	// The number of refused inserts must equal the overflow beyond the cap
+	// (each distinct tuple is a new key; the first `cap` fill the map, the
+	// rest are refused). This pins "refuse, don't evict" precisely.
+	if want := uint64(overfill - cap); refused != want {
+		t.Fatalf("M8 CAP: refused=%d, want exactly overflow=%d (overfill %d - cap %d) — off means evict-then-reinsert churn", refused, want, overfill, cap)
+	}
+
+	// A tuple whose insert was refused (one of the LAST `overfill-cap`
+	// filled) MUST still return the correct walk-fallback verdict on a
+	// re-ask. Re-ask the very last one — its key is not in the map, so
+	// this re-walks; the verdict MUST be allow.
+	refusedOpts := base
+	refusedOpts.Name = fmt.Sprintf("obj-%06d", overfill-1)
+	a, _, err := rbac.EvaluateRBAC(context.Background(), refusedOpts)
+	if err != nil {
+		t.Fatalf("M8 refused re-ask: err=%v", err)
+	}
+	if !a {
+		t.Fatalf("M8 CAP BROKEN: a refused-insert tuple returned deny on re-ask — the walk-fallback verdict is wrong (the caller must always get the freshly-walked allow; only the cache insert is skipped)")
+	}
+
+	// Entries must STILL be exactly the cap after the refused re-ask (the
+	// re-ask of a refused key must not grow the map beyond cap, and the
+	// idempotent-overwrite exemption applies only to keys ALREADY present).
+	_, _, _, _, entriesAfter := rbac.AuthzMemoStatsForTest()
+	if entriesAfter != cap {
+		t.Fatalf("M8 CAP: entries grew to %d after re-asking a refused key (want steady at cap=%d)", entriesAfter, cap)
+	}
+}
+
 // currentPublishSeq reads the live snapshot's PublishSeq via the cache
 // test seam. Helper for the F3 synthetic-republish phases.
 func currentPublishSeq(t *testing.T) uint64 {

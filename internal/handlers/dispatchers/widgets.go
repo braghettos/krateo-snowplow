@@ -67,7 +67,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	got := fetchObject(req)
+	got := fetchObjectFn(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
@@ -88,7 +88,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// dispatch by EvaluateRBAC. Cache=off skips the gate — fetchObject
 	// already ran per-user against apiserver.
 	if !cache.Disabled() {
-		if !checkDispatchRBAC(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
+		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
 			log.Warn("widget dispatch denied by EvaluateRBAC",
 				slog.String("gvr", got.GVR.String()),
 			)
@@ -314,7 +314,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// the resolve chain). Additive to the stage-error sink.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
 
-	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
+	res, err := widgetsResolveFn(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
 		RC:      r.saRC,
 		AuthnNS: r.authnNS,

@@ -82,7 +82,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	got := fetchObject(req)
+	got := fetchObjectFn(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
@@ -94,7 +94,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// Cache=off skips this gate — fetchObject already runs per-user
 	// against apiserver, which enforces RBAC inline.
 	if !cache.Disabled() {
-		if !checkDispatchRBAC(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
+		if !checkDispatchRBACFn(req.Context(), got.GVR, got.Unstructured.GetNamespace()) {
 			log.Warn("RESTAction dispatch denied by EvaluateRBAC",
 				slog.String("name", got.Unstructured.GetName()),
 				slog.String("namespace", got.Unstructured.GetNamespace()),
@@ -294,7 +294,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (no informer/dep edge can invalidate it). Additive to the stage-error
 	// sink — both gate the Put independently. nil-receiver-safe.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
-	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
+	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
 		AuthnNS: r.authnNS,

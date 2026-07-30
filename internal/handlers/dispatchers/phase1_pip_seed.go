@@ -633,8 +633,34 @@ func hasTemplatedEndpointRef(cr *templatesv1.RESTAction) bool {
 	return false
 }
 
+// hasTemplatedEndpointRefFn is the #113 seed-skip PREDICATE seam. Production
+// wires it to the real hasTemplatedEndpointRef; the ONLY reassigner is the
+// _test.go falsifier, which transiently NEUTERS it to always-false to prove the
+// RED (an impl that fails to skip a templated-endpointRef RA reaches the Put and
+// poisons the no-extras cell with a truncated body — the #113 §4 defect). A
+// package var (not a parameter) so seedOneRestaction's signature is untouched;
+// production never reassigns it. Idiom-match: resolveOnceFn.
+var hasTemplatedEndpointRefFn = hasTemplatedEndpointRef
+
+// seedObjectsGetFn is the RESTAction-fetch seam for seedOneRestaction.
+// Production wires it to the real objects.Get; the ONLY reassigner is the
+// _test.go falsifier, which injects a fetched RESTAction unstructured (a
+// templated- vs static-endpointRef shape) to drive the #113 seed-skip
+// hermetically — without a cluster. A package var (not a parameter) so
+// seedOneRestaction's signature is untouched; production never reassigns it.
+// Idiom-match: resolveOnceFn / paginationFetchPageFn.
+var seedObjectsGetFn = objects.Get
+
+// seedRestactionResolveAndPutFn is the RESOLVE+encode+GTTL-gate+Put TAIL of
+// seedOneRestaction — everything AFTER the #113 templated-endpointRef skip.
+// Extracting it as a seam lets a test observe whether the seed reached the Put
+// (static RA) or short-circuited before it (templated RA → NO Put) without a
+// live resolver/encoder. Production wires it to the real tail
+// (seedRestactionResolveAndPutProd); only the _test.go falsifier reassigns it.
+var seedRestactionResolveAndPutFn = seedRestactionResolveAndPutProd
+
 func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.ObjectReference, authnNS string, mode seedScopeMode) error {
-	got := objects.Get(ctx, ref)
+	got := seedObjectsGetFn(ctx, ref)
 	if got.Err != nil {
 		// #158 (design §1.3): preserve the typed status error so the call
 		// site's classifySeedErr sees 403 (RBAC deny) vs 5xx (operational)
@@ -741,7 +767,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// (§3.2) → never cached anyway, so the seed was never going to warm a servable
 	// cell for it. Greppable skip line mirrors the Class-5 refHasUnresolvedTemplateToken
 	// idiom. Every api-step EndpointRef is nil-guarded (*Reference, may be nil).
-	if hasTemplatedEndpointRef(&cr) {
+	if hasTemplatedEndpointRefFn(&cr) {
 		slog.Default().Info("phase1.seed.skip.templated_endpointref",
 			slog.String("subsystem", "cache"),
 			slog.String("restaction", ref.Namespace+"/"+ref.Name),
@@ -801,8 +827,30 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
 	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
 
+	// Resolve + encode + GTTL-gate + Put TAIL (via the seedRestactionResolveAndPutFn
+	// seam — prod default is seedRestactionResolveAndPutProd). The #113 templated-
+	// endpointRef skip above short-circuits BEFORE this tail, so a templated RA
+	// never reaches the Put.
+	return seedRestactionResolveAndPutFn(ctx, resCtx, &cr, ref, authnNS, key, handle, inputs, got, stageErrSink, extTouchedSink)
+}
+
+// seedRestactionResolveAndPutProd is the production resolve+encode+GTTL-gate+Put
+// tail of seedOneRestaction, extracted verbatim behind the
+// seedRestactionResolveAndPutFn seam. Behaviour is byte-identical to the inlined
+// tail; the only change is that it is now reachable/observable through a seam.
+func seedRestactionResolveAndPutProd(
+	ctx, resCtx context.Context,
+	cr *templatesv1.RESTAction,
+	ref templatesv1.ObjectReference,
+	authnNS, key string,
+	handle cacheHandle,
+	inputs *cache.ResolvedKeyInputs,
+	got objects.Result,
+	stageErrSink *cache.StageErrorSink,
+	extTouchedSink *cache.ExternalTouchedSink,
+) error {
 	res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{
-		In: &cr,
+		In: cr,
 		// Ship 0.30.230 fix-at-root: SArc is the SA *rest.Config carried
 		// on ctx by withCohortSeedContext upstream. Threading it here
 		// ensures the inner endpointReferenceMapper has a non-nil rc for
@@ -845,7 +893,7 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// override) when the knob is unset or the RA has no UAF stage → byte-identical
 	// to today for a non-UAF seed cell and when disabled.
 	if inputs != nil {
-		inputs.HasUAF = restactionHasUAFStage(&cr)
+		inputs.HasUAF = restactionHasUAFStage(cr)
 	}
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.

@@ -59,6 +59,21 @@ var restActionGVR = schema.GroupVersionResource{
 	Resource: "restactions",
 }
 
+// recordListDepFn is the list-scope (name="*" wildcard) dep-record seam
+// used by recordWidgetDeps for a NAME-LESS resourcesRefs target (a ref
+// that displays "all of kind X in namespace Y" — the /call path carries
+// resource+apiVersion but no name). Production wires it to the real
+// DepTracker.RecordList; the ONLY reassigner is the _test.go falsifier,
+// which transiently neuters it to a by-name Record to prove the RED
+// (a by-name edge wildcard-misses a sibling object's reconcile → zero
+// delivery). A package var (not a parameter) so recordWidgetDeps's
+// signature is untouched; production never reassigns it.
+//
+// Idiom-match: resolveOnceFn / paginationFetchPageFn in this package.
+var recordListDepFn = func(deps *cache.DepTracker, l1Key string, gvr schema.GroupVersionResource, namespace string) {
+	deps.RecordList(l1Key, gvr, namespace)
+}
+
 // recordWidgetDeps walks the resolved widget object and records dep
 // edges into the cache.DepTracker. l1Key is the L1 entry's cache key
 // the dependent edges are recorded against.
@@ -118,8 +133,9 @@ func recordWidgetDeps(log *slog.Logger, l1Key string, gvr schema.GroupVersionRes
 		ensureWatcherInformerForGVR(refGVR)
 		if ref.Name == "" {
 			// List-scope dep (e.g., a ref that targets "all of kind X
-			// in namespace Y"). Record with name="*".
-			deps.RecordList(l1Key, refGVR, ref.Namespace)
+			// in namespace Y"). Record with name="*" (via the
+			// recordListDepFn seam — prod default is deps.RecordList).
+			recordListDepFn(deps, l1Key, refGVR, ref.Namespace)
 			continue
 		}
 		deps.Record(l1Key, refGVR, ref.Namespace, ref.Name)

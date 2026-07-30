@@ -144,7 +144,10 @@ func TestC113_3_SeedSkipWiredBeforeResolve(t *testing.T) {
 	}
 	s := string(src)
 	for _, want := range []string{
-		"if hasTemplatedEndpointRef(&cr) {",
+		// The skip routes through the hasTemplatedEndpointRefFn seam (prod
+		// default = hasTemplatedEndpointRef), so the falsifier can neuter the
+		// predicate. The wiring guard tracks the seam call site.
+		"if hasTemplatedEndpointRefFn(&cr) {",
 		"phase1.seed.skip.templated_endpointref",
 	} {
 		if !strings.Contains(s, want) {
@@ -152,7 +155,7 @@ func TestC113_3_SeedSkipWiredBeforeResolve(t *testing.T) {
 		}
 	}
 	// The skip MUST precede restactions.Resolve (else it can't prevent the Put).
-	skipIdx := strings.Index(s, "if hasTemplatedEndpointRef(&cr) {")
+	skipIdx := strings.Index(s, "if hasTemplatedEndpointRefFn(&cr) {")
 	resolveIdx := strings.Index(s, "res, err := restactions.Resolve(resCtx, restactions.ResolveOptions{")
 	if skipIdx < 0 || resolveIdx < 0 || skipIdx > resolveIdx {
 		t.Fatalf("#113 seed-skip must appear BEFORE restactions.Resolve (skipIdx=%d resolveIdx=%d)", skipIdx, resolveIdx)

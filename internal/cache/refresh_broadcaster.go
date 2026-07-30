@@ -86,9 +86,17 @@ func RefreshSSEEnabled() bool {
 	}
 }
 
+// refreshCoalesceWindowFn is a (var-seam) indirection over the coalesce-window
+// resolution so the L11 falsifier can transiently install a wrong-shaped
+// resolver (one that coerces an explicit 0 into the 250ms DEFAULT, coalescing
+// away a burst) to observe RED, then restore the real fn. Production NEVER
+// reassigns it. Repo idiom: resolveOnceFn / nestedCallResolver.
+var refreshCoalesceWindowFn = refreshCoalesceWindow
+
 // refreshCoalesceWindow returns the active per-key coalesce window. A value
-// <= 0 disables coalescing (every emit fans out). Read fresh per emit so a
-// deployer can re-tune at pod start (matches the rateFloor env-read idiom).
+// <= 0 disables coalescing (every emit fans out) — an EXPLICIT 0 must be
+// honoured as "off", NOT silently coerced to the default. Read fresh per emit
+// so a deployer can re-tune at pod start (matches the rateFloor env-read idiom).
 func refreshCoalesceWindow() time.Duration {
 	return time.Duration(int64FromEnv(envRefreshCoalesceWindowMS, defaultRefreshCoalesceWindowMS)) * time.Millisecond
 }
@@ -155,7 +163,7 @@ func refreshHub() *refreshBroadcaster {
 // non-suppressed emit it stamps lastEmit[l1Key]=now. A window <= 0 disables
 // coalescing entirely (always returns false). Design §2.3.
 func (h *refreshBroadcaster) coalesced(l1Key string, now time.Time) bool {
-	win := refreshCoalesceWindow()
+	win := refreshCoalesceWindowFn()
 	if win <= 0 {
 		return false
 	}
