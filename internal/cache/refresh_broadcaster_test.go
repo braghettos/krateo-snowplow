@@ -281,6 +281,96 @@ func TestRefreshBroadcaster_CoalescePerKey(t *testing.T) {
 	}
 }
 
+// TestRefreshBroadcaster_ZeroWindowDisablesCoalescing (L11). An EXPLICIT
+// REFRESH_COALESCE_WINDOW_MS=0 must DISABLE coalescing — a 5-event burst for
+// the SAME key delivers all 5, coalesced==0. This guards the coalesced() win<=0
+// early-return against a naive "0 means use the default 250ms" coercion that
+// would silently collapse the burst to 1.
+//
+// The RED arm (TestRefreshBroadcaster_ZeroWindowRedArm below) proves the
+// discrimination by transiently installing exactly that wrong-shaped resolver.
+func TestRefreshBroadcaster_ZeroWindowDisablesCoalescing(t *testing.T) {
+	withRefreshLayer(t) // sets REFRESH_COALESCE_WINDOW_MS=0 (coalescing OFF)
+
+	// Sanity: the active window really is 0 (disable), not the default.
+	if w := refreshCoalesceWindow(); w != 0 {
+		t.Fatalf("refreshCoalesceWindow()=%v under REFRESH_COALESCE_WINDOW_MS=0 — want 0 (disable)", w)
+	}
+
+	ch, unsub := SubscribeRefresh(map[string]struct{}{"k": {}})
+	defer unsub()
+
+	const burst = 5
+	for i := 0; i < burst; i++ {
+		PublishRefresh("k")
+	}
+
+	// All 5 must be delivered (buffer cap 64 >> 5, so none dropped).
+	got := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && got < burst {
+		if _, ok := drainOne(t, ch, 50*time.Millisecond); ok {
+			got++
+		}
+	}
+	if got != burst {
+		t.Fatalf("zero-window burst delivered %d/%d — coalescing was NOT disabled by window=0", got, burst)
+	}
+	published, delivered, dropped, coalesced := RefreshBroadcasterCounters()
+	if coalesced != 0 {
+		t.Fatalf("coalesced=%d want 0 — window=0 must fan out EVERY emit", coalesced)
+	}
+	if published != burst || delivered != burst || dropped != 0 {
+		t.Fatalf("window=0 counters: published=%d delivered=%d dropped=%d, want %d/%d/0",
+			published, delivered, dropped, burst, burst)
+	}
+}
+
+// TestRefreshBroadcaster_ZeroWindowRedArm proves L11 DISCRIMINATES: with the
+// refreshCoalesceWindowFn seam transiently swapped for the buggy resolver that
+// coerces an explicit 0 into the 250ms DEFAULT, the same 5-event burst collapses
+// (coalesced>0, delivered<5) — the exact defect the zero-window path prevents.
+// Restores the real fn after (t.Cleanup) so the committed suite stays GREEN.
+func TestRefreshBroadcaster_ZeroWindowRedArm(t *testing.T) {
+	withRefreshLayer(t) // REFRESH_COALESCE_WINDOW_MS=0
+
+	orig := refreshCoalesceWindowFn
+	// Buggy resolver: treat 0 as "unset" → default window (the naive coercion
+	// L11 guards against).
+	refreshCoalesceWindowFn = func() time.Duration {
+		w := orig()
+		if w <= 0 {
+			return time.Duration(defaultRefreshCoalesceWindowMS) * time.Millisecond
+		}
+		return w
+	}
+	t.Cleanup(func() { refreshCoalesceWindowFn = orig })
+
+	ch, unsub := SubscribeRefresh(map[string]struct{}{"k": {}})
+	defer unsub()
+
+	const burst = 5
+	for i := 0; i < burst; i++ {
+		PublishRefresh("k")
+	}
+
+	got := 0
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, ok := drainOne(t, ch, 40*time.Millisecond); ok {
+			got++
+		}
+	}
+	_, _, _, coalesced := RefreshBroadcasterCounters()
+	if coalesced == 0 {
+		t.Fatalf("RED arm: coalesced=0 with 0-coerced-to-default window — L11 does not discriminate")
+	}
+	if got >= burst {
+		t.Fatalf("RED arm: delivered %d/%d — the default-window coercion failed to collapse the burst", got, burst)
+	}
+	t.Logf("RED arm: 0-coerced-to-250ms → burst collapsed (delivered=%d/%d, coalesced=%d)", got, burst, coalesced)
+}
+
 // --- 9.6 — slow consumer never stalls the producer (-race) ------------------
 
 // TestRefreshBroadcaster_SlowConsumerNeverStalls is falsifier 9.6. Run under

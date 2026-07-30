@@ -373,7 +373,7 @@ const (
 //   - success → return (ep, stageProceed).
 func (r *resolveRun) resolveStageEndpoint(id string, apiCall *templates.API, uafActive bool) (endpoints.Endpoint, stageAction) {
 	if uafActive {
-		saEP, saErr := dynamic.ServiceAccountEndpoint()
+		saEP, saErr := serviceAccountEndpointFn()
 		if saErr != nil {
 			r.log.Error("userAccessFilter: cannot acquire ServiceAccount endpoint; falling through to per-user dispatch (degraded mode)",
 				slog.String("name", id), slog.Any("err", saErr))
@@ -1673,6 +1673,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 // without standing up a real discovery client. Production path is
 // unchanged. Mirrors cache.discoveryClientBuilder (discovery_lookup.go:151).
 var discoverGroupResourcesFn = cache.DiscoverGroupResources
+
+// serviceAccountEndpointFn is the package-private indirection over
+// dynamic.ServiceAccountEndpoint so the L13(b) fail-closed falsifier
+// (refilter_concurrency_test.go) can drive the UAF SA-endpoint ACQUIRE-FAILURE
+// branch of resolveStageEndpoint deterministically — without depending on the
+// ambient /var/run/secrets SA files being absent (a fragile, non-hermetic
+// trigger). Production path is UNCHANGED: the default is the real
+// dynamic.ServiceAccountEndpoint and production never reassigns it. Mirrors
+// discoverGroupResourcesFn (above) and cache.discoveryClientBuilder
+// (discovery_lookup.go:151) — the established resolveOnceFn/nestedCallResolver
+// var-seam idiom.
+var serviceAccountEndpointFn = dynamic.ServiceAccountEndpoint
 
 // lazyRegisterInnerCallPaths walks the per-stage RequestOptions slice
 // (one entry per iterator dispatch — the iterator + non-iterator paths
