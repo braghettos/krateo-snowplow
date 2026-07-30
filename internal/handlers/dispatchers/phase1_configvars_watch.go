@@ -198,6 +198,18 @@ func enqueueBootReDrive(reason string) {
 	// than a stale prior. A plain F.4 deadline-cut requeue does NOT come through
 	// here (it keeps the state) — only a genuine config change clears.
 	prewarmEngineSingleton().clearBootConvergenceState(bootScope.key())
+	// #135 F4b Lever B — RESET the boot scope's workqueue requeue count so this
+	// genuine topology change re-dequeues at attempt==0 → rePrewarmBootScoped
+	// WALKS the new config.json nav set instead of REUSING the prior topology's
+	// harvester snapshot. MUST precede enqueueScope (a plain queue.Add that does
+	// NOT reset NumRequeues): without it, a redrive landing mid-F.4-requeue-streak
+	// (NumRequeues>0) leaves attempt>0 → Lever B reuses the STALE nav set across
+	// the topology change. A plain F.4 deadline-cut resume does NOT come through
+	// here (it AddRateLimited's in processScope), so its attempt>0 fast-path reuse
+	// is preserved — only a genuine config change forces the re-walk. Paired with
+	// clearBootConvergenceState above: a topology change resets BOTH the #105
+	// convergence sets AND the #135 requeue-attempt count on the same event.
+	prewarmEngineSingleton().forgetScope(bootScope)
 	prewarmEngineSingleton().enqueueScope(bootScope)
 	slog.Info("prewarm.configvars.boot_redrive_enqueued",
 		slog.String("subsystem", "cache"),
