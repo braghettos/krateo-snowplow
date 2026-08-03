@@ -52,6 +52,8 @@ jobs:
       - name: Build and push (linux/amd64, linux/arm64)
         uses: docker/build-push-action@v7
         with:
+          context: go/snowplow
+          file: go/snowplow/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
