@@ -1,0 +1,38 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "snowplow.fullname" . }}-{{ .Release.Namespace }}
+  labels:
+    {{- include "snowplow.labels" . | nindent 4 }}
+rules:
+# ── Cluster-wide read for informer-driven L3 cache ──────────────────────────
+# Snowplow dynamically discovers CRDs at runtime (see autoDiscoverGroups in
+# cache-warmup config) and starts informers on newly-observed CR types, so
+# the service account needs broad read+watch. Narrowing this requires
+# enumerating every CRD that dashboards and widgets depend on transitively —
+# empirically that list is much larger than the upstream chart ships and
+# includes: widgets.templates.krateo.io/*, templates.krateo.io/*,
+# core.krateo.io/*, composition.krateo.io/*, apiextensions.k8s.io/*,
+# rbac.authorization.k8s.io/*, ogen/git/argoproj integrations, plus any
+# new CRD a customer registers. The right default is broad read.
+#
+# This is a READ-only rule; no create/update/delete. The pod cannot mutate
+# the cluster through this binding.
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs:
+  - get
+  - list
+  - watch
+
+# ── Per-user authorization checks ───────────────────────────────────────────
+# Snowplow creates SelfSubjectAccessReview / SubjectAccessReview to pre-
+# compute RBAC for each user before serving widget responses. These APIs
+# only support the `create` verb.
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - selfsubjectaccessreviews
+  - subjectaccessreviews
+  verbs:
+  - create

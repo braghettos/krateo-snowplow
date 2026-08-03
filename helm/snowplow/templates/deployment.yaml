@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "snowplow.fullname" . }}
+  labels:
+    {{- include "snowplow.labels" . | nindent 4 }}
+spec:
+  progressDeadlineSeconds: {{ .Values.progressDeadlineSeconds }}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "snowplow.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/configmap: {{ printf "%s%s" (include (print $.Template.BasePath "/configmap.yaml") .) (include (print $.Template.BasePath "/configmap.jq-custom-modules.yaml") .) | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "snowplow.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "snowplow.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ include "snowplow.fullname" . }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "snowplow.fullname" . }}
+            - secretRef:
+                name: {{ .Values.jwtSignKeySecretName }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: jq-modules
+              mountPath: /jq-modules
+              readOnly: true
+            # #57 — the prewarm seed's projected (audience=authn) SA token,
+            # mounted at the directory of SERVICEACCOUNT_TOKEN_PATH so the
+            # authn.Client reads it fresh on each exchange. UNCONDITIONAL — the
+            # authn JWT is a hard platform requirement (no seedAuthn.enabled gate).
+            - name: seed-authn-token
+              mountPath: {{ dir .Values.seedAuthn.tokenPath | quote }}
+              readOnly: true
+          {{- with .Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: jq-modules
+          configMap:
+            name: {{ include "snowplow.fullname" . }}-jq-custom-modules
+        # #57 — projected ServiceAccount token bound to the authn audience.
+        # The audience MUST be exactly the authn operator's
+        # --serviceaccount-audience ("authn"); the file lands at
+        # basename(SERVICEACCOUNT_TOKEN_PATH) inside the mount dir. UNCONDITIONAL
+        # — the authn JWT is a hard platform requirement (no seedAuthn.enabled gate).
+        - name: seed-authn-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: {{ base .Values.seedAuthn.tokenPath | quote }}
+                  audience: {{ .Values.seedAuthn.tokenAudience | quote }}
+                  expirationSeconds: 3600
+      {{- with .Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

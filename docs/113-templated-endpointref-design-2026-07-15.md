@@ -3,7 +3,7 @@
 Date: 2026-07-15
 Author: cache-architect
 Repo: main @ 330a649 (1.7.12); 1.7.13 candidate
-Issue: braghettos/krateo-snowplow #113 (hub-spoke: one RA serves N spokes)
+Issue: krateo-platformops/snowplow #113 (hub-spoke: one RA serves N spokes)
 
 ## Headline
 

@@ -1,0 +1,316 @@
+# Default values for snowplow (krateo-platformops fork).
+#
+# Diverges from upstream krateoplatformops/snowplow-chart in the ways
+# needed to run the cache-enabled fork at 50K-composition scale:
+#   - image points at ghcr.io/krateo-platformops/snowplow
+#   - resources pre-sized for informer + in-process cache + GC headroom
+#   - env carries GOMEMLIMIT/GOGC for cgroup-aware GC
+#   - envFrom picks up the external snowplow-api-override ConfigMap
+#     (managed by the portal blueprint) in addition to the chart's
+#     own snowplow ConfigMap
+#   - Redis sidecar removed (v0.25.266+): cache is in-process MemCache
+#   - probes target the single http port (8081) with explicit, widened
+#     thresholds (the 0.25.x dedicated-PROBE_PORT split is NOT on the
+#     1.0.x ship line)
+
+replicaCount: 1
+
+# Deployment strategy (C5, 1.5.29 prewarm-gated readiness). maxUnavailable:0 +
+# maxSurge:1 means on a rolling deploy the NEW pod prewarms behind its (now
+# prewarm-gated) /readyz while the OLD warm pod keeps serving ALL traffic until
+# the new pod is Ready+warm — no cold-serve / 503 gap on deploys. Ships WITH the
+# prewarm-complete gate (the gate alone does not prevent the deploy gap).
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# /readyz now flips on PREWARM-COMPLETE (1.5.29 shape A): informer-sync AND the
+# per-cohort seed complete (or the pipGlobalTimeout backstop, ~8min). The pod is
+# withheld from Service endpoints until it can serve WARM. The 1200s window is
+# the Deployment-level rollout deadline and MUST exceed the total warmup
+# (informer initial LIST/WATCH at 50K, ~5min, + the seed backstop ~8min) — 1200s
+# (20min) covers min(PHASE1_TIMEOUT_SECONDS, pipGlobalTimeout)+sync comfortably.
+# (startupProbe targets /health, which binds EARLY — it does not gate prewarm;
+# the readinessProbe on /readyz observes the prewarm-gated 503→200.)
+progressDeadlineSeconds: 1200
+
+image:
+  repository: ghcr.io/krateo-platformops/snowplow
+  pullPolicy: Always
+  # Empty -> defaults to the chart appVersion (= APP_VERSION = latest semver tag of the
+  # krateo-platformops/snowplow app repo, resolved by release-oci). The app fork builds multi-arch
+  # (amd64+arm64) images tagged with that same app version, so the chart always deploys the
+  # image the app actually published. Override here only to pin a specific tag.
+  #
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: "snowplow"
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+service:
+  type: LoadBalancer
+  port: 8081
+
+# NOTE: the snowplow binary (1.0.x ship line) has NO dedicated probe
+# listener -- it serves /health + /readyz on the single `http` port
+# (PORT, 8081), so all three probes below target `http`. A prototype
+# probe-port split (PROBE_PORT/8082) lived only on the abandoned 0.25.x
+# line and was never implemented on the ship line; do not re-add
+# probePort/PROBE_PORT unless the binary grows a real second listener.
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+
+# Right-sized from stress test data (50K compositions x 1000 users):
+#   Peak heap:   3.9 GB (cold start with 1000 users)
+#   Steady heap: 3.3 GB
+#   In-process cache: ~2-3 GB (L1 resolved entries, replaces Redis)
+#   Peak RSS:    ~6 GB total
+#
+# Memory tuning history:
+#   - Original 20 Gi: unchunked informer LIST at 50K (~15 GB spike).
+#   - 12 Gi: with chunked LIST (Limit=500) + informer.SetTransform
+#     stripping managedFields/last-applied -- peak RSS ~6 GB.
+#   - 8 Gi target (this revision): contingent on GOMEMLIMIT being set
+#     BELOW the container limit so the Go runtime backpressures via
+#     aggressive GC before Linux OOM-kills the pod. The earlier 8 Gi
+#     attempts OOMed because GOMEMLIMIT was set >= container limit and
+#     the runtime never saw memory pressure. Validate at 50K under
+#     Phase-6 load before treating this as the new baseline.
+resources:
+  limits:
+    cpu: 4
+    memory: 8Gi
+  requests:
+    cpu: 2
+    memory: 4Gi
+
+# Probe configuration.
+#
+# The snowplow binary serves /health and /readyz on the single `http`
+# port (PORT, 8081) -- there is no dedicated probe listener on the 1.0.x
+# ship line, so all three probes target `http`. The timeouts/thresholds
+# below are EXPLICIT (not k8s defaults): the k8s defaults
+# (timeoutSeconds 1, failureThreshold 3, periodSeconds 10) leave only a
+# 30-second window before kubelet kills the pod; we widen that as
+# defence-in-depth so a transient scheduler hiccup does not restart a
+# healthy pod.
+
+# Startup probe: gives the binary up to 6 minutes (36 x 10s) to start
+# serving /health. The http server (incl. /health) binds early, before
+# the background informer-sync / prewarm work, so this is mostly
+# headroom for image pull / kube-scheduler latency.
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  failureThreshold: 36
+  periodSeconds: 10
+  timeoutSeconds: 3
+
+# Liveness probe: checks only that the binary is alive (/health is a
+# cheap write with zero kube-API touches). failureThreshold 5 +
+# periodSeconds 10 + timeoutSeconds 3 = a 50-second window before
+# kubelet restarts, vs the 30-second window of k8s defaults.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 5
+
+# Readiness probe: /readyz flips to 200 once Phase1Done is set. As of
+# 1.5.29 (shape A prewarm-gated readiness) Phase1Done is set AFTER the
+# per-cohort prewarm seed completes (or its pipGlobalTimeout backstop, ~8min),
+# NOT merely at informer-sync — so the pod is withheld from Service endpoints
+# until it can serve WARM (never routed cold into the compositions-page fan-out
+# under the aggregate OOM gate). Post-Ready L1 misses still fall through to a
+# foreground resolve (the #41 on-miss floor is intact). failureThreshold here
+# does NOT kill the pod (readiness only withholds from Endpoints); the rollout
+# bound is progressDeadlineSeconds above.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+
+# Command-line args for the snowplow container. Empty by default --
+# the binary reads all config from env vars / flags with env fallbacks.
+args: []
+
+# Additional volumes beyond the chart-managed jq-modules ConfigMap.
+# (None. The frontend-config-vars ConfigMap that drives prewarm nav
+# roots -- INIT / ROUTES_LOADER -- is read via the k8s API by the
+# Phase-1 walker, NOT mounted; see phase1_roots.go. The binary reads no
+# /etc files, so no extra mount is needed.)
+volumes: []
+
+volumeMounts: []
+
+# Extra envFrom entries appended to the default (chart-managed
+# ConfigMap + jwt-sign-key Secret). Used to pick up ConfigMaps owned
+# by other components without re-templating them here.
+extraEnvFrom:
+  - configMapRef:
+      name: snowplow-api-override
+      optional: true
+
+# Redis sidecar removed -- snowplow uses in-process MemCache (v0.25.266+).
+initContainers: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Env vars rendered into the chart's snowplow ConfigMap and consumed
+# via envFrom. Any value that should reach the snowplow process goes
+# here -- the container itself has no direct `env:` array.
+env:
+  DEBUG: "false"
+  BLIZZARD: "false"
+  JQ_MODULES_PATH: /jq-modules
+  # Go runtime: trigger proactive GC at 7 GiB so we stay under the
+  # 8 Gi cgroup limit (~1 GiB headroom). Stress test peak was 3.9 GB at
+  # 1000 users.
+  # Must be BELOW the container memory limit (8 Gi) so the Go runtime
+  # backpressures via GC before Linux OOM-kills the pod. Setting this
+  # at or above the container limit is a misconfiguration that has
+  # caused OOM-kill incidents.
+  GOMEMLIMIT: 7GiB
+  # Lower GOGC (default 100) trades ~1% CPU for tighter memory headroom.
+  GOGC: "50"
+  CACHE_ENABLED: "true"
+  # Structured single-line JSON logs in production. The default pretty
+  # (ANSI, multi-line, synchronous-stderr) handler measured ~7,355
+  # lines/sec on krateo-enterprise and is a steady-state CPU/I/O drag; set
+  # false so prod emits cheap one-line JSON. Pairs with snowplow Fix 2b
+  # (per-resolve success logs moved INFO->Debug).
+  PRETTY_LOG: "false"
+  # Phase 1 informer-sync barrier bounds (snowplow Fix 1b).
+  #   PHASE1_TIMEOUT_SECONDS  — absolute outer backstop for the whole
+  #     Phase 1 warmup. #130 F3: RAISED 180->900 (the seed companion, TRACED).
+  #     The Step-7.6 cohort seed runs under
+  #     seedCtx = context.WithTimeout(phase1Ctx, pipGlobalTimeout=480s)
+  #     (phase1_walk.go:826) — it INHERITS the phase-1 deadline, it does NOT
+  #     get a fresh 480s. So the seed's effective budget =
+  #     min(PHASE1_TIMEOUT - preSeedElapsed, 480s). On the measured 1.7.6 boot
+  #     (PHASE1_TIMEOUT=300) the pre-seed phases (roots-walk ~150s +
+  #     content-prewarm ~11s + discovery re-walk ~100s) consumed ~251s BEFORE
+  #     the seed started (seed ranks emitted at t+251s), leaving the seed only
+  #     ~49s — it starved (sync_incomplete). To let the seed's designed 480s
+  #     budget actually bound it, PHASE1_TIMEOUT must be >= preSeedElapsed +
+  #     480 + margin. 900 gives 900-251=649s > 480 at THIS cluster, so the
+  #     seed's own 480s cap is the bound (the intended state); it also restores
+  #     the pre-2026-06 value. At 50K the pre-seed walk is larger, so re-measure
+  #     preSeedElapsed there and re-raise if 900-preSeed < 480.
+  #     TRADE (Option A, design §8, surfaced for the gate): the earlier
+  #     900->180 lowering guarded against a pathological never-converging boot
+  #     holding /readyz 503 up to 15 min. F3 re-accepts a longer worst-case
+  #     time-to-Ready for correct all-cohort first-nav coverage — BUT the
+  #     Lever-2 latch fires at min(all-reachable-cohorts-warm, backstop), so the
+  #     COMMON case still flips Ready as soon as the reachable cohorts warm; the
+  #     900s ceiling is only hit on a genuinely pathological boot.
+  #   PHASE1_SYNC_PASS_GRACE_SECONDS — per-pass grace for one
+  #     WaitForCacheSync pass; one stuck informer can stall at most this
+  #     long, not the whole budget.
+  #   PHASE1_SYNC_QUIESCENCE_SECONDS — registered-set stability window
+  #     after which the barrier returns "good enough", deferring any
+  #     still-unsynced informer to lazy-register fallthrough + refresher.
+  PHASE1_TIMEOUT_SECONDS: "900"
+  PHASE1_SYNC_PASS_GRACE_SECONDS: "45"
+  PHASE1_SYNC_QUIESCENCE_SECONDS: "10"
+  # R1 Layer 2 bounded-staleness backstop (snowplow #36). When > 0, an
+  # apistage catalog entry stored while its GVR informer is NOT servable
+  # (registered-but-not-synced / watch-broken / unconfirmed) gets this SHORT
+  # per-entry TTL instead of the standard RESOLVED_CACHE_TTL_SECONDS (3600),
+  # so a degraded / not-fully-resolved entry self-corrects within the bound
+  # even if a dirty-mark or refresh-ordering gap is missed. The dirty-mark +
+  # refresher remain the primary invalidation; this is the safety-net floor.
+  # 300s = a degraded catalog entry is corrected within ~5 min worst case.
+  # Set to "0" to disable (entries then use the standard TTL exactly as before).
+  CATALOG_UNSERVABLE_TTL_SECONDS: "300"
+  # #57 — prewarm seed loopback auth. The seed exchanges its projected
+  # (audience=authn) ServiceAccount token at URL_AUTHN for an authn-issued JWT
+  # and appends it on a /call api-step whose resolved endpoint host EXACTLY
+  # equals URL_SELF (snowplow's own service) — so a nested loopback /call
+  # carries a bearer snowplow's own middleware accepts and the
+  # composition-resources RAs warm. URL_SELF anchors the self-loopback
+  # bearer-append arm (exact scheme+host+port match; empty disables the arm).
+  # SERVICEACCOUNT_TOKEN_PATH is the projected token mount (see seedAuthn below).
+  URL_AUTHN: "http://authn.krateo-system.svc.cluster.local:8082"
+  URL_SELF: "http://snowplow.krateo-system.svc.cluster.local:8081"
+  SERVICEACCOUNT_TOKEN_PATH: "/var/run/secrets/krateo.io/serviceaccount/token"
+
+# #57 seedAuthn — the prewarm seed→authn loopback-token deployment artifacts
+# (projected audience=authn SA token volume/mount + the authn ServiceAccount
+# allowlist CR + the seed-group ClusterRole/Binding) are ALWAYS rendered. The
+# projected authn JWT is a HARD PLATFORM REQUIREMENT for snowplow (same as the
+# Krateo composition-dynamic-controller, which requires the identical JWT) —
+# there is NO opt-in flag.
+#
+# HARD DEPENDENCY (install-time): the allowlist object is a
+# `serviceaccount.authn.krateo.io` CR, so THIS CHART FAILS TO INSTALL on a
+# cluster lacking:
+#   - the `serviceaccount.authn.krateo.io` CRD (chart `krateo-authn-crd`), AND
+#   - the Krateo authn operator (image >= 0.24.0) serving POST
+#     /serviceaccount/login (the TokenReview-backed SA-token exchange), AND
+#   - the authn RBAC to run it (authentication.k8s.io/tokenreviews: create +
+#     serviceaccount.authn.krateo.io/serviceaccounts: get,list,watch).
+# ROLLOUT ORDERING (by design): the platform install pipeline MUST sequence
+# authn 0.24.0 + krateo-authn-crd BEFORE the snowplow chart, else the install
+# fails fast on the unknown kind. This is the intended fail-loud posture, not a
+# regression. (The snowplow SA `snowplow` in krateo-system is placed in the
+# allowlist by the ServiceAccount CR this chart renders.)
+#
+# DYNAMIC-GVR LIMITATION (documented, not solved): the seed-loopback ClusterRole
+# is a STATIC least-privilege grant over the KNOWN composition apiGroups
+# (composition.krateo.io + core.krateo.io). A blueprint declaring a CUSTOM
+# apiGroup is NOT covered → its nested seed resolve 403s → that composition
+# warms PARTIALLY at boot, but STILL SERVES CORRECTLY on the live /call (the
+# seed is best-effort warmth, not a correctness gate). Same dynamic-GVR problem
+# core-provider solves per-composition; mitigation = extend this grant or a
+# per-composition seed-grant. Bounded + documented.
+seedAuthn:
+  # The issued identity's group (authn ServiceAccount CR spec.groups → cert O=)
+  # that the ClusterRoleBinding grants the nested-RA reads to.
+  group: "krateo:snowplow-seed"
+  # The namespace the authn operator watches for ServiceAccount allowlist CRs.
+  authnNamespace: krateo-system
+  # Projected token audience — MUST be exactly "authn" (the authn operator's
+  # --serviceaccount-audience). Mount path == SERVICEACCOUNT_TOKEN_PATH above.
+  tokenAudience: authn
+  tokenPath: /var/run/secrets/krateo.io/serviceaccount/token
+
+jwtSignKeySecretName: jwt-sign-key

@@ -3,7 +3,7 @@
 > snowplow is the Krateo content bridge: it resolves `RESTAction` and `Widget` custom resources into
 > the JSON the Krateo frontend renders, served over `/call`, with a removable three-tier cache. This
 > index is the agent entry point to the **internals & runtime** view. The **deployment, CRD and
-> wiring** view lives in the chart repo `braghettos/krateo-snowplow-chart` `docs/`.
+> wiring** view lives in the chart repo `krateo-platformops/snowplow` `docs/`.
 
 ## How to use this index (agents)
 

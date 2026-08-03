@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "type": "object",
+  "title": "Snowplow CRDs",
+  "description": "Dedicated CRD chart for snowplow (golden rule: CRDs in a separate chart, separate lifecycle). No tunable values.",
+  "additionalProperties": false,
+  "properties": {
+    "global": {
+      "type": "object",
+      "title": "Global values",
+      "description": "Helm global values (injected when this chart is used as a subchart)."
+    }
+  }
+}

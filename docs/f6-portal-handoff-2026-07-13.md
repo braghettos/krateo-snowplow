@@ -8,7 +8,7 @@ Snowplow F6 (`spec.keyExtras`) is merged but **cut-blocked on this portal-side l
 
 This doc is the zero-re-derivation pack: the CRD schema field to add, ready-to-paste `keyExtras` blocks for all 104 widgets that need one (grouped by declaration set), the post-landing verification recipe, and the sequencing.
 
-The widget→keyExtras mapping is **authoritative** (read from the live CRs on GKE `krateo-installer-test`). The one thing this pack cannot pin is the exact per-file location of each declaration inside the Portal blueprint chart (`oci://ghcr.io/braghettos/krateo/portal` 1.5.11) — the widget-template YAML naming convention observed in the older generation is `<kind>.<widget-name>.yaml` under `blueprint/templates/`; confirm against the 1.5.11 chart source (see audit §Caveats).
+The widget→keyExtras mapping is **authoritative** (read from the live CRs on GKE `krateo-installer-test`). The one thing this pack cannot pin is the exact per-file location of each declaration inside the Portal blueprint chart (`oci://ghcr.io/krateo-platformops/charts/portal` 1.5.11) — the widget-template YAML naming convention observed in the older generation is `<kind>.<widget-name>.yaml` under `blueprint/templates/`; confirm against the 1.5.11 chart source (see audit §Caveats).
 
 ## 1. CRD schema field (add to every widget-kind CRD)
 

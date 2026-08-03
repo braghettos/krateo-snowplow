@@ -1,0 +1,107 @@
+# #57 — prewarm seed → authn loopback-token authorization artifacts (static,
+# helm-applied; no controller). Three objects, ALWAYS rendered (the projected
+# authn JWT is a HARD platform requirement for snowplow, same as the CDC — no
+# opt-in flag; see the values.yaml seedAuthn comment + README hard-dependency):
+#
+# HARD DEPENDENCY: object (1) below is a serviceaccount.authn.krateo.io CR, so
+# THIS CHART FAILS TO INSTALL on a cluster lacking the krateo-authn-crd
+# (serviceaccount.authn.krateo.io CRD) + authn 0.24.0+. That is INTENDED — the
+# platform install pipeline sequences authn 0.24.0 + krateo-authn-crd BEFORE
+# snowplow (mirrors the CDC's identical hard-requirement). Install snowplow only
+# after authn is present, or the install fails fast by design.
+#
+#   1. the authn ServiceAccount ALLOWLIST CR (serviceaccount.authn.krateo.io) —
+#      its EXISTENCE is what authorises snowplow's SA to exchange its projected
+#      audience=authn token for an authn-issued JWT (authn validates the token
+#      via the K8s TokenReview API; an SA with no matching CR cannot exchange).
+#      spec.groups becomes the issued JWT's group (→ the client cert O=).
+#   2. a ClusterRole granting the WARM-PATH reads the nested composition RAs
+#      perform — restactions/widgets + composition.krateo.io/* + namespaces +
+#      configmaps + customresourcedefinitions (scoped to the traced corpus
+#      reads; NO secrets — see the rule-block rationale below).
+#   3. a ClusterRoleBinding binding the issued GROUP to (2) — composition RAs
+#      span namespaces (demo-system, krateo-system, ...), so cluster-scope is
+#      simpler than N RoleBindings and mirrors core-provider's choice.
+#
+# Without (1) the token exchange fails (authn rejects); without (2)+(3) the
+# exchange succeeds but snowplow 403s the loopback resolve (the issued group
+# has no RBAC). The snowplow SA itself is created by serviceaccount.yaml.
+apiVersion: serviceaccount.authn.krateo.io/v1alpha1
+kind: ServiceAccount
+metadata:
+  name: snowplow-seed
+  namespace: {{ .Values.seedAuthn.authnNamespace }}
+  labels:
+    {{- include "snowplow.labels" . | nindent 4 }}
+spec:
+  serviceAccountRef:
+    namespace: {{ .Release.Namespace }}
+    name: {{ include "snowplow.serviceAccountName" . }}
+  groups:
+    - {{ .Values.seedAuthn.group | quote }}
+  displayName: "snowplow prewarm seed"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "snowplow.fullname" . }}-seed-loopback
+  labels:
+    {{- include "snowplow.labels" . | nindent 4 }}
+# SCOPED to the ACTUAL warm-path reads (arch-listshape traced the nested
+# composition-resources resolves against the corpus): namespaces (84×),
+# fullstackapps + the composition group (69×), customresourcedefinitions
+# (11×), configmaps (10×), widgets/restactions (1×+). DELIBERATELY NO
+# `secrets`: the warm path reads ZERO secrets (the only secrets reader is the
+# settings-users step, which is UAF-gated and OFF the prewarm path), and a
+# cluster-wide secrets-read on the seed group is a high-value compromised-seed
+# surface for zero warm benefit — least-privilege drops it. (Mitigation note:
+# the #58-gated apistage serve re-narrows the warmed shared cell per-user, so a
+# broad grant wouldn't directly leak to users; this is the compromised-seed
+# surface, hence still dropped.)
+rules:
+  # Core: namespace enumeration + configmaps the composition pages dereference.
+  - apiGroups: [""]
+    resources: ["namespaces", "configmaps"]
+    verbs: ["get", "list"]
+  # CRD discovery (composition-schema/discovery steps enumerate served resources).
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  # RESTAction/widget substrate the loopback resolves (nested /call targets).
+  - apiGroups: ["templates.krateo.io"]
+    resources: ["restactions"]
+    verbs: ["get", "list"]
+  - apiGroups: ["widgets.templates.krateo.io"]
+    resources: ["widgets"]
+    verbs: ["get", "list"]
+  # DYNAMIC-GVR LIMITATION (documented, not solved): this static grant covers
+  # only the KNOWN composition apiGroups (composition.krateo.io +
+  # core.krateo.io). A blueprint declaring a CUSTOM apiGroup is NOT covered →
+  # its nested seed resolve 403s → that composition warms PARTIALLY at boot,
+  # but STILL SERVES CORRECTLY on the live /call (the seed is best-effort
+  # warmth, not a correctness gate). Same dynamic-GVR problem core-provider
+  # solves per-composition; mitigation = extend this grant or a per-composition
+  # seed-grant. Bounded + documented, not solved now.
+  # Composition objects the pages read. See DYNAMIC-GVR LIMITATION note.
+  - apiGroups: ["composition.krateo.io"]
+    resources: ["fullstackapps"]
+    verbs: ["get", "list"]
+  - apiGroups: ["core.krateo.io"]
+    resources: ["compositiondefinitions"]
+    verbs: ["get", "list"]
+# NO secrets. NO write verbs. get/list only.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "snowplow.fullname" . }}-seed-loopback
+  labels:
+    {{- include "snowplow.labels" . | nindent 4 }}
+subjects:
+  - kind: Group
+    apiGroup: rbac.authorization.k8s.io
+    name: {{ .Values.seedAuthn.group | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "snowplow.fullname" . }}-seed-loopback

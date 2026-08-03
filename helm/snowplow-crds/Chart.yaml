@@ -1,0 +1,34 @@
+apiVersion: v2
+name: snowplow-crds
+description: Krateo PlatformOps Snowplow CRDs
+
+# A chart can be either an 'application' or a 'library' chart.
+#
+# Application charts are a collection of templates that can be packaged into versioned archives
+# to be deployed.
+#
+# Library charts provide useful utilities or functions for the chart developer. They're included as
+# a dependency of application charts to inject those utilities and functions into the rendering
+# pipeline. Library charts do not define any templates and therefore cannot be deployed.
+type: application
+
+# This is the chart version. This version number should be incremented each time you make changes
+# to the chart and its templates, including the app version.
+# Versions are expected to follow Semantic Versioning (https://semver.org/)
+# Versioned with the SAME release tag as the main chart (krateo-snowplow): the CHART_VERSION
+# placeholder is substituted to the git tag by release-oci.yaml, so one chart-repo tag publishes
+# krateo-snowplow and krateo-snowplow-crd at the same version. The installer pins both at one
+# version. (Was independently pinned at 0.21.3 — restactions CRD, Ship S.1 / 0.30.205 schema with
+# UserAccessFilter.resourcesFrom + the resource/resourcesFrom XOR validation.)
+version: CHART_VERSION
+
+
+home: https://krateo.io
+icon: https://github.com/krateoplatformops/krateo/blob/main/docs/media/logo.svg
+keywords:
+  - krateo
+  - platformops
+  - snowplow
+  - crd
+sources:
+  - https://github.com/krateo-platformops/snowplow
