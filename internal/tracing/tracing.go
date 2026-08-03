@@ -37,7 +37,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/env"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"

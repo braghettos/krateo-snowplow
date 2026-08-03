@@ -6,12 +6,12 @@ import (
 	"log/slog"
 	"strings"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/plumbing/kubeutil"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/kubeutil"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/client-go/rest"
 )
 

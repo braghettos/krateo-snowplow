@@ -29,8 +29,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 )
 
 // ──────────────────────────────────────────────────────────────────────

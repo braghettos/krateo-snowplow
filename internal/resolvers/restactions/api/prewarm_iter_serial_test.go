@@ -16,7 +16,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestFAL_PrewarmIterSerial_ForcesParallelismOne proves a resolve context

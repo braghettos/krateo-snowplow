@@ -5,7 +5,7 @@
 // encode-to-string, no json.Unmarshal-back. It eliminates the D3+D4 jq
 // string round-trip identified in docs/ship-a-jq-roundtrip-design.md §0.
 //
-// It deliberately does NOT patch github.com/krateoplatformops/plumbing/jqutil
+// It deliberately does NOT patch github.com/krateo-platformops/plumbing/jqutil
 // (that is an upstream dependency). It REPLICATES jqutil.Eval's control flow
 // (parse / compile / runtime-error / zero-yield / single / multi-yield)
 // exactly as the design's §3.4.1 specifies, but separates the five outcomes

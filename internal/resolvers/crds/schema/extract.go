@@ -3,7 +3,7 @@ package schema
 import (
 	"fmt"
 
-	"github.com/krateoplatformops/plumbing/maps"
+	"github.com/krateo-platformops/plumbing/maps"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )

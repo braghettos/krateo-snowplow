@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/maps"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/maps"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 const (

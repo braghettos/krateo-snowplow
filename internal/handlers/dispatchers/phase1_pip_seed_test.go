@@ -35,8 +35,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // TestPipCohortTimeout_RestoredToFixed120s is the Ship 0.30.191 SCOPE

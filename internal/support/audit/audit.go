@@ -31,7 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
+	xcontext "github.com/krateo-platformops/plumbing/context"
 
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/log"
@@ -158,7 +158,7 @@ type Emitter struct {
 }
 
 // New returns an Emitter bound to logger. Obtain logger from the
-// LoggerProvider via provider.Logger("github.com/krateoplatformops/snowplow/audit").
+// LoggerProvider via provider.Logger("github.com/krateo-platformops/snowplow/audit").
 func New(logger log.Logger) *Emitter { return &Emitter{logger: logger} }
 
 // defaultEmitter is the process-wide audit emitter installed from main once

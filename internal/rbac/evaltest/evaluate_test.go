@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 
 	authv1 "k8s.io/api/authorization/v1"
 	rbacv1 "k8s.io/api/rbac/v1"

@@ -21,9 +21,9 @@ package dispatchers
 import (
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestWithCohortSeedContext_OverridesWalkScope — the seed cohort ctx derived

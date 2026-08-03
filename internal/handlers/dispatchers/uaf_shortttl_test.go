@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestUAF_C118_6_AllThreePutSitesWired is the SOURCE-LEVEL guard that the short

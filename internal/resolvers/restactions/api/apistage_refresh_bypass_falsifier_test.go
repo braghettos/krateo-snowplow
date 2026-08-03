@@ -35,11 +35,11 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/plumbing/ptr"
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/ptr"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

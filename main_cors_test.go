@@ -28,8 +28,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/server/use"
-	"github.com/krateoplatformops/plumbing/server/use/cors"
+	"github.com/krateo-platformops/plumbing/server/use"
+	"github.com/krateo-platformops/plumbing/server/use/cors"
 )
 
 // exposeList parses an Access-Control-Expose-Headers value ("A, B, C") into a

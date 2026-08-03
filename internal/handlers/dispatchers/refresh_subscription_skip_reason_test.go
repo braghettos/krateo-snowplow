@@ -18,7 +18,7 @@ package dispatchers
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestDeriveSubscriptionKeyWithReason_InformerMiss — the widget CR is NOT seeded

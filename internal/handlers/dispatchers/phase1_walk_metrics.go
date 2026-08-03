@@ -51,8 +51,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 

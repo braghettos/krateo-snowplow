@@ -37,12 +37,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // ── recorder that timestamps the latch fire relative to seed events ─────────

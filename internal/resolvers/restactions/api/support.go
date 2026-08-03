@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/env"
 )
 
 // depthSentinelNotComputed is the value the "depth" log field carries

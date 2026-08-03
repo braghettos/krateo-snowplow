@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/jqutil"
+	"github.com/krateo-platformops/plumbing/jqutil"
 )
 
 func eval(t *testing.T, query string, data any) any {

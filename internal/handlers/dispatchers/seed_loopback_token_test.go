@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
+	xcontext "github.com/krateo-platformops/plumbing/context"
 )
 
 // shortDeadlineCtx models the production reality that installSeedLoopbackToken

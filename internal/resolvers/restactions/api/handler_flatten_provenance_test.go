@@ -22,7 +22,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateo-platformops/plumbing/ptr"
 )
 
 // accumulate runs jsonHandlerCore for a sequence of already-decoded element

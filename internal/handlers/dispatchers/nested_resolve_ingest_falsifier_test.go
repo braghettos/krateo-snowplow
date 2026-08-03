@@ -29,9 +29,9 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 

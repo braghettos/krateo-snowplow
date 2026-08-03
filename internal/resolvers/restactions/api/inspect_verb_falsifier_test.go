@@ -28,7 +28,7 @@ import (
 	"context"
 	"testing"
 
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // TestInspect_CollectionStage_VerbList is the DISCRIMINATING falsifier: a

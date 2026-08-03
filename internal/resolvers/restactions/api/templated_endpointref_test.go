@@ -29,9 +29,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	corev1 "k8s.io/api/core/v1"
 )
 

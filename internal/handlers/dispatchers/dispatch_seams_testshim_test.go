@@ -11,10 +11,10 @@ import (
 	"context"
 	"net/http"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 

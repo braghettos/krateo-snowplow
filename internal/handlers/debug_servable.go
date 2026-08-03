@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // debugServableBody is the JSON body returned by /debug/servable.

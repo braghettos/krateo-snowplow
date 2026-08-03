@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/widgetdatatemplate"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/widgetdatatemplate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

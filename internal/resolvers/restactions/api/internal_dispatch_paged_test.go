@@ -48,9 +48,9 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/client-go/rest"
 )
 

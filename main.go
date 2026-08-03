@@ -22,27 +22,26 @@ import (
 	"syscall"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/plumbing/kubeutil"
-	"github.com/krateoplatformops/plumbing/server/use"
-	"github.com/krateoplatformops/plumbing/server/use/cors"
-	"github.com/krateoplatformops/plumbing/slogs/pretty"
-	_ "github.com/krateoplatformops/snowplow/docs"
-	"github.com/krateoplatformops/snowplow/internal/authn"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
-	"github.com/krateoplatformops/snowplow/internal/handlers"
-	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
-	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
-	"github.com/krateoplatformops/snowplow/internal/logging"
-	"github.com/krateoplatformops/snowplow/internal/metrics"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
-	crdschema "github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
-	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
-	"github.com/krateoplatformops/snowplow/internal/support/audit"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
-	"github.com/krateoplatformops/snowplow/internal/tracing"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/kubeutil"
+	"github.com/krateo-platformops/plumbing/server/use"
+	"github.com/krateo-platformops/plumbing/server/use/cors"
+	_ "github.com/krateo-platformops/snowplow/docs"
+	"github.com/krateo-platformops/snowplow/internal/authn"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/handlers"
+	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/logging"
+	"github.com/krateo-platformops/snowplow/internal/metrics"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
+	crdschema "github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
+	"github.com/krateo-platformops/snowplow/internal/tracing"
 	httpSwagger "github.com/swaggo/http-swagger"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -183,14 +182,10 @@ func main() {
 
 	var lh slog.Handler
 	if *prettyLog {
-		lh = pretty.New(&slog.HandlerOptions{
+		lh = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 			Level:     logLevel,
 			AddSource: false,
-		},
-			pretty.WithDestinationWriter(os.Stderr),
-			pretty.WithColor(),
-			pretty.WithOutputEmptyAttrs(),
-		)
+		})
 	} else {
 		lh = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level:     logLevel,
@@ -277,7 +272,7 @@ func main() {
 	defer func() { _ = logShutdown(context.Background()) }()
 	if logProvider != nil {
 		audit.SetDefault(audit.New(
-			logProvider.Logger("github.com/krateoplatformops/snowplow/audit"),
+			logProvider.Logger("github.com/krateo-platformops/snowplow/audit"),
 		))
 	}
 

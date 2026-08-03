@@ -28,7 +28,7 @@ package dispatchers
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestFalsifierFA1_ApistageHandlerRegistered asserts the registry-level

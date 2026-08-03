@@ -9,7 +9,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 func init() {

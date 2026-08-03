@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

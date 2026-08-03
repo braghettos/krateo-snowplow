@@ -45,7 +45,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // Ship 0.30.242 H.c-layered Phase 2c — publishNUserCohortSnapshot + itoa

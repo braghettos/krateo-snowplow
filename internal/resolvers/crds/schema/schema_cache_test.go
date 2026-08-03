@@ -33,7 +33,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

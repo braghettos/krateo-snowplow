@@ -14,7 +14,7 @@ package unbalanced
 import (
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 func stampedSite(handle *cache.ResolvedCacheStore, key string, encoded []byte, inputs *cache.ResolvedKeyInputs) {

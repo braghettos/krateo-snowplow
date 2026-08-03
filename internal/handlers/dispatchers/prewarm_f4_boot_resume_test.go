@@ -50,8 +50,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 )
 
 // f4WidgetKey derives the production widget cell key EXACTLY as seedOneWidget

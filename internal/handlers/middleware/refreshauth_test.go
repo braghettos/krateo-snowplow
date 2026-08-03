@@ -25,9 +25,9 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
 const refreshAuthTestKey = "test-signing-key-for-refreshauth-m17-2026-07-30"

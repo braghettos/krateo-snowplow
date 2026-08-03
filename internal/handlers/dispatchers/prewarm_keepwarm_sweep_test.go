@@ -37,11 +37,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // GTTL-2 — cadence == TTL×3/4 derived from RESOLVED_CACHE_TTL_SECONDS.

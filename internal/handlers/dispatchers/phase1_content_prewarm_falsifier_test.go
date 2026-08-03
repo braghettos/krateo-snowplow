@@ -33,8 +33,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

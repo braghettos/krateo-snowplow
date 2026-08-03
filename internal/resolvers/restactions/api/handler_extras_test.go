@@ -27,8 +27,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/ptr"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // (a) value present: the step filter reads `.extras.foo` and gets the value.

@@ -12,10 +12,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/plumbing/http/response"
-	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/ptr"
 )
 
 // external_fetch_falsifier_test.go — the (a)-(k) falsifiers for the

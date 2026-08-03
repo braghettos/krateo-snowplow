@@ -26,7 +26,7 @@ package logging
 import (
 	"context"
 
-	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/env"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	sdklog "go.opentelemetry.io/otel/sdk/log"

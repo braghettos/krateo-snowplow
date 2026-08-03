@@ -59,7 +59,7 @@ import (
 
 	"log/slog"
 
-	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/env"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientcache "k8s.io/client-go/tools/cache"
 )

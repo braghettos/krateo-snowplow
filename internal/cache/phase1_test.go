@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/apimachinery/pkg/runtime/schema"

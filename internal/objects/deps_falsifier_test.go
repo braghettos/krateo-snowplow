@@ -18,7 +18,7 @@ package objects
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestFalsifierF3_GetRecordsDepEdge invokes objects.Get under a

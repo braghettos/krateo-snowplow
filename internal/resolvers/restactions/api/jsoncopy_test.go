@@ -44,7 +44,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/maps"
+	"github.com/krateo-platformops/plumbing/maps"
 )
 
 // ─────────────────────────────────────────────────────────────────────

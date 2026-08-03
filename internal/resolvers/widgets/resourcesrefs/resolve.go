@@ -12,10 +12,10 @@ import (
 	"net/url"
 	"strconv"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )

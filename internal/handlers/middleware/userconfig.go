@@ -3,7 +3,7 @@
 // Ship D.2 / 0.30.143 missed.
 //
 // PROVENANCE / UPSTREAM DRIFT MONITOR (AC-D3.1 + AC-D3.14).
-//   - Upstream module:  github.com/krateoplatformops/plumbing
+//   - Upstream module:  github.com/krateo-platformops/plumbing
 //   - Upstream version: v0.9.3                       (pinned in go.mod)
 //   - Upstream file:    server/use/userconfig.go
 //   - Upstream func:    use.UserConfig(signingKey, authnNS string)
@@ -40,16 +40,16 @@ import (
 	"net/http"
 	"strings"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/http/response"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/plumbing/kubeutil"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/kubeutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/rest"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
 // PinnedPlumbingVersion is the upstream `plumbing` module version this

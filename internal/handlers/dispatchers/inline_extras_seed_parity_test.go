@@ -25,8 +25,8 @@ package dispatchers
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 )
 
 // seedKeyExtrasFor reproduces the seed's per-cohort key-extras fold

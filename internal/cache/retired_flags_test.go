@@ -14,7 +14,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // capturedRecord is one slog record the test handler retained.

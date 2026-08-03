@@ -58,7 +58,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/krateoplatformops/plumbing/kubeutil/plurals"
+	"github.com/krateo-platformops/plumbing/kubeutil/plurals"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/meta"

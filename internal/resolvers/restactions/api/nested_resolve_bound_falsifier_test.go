@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // headroomModel is the shared test seam state: a fixed GOMEMLIMIT + a live-heap

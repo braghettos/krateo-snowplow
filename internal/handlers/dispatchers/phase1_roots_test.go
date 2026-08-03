@@ -13,7 +13,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 )
 
 // TestFrontendConfig_ParsesInitAndRoutesLoader proves config.json's

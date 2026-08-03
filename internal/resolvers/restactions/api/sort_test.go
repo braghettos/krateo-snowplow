@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 func Example_topologicalSort() {

@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // mintTokenOutsider mints a JWT for a user in a group the seed does NOT grant

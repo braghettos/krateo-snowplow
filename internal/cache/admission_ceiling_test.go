@@ -8,7 +8,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestAdmissionCeiling_HeadroomMinusReserve pins ceiling = (limit − liveHeap) −

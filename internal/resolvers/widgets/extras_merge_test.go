@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/resourcesrefstemplate"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/widgetdatatemplate"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/resourcesrefstemplate"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/widgetdatatemplate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/utils/ptr"

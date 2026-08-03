@@ -4,8 +4,8 @@ import (
 	"context"
 	"log/slog"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )

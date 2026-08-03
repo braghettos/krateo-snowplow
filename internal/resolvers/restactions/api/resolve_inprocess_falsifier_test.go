@@ -25,11 +25,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/plumbing/ptr"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/client-go/rest"
 )
 

@@ -19,7 +19,7 @@ import (
 	"sync"
 	"testing"
 
-	pmaps "github.com/krateoplatformops/plumbing/maps"
+	pmaps "github.com/krateo-platformops/plumbing/maps"
 )
 
 func memoCacheOn(t *testing.T) {

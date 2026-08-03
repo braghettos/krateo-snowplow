@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestF5_1_RecordBackstop_BumpsCounter — the alert-fires arm. Each

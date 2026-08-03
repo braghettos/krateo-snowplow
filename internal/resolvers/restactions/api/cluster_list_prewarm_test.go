@@ -13,8 +13,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/ptr"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // raWithStages is a test helper that builds a *templates.RESTAction from

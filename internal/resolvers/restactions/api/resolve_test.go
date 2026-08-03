@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/e2e"
-	xenv "github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/snowplow/apis"
-	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/e2e"
+	xenv "github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/snowplow/apis"
+	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 
 	"sigs.k8s.io/e2e-framework/klient/decoder"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"

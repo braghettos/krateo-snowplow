@@ -23,7 +23,7 @@ import (
 	"strings"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
+	xcontext "github.com/krateo-platformops/plumbing/context"
 )
 
 // newLevelLogger builds a JSON logger exactly the way main.go does:

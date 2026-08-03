@@ -27,7 +27,7 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/env"
 )
 
 // requiredScopedRoutes is the static expected set of `/call`-class

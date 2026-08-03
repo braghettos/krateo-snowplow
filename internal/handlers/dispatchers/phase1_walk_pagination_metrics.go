@@ -56,7 +56,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // Grand totals across every paginated apiRef widget. Bumped from

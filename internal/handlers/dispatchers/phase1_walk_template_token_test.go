@@ -9,7 +9,7 @@ package dispatchers
 import (
 	"testing"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 func refOf(name, namespace string) templatesv1.ObjectReference {

@@ -46,11 +46,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // ── the WALK-COUNTING seam ────────────────────────────────────────────────

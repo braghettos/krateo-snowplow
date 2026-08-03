@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/handlers"
+	"github.com/krateo-platformops/snowplow/internal/handlers"
 	"github.com/stretchr/testify/assert"
 )
 

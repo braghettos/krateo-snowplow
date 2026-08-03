@@ -65,8 +65,8 @@ import (
 	"context"
 	"log/slog"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )

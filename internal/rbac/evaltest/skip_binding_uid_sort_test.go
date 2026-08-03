@@ -42,7 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 )
 
 // canonicalSACRBShape reproduces the live-cluster 50K shape that makes

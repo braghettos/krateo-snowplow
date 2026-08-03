@@ -31,7 +31,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // C62-2 — the RED→GREEN sufficiency arm. RED pre-fix (cold Put doesn't

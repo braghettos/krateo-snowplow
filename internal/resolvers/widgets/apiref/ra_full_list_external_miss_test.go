@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestRAServe_KnownSliceableCellMiss_ExternalTouched_DeclinesPut is the M6

@@ -12,8 +12,8 @@ package dispatchers
 import (
 	"context"
 
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
 // setNestedCallResolverForTest installs fn as the nested-/call resolver

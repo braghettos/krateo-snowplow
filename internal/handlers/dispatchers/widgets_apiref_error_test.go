@@ -28,7 +28,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/http/response"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )

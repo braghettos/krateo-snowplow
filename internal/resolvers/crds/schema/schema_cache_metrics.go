@@ -30,7 +30,7 @@ import (
 	"expvar"
 	"sync"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // crdSchemaMemoMetricsOnce guards expvar.Publish so registration runs at most

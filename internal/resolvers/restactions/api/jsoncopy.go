@@ -49,7 +49,7 @@
 //     (~5–10 ns), multiplied by ~190K leaves per content-cache hit.
 //
 //   - **Win mechanism #2 — in-package call-frame elision.** Upstream's
-//     `DeepCopyJSON` lives in `github.com/krateoplatformops/plumbing/maps`;
+//     `DeepCopyJSON` lives in `github.com/krateo-platformops/plumbing/maps`;
 //     each recursive descent pays a cross-module call frame. Ship C's
 //     `CopyJSONValue` lives in the same package as its caller
 //     (`apistage.go`'s `listEnvelopeValue`), so Go's mid-stack inliner

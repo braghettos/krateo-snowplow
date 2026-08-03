@@ -12,7 +12,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
 // debugRefreshesServer wires the PRODUCTION gate (RefreshAuth → DebugRefreshes)

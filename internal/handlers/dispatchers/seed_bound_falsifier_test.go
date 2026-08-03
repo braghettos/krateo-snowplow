@@ -34,7 +34,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // tightHeadroomSeams installs deterministic runtime seams so the shared

@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jqutil"
-	"github.com/krateoplatformops/snowplow/internal/support/audit"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jqutil"
+	"github.com/krateo-platformops/snowplow/internal/support/audit"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
 // exportParams are the /export-specific query parameters, stripped from

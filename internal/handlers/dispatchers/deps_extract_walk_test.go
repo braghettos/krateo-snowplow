@@ -14,7 +14,7 @@ package dispatchers
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 )
 
 // TestParseCallPathToObjectRef covers the /call widget-endpoint decoder.
@@ -50,7 +50,7 @@ func TestParseCallPathToObjectRef(t *testing.T) {
 		},
 		{
 			name:   "external link — not a /call endpoint",
-			path:   "https://github.com/krateoplatformops/snowplow",
+			path:   "https://github.com/krateo-platformops/snowplow",
 			wantOK: false,
 		},
 		{

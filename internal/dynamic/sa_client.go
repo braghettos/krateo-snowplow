@@ -28,7 +28,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/endpoints"
 	"k8s.io/client-go/rest"
 )
 

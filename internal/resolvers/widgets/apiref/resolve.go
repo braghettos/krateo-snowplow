@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	pmaps "github.com/krateoplatformops/plumbing/maps"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	pmaps "github.com/krateo-platformops/plumbing/maps"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/client-go/rest"
 )
 

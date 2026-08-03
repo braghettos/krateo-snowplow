@@ -25,11 +25,11 @@ import (
 	"strings"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	restactionsapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

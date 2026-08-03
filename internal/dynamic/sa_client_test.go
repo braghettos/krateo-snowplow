@@ -17,7 +17,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/endpoints"
 )
 
 func TestServiceAccountEndpoint_NoTokenFileReturnsError(t *testing.T) {

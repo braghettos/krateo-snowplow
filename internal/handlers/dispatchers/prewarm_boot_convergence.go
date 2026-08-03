@@ -54,7 +54,7 @@ import (
 	"context"
 	"sort"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // bootMaxNoProgressPasses is the #105 re-enqueue bound: after this many

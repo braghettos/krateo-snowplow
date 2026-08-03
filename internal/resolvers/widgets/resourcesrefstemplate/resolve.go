@@ -9,10 +9,10 @@ import (
 	"errors"
 	"log/slog"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jqutil"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jqutil"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 	"k8s.io/utils/ptr"
 )
 

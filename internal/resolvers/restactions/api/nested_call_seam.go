@@ -32,7 +32,7 @@ package api
 import (
 	"context"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // NestedCallResolverFunc resolves a /call-loopback stage IN-PROCESS. ref

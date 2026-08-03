@@ -25,7 +25,7 @@ package dispatchers
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

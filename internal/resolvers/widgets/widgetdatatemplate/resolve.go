@@ -8,9 +8,9 @@ import (
 	"context"
 	"strings"
 
-	"github.com/krateoplatformops/plumbing/jqutil"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	"github.com/krateo-platformops/plumbing/jqutil"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
 type EvalResult struct {

@@ -51,8 +51,8 @@ package cache
 import (
 	"context"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/kubeconfig"
 	"k8s.io/client-go/rest"
 )
 

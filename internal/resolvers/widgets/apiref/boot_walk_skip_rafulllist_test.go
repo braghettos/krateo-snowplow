@@ -28,9 +28,9 @@ import (
 	"context"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // bootWalkCtx returns a ctx stamped exactly as withPhase1SAContext stamps the

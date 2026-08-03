@@ -37,9 +37,9 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/ptr"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // selfHostKey is the (scheme, host, port) tuple parsed once from URL_SELF.

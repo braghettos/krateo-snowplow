@@ -29,8 +29,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // raRef builds the ObjectReference the nav-walk harvester produces for a

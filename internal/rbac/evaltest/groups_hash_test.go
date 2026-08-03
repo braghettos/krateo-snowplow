@@ -29,7 +29,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 )
 
 // TestM9_CanonicalGroupsHash_Collision asserts the length-prefix framing

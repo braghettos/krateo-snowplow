@@ -29,8 +29,8 @@ package dispatchers
 import (
 	"context"
 
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 )
 
 // fetchObjectFn is the fetch-the-dispatched-CR seam (fetchObject → objects.Get).

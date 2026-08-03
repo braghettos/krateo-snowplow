@@ -24,8 +24,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
 // refreshServerGzip wires the PRODUCTION chain (RefreshAuth -> Refreshes)

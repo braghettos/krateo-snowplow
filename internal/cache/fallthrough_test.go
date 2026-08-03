@@ -36,9 +36,9 @@ import (
 	"sync"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/plumbing/server/use"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/server/use"
 )
 
 // ─────────────────────────────────────────────────────────────────────

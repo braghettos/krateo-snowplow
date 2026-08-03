@@ -31,7 +31,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/endpoints"
 )
 
 const (

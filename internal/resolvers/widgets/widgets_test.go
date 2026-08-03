@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/e2e"
-	xenv "github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/snowplow/apis"
-	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/objects"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/e2e"
+	xenv "github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/snowplow/apis"
+	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"

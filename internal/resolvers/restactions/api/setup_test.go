@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/krateoplatformops/plumbing/ptr"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 func Example_createRequestOptions() {

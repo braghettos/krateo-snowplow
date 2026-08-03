@@ -22,7 +22,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // emitKeyRealDefault computes the EMIT cache key the /call dispatcher would

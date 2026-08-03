@@ -37,8 +37,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/ptr"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // benchScaleNamespaces models the bench cluster's namespace set in the

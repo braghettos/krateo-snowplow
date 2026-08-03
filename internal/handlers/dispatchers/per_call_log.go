@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
+	xcontext "github.com/krateo-platformops/plumbing/context"
 	"go.opentelemetry.io/otel/trace"
 )
 

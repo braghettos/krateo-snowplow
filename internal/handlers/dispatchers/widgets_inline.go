@@ -47,8 +47,8 @@ import (
 	"encoding/json"
 	"log/slog"
 
-	"github.com/krateoplatformops/plumbing/maps"
-	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/plumbing/maps"
+	"github.com/krateo-platformops/snowplow/internal/objects"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

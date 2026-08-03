@@ -36,12 +36,12 @@ import (
 	goruntime "runtime"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/snowplow/apis"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/apis"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )

@@ -47,11 +47,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // rankObsEvent records one seed in call order with the seeding identity and the

@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
+	xcontext "github.com/krateo-platformops/plumbing/context"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 

@@ -38,10 +38,10 @@ import (
 	"log/slog"
 
 	"github.com/itchyny/gojq"
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
 // refilterResult is the (kept, dropped, total) summary the resolver

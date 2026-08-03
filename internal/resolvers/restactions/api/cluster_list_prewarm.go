@@ -29,9 +29,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )

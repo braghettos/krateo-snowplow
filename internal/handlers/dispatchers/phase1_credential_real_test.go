@@ -41,9 +41,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/kubeconfig"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 
 	"k8s.io/client-go/rest"
 )

@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"strings"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/http/response"
-	"github.com/krateoplatformops/plumbing/jqutil"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/jqutil"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
 const (

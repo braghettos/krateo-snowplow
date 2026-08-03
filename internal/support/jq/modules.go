@@ -15,7 +15,7 @@ import (
 	"sync"
 
 	"github.com/itchyny/gojq"
-	"github.com/krateoplatformops/plumbing/jqutil"
+	"github.com/krateo-platformops/plumbing/jqutil"
 )
 
 const (

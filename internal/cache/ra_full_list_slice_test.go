@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/jqutil"
+	"github.com/krateo-platformops/plumbing/jqutil"
 )
 
 // HG-4a.empty — FullListIsEmpty: the mechanism-uniform emptiness probe that

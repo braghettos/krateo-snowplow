@@ -45,7 +45,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // keepwarmSweepStarted guards StartKeepwarmSweep against a double start

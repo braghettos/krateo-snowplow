@@ -36,8 +36,8 @@ import (
 	"context"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 )
 
 // l1Ctx builds a ctx carrying the given identity. Empty username + nil groups

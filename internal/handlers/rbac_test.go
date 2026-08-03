@@ -19,7 +19,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
 const rbacTestSignKey = "test-sign-key-rbac-inspect-endpoint"

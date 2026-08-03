@@ -45,7 +45,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/plumbing/kubeconfig"
 )
 
 // realShapedSACA generates a real, parseable self-signed CA certificate

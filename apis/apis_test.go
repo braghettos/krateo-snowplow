@@ -6,8 +6,8 @@ package apis_test
 import (
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/apis"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/apis"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 
 	"k8s.io/apimachinery/pkg/runtime"
 )

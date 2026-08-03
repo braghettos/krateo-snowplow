@@ -15,10 +15,10 @@ import (
 	"context"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	pmaps "github.com/krateoplatformops/plumbing/maps"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	pmaps "github.com/krateo-platformops/plumbing/maps"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestSeedMemo_NotConsultedOffSeedPath — C-F4-8. The memo lookup in

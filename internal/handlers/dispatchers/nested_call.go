@@ -41,14 +41,14 @@ import (
 	"fmt"
 	"log/slog"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/snowplow/apis"
-	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/snowplow/apis"
+	v1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/objects"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 

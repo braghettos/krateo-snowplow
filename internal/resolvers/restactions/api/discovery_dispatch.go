@@ -73,10 +73,10 @@ import (
 	"net/http"
 	"sync"
 
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/plumbing/ptr"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/dynamic"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 )

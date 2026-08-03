@@ -28,8 +28,8 @@ import (
 
 	rbacv1 "k8s.io/api/rbac/v1"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
 )
 
 // TestL2Fix_DenyNotCached_ReEvaluatesEveryCall asserts a deny verdict is

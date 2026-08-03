@@ -17,8 +17,8 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 	"sigs.k8s.io/e2e-framework/support/kind"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	xenv "github.com/krateoplatformops/plumbing/env"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	xenv "github.com/krateo-platformops/plumbing/env"
 )
 
 var (

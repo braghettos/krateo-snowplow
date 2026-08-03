@@ -35,8 +35,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // envSeedExternalFetchTimeoutMS is the string-typed installer knob

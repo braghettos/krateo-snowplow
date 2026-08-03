@@ -9,8 +9,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/http/response"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/http/response"
 	"sigs.k8s.io/yaml"
 )
 

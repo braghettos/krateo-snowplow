@@ -47,11 +47,11 @@ import (
 	"strings"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/env"
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/plumbing/ptr"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/env"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/plumbing/ptr"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 

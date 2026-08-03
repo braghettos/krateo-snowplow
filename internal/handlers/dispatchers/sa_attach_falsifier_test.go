@@ -39,7 +39,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestSnowplowSACtx_OutOfCluster_ReturnsNilNil pins AC-307.7: a unit-test

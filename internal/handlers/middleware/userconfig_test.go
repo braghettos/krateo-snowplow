@@ -44,16 +44,16 @@ import (
 	"testing"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/plumbing/server/use"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/server/use"
 	"k8s.io/client-go/kubernetes/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/handlers/middleware"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
 const (
@@ -499,7 +499,7 @@ func TestUserConfigMirror_PlumbingVersionPin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read go.mod: %v", err)
 	}
-	want := fmt.Sprintf("github.com/krateoplatformops/plumbing %s", pinned)
+	want := fmt.Sprintf("github.com/krateo-platformops/plumbing %s", pinned)
 	if !bytes.Contains(data, []byte(want)) {
 		t.Errorf("go.mod does not contain pinned %q.\nThe middleware was transcribed from plumbing %s; if you bump plumbing in go.mod, re-audit internal/handlers/middleware/userconfig.go against the new server/use/userconfig.go line-by-line and update PinnedPlumbingVersion.\nFirst 256 bytes of go.mod: %s",
 			want, pinned, truncate(data, 256))

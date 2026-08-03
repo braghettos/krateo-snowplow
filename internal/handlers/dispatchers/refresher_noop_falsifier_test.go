@@ -24,7 +24,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestFalsifierFNoop_RefreshFuncReallyReResolves registers the Ship C

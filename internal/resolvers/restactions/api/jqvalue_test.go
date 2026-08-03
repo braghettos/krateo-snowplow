@@ -29,7 +29,7 @@ import (
 	"sync"
 	"testing"
 
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // jsonEq reports whether a and b serialise to byte-identical JSON — the

@@ -32,7 +32,7 @@ import (
 	"net/url"
 	"strings"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 // ParseCallPathToObjectRef parses a `/call?resource=...&apiVersion=...&

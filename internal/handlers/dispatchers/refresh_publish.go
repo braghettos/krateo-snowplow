@@ -34,7 +34,7 @@
 // armed set under the lock).
 package dispatchers
 
-import "github.com/krateoplatformops/snowplow/internal/cache"
+import "github.com/krateo-platformops/snowplow/internal/cache"
 
 // publishIfSubscribed announces a genuine cold-dispatch Put of l1Key to any
 // already-armed /refreshes subscriber, and is a no-op when none is armed

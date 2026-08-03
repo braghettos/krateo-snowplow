@@ -24,7 +24,7 @@ import (
 	"os"
 
 	// Side-effect import: trigger cache package init().
-	_ "github.com/krateoplatformops/snowplow/internal/cache"
+	_ "github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 func main() {

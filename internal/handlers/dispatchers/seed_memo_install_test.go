@@ -13,10 +13,10 @@ package dispatchers
 import (
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/apiref"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/widgets/apiref"
 )
 
 // TestCohortSeedContext_InheritsSeedResolveMemo — the memo the seed pass

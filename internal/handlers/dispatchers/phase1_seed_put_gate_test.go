@@ -29,7 +29,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // GTTL-1 GREEN + control: stage-error → decline + counter++; empty (no error) →

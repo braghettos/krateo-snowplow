@@ -24,8 +24,8 @@ import (
 	"strings"
 	"testing"
 
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 func raWithSteps(steps ...*templatesv1.API) *templatesv1.RESTAction {

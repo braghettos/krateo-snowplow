@@ -44,7 +44,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // l1LookupCell holds the hit + miss counters for one

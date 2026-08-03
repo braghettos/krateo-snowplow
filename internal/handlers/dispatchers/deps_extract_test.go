@@ -13,7 +13,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	rbacv1 "k8s.io/api/rbac/v1"
 	corev1 "k8s.io/api/core/v1"
 	appsv1 "k8s.io/api/apps/v1"

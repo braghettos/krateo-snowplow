@@ -3,7 +3,7 @@ package api
 import (
 	"fmt"
 
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 )
 
 func topologicalSort(items []*templates.API) ([]string, error) {

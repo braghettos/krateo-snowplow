@@ -31,8 +31,8 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	corev1 "k8s.io/api/core/v1"
 )
 

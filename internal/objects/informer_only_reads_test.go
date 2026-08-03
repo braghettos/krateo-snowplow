@@ -26,8 +26,8 @@ import (
 	"strings"
 	"testing"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // endpointErrFragment is the exact log message getFromAPIServer emits on the

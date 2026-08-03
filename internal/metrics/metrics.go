@@ -31,12 +31,12 @@ package metrics
 import (
 	"context"
 
-	"github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/dynamic"
-	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/crds/schema"
+	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateo-platformops/snowplow/internal/rbac"
+	"github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -63,7 +63,7 @@ const (
 	EnvOTLPEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
 
 	serviceName = "snowplow"
-	meterName   = "github.com/krateoplatformops/snowplow"
+	meterName   = "github.com/krateo-platformops/snowplow"
 )
 
 // ShutdownFunc flushes and stops the metrics pipeline. Always non-nil; a

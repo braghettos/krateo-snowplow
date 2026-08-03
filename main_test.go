@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // TestWriteTimeoutGuard locks the http.Server WriteTimeout at 300s.

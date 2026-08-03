@@ -39,7 +39,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 
-	"github.com/krateoplatformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/env"
 )
 
 // seedUnitFootprintViolations is the production-mode counter bumped when a

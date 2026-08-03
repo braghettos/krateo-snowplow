@@ -30,7 +30,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // ship97LISTEnvelope is a well-formed widgets LIST envelope. Same shape

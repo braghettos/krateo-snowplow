@@ -9,7 +9,7 @@ package dispatchers
 import (
 	"context"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // setResolveOnceForTest swaps the package-level resolveOnceFn for the

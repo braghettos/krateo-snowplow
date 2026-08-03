@@ -28,7 +28,7 @@ package api
 import (
 	"testing"
 
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

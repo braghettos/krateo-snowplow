@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"time"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/http/response"
-	"github.com/krateoplatformops/plumbing/kubeconfig"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/dynamic"
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/kubeconfig"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )

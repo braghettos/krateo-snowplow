@@ -18,8 +18,8 @@ import (
 	"math"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	restapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	restapi "github.com/krateo-platformops/snowplow/internal/resolvers/restactions/api"
 )
 
 func TestAdmissionCeiling_ParityAcrossBothCopies(t *testing.T) {

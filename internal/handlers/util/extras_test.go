@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 )
 
 func TestParseExtras(t *testing.T) {

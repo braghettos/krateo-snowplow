@@ -36,7 +36,7 @@ import (
 	"expvar"
 	"sync"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 var prewarmEngineMetricsOnce sync.Once

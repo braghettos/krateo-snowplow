@@ -11,9 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/krateoplatformops/plumbing/endpoints"
-	"github.com/krateoplatformops/snowplow/internal/cache"
-	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
+	"github.com/krateo-platformops/plumbing/endpoints"
+	"github.com/krateo-platformops/snowplow/internal/cache"
+	idynamic "github.com/krateo-platformops/snowplow/internal/dynamic"
 	"k8s.io/client-go/rest"
 )
 

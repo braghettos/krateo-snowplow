@@ -8,10 +8,10 @@ import (
 	"io"
 	"log/slog"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/ptr"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
 // jsonHandlerOptions plumbs per-stage knobs into jsonHandlerCore.

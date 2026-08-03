@@ -54,8 +54,8 @@ import (
 	"strconv"
 	"sync/atomic"
 
-	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	xcontext "github.com/krateo-platformops/plumbing/context"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // selfLoopbackHost is the URL_SELF host (Hostname, no port/scheme) parsed once at

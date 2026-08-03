@@ -40,7 +40,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 )
 
 // goodEntry is the non-trivial "correct" L1 payload the refresher must

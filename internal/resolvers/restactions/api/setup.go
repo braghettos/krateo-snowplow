@@ -5,11 +5,11 @@ import (
 	"log/slog"
 	"net/http"
 
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/plumbing/jqutil"
-	"github.com/krateoplatformops/plumbing/ptr"
-	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
-	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	httpcall "github.com/krateo-platformops/plumbing/http/request"
+	"github.com/krateo-platformops/plumbing/jqutil"
+	"github.com/krateo-platformops/plumbing/ptr"
+	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
 // Ship 0.30.127: phase1IteratorCap (added 0.30.111) was DELETED. The cap
