@@ -23,6 +23,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "registry": {
+          "type": "string",
+          "description": "Container image registry host. Overridden by global.imageRegistry when that is set (host-only; repository path preserved).",
+          "title": "Registry"
+        },
         "repository": {
           "type": "string",
           "description": "Container image repository.",
@@ -622,7 +627,14 @@
     "global": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Helm global values (injected by the composition runtime)."
+      "description": "Helm global values (injected by the composition runtime).",
+      "properties": {
+        "imageRegistry": {
+          "type": "string",
+          "title": "Image registry",
+          "description": "Registry-host override applied to every image (mirror / air-gapped installs). Replaces the per-image registry host; repository paths are preserved."
+        }
+      }
     }
   },
   "description": "Krateo PlatformOps Snowplow blueprint \u2014 full-coverage schema (chart 0.30.249)."

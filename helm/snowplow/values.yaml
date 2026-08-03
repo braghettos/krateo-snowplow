@@ -13,6 +13,11 @@
 #     thresholds (the 0.25.x dedicated-PROBE_PORT split is NOT on the
 #     1.0.x ship line)
 
+global:
+  # Optional registry-host override applied to EVERY image (mirror / air-gapped installs).
+  # When set, it replaces the per-image `registry` host; repository paths are preserved.
+  imageRegistry: ""
+
 replicaCount: 1
 
 # Deployment strategy (C5, 1.5.29 prewarm-gated readiness). maxUnavailable:0 +
@@ -37,7 +42,10 @@ strategy:
 progressDeadlineSeconds: 1200
 
 image:
-  repository: ghcr.io/krateo-platformops/snowplow
+  # Registry host, split out so global.imageRegistry can relocate every image for
+  # mirror / air-gapped installs (host-only override; the repository path is preserved).
+  registry: ghcr.io
+  repository: krateo-platformops/snowplow
   pullPolicy: Always
   # Empty -> defaults to the chart appVersion (= APP_VERSION = latest semver tag of the
   # krateo-platformops/snowplow app repo, resolved by release-oci). The app fork builds multi-arch
