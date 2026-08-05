@@ -1,0 +1,22 @@
+# gitleaks configuration — inherits the full default ruleset and allowlists a set of
+# verified-non-secret matches that the broad `generic-api-key` rule flags across git history:
+# test fixtures, a signature-less JWT-header test token, a source sentinel constant, a benchmark
+# throwaway password, and documentation example AWS keys (deliberately invalid `AKIB…` prefix).
+# Audited 2026-08-05 — none are real credentials. Add new fixtures here rather than weakening rules.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Verified non-secret fixtures / docs / sentinels (generic-api-key false positives)"
+regexTarget = "match"
+regexes = [
+  '''eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ\.''',
+  '''outer-L1-key-for-dep-test''',
+  '''apistage-outer-L1-key''',
+  '''test-cell-key-it-[0-9a-z]+''',
+  '''test-signing-key-for-snowplow-[a-z0-9-]+''',
+  '''__snowplow_v3_child_l1_ref__''',
+  '''AKIBZQ4DSBNZFAUKNDF7''',
+  '''8CGb87PaNXmdUCdlwVbqwq5C9uNAFq6bcFx842uca''',
+  '''JSqt0OLM6YAT''',
+]
