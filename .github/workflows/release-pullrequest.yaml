@@ -21,9 +21,8 @@ jobs:
       contents: read
       packages: write
     with:
-      context: go/snowplow
+      modules: '[{"mod":"snowplow","context":"go/snowplow"}]'
       push: false
-
   checks:
     uses: krateo-platformops/.github/.github/workflows/component-go-checks.yaml@main
     with:
