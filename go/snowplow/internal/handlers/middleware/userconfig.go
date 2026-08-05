@@ -4,7 +4,7 @@
 //
 // PROVENANCE / UPSTREAM DRIFT MONITOR (AC-D3.1 + AC-D3.14).
 //   - Upstream module:  github.com/krateo-platformops/plumbing
-//   - Upstream version: v0.9.3                       (pinned in go.mod)
+//   - Upstream version: v1.13.0                       (pinned in go.mod)
 //   - Upstream file:    server/use/userconfig.go
 //   - Upstream func:    use.UserConfig(signingKey, authnNS string)
 //                       func(http.Handler) http.Handler
@@ -57,7 +57,7 @@ import (
 // version drifts from this constant, `TestUserConfigMirror_PlumbingVersionPin`
 // fails and the operator must re-audit upstream
 // `server/use/userconfig.go` line-by-line before bumping this string.
-const PinnedPlumbingVersion = "v0.9.3"
+const PinnedPlumbingVersion = "v1.13.0"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
