@@ -1,3 +1,12 @@
+# PR CI via shared reusable workflows (krateo-platformops/.github): a validate-only multi-platform
+# image build (component-image-build, push: false) + Go checks (component-go-checks: unit tests +
+# CRD-drift guard) run from the go/snowplow module dir. One source of truth, and go/-fold-safe.
+#
+# The reusable go-checks covers `go test ./...` and the crds/ drift guard (crd_drift: true replaces
+# the old `codegen` job's scripts/gen.sh --check). The snowplow-specific AST-lint gates
+# (ResolveOptions rc/SArc, ResolvedEntry Put-site scope-completeness, BindingUID single-source, and
+# the unchecked *unstructured assert guard) are NOT covered by the reusable, so they are kept as a
+# local `lint-gates` job that runs from the go/snowplow module dir (fold-safe).
 name: release-pullrequest
 
 on:
@@ -5,30 +14,30 @@ on:
     branches:
       - main
 
-env:
-  GHCR_REPO: ghcr.io/${{ github.repository }}
-
 jobs:
+  build:
+    uses: krateo-platformops/.github/.github/workflows/component-image-build.yaml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      modules: '[{"mod":"snowplow","context":"go/snowplow"}]'
+      push: false
+  checks:
+    uses: krateo-platformops/.github/.github/workflows/component-go-checks.yaml@main
+    with:
+      module: go/snowplow
+      crd_drift: true
+      test_args: >-
+        -race -tags=unit,integration -p 1 -coverprofile=coverage.txt
+        -covermode=atomic ./...
+    secrets: inherit
 
-  # Stage 1 of the CRD pipeline (Go type -> crds/): assert the committed
-  # crds/ manifests match what controller-gen produces from the current
-  # Go types, using the controller-tools version pinned in go.mod. A
-  # stale or hand-edited crds/ fails the PR — so a CRD-field change to
-  # apis/ can never be merged without the regenerated YAML alongside it.
-  codegen:
+  lint-gates:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version: 'stable'
-      - name: Gather dependencies
-        run: go mod download
-      - name: Verify crds/ is in sync with the Go types
-        run: bash scripts/gen.sh --check
-
-  test:
-    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go/snowplow
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -39,36 +48,26 @@ jobs:
       # 0.30.230-class nil-rc guard (#131): fail the PR if any rest.Config-bearing
       # ResolveOptions literal omits its rc field (RC / SArc). A zero rest.Config
       # threads ~8 calls deep and breaks every Kind=* widget at cache.GVRFor —
-      # the latent path behind four HARD REVERTs. Cheap AST check, runs before
-      # the long coverage run so it fails fast.
+      # the latent path behind four HARD REVERTs.
       - name: ResolveOptions rc/SArc construction-site gate
         run: bash scripts/check_resolveoptions_rc.sh
       # L-SCOPE-COMPLETENESS gate (#118d-class enumeration incompleteness): fail
       # the PR if any ResolvedEntry Put site neither stamps the per-entry
       # TTLOverride nor carries a //scope-waiver:TTLOverride: annotation, or if a
-      # readiness-critical boot-prewarm scope stamp was dropped. Cheap AST check,
-      # runs before the long coverage run so it fails fast.
+      # readiness-critical boot-prewarm scope stamp was dropped.
       - name: ResolvedEntry Put-site scope-completeness gate
         run: bash scripts/check_resolved_entry_put_sites.sh
       # H6 (SEC-adj forgery single-source): the AST lints under scripts/lint/
       # are //go:build ignore standalone programs that no workflow invoked, so
       # a BindingUID derivation reintroduced OUTSIDE the match_subject.go single
       # source of truth would NOT fail CI. This step runs the lint over the
-      # production tree and fails the PR on any parallel derivation. Cheap AST
-      # check, runs before the long coverage run so it fails fast.
+      # production tree and fails the PR on any parallel derivation.
       - name: BindingUID single-source (no parallel derivation) gate
         run: bash scripts/check_no_parallel_binding_derivation.sh
       # H6 companion: the Ship 0.30.233 defect class — a raw
       # obj.(*unstructured.Unstructured) content-assert inside a literal
       # informer event-handler body — silently drops every CRD event post-H5
       # (delivery shape is *bytesObject). This step runs the orphaned lint over
-      # internal/cache and fails the PR on any unchecked assert. Cheap AST
-      # check, runs before the long coverage run so it fails fast.
+      # internal/cache and fails the PR on any unchecked assert.
       - name: No unchecked *unstructured.Unstructured assert in informer handlers gate
         run: bash scripts/check_no_unchecked_unstructured_assert.sh
-      - name: Run coverage
-        run: go test -race -tags=unit,integration -p 1 -coverprofile=coverage.txt -covermode=atomic ./...
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
