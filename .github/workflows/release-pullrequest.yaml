@@ -29,6 +29,9 @@ jobs:
     with:
       module: go/snowplow
       crd_drift: true
+      test_args: >-
+        -race -tags=unit,integration -p 1 -coverprofile=coverage.txt
+        -covermode=atomic ./...
     secrets: inherit
 
   lint-gates:
