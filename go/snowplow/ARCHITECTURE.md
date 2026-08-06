@@ -1,7 +1,16 @@
+---
+type: Architecture
+title: snowplow — architecture map
+description: The one-page map of snowplow — what it is, the request path, the three-tier cache, prewarm, RBAC/UAF, and the provisionality invariant, with links to the code-traced deep dives.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [architecture, cache, rbac, prewarm, restaction, widget]
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # snowplow — architecture
 
 The single canonical map of snowplow. Everything else hangs off this file; the deep dives under
-[`docs/architecture/`](docs/architecture/) trace each subsystem through the code at `file:line`.
+[`docs/architecture/`](docs/architecture/) trace each subsystem through the code.
 
 > **Read this as a map, not the territory.** Every claim here is traced to the deep dives, which are
 > traced to the current tree. If a deep dive and this page disagree, the deep dive (and the code it
@@ -12,8 +21,11 @@ The single canonical map of snowplow. Everything else hangs off this file; the d
 A **content bridge**: it resolves `RESTAction` and frontend `Widget` custom resources into the JSON
 the Krateo frontend renders, served over **`/call`**. It is not a BFF and holds no product state —
 it composes content on demand from Kubernetes CRs and serves it to whatever client (the SPA, or
-`curl`) reads it. Server wiring and routes live in `main.go` (`/call`, `/health`, `/readyz`,
-`/debug/vars`, `/debug/pprof`).
+`curl`) reads it. Server wiring and routes live in `main.go`: the content routes (`GET/POST/PUT/
+PATCH/DELETE /call`, `GET /list`, `GET /export`, `GET /api-info/names`, `POST /jq`, `GET /rbac`),
+the per-subject live-refresh SSE stream (`GET /refreshes`), the probes (`/health`, `/readyz`), and
+the debug surface (`/debug/vars`, `/debug/pprof/*`, `/debug/servable`, `/debug/apistage`,
+`/debug/refreshes`, `/swagger/`).
 
 ## The request path (→ [request-lifecycle.md](docs/architecture/request-lifecycle.md))
 
@@ -40,30 +52,48 @@ L3 informer cache  ─▶  L1 resolved-entry cache  ─▶  dispatcher cache
 
 - A widget has **two** L1 keys: an **identity-free content key** (`dispatchWidgetContentKey`,
   username/groups zeroed) and an **identity-bound key** that folds the **first-match RBAC
-  `BindingUID`** (`dispatchCacheLookupKey` → `rbac.EvaluateRBAC`). Keys are a versioned SHA-256
-  (`resolved.go ComputeKey`, `resolvedKeyVersion="v4"`).
+  `BindingUID`** *plus* the identity's **per-subject RBAC sub-generation** (`RBACSubGen`)
+  (`dispatchCacheLookupKey` → `rbac.EvaluateRBAC` + `cache.RBACSubGenForSubject`). Keys are a
+  versioned SHA-256 (`resolved.go ComputeKey`, `resolvedKeyVersion="v6"`).
   > **Correction over older docs/notes:** the identity-bound key is **per-binding-UID**, *not*
-  > "per-cohort". The pre-`v4` per-cohort `BindingSetHash` was replaced by per-binding `BindingUID`.
-  > Per-binding sharing is the equivalence class that still satisfies "never cohort-only" (below).
+  > "per-cohort". The pre-`v4` per-cohort `BindingSetHash` was replaced by per-binding `BindingUID`;
+  > `v5`/`v6` added the RBAC sub-generation fold so a grant/revoke touching a user's own bindings
+  > cold-misses that user's cells. Per-binding sharing is the equivalence class that still
+  > satisfies "never cohort-only" (below).
+- Request `extras` partition the key only on two author-declared axes: the widget's
+  `spec.keyExtras` allowlist and the `spec.identityContext` identity keys (username/groups);
+  undeclared request extras never fork a cell (an undeclared-extras resolve is served but not
+  cached).
 - **Invalidation:** `DELETE` evicts only the deleted object's own self-representation; LIST-deps and
   dependent GET-deps are dirty-marked; `ADD`/`UPDATE` dirty-mark (never evict). Values are
-  deduplicated by equivalence class.
+  deduplicated by equivalence class. A resolve that touched a genuine **external** endpoint is
+  never cached (no dep edge can invalidate it) unless the widget opts into a bounded-staleness TTL
+  via the `krateo.io/external-cache-ttl-seconds` annotation.
 
 ## Prewarm (→ [prewarm.md](docs/architecture/prewarm.md))
 
 - Boot seed (`RegisterMetaQuerySeeds`) + a **phase-1 walker that replays frontend navigation**:
   roots are read from the frontend ConfigMap (`navmenus` INIT + `routesloaders` ROUTES_LOADER, not
   hardcoded), recursing `status.resourcesRefs` **only where `verb==GET`**.
-- Cohort model is **dynamic** — no static cohort list, no lazy cold-fill.
-- **The full prewarm *engine* is opt-in** (`PREWARM_ENGINE_ENABLED=false` by default); with it off,
-  the legacy global-cohort seed path runs. CRUD re-prewarm is two mechanisms (object CRUD →
-  refresher re-resolve; new-GVR → engine re-walk); widget-CR-triggered subtree re-walk is currently
-  a **placeholder**.
+- Cohort model is **dynamic** — no static cohort list, no lazy cold-fill. The seed is rank-major
+  (widget-capable identities first) and class-interleaved (each rank's widgets then its
+  RESTActions).
+- **The prewarm engine is the only seed path and is implicit-on-cache**: the whole prewarm family
+  (`PREWARM_ENABLED`, `PREWARM_CONTENT_ENABLED`, `PREWARM_PIP_ENABLED`, `PREWARM_ENGINE_ENABLED`,
+  `PROACTIVE_RA_SEED_ENABLED`) is **retired** into `CACHE_ENABLED` (`retired_flags.go` audits stale
+  values); the legacy global-cohort `runPIPSeed` path is **deleted**. Back-out is
+  `CACHE_ENABLED=false`.
+- **`/readyz` gates on prewarm-complete**: the seed runs *before* `MarkPhase1Done`; readiness flips
+  when every cohort's nav widgets are warm (the first-nav latch), with fire-regardless backstops
+  (Ready-degraded, never not-Ready-forever). Steady-state re-prewarm is object CRUD → refresher
+  re-resolve, new-GVR → engine re-walk, and a TTL-cadenced keepwarm sweep; widget-CR-triggered
+  subtree re-walk is still a **placeholder**.
 
 ## RBAC & user-aware filtering (→ [rbac-uaf.md](docs/architecture/rbac-uaf.md))
 
-- L1 is **keyed per binding-UID, never cohort-only** — this is the load-bearing invariant (a
-  6-revert retrospective); cohort-only keying leaks one user's resources to another.
+- L1 is **keyed per binding-UID (plus the subject's RBAC sub-generation), never cohort-only** —
+  this is the load-bearing invariant (a 6-revert retrospective); cohort-only keying leaks one
+  user's resources to another.
 - An **RBAC subject index** (`internal/cache/rbac_snapshot.go`) selects candidate bindings;
   `EvaluateRBAC` walks ClusterRoleBindings then RoleBindings with **predicate symmetry** across
   User / Group / ServiceAccount subjects.
@@ -96,6 +126,7 @@ RESTAction/widget contract, and must be removable wholesale when Kubernetes ship
 | `internal/cache/` | L3 informer + L1 resolved cache, keying, invalidation, dedup, prewarm engine | [caching](docs/architecture/caching.md), [prewarm](docs/architecture/prewarm.md) |
 | `internal/rbac/` | RBAC evaluation, subject index, authz memo | [rbac-uaf](docs/architecture/rbac-uaf.md) |
 | `internal/objects/`, `internal/dynamic/` | object fetch, cached dynamic client | [request-lifecycle](docs/architecture/request-lifecycle.md) |
+| `internal/metrics/`, `internal/tracing/`, `internal/logging/`, `internal/support/audit/` | default-off OTel export (metrics mirror, traces, log/audit bridge) | [observability](docs/architecture/observability.md) |
 | `apis/templates/` | the `RESTAction` / `Widget` CRD types | [restactions.md](howto/restactions.md), [widgets.md](howto/widgets.md) |
 
 ## For agents
