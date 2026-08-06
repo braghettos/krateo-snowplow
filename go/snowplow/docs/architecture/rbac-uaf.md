@@ -221,9 +221,11 @@ the cell left the cache (#118). The durable fix is the **per-subject sub-generat
   (`rbac_subgen_pending.go`) so the counter and the published snapshot move together (the
   (c)-v2 ordering fix — this is what bumped the key salt to v6).
 - `cache.RBACSubGenForSubject(username, groups)` folds the subject's effective counters into one
-  `uint64`, and `dispatchCacheLookupKey` stamps it into `ResolvedKeyInputs.RBACSubGen`, which
-  `ComputeKey` hashes for every identity-bound class. A change to *your* RBAC → *your* keys
-  rotate → cold miss → fresh resolve + fresh refilter. Blast radius is herd-proportional.
+  `uint64`, and `dispatchCacheLookupKey` — the only stamping site — stamps it into
+  `ResolvedKeyInputs.RBACSubGen` for the dispatch-keyed classes (`restactions`, `widgets`),
+  where `ComputeKey` hashes it (`raFullList` hashes the field as a constant `0` — §3.1). A
+  change to *your* RBAC → *your* `restactions`/`widgets` keys rotate → cold miss → fresh
+  resolve + fresh refilter. Blast radius is herd-proportional.
 - The interim exposure cap — a short TTL override on UAF-bearing cells
   (`UAF_RESOLVED_TTL_SECONDS`, `dispatchers/uaf_shortttl.go`) — remains available,
   default-disabled.
@@ -234,16 +236,34 @@ the cell left the cache (#118). The durable fix is the **per-subject sub-generat
 
 ### 3.1 What gets keyed
 
-`ComputeKey` (`cache/resolved.go`) builds the L1 cell key. For every identity-bound entry class
-(`restactions`, `widgets`, `apistage`, `raFullList`) it folds **two identity terms**: the
-**`BindingUID`** — the first-match binding that authorised *this layer's* GET for *this
-request's* identity — and the subject's **`RBACSubGen`** (§2.7). `dispatchCacheLookupKey`
-derives the UID with a direct `EvaluateRBAC(verb=get, …)` call leaving `SkipBindingUID` at its
-safe zero value so the returned UID is the deterministic sorted first-match.
+`ComputeKey` (`cache/resolved.go`) builds the L1 cell key. Mechanically it hashes the
+`BindingUID` and `RBACSubGen` fields for every class except `widgetContent`; what those fields
+actually *carry* is per-class:
 
-The result: **two users granted by the SAME binding (at the same sub-generation) share one cell;
-the same user authorised by DIFFERENT bindings on different layers gets different cells; a
-grant/revoke touching a user's own bindings rotates that user's cells.** This is finer-grained
+- **`restactions`, `widgets` — identity-bound, two live terms.** `dispatchCacheLookupKey`
+  (`dispatchers/helpers.go`) derives the **`BindingUID`** — the first-match binding that
+  authorised *this layer's* GET for *this request's* identity — with a direct
+  `EvaluateRBAC(verb=get, …)` call leaving `SkipBindingUID` at its safe zero value (so the
+  returned UID is the deterministic sorted first-match), and stamps the subject's
+  **`RBACSubGen`** (§2.7) alongside it. That is the *only* `RBACSubGen` stamping site; a
+  grant/revoke touching the user's own bindings rotates these cells via the sub-gen fold.
+- **`raFullList` — identity-bound via `BindingUID` ONLY.** Its single key source is
+  `seedFullListRAKey` (`resolvers/widgets/apiref/ra_full_list.go`), which derives the
+  first-match `BindingUID` on the RA's own coordinates but never sets `RBACSubGen`
+  (`RAFullListKeyInputs`, `cache/ra_full_list_slice.go`), so every `raFullList` cell hashes
+  `RBACSubGen == 0` on Put *and* Get. The sub-gen term is mechanically folded but semantically
+  inert: these cells rotate only when the `BindingUID` itself changes — there is no
+  grant/revoke sub-gen rotation for this class.
+- **`apistage` — identity-free content cells, NOT identity-bound.** `contentKeyInputs`
+  (`resolvers/restactions/api/apistage.go`) never sets `BindingUID` or `RBACSubGen`, so both
+  fold as empty/zero constants and the cell is identity-invariant. It is populated SA-maximal
+  and RBAC-narrowed **per request at serve time**, fail-closed — the ADR 0003 pattern, same
+  family as `widgetContent` (§3.3).
+
+For the identity-bound classes the result is: **two users granted by the SAME binding (for
+`restactions`/`widgets`, at the same sub-generation) share one cell; the same user authorised
+by DIFFERENT bindings on different layers gets different cells; a grant/revoke touching a
+user's own bindings rotates that user's `restactions`/`widgets` cells.** This is finer-grained
 than the v3 cohort hash (`BindingSetHash`) it replaced. The key salt is `resolvedKeyVersion =
 "v6"` — see caching.md §3.1 for the v1→v6 lineage.
 
@@ -270,7 +290,9 @@ serve-time gate `gateWidgetEnvelope` (`dispatchers/widget_content.go`) **overwri
 `allowed` flag per-request via `rbac.UserCan` under the requesting identity before
 serialisation.** So the body is shared but the bytes that leave the pod are per-user — the
 identity narrowing moves from the *key* to a *serve-time rewrite*. This is the
-identity-free-content-key + serve-time-UAF pattern (ADR 0003). The general rule holds: an entry
+identity-free-content-key + serve-time-UAF pattern (ADR 0003). `apistage` reaches the same
+identity-free end state by different mechanics — its identity fields are never set and fold as
+constants (§3.1) — and is governed by the same ADR 0003 rule. The general rule holds: an entry
 is identity-free in the key **only if** it is re-narrowed per-user at serve time.
 
 ### 3.4 The empty-UID biconditional — and the #95 serve/Put guard
@@ -328,9 +350,10 @@ are the ones that leave `SkipBindingUID` false and keep the deterministic UID.
 
 ## 5. Invariants
 
-1. **Identity-bound L1 cells are keyed by `BindingUID` + `RBACSubGen`, never cohort/content
-   alone.** Violation = cross-user leak (§3.2). The sole identity-free class, `widgetContent`,
-   is re-narrowed per-user at serve time (§3.3). (ADR 0002 / 0003.)
+1. **Identity-bound L1 cells are keyed by `BindingUID` (`restactions`/`widgets` additionally by
+   `RBACSubGen`), never cohort/content alone.** Violation = cross-user leak (§3.2). The
+   identity-free classes — `widgetContent` and `apistage` — are re-narrowed per-user at serve
+   time (§3.1, §3.3). (ADR 0002 / 0003.)
 2. **Zero `SubjectAccessReview` to the apiserver in cache=on mode.** All checks resolve against
    the informer-cached typed RBAC snapshot. A nil watcher or nil snapshot **degrades to deny**,
    never to apiserver fallback. The hard rollback trigger for the tag.

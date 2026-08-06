@@ -3,9 +3,10 @@ type: Decision
 title: "ADR 0002 — L1 resolved-cache cells are keyed per-binding, never cohort-only"
 description: >-
   Identity-bound L1 cache cells fold the authorising RBAC binding's UID (plus,
-  since #118, the requesting subject's RBAC sub-generation) into the cache key,
-  so a narrowly-authorised user can never read a broadly-authorised user's
-  cached bytes. Empty-identity cells are neither populated nor served.
+  for the dispatch-keyed classes since #118, the requesting subject's RBAC
+  sub-generation) into the cache key, so a narrowly-authorised user can never
+  read a broadly-authorised user's cached bytes. Empty-identity cells are
+  neither populated nor served.
 resource: snowplow
 tags:
   - adr
@@ -50,9 +51,9 @@ authorised the specific layer's GET.
 
 ## Decision
 
-For the identity-bound entry classes — `restactions`, `widgets`, `raFullList` — the dispatch key
-folds **two** identity terms (`ComputeKey`, `internal/cache/resolved.go`; the current key-schema
-salt is `resolvedKeyVersion = "v6"`):
+For the dispatch-keyed identity-bound entry classes — `restactions`, `widgets` — the dispatch
+key folds **two** identity terms (`ComputeKey`, `internal/cache/resolved.go`; the current
+key-schema salt is `resolvedKeyVersion = "v6"`):
 
 1. **`BindingUID`** — the UID of the first-match RBAC binding that authorised *this layer's GET*
    for *this request's identity*.
@@ -75,6 +76,16 @@ salt is `resolvedKeyVersion = "v6"`):
    UAF refilter depends on), with blast radius proportional to the affected subjects — not the
    whole cache. The seed writes `RBACSubGen==0` (a warm-miss perf gap for moved-sub-gen
    subjects, ticketed; never an authz-staleness bug — the dispatch key stays correct).
+
+`raFullList` is identity-bound via **`BindingUID` only**. Its single key source is
+`seedFullListRAKey` (`internal/resolvers/widgets/apiref/ra_full_list.go`), which derives the
+first-match `BindingUID` on the RA's own coordinates and passes it to `RAFullListKeyInputs`
+(`internal/cache/ra_full_list_slice.go`), which never sets `RBACSubGen` — so every `raFullList`
+cell hashes `RBACSubGen == 0` on Put *and* Get. The sub-gen term is mechanically folded but
+semantically inert for this class: there is no grant/revoke sub-gen rotation for `raFullList`
+cells; they rotate only when the authorising `BindingUID` itself changes. (The only
+`RBACSubGen` stamping site in the tree is `dispatchCacheLookupKey` — the `restactions`/`widgets`
+dispatch key above.)
 
 This is **finer-grained** than the v3 cohort hash it replaced: two users granted by the *same*
 binding share one cell; the *same* user authorised by *different* bindings on different layers
@@ -107,7 +118,9 @@ inputs never populate the identity fields (`contentKeyInputs`,
 `internal/resolvers/restactions/api/apistage.go`), so the cell is identity-invariant, populated
 SA-maximal, and **must** be RBAC-narrowed at serve time. Apistage is therefore governed by
 ADR 0003's identity-free-with-serve-time-gate rule, not by this ADR's per-binding rule. The
-identity-bound classes today are exactly `restactions`, `widgets`, and `raFullList`.
+identity-bound classes today are exactly `restactions`, `widgets`, and `raFullList` — the last
+via `BindingUID` only (its key source never stamps `RBACSubGen`, which hashes as a constant `0`
+for that class; see Decision).
 
 ## Consequences
 
@@ -116,8 +129,10 @@ identity-bound classes today are exactly `restactions`, `widgets`, and `raFullLi
 - **The cache is per-binding, not per-user.** Memory scales with the number of distinct
   authorising bindings, not with the user count — which is what makes the cache viable at
   50K compositions × 1000 users while staying leak-free.
-- **Out-of-band RBAC changes rotate keys.** The `RBACSubGen` fold means a live grant/revoke is
-  reflected on the affected subjects' next `/call` without a global flush. As an interim bound
+- **Out-of-band RBAC changes rotate keys — for the dispatch-keyed classes.** The `RBACSubGen`
+  fold means a live grant/revoke is reflected on the affected subjects' next
+  `restactions`/`widgets` `/call` without a global flush; `raFullList` cells rotate only on a
+  `BindingUID` change. As an interim bound
   for the residual refilter dependency, cells whose RESTAction declares a `userAccessFilter`
   stage also carry a short TTL override (`UAF_RESOLVED_TTL_SECONDS`, #118 (d); `HasUAF` is
   entry bookkeeping, not key material).
@@ -126,7 +141,8 @@ identity-bound classes today are exactly `restactions`, `widgets`, and `raFullLi
   rule stands: *an entry may be identity-free in the key only if it is re-narrowed per-user at
   serve time.*
 - **A regression here is high-severity.** Symptom: a user sees rows they lack a grant for. First
-  check: `ComputeKey` still folds `BindingUID` + `RBACSubGen` for the affected class; the F7
+  check: `ComputeKey` still folds `BindingUID` (+ `RBACSubGen` for the dispatch-keyed classes)
+  for the affected class; the F7
   tests; `compute_key_identity_invariants_test.go`; the `feedback_l1_per_user_keyed_never_cohort`
   history. Re-introducing a cohort/content-only key for an identity-bound class is the exact
   mistake this ADR exists to prevent.

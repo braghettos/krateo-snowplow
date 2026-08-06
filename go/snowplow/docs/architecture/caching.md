@@ -152,9 +152,12 @@ versioned, NUL-delimited byte stream. The fields folded in, in order:
    `"apistage"`, `"widgetContent"`, `"raFullList"`. The string *values* are load-bearing
    (hashed into the key + used as refresher registry keys).
 3. The dispatched object's `Group / Version / Resource / Namespace / Name`.
-4. **Identity** — folded for *every class except* `widgetContent`, as **two** terms:
-   - `BindingUID` — the first-match binding that authorised this layer's GET (§3.2);
-   - `RBACSubGen` — the requesting identity's per-subject RBAC **sub-generation**
+4. **Identity** — the `BindingUID` and `RBACSubGen` fields are mechanically hashed for *every
+   class except* `widgetContent`, but what they carry is per-class:
+   - `restactions` / `widgets` — **two live terms**, stamped at dispatch by
+     `dispatchCacheLookupKey` (`helpers.go` — the only `RBACSubGen` stamping site in the tree):
+     `BindingUID`, the first-match binding that authorised this layer's GET (§3.2), and
+     `RBACSubGen`, the requesting identity's per-subject RBAC **sub-generation**
      (`cache.RBACSubGenForSubject` over the user + groups + SA counters). A grant/revoke that
      touches this user's own bindings bumps a subject counter at snapshot publish
      (`rbac_subgen_pending.go`) → the term changes → cold miss → fresh resolve + fresh UAF
@@ -162,6 +165,16 @@ versioned, NUL-delimited byte stream. The fields folded in, in order:
      which is why this replaced a global RBAC generation. The seed writes `RBACSubGen==0`
      (a warm-miss perf gap for a moved-sub-gen subject, not an authz bug — de-scoped as
      seed-reachability work).
+   - `raFullList` — identity-bound via **`BindingUID` only**. Its single key source
+     (`seedFullListRAKey`, `resolvers/widgets/apiref/ra_full_list.go` → `RAFullListKeyInputs`,
+     `cache/ra_full_list_slice.go`) never sets `RBACSubGen`, so every `raFullList` cell hashes
+     `RBACSubGen==0` on Put *and* Get — the sub-gen term is folded as a constant, semantically
+     inert. These cells rotate only when the `BindingUID` itself changes; there is no
+     grant/revoke sub-gen rotation for this class.
+   - `apistage` — **identity-free content cells**: `contentKeyInputs`
+     (`resolvers/restactions/api/apistage.go`) never sets either field, so both fold as
+     empty/zero constants and the cell is identity-invariant. It is populated SA-maximal and
+     RBAC-narrowed per request at serve time, fail-closed (the ADR 0003 pattern).
 5. `PerPage` / `Page`.
 6. `Stage` — only for `apistage` entries; written with a `0x01` sentinel and skipped when empty
    so non-apistage keys hash byte-identically across the field's introduction.
@@ -335,8 +348,9 @@ records silently and relies on TTL for correctness.
    and is bypassed entirely for RBAC-sensitive `widgetData` widgets. The cached body is the
    shell; the body that leaves the pod is per-user.
 3. **Per-user (per-binding) keying, never cohort-only — and never the empty row.** Identity-bound
-   classes fold `BindingUID` + `RBACSubGen`; only `widgetContent` is identity-free, and only
-   because its served body is re-stamped per request. Every member of a `BindingUID` equivalence
+   classes fold `BindingUID` (`restactions`/`widgets` additionally `RBACSubGen`); the
+   identity-free classes — `widgetContent` and `apistage` — are so only
+   because their served bodies are re-narrowed per request. Every member of a `BindingUID` equivalence
    class resolves to byte-identical output. An empty `BindingUID` (deny / no snapshot / cache
    off) is **not cache-eligible** on the dispatch path — `serveFromCacheEligible` blocks both
    the read and the write, closing the #95 cross-identity leak through the shared `""` row.
