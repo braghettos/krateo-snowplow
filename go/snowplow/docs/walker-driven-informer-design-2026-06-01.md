@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Walker-driven informer / plurals-based design (v6) — 2026-06-01
+description: "Walker-driven informer design v6 (basis of ADR 0005): delete the CRD-watch backplane; per-group one-shot discovery from the walker."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 # Walker-driven informer / plurals-based design (v6) — 2026-06-01
 
 Status: Design captured through v6. Three ships: Ship 0 deployed 0.30.222, Ship 0.5 deletes crdwatch.go (v6), Ship 1 plurals additive, Ship 2 plurals replacement.

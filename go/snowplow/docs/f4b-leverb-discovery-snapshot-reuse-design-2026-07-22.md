@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F4b Lever B — reuse the harvested discovery snapshot on boot RESUME passes (#135)"
+description: "F4b Lever B design (#135): reuse the harvested discovery snapshot on boot RESUME passes."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-22T00:00:00Z
+---
+
 # F4b Lever B — reuse the harvested discovery snapshot on boot RESUME passes (#135)
 
 Date: 2026-07-22

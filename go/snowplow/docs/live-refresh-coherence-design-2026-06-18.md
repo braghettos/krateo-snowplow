@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Snowplow per-key live-refresh-coherence — file:line implementation design"
+description: Implementation design for per-key live-refresh coherence (the /refreshes SSE ship).
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-18T00:00:00Z
+---
+
 # Snowplow per-key live-refresh-coherence — file:line implementation design
 
 **Date:** 2026-06-18

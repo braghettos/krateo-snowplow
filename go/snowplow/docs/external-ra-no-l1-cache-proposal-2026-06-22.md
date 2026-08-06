@@ -1,3 +1,12 @@
+---
+type: Decision
+title: Unified proposal — internal references resolve in-process (cacheable); external endpoints take HTTP + skip L1 (2026-06-22)
+description: "Ratified proposal: internal references resolve in-process and stay cacheable (spec.api[].resolve, default true); genuine external endpoints take HTTP and skip L1."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-22T00:00:00Z
+---
+
 # Unified proposal — internal references resolve in-process (cacheable); external endpoints take HTTP + skip L1 (2026-06-22)
 
 **Status:** Internal-half mechanism **RATIFIED by Diego 2026-06-22** (direct-apiserver-path + `spec.api[].resolve`, default true). External half: PROPOSAL → PM gate → dev. Plan only.

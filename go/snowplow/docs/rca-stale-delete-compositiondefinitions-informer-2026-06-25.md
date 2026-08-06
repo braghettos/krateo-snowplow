@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: RCA + design — deleted CompositionDefinition persists in /blueprints (informer/invalidation gap) — 2026-06-25
+description: "RCA: deleted CompositionDefinition persisted in /blueprints — informer/invalidation gap (refutes the cache-key-divergence hypothesis)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-25T00:00:00Z
+---
+
 # RCA + design — deleted CompositionDefinition persists in /blueprints (informer/invalidation gap) — 2026-06-25
 
 **Author**: cache architect

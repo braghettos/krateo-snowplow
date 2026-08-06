@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2.2 — Closeout (0.30.220 HARD REVERT)
+description: "Path 3.2.2 closeout: the 0.30.220 walker-pagination HARD REVERT."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 # Path 3.2.2 — Closeout (0.30.220 HARD REVERT)
 
 ## Verdict

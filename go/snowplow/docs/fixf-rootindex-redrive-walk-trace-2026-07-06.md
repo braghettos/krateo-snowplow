@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: FIX-F first-nav latch zero-fire — root-cause trace (2026-07-06)
+description: "FIX-F root-cause trace: first-nav latch zero-fire on the 60K corpus."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-06T00:00:00Z
+---
+
 # FIX-F first-nav latch zero-fire — root-cause trace (2026-07-06)
 
 Repo: main @ 70b9fba (== tag 1.6.0, verified `git merge-base --is-ancestor` + empty

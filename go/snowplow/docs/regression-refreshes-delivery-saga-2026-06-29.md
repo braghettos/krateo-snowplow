@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: "Regression journal — `/refreshes` zero-delivery saga (4 cycles, #61 → #64)"
+description: "Regression journal: the /refreshes zero-delivery saga (4 fix cycles, #61-#64, fixed in 1.5.13)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-29T00:00:00Z
+---
+
 # Regression journal — `/refreshes` zero-delivery saga (4 cycles, #61 → #64)
 
 Date: 2026-06-29. Final fix shipped **1.5.13** (snowplow `6a221d4`, chart `1.0.39`).

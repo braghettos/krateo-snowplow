@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2 — Phase 0 baselines (snowplow 0.30.215)
+description: Path 3.2 Phase-0 baselines (0.30.215).
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2 — Phase 0 baselines (snowplow 0.30.215)
 
 **Author**: cache-developer

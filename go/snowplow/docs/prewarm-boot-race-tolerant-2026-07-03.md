@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Boot-race-tolerant, self-healing Phase-1 prewarm — design
+description: "Design: boot-race-tolerant, self-healing Phase-1 prewarm (shape A)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-03T00:00:00Z
+---
+
 # Boot-race-tolerant, self-healing Phase-1 prewarm — design
 
 Date: 2026-07-03

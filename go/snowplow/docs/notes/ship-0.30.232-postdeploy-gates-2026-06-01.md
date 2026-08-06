@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: Ship 0.30.232 — post-deploy gate sequence (HARD)
+description: Ship 0.30.232 post-deploy gate sequence.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 # Ship 0.30.232 — post-deploy gate sequence (HARD)
 
 date: 2026-06-01

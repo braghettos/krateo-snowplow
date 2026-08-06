@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2 — cluster_list collapse + PIP pre-warm + refresher discipline
+description: "Path 3.2 design: cluster_list collapse + PIP pre-warm + refresher discipline."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2 — cluster_list collapse + PIP pre-warm + refresher discipline
 
 **Author**: cache-architect

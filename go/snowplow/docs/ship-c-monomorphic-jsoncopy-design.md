@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship C — Monomorphic JSON-tree copier (D1)
+description: "Ship C design (A+B+C resolver-path rebuild): monomorphic JSON-tree copier."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-20T00:00:00Z
+---
+
 # Ship C — Monomorphic JSON-tree copier (D1)
 
 **Status:** TEAM-LEAD GATE PASSED (post-§2 revision, 2026-05-20). Awaiting PM

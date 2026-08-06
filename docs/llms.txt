@@ -30,3 +30,6 @@ go/snowplow/howto/install.md: Kind quickstart install
 go/snowplow/howto/operating.md: operator runbook — probes, tuning, incident table
 go/snowplow/docs/swagger.json: the authoritative OpenAPI spec (served at GET /swagger/)
 go/snowplow/CONTRIBUTING.md: build / test traps / release / invariants
+# Archive (frontmatter tags: [archive]; point-in-time historical record pinned to old SHAs/versions — NOT current truth; never ground answers in these without re-verifying against the code):
+go/snowplow/docs/*.md (dated design/RCA/troubleshoot/regression docs): 38 archived engineering documents, each frontmattered with its original date
+go/snowplow/docs/notes/README.md: charter + entry point of the 41-file append-only engineering ship-log (ship-*, path3-*, task-*, bench-*)

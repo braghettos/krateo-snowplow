@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Snowplow Test-Coverage Audit — 2026-07-30
+description: "Test-coverage audit: 131-feature coverage-vs-gap inventory driving the test-suite build."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-30T00:00:00Z
+---
+
 # Snowplow Test-Coverage Audit — 2026-07-30
 
 Feature × existing-coverage × gap inventory across all packages, produced to drive an extensive

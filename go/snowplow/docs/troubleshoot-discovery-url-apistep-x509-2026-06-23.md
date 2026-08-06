@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: "Troubleshooting — x509 \"unknown authority\" on a bare group-discovery api-step — 2026-06-23"
+description: "Troubleshooting: x509 unknown-authority on a bare group-discovery api-step path."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-23T00:00:00Z
+---
+
 # Troubleshooting — x509 "unknown authority" on a bare group-discovery api-step — 2026-06-23
 
 **Symptom:** `Get "https://kubernetes.default.svc/apis/templates.krateo.io/v1": tls: failed to verify certificate: x509: certificate signed by unknown authority` (500). Seen on snowplow **1.1.0**.

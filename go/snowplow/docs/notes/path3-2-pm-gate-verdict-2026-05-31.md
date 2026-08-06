@@ -1,3 +1,12 @@
+---
+type: Decision
+title: Path 3.2 — PM Gate Verdict
+description: Path 3.2 PM gate verdict.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2 — PM Gate Verdict
 
 **Author**: cache-pm

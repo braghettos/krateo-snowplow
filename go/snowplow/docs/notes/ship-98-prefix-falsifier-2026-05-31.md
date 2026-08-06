@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship #98 — Phase 1 Pre-flight Falsifier"
+description: "Ship #98 Phase-1 pre-flight falsifier."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Ship #98 — Phase 1 Pre-flight Falsifier
 
 Signed: cache-developer. Date: 2026-05-31. Status: **PROCEED**.

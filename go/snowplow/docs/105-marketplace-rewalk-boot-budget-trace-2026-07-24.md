@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: "#105 — marketplace-detail null-jq re-enqueues the whole boot re-walk, unboundedly"
+description: "Trace + fix design for #105: marketplace-detail null-jq re-enqueueing the whole boot re-walk unboundedly."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-24T00:00:00Z
+---
+
 # #105 — marketplace-detail null-jq re-enqueues the whole boot re-walk, unboundedly
 
 TRACE + FIX-DESIGN. Read-only. Frozen ref: origin/main `8fc4d87` (= 1.7.17 + #119 PARKED).

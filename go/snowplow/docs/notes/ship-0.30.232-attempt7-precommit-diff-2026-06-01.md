@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship 0.30.232 attempt #7 — pre-commit diff"
+description: "Ship 0.30.232 attempt #7 pre-commit diff."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 diff --git a/internal/handlers/dispatchers/phase1_walk.go b/internal/handlers/dispatchers/phase1_walk.go
 index 7257f9c..09fd596 100644
 --- a/internal/handlers/dispatchers/phase1_walk.go

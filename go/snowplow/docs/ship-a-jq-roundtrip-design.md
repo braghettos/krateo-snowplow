@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship A — Eliminate the jq string round-trip (D3 + D4)
+description: "Ship A design (A+B+C resolver-path rebuild): eliminate the jq string round-trip."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-19T00:00:00Z
+---
+
 # Ship A — Eliminate the jq string round-trip (D3 + D4)
 
 **Status:** GATE-PASSED — GO for development (PM gate, 2026-05-19).

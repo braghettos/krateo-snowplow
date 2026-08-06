@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship 0.30.232 — Attempt #7 nil-rc whack-a-mole — phase1Walker boot literal + type-safety enforcement"
+description: "Ship 0.30.232 attempt #7 design: phase1Walker boot literal + type-safety enforcement."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 # Ship 0.30.232 — Attempt #7 nil-rc whack-a-mole — phase1Walker boot literal + type-safety enforcement
 
 date: 2026-06-01

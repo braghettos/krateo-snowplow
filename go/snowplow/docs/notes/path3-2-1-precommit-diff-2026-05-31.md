@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2.1 / 0.30.219 — Pre-commit diff (Phase 3 ACK)
+description: Path 3.2.1 (0.30.219) pre-commit diff (Phase 3 ACK).
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2.1 / 0.30.219 — Pre-commit diff (Phase 3 ACK)
 
 Date: 2026-05-31

@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "#113 — template a RESTAction api-step `endpointRef` from request extras"
+description: "Design for #113: templating a RESTAction api-step endpointRef.name from request extras (hub-spoke), with the two credential-selection guardrails."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-15T00:00:00Z
+---
+
 # #113 — template a RESTAction api-step `endpointRef` from request extras
 
 Date: 2026-07-15

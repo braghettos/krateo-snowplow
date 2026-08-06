@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Task #194 — Ship L (0.30.246) implementation spec: CRD lifecycle bytesObject fix (ADD + UPDATE + DELETE)"
+description: "Task #194 Ship L (0.30.246) implementation spec: CRD-lifecycle bytesObject fix."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-04T00:00:00Z
+---
+
 # Task #194 — Ship L (0.30.246) implementation spec: CRD lifecycle bytesObject fix (ADD + UPDATE + DELETE)
 
 **Author:** architect

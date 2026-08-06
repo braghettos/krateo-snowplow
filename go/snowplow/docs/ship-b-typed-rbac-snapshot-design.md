@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship B — Typed RBAC snapshot (D2)
+description: "Ship B design (A+B+C resolver-path rebuild): typed RBAC snapshot."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-20T00:00:00Z
+---
+
 # Ship B — Typed RBAC snapshot (D2)
 
 **Status:** GATE-PASSED — GO for development (PM gate, 2026-05-20).

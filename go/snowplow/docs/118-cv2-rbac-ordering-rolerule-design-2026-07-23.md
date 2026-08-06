@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "#118 (c)-v2 — RBAC ordering + role-rule bump: durable UAF authz-staleness fix"
+description: "Design (#118 c-v2): RBAC ordering + role-rule bump as the durable UAF authz-staleness fix."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-23T00:00:00Z
+---
+
 # #118 (c)-v2 — RBAC ordering + role-rule bump: durable UAF authz-staleness fix
 
 Date: 2026-07-23

@@ -1,3 +1,12 @@
+---
+type: Decision
+title: Proactive CR warm — design (plan only, READ-ONLY trace) — 2026-06-20
+description: "PARKED design: proactive CR warm — per-call-variable extras make the controller /call un-cacheable by construction; do not build."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-20T00:00:00Z
+---
+
 # Proactive CR warm — design (plan only, READ-ONLY trace) — 2026-06-20
 
 **Author**: cache architect

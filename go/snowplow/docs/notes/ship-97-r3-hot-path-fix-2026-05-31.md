@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship #97 — R3 hot-path inert at apistage.go:140 — design"
+description: "Ship #97 design: R3 hot-path inert at apistage.go:140 (0.30.214)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Ship #97 — R3 hot-path inert at apistage.go:140 — design
 
 Signed: cache-architect. Date: 2026-05-31. Status: design-only (no code, no commits).

@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "#106 — Config-vars watcher data-change redrive gate (design memo v2)"
+description: "Design memo (#106): gate the config-vars watcher's boot re-drive on an actual data change, so byte-identical config.json re-applies stop re-walking."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-07T00:00:00Z
+---
+
 # #106 — Config-vars watcher data-change redrive gate (design memo v2)
 
 Author: architect (archC2d), 2026-07-07. PM gate: ACCEPT (pmC2d, C106-1..4; INFO skip line binding).

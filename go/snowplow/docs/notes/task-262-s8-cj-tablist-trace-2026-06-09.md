@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Task #262 — S8 cyberjoker widget-error TRACE (re-run on aligned-window data)"
+description: "Task #262 S8 widget-error trace (tab-list, aligned-window data)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-09T00:00:00Z
+---
+
 # Task #262 — S8 cyberjoker widget-error TRACE (re-run on aligned-window data)
 
 **Date:** 2026-06-09

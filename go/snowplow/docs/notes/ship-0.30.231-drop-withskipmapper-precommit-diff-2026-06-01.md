@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship 0.30.231 — drop WithSkipMapper — pre-commit diff
+description: "Ship 0.30.231 pre-commit diff: drop WithSkipMapper from the dynamic client."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 diff --git a/internal/dynamic/client.go b/internal/dynamic/client.go
 index 352fab5..c35300d 100644
 --- a/internal/dynamic/client.go

@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "#118 — userAccessFilter RBAC stale-read: resolved-cache key blind to the refilter's RBAC dependency"
+description: "Design (#118): userAccessFilter RBAC stale-read — the resolved-cache key was blind to the refilter's RBAC dependency."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-22T00:00:00Z
+---
+
 # #118 — userAccessFilter RBAC stale-read: resolved-cache key blind to the refilter's RBAC dependency
 
 Design doc. Author: cache-architect. Date: 2026-07-22.

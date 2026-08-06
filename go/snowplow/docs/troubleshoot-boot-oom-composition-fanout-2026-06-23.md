@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: Troubleshooting — snowplow 1.4.3 boot-OOM (concurrent composition fan-out) — 2026-06-23
+description: "Troubleshooting: 1.4.3 boot OOM from unbounded concurrent composition fan-out."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-23T00:00:00Z
+---
+
 # Troubleshooting — snowplow 1.4.3 boot-OOM (concurrent composition fan-out) — 2026-06-23
 
 **Cluster:** bs-test-ger-03 (operations-dev-krateo-io, europe-west10), snowplow 1.4.3, read-only via `/tmp/bs-test-ger-03.kubeconfig`. Diagnosis TRACED to canonical code @ 1.4.3 + live runtime artifacts (`/tmp/bs-sp-prev.log`, expvar `http://34.32.39.90:8081/debug/vars`).

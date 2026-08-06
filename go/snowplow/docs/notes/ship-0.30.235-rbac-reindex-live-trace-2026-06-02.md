@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship 0.30.235 — UAF refilter sees post-filter-projected items (LIVE TRACE)
+description: "Ship 0.30.235 live trace: UAF refilter seeing post-filter-projected items."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-02T00:00:00Z
+---
+
 # Ship 0.30.235 — UAF refilter sees post-filter-projected items (LIVE TRACE)
 
 **Author:** cache-architect

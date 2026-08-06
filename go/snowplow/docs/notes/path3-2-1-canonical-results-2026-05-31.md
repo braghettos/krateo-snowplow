@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2.1 / 0.30.219 — Canonical results
+description: Path 3.2.1 (0.30.219) canonical benchmark results.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2.1 / 0.30.219 — Canonical results
 
 Date: 2026-05-31 22:35 CEST

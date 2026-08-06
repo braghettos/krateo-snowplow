@@ -1,3 +1,12 @@
+---
+type: Decision
+title: Prewarm + Runtime-Refresher — Open-Question Register
+description: "Open-question register for the prewarm + runtime-refresher campaign (task #102 consolidation, 0.30.11x era; undated — timestamp approximate). Rulings R1-R6 + the O-item ledger."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 # Prewarm + Runtime-Refresher — Open-Question Register
 
 > Durable reconstruction of the architect's task-#102 consolidation.

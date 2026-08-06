@@ -76,10 +76,13 @@ operating: [install on Kind](../go/snowplow/howto/install.md),
 [developer-guide](../go/snowplow/howto/developer-guide.md) (superseded by
 CONTRIBUTING for the build flow).
 
-**Design docs & engineering notes** — ~40 dated design/RCA/troubleshooting documents
-under [go/snowplow/docs/](../go/snowplow/docs/) and the append-only ship-log under
-[go/snowplow/docs/notes/](../go/snowplow/docs/notes/README.md): point-in-time leads,
-**not** authoritative — the code and the deep dives above win.
+**Archive** (`tags: [archive]`) — 38 point-in-time design/RCA/troubleshoot/regression
+documents under [go/snowplow/docs/](../go/snowplow/docs/) and the 41-file append-only
+engineering ship-log under
+[go/snowplow/docs/notes/](../go/snowplow/docs/notes/README.md). Each carries archive
+frontmatter with its original date and is preserved verbatim as historical record:
+what was true **on that date**, at the SHA/version pinned in its header — **not**
+current truth. The code and the deep dives above always win.
 
 **API spec** — [swagger.json](../go/snowplow/docs/swagger.json) /
 [swagger.yaml](../go/snowplow/docs/swagger.yaml), served live at `GET /swagger/`.

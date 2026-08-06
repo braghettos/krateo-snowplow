@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship 1 / 0.30.225 — pre-commit diff + gates (2026-06-01)
+description: Ship 1 (0.30.225) pre-commit diff + gates.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 # Ship 1 / 0.30.225 — pre-commit diff + gates (2026-06-01)
 
 **Branch**: `ship-0.30.222-handler-extension-registry-walker-spawn`
