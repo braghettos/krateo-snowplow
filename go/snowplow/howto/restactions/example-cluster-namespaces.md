@@ -1,17 +1,30 @@
+---
+type: Usage
+title: "RESTAction walkthrough: list cluster namespaces"
+description: Apply a RESTAction that lists Kubernetes namespaces through the apiserver, filter the response with jq, grant the required user RBAC and execute it via the snowplow /call endpoint.
+resource: snowplow
+tags:
+  - snowplow
+  - restaction
+  - walkthrough
+  - jq
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # Example [`RESTAction`][restactions]: list _cluster-namespaces_
 
 ## Prerequisites
 
 Before you begin with this example, make sure you have **Snowplow** installed on a Kind cluster.
-Follow the guide here to set it up: [Installing `snowplow` on Kind](howto/install.md).
+Follow the guide here to set it up: [Installing `snowplow` on Kind](../install.md).
 
 ## Overview
 
 This `RESTAction` retrieves a list of Kubernetes namespaces by calling the Kubernetes API server at the `/api/v1/namespaces` endpoint.
 
-It then applies a [JSONPath/JQ-like][jq] filter to extract only the namespace names (`.metadata.name`) from the API response.
+It then applies a [jq][jq] filter to extract only the namespace names (`.metadata.name`) from the API response.
 
-The result can be consumed by other Krateo resources or displayed in the Karateo PlatformOps UI, depending on configuration.
+The result can be consumed by other Krateo resources or displayed in the Krateo PlatformOps UI, depending on configuration.
 
 ## Example
 
@@ -166,9 +179,11 @@ curl -sv -G \
 ```
 
 > The _.env_ file stores the environment variables required to authenticate with Snowplow.
-> In particular, it contains the _KRATEO_ACCESS_TOKEN_, which you obtained during the Snowplow [installation][install.md] process when > you created a user using the `krateoctl add-user` command, as [explained in the previous guide][install.md].
+> In particular, it contains the _KRATEO_ACCESS_TOKEN_ minted in step 4 of the
+> [installation guide](../install.md). The user's `<user>-clientconfig` Secret
+> (step 5 there) must also exist — without it snowplow answers `401`.
 
-Snowplow will fetch the corresponding CR, execute all the API calls, apply filters, iterators, and JQ expressions, and store the results in the resource's `status` field.
+Snowplow fetches the corresponding CR, executes all the API calls, applies filters, iterators, and jq expressions, and returns the results under the `status` field **of the HTTP response**. (Nothing is written back to the cluster — `kubectl get restaction` still shows the CR as stored.)
 
 ```json
 {

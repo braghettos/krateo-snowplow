@@ -1,3 +1,17 @@
+---
+type: Usage
+title: Installing snowplow on Kind
+description: Quickstart that installs the snowplow Helm chart on a disposable Kind cluster, mints a Krateo user (JWT + clientconfig Secret) and prepares RBAC for the RESTAction walkthroughs.
+resource: snowplow
+tags:
+  - snowplow
+  - install
+  - kind
+  - helm
+  - quickstart
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # Installing `snowplow` on [Kind][kind]
 
 > **Production deploys** use the Helm chart from this repo (`helm/snowplow`,
@@ -76,7 +90,65 @@ echo "KRATEO_ACCESS_TOKEN=${KRATEO_ACCESS_TOKEN}" >> .env
 > quickstart free of extra tooling. The user belongs to the `devs` group, which the RBAC below
 > targets.
 
-## 5. RBACs for the Krateo PlatformOps User
+## 5. Create the user's `clientconfig` Secret
+
+The JWT alone is **not** enough. On every `/call`, after validating the JWT,
+snowplow loads the caller's per-user Kubernetes credentials from a
+**`<user>-clientconfig` Secret** in `AUTHN_NAMESPACE` — the chart sets
+`AUTHN_NAMESPACE` to the **release namespace** (`helm/snowplow/templates/configmap.yaml`).
+If the Secret is missing, `/call` returns **401** (`middleware.UserConfig`:
+Secret NotFound → Unauthorized). In production the `authn` service creates this
+Secret at login (a CSR-signed client certificate with `CN=<user>` /
+`O=<groups>` — the same thing `krateoctl add-user` does via the shared
+`signup` library). Here we mint the certificate by hand through the Kubernetes
+CSR API:
+
+```sh {name=create-clientconfig depends=create-krateo-user}
+openssl genrsa -out /tmp/${KRATEO_USER}.key 2048
+openssl req -new -key /tmp/${KRATEO_USER}.key \
+  -subj "/CN=${KRATEO_USER}/O=devs" -out /tmp/${KRATEO_USER}.csr
+
+cat <<EOF | kubectl apply -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: ${KRATEO_USER}
+spec:
+  request: $(base64 < /tmp/${KRATEO_USER}.csr | tr -d '\n')
+  signerName: kubernetes.io/kube-apiserver-client
+  usages:
+  - digital signature
+  - key encipherment
+  - client auth
+EOF
+
+kubectl certificate approve ${KRATEO_USER}
+until CRT=$(kubectl get csr ${KRATEO_USER} -o jsonpath='{.status.certificate}') \
+  && [ -n "${CRT}" ]; do sleep 1; done
+CA=$(kubectl config view --raw --minify \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${KRATEO_USER}-clientconfig
+  namespace: ${NAMESPACE}
+stringData:
+  server-url: https://kubernetes.default.svc
+  certificate-authority-data: ${CA}
+  client-certificate-data: ${CRT}
+  client-key-data: $(base64 < /tmp/${KRATEO_USER}.key | tr -d '\n')
+EOF
+```
+
+> The Secret's key names and base64-encoded certificate values follow the
+> [`Endpoint`](endpoints.md) contract. The certificate identity (`CN`/`O`) is
+> what the Kubernetes apiserver enforces RBAC against on the cache-off
+> fallback path; keep it aligned with the JWT's `username`/`groups` claims so
+> cache-on (in-process RBAC over the JWT identity) and cache-off agree.
+
+## 6. RBACs for the Krateo PlatformOps User
 
 After creating a new user, you must assign them a minimal set of RBAC permissions.
 In this case, since we are testing [RESTActions][restactions], the user needs at least read access to this resource.
@@ -118,7 +190,7 @@ EOF
 ```
 
 
-## 6. Deploy snowplow
+## 7. Deploy snowplow
 
 First install the CRDs snowplow needs. The `snowplow-crds` chart ships the `RESTAction` CRD;
 the `authn-crds` chart ships the `serviceaccount.authn.krateo.io` CRD that the snowplow chart's
@@ -147,11 +219,13 @@ helm install snowplow oci://ghcr.io/krateo-platformops/charts/snowplow \
 
 > `env.*` values are rendered into the chart's `snowplow` ConfigMap and consumed
 > via `envFrom`; the container has no direct `env:` array. `CACHE_ENABLED=true`
-> turns on the in-process cache path; omit it (or set `false`) for the
-> transparent direct-apiserver fallback.
+> is the **chart default** (`helm/snowplow/values.yaml`) and turns on the
+> in-process cache path; set it explicitly to `false` for the transparent
+> direct-apiserver fallback. (The binary itself defaults to cache-off when the
+> variable is absent — only `"true"`, `"1"` or `"yes"` enable it.)
 
 
-## 7. Wait until the `snowplow` deployment is ready
+## 8. Wait until the `snowplow` deployment is ready
 
 Finally, wait for the `snowplow` deployment to become **available**.
 This ensures all pods are up and running before proceeding.

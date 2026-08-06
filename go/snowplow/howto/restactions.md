@@ -1,9 +1,22 @@
+---
+type: Usage
+title: RESTAction — declarative chained REST calls
+description: The RESTAction resource — declaratively define chained HTTP calls with jq filters, iterators, endpointRef credentials, in-process resolve of referenced CRs and per-item RBAC refiltering, executed via the snowplow /call endpoint.
+resource: snowplow
+tags:
+  - snowplow
+  - restaction
+  - jq
+  - call
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # `RESTAction`
 
 **API Group:** `templates.krateo.io`  
 **Kind:** `RESTAction`  
 **Version:** `v1`  
-**Scope:** Namespaced  
+**Scope:** Namespaced (short name: `ra`)  
 
 ## Overview
 
@@ -38,7 +51,7 @@ The `spec` field defines the configuration for the REST action workflow.
 
 | Field | Type | Description | Required |
 |--------|------|-------------|-----------|
-| `api` | `array` | List of API requests to execute. Each item defines one HTTP call. | ✅ |
+| `api` | `array` | List of API requests to execute. Each item defines one HTTP call. (Not enforced as required by the CRD schema, but a `RESTAction` without it resolves to nothing.) | ❌ |
 | `filter` | `string` | Optional filter to apply to the overall output or results. | ❌ |
 
 
@@ -59,7 +72,7 @@ Defines a single HTTP request and its dependencies.
 | `continueOnError` | `boolean` | If `true`, continues execution even if this call fails. | ❌ |
 | `endpointRef` | `object` | Reference (`name` + `namespace`) to a Kubernetes [`Endpoint`](endpoints.md) object defining the target service. | ❌ |
 | `dependsOn` | `object` | Declares a dependency on another API call defined in this spec. | ❌ |
-| `resolve` | `boolean` | When this stage's `path` is a **direct apiserver path to a `RESTAction` or `Widget` CR**, controls whether snowplow runs the fetched CR through the resolver in-process. **Defaults to `true`.** See [resolving a referenced RESTAction/Widget in-process](#resolving-a-referenced-restactionwidget-in-process). | ❌ |
+| `resolve` | `boolean` | When this stage's `path` is a **direct apiserver path to a `RESTAction` or `Widget` CR**, controls whether snowplow runs the fetched CR through the resolver in-process. **Opt-in — defaults to `false`** (the raw stored CR is returned). See [resolving a referenced RESTAction/Widget in-process](#resolving-a-referenced-restactionwidget-in-process). | ❌ |
 | `userAccessFilter` | `object` | Dispatch this read stage via snowplow's ServiceAccount and RBAC-refilter the result per item against the requesting user. Read-verb stages only. See below. | ❌ |
 
 ### `spec.api[].endpointRef`
@@ -91,22 +104,22 @@ api:
   - name: inner
     path: /apis/templates.krateo.io/v1/namespaces/krateo-system/restactions/my-inner-ra
     verb: GET
-    # resolve: true   # ← the default
+    resolve: true   # opt-in — omitted means false (raw CR)
 ```
 
-With `resolve: true` (the **default**) snowplow fetches that CR from the
-in-process informer (cacheable, dependency-tracked) and then **runs it through
-the resolver in-process** — `RESTAction`s through the RESTAction resolver,
-`Widget`s through the widget resolver — substituting the **resolved** envelope
-for the stage output. The result is byte-identical to what an HTTP `/call` of
-that referenced CR would return, but with **no outbound HTTP round-trip**. The
-referenced CR becomes a cache dependency of the entry, so editing it
-re-resolves the dependent entry.
+With `resolve: true` snowplow fetches that CR from the in-process informer
+(cacheable, dependency-tracked) and then **runs it through the resolver
+in-process** — `RESTAction`s through the RESTAction resolver, `Widget`s through
+the widget resolver — substituting the **resolved** envelope for the stage
+output. The result is byte-identical to what an HTTP `/call` of that referenced
+CR would return, but with **no outbound HTTP round-trip**. The referenced CR
+becomes a cache dependency of the entry, so editing it re-resolves the
+dependent entry.
 
 | `resolve` value | Behaviour |
 |---|---|
-| `true` (default) | Fetch the CR, then resolve it in-process; the stage output is the **resolved** envelope. |
-| `false` | Return the **raw** stored CR, unresolved (the pre-1.0 behaviour). |
+| `false` / omitted (**the default**) | Return the **raw** stored CR, unresolved. Aligned with the frontend's progressive rendering — the server returns raw refs/CRs unless a stage explicitly asks for resolution. |
+| `true` | Fetch the CR, then resolve it in-process; the stage output is the **resolved** envelope. |
 | any value, on a non-`RESTAction`/`Widget` path (e.g. a `ConfigMap`) | No-op — the raw fetched object is returned (resolution is meaningful only for `RESTAction`/`Widget`). |
 
 The in-process resolve is RBAC-gated (the requesting identity must be allowed
@@ -119,12 +132,11 @@ referenced CR is fetched over the requesting user's own token (the user's
 apiserver RBAC is the authoritative gate) and resolved in-process all the same —
 only slower (no informer serve, no memoisation), never a different result.
 
-> **Release note — `resolve` defaults to `true`.** If you have an existing
-> `RESTAction` that fetches another `RESTAction`/`Widget` CR by its direct
-> apiserver path and consumes the **raw** CR spec, set `resolve: false` on that
-> stage to preserve the old output. The common case — referencing another
-> `RESTAction` to consume its **resolved** data — is exactly what the default
-> gives you.
+> **Release note — `resolve` is opt-in (defaults to `false`).** A stage that
+> consumes a referenced `RESTAction`/`Widget`'s **resolved** data (e.g. reads a
+> child's resolved-only `.status.<field>`) MUST set `resolve: true` explicitly.
+> An omitted field is never persisted or defaulted by the apiserver; the
+> resolver treats `nil` as `false`.
 
 > **Note — the `/call?resource=…` loopback path is retired.** Earlier versions
 > let a stage reference another `RESTAction` by a `/call?resource=…&apiVersion=…`
@@ -140,7 +152,7 @@ read) and the returned items are **refiltered per item** through the in-process
 RBAC evaluator before being returned to the caller — so a narrow user sees only
 the items they may access. Allowed only on read verbs (`GET`/`HEAD`); admission
 CEL also forbids `exportJwt: true` on such a stage. Type `UserAccessFilterSpec`
-(`apis/templates/v1/core.go:112`).
+(`apis/templates/v1/core.go`).
 
 | Field | Type | Description | Required |
 |--------|------|-------------|-----------|
@@ -149,6 +161,7 @@ CEL also forbids `exportJwt: true` on such a stage. Type `UserAccessFilterSpec`
 | `resource` | `string` | Static plural resource name. Exactly one of `resource` / `resourcesFrom`. | conditional |
 | `resourcesFrom` | `string` | jq over the resolve dict yielding a `[]string` of plurals; an item is kept if the user may act on **any** of them (OR). | conditional |
 | `namespaceFrom` | `string` | jq evaluated per item to derive the namespace for the RBAC check. Defaults to `.metadata.namespace`. | ❌ |
+| `nameFrom` | `string` | jq evaluated per item to derive the object **name** for the RBAC check, so `resourceNames`-scoped grants are honoured on name-specific verbs. Defaults to `.metadata.name`; use `"."` when the items are bare name strings. No effect on collection verbs (`list`/`watch`/…). | ❌ |
 
 ## Passing per-request context
 
@@ -189,6 +202,15 @@ structure either way; a JSON body is passed through unchanged (byte-identical).
 This lets a `RESTAction` consume e.g. a Helm repo `index.yaml`. See
 [ADR 0006](../docs/adr/0006-snowplow-owned-external-fetch.md).
 
+## jq templating of `path`, `payload` and `headers`
+
+A stage's `path`, `payload` and each `headers` entry may embed a **jq template**
+delimited by `${ ... }`. The template is evaluated against the shared resolve
+dict (previous stage outputs + `extras`) before the request is issued; a plain
+string without the delimiter is passed through verbatim. (`endpointRef.name`
+supports the same templating, with a guardrail: a request-templated name may
+never resolve to a reserved `<user>-clientconfig` credential Secret.)
+
 ## Example
 
 ```yaml
@@ -204,8 +226,6 @@ spec:
         namespace: default
       verb: GET
       path: /users
-      headers:
-        - "Authorization: Bearer $(TOKEN)"
       continueOnError: false
 
     - name: update-user
@@ -215,7 +235,10 @@ spec:
         name: user-endpoint
         namespace: default
       verb: PUT
-      path: /users/123
-      payload: '{"status":"active"}'
+      path: '${ "/users/" + (.["get-user"].items[0].id | tostring) }'
+      headers:
+        - "Content-Type: application/json"
+      payload: '${ {status: "active"} }'
 
   filter: ""
+```

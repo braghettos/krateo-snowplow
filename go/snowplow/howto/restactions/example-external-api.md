@@ -1,14 +1,27 @@
+---
+type: Usage
+title: "RESTAction walkthrough: invoke an external API"
+description: Chain two dependent RESTAction stages against an external service (HTTPBin) through an Endpoint Secret, template the second payload with jq, and execute via the snowplow /call endpoint.
+resource: snowplow
+tags:
+  - snowplow
+  - restaction
+  - walkthrough
+  - endpoint
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # Example [`RESTAction`][restactions]: Invoke external API
 
 ## Prerequisites
 
 Before you begin with this example, make sure you have **Snowplow** installed on a Kind cluster.
-Follow the guide here to set it up: [Installing `snowplow` on Kind](howto/install.md).
+Follow the guide here to set it up: [Installing `snowplow` on Kind](../install.md).
 
 
 ## Overview
 
-This [`RESTAction`][restactions] calls an external service. When you want to call a service other than the Kubernetes API server, you need to specify an [`Endpoint`][endpoints]. By default, the [`Endpoint`][endpoints] points to the Kubernetes API server, which is why it is not required when calling Kubernetes APIs.
+This [`RESTAction`][restactions] calls an external service. When you want to call a service other than the Kubernetes API server, you need to specify an [`Endpoint`][endpoints]. When `endpointRef` is omitted, snowplow resolves the calling user's own `<user>-clientconfig` Secret and targets the Kubernetes API server — which is why no `endpointRef` is needed when calling Kubernetes APIs.
 
 
 ```sh {name=create-endpoint}
@@ -104,10 +117,12 @@ curl -sv -G \
 
 
 > The _.env_ file stores the environment variables required to authenticate with Snowplow.
-> In particular, it contains the _KRATEO_ACCESS_TOKEN_, which you obtained during the Snowplow [installation][install.md] process when > you created a user using the `krateoctl add-user` command, as [explained in the previous guide][install.md].
+> In particular, it contains the _KRATEO_ACCESS_TOKEN_ minted in step 4 of the
+> [installation guide](../install.md). The user's `<user>-clientconfig` Secret
+> (step 5 there) must also exist — without it snowplow answers `401`.
 
 
-Snowplow will fetch the corresponding CR, execute all the API calls, apply filters, iterators, and JQ expressions, and store the results in the resource's `status` field.
+Snowplow fetches the corresponding CR, executes all the API calls, applies filters, iterators, and jq expressions, and returns the results under the `status` field **of the HTTP response** (nothing is written back to the cluster):
 
 ```json
 "status": {
