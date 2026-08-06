@@ -10,8 +10,9 @@ internals behind these knobs see the architecture deep-dives:
 
 ## Deploy
 
-snowplow ships as a Helm chart, `braghettos/krateo-snowplow-chart`. The chart's
-defaults are pre-sized for the cache-enabled fork at 50K-composition scale; the
+snowplow ships as a Helm chart from this repo (`helm/snowplow`, published as
+`oci://ghcr.io/krateo-platformops/charts/snowplow`). The chart's
+defaults are pre-sized for cache-enabled operation at 50K-composition scale; the
 load-bearing values are below. The container takes **no direct `env:` array** —
 every value goes through the chart-managed `snowplow` ConfigMap and is consumed
 via `envFrom` (`values.yaml`, `env:` block).

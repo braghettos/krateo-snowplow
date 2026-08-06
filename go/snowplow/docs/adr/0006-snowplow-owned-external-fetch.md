@@ -9,11 +9,12 @@
 ## Context
 
 A `RESTAction` `spec.api[]` stage that targets an external `endpointRef` is dispatched
-through `github.com/krateoplatformops/plumbing` `http/request.Do`. That function **rejects any
+through `github.com/krateo-platformops/plumbing` `http/request.Do`. That function **rejects any
 non-JSON `Content-Type` with HTTP 406 *before* the `ResponseHandler` is invoked**
 (`plumbing@v0.9.x http/request/request.go:118-119`, identical through the latest `v1.9.0`), and
 its handler type is `func(io.ReadCloser) error` (request.go:25) — the `*http.Response`/headers
-are **not** passed to snowplow. snowplow cannot patch plumbing (never-upstream, ADR convention).
+are **not** passed to snowplow. snowplow does not patch plumbing for this (kept a shared,
+unforked library).
 
 The portal Marketplace blueprint-discovery RA must GET a Helm repo `index.yaml` — which repos
 commonly serve as `text/plain` / `text/yaml` / `application/x-yaml`. Under the plumbing path that

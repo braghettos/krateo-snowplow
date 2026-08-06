@@ -146,5 +146,5 @@ distinct extras resolve to distinct cache entries (`cache/resolved.go:679-688`).
 `resourcesRefs(+Template)` → CRD-schema validate (`resolve.go:69-170`). Each phase
 is wall-clocked for the seed-path timing log.
 
-Refer to the [Krateo Widgets documentation](https://github.com/krateoplatformops/frontend/blob/main/docs/docs.md)
+Refer to the [Krateo Widgets documentation](https://github.com/krateo-platformops/frontend/blob/main/docs/docs.md)
 for the frontend-side widget catalogue.

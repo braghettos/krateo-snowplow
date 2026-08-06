@@ -39,5 +39,11 @@ with the real authentication flow.
 This follows microservice testing best practice — reduce inter-service coupling and lean on
 existing operational tools — while staying aligned with the production authentication mechanism.
 
-[authn]: https://github.com/krateoplatformops/authn
-[krateoctl]: https://github.com/krateoplatformops/krateoctl/releases
+> **Note (post org migration):** `krateoctl` is not published under the
+> `krateo-platformops` org. The token it mints is a plain HS256 JWT from the shared
+> auth library (`github.com/krateo-platformops/plumbing` `jwtutil`);
+> [`howto/install.md`](../../howto/install.md) shows a tool-free way to mint the
+> same token.
+
+[authn]: https://github.com/krateo-platformops/authn
+[krateoctl]: ../../howto/install.md

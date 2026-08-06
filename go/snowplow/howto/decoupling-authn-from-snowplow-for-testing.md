@@ -34,5 +34,10 @@ This decision improves service isolation, test reliability, and development velo
 It follows microservice testing best practices by reducing inter-service coupling and leveraging existing operational tools.
 
 
-[authn]: https://github.com/krateoplatformops/authn
-[krateoctl]: https://github.com/krateoplatformops/krateoctl/releases
+> **Note (post org migration):** `krateoctl` is not published under the
+> `krateo-platformops` org. The token it mints is a plain HS256 JWT from the shared
+> auth library (`github.com/krateo-platformops/plumbing` `jwtutil`); see
+> [install.md](install.md) for a tool-free way to mint the same token.
+
+[authn]: https://github.com/krateo-platformops/authn
+[krateoctl]: install.md

@@ -1,0 +1,18 @@
+# A RESTAction that lists cluster namespaces via the Kubernetes API server and
+# JQ-filters the response down to the namespace names. Resolved on demand by
+# snowplow's GET /call — applying it stores inert spec, nothing reconciles it.
+# Walkthrough: go/snowplow/howto/restactions/example-cluster-namespaces.md
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: cluster-namespaces
+  namespace: demo-system
+  annotations:
+    krateo.io/verbose: "true"
+spec:
+  api:
+    - name: namespaces
+      path: /api/v1/namespaces?limit=15
+      filter: "[.namespaces.items[] | .metadata.name]"
+      continueOnError: true
+      errorKey: namespacesError

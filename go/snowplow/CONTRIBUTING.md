@@ -94,21 +94,18 @@ A change without an architect sign-off on design and a PM falsifier does not mer
 
 ## Release process
 
-snowplow and its Helm chart are **separate repos that ship in lockstep**.
+snowplow is a **monorepo**: the app (`go/snowplow/`) and its Helm charts (`helm/snowplow/`,
+`helm/snowplow-crds/`) live in `krateo-platformops/snowplow` and ship from **one tag**.
 
-1. **Tag the code repo** — `braghettos/krateo-snowplow` (this repo; confirm with `git remote -v` →
-   `origin https://github.com/braghettos/krateo-snowplow.git`). The image is built and published from
-   the tag.
-2. **Lockstep-tag the chart repo** — `braghettos/krateo-snowplow-chart`, matching the code tag.
-3. **Reconcile via `helm upgrade`** against the new chart version. **Never** `kubectl set image` or
-   otherwise mutate the running Deployment out of band — the chart is the source of truth and an
-   in-place image bump drifts the cluster from the chart.
-
-Repo-name accuracy is critical:
-
-- The chart repo's `origin` remote points at **upstream** (`krateoplatformops/*`). Push the
-  braghettos fork remote **explicitly** — do not push tags to `origin` blindly.
-- **Never push to `krateoplatformops/*`.** This is the braghettos fork only, for both repos.
+1. **Tag the repo** with plain semver, `X.Y.Z` — **no `v` prefix** (the release workflows
+   trigger on `[0-9]+.[0-9]+.[0-9]+` only; a `v`-prefixed tag silently ships nothing).
+2. CI does the rest: the multi-arch image `ghcr.io/krateo-platformops/snowplow:X.Y.Z` plus the
+   `snowplow` and `snowplow-crds` charts at `oci://ghcr.io/krateo-platformops/charts/`, all at
+   the same version. The full runbook is [`docs/release.md`](../../docs/release.md).
+3. **Reconcile via `helm upgrade`** (or bump the installer's chart pin) against the new chart
+   version. **Never** `kubectl set image` or otherwise mutate the running Deployment out of
+   band — the chart is the source of truth and an in-place image bump drifts the cluster from
+   the chart.
 
 ## Invariants a change must not break
 

@@ -100,7 +100,8 @@ RESTAction/widget contract, and must be removable wholesale when Kubernetes ship
 
 ## For agents
 
-The Krateo `krateo-snowplow-agent` grounds in these docs at the **deployed version's tag** — see
+The Krateo `snowplow-agent` grounds in these docs at the **deployed version's tag** — see
 [`docs/llms.txt`](docs/llms.txt) for the index and the version-pinned retrieval procedure. The
-deployment/CRD/wiring view lives in the chart repo (`braghettos/krateo-snowplow-chart` `docs/`);
-this repo's docs are the internals/runtime view.
+deployment/CRD/wiring view lives in this same repo: the Helm charts under
+[`helm/`](../../helm/snowplow/) and the standard doc bundle at the repo root
+([`docs/`](../../docs/index.md)); this directory's docs are the internals/runtime view.

@@ -1,0 +1,32 @@
+# snowplow — LLM doc index (pinned: 1.9.0)
+# One line per file; regenerate the pin on release. Read files at the tag that matches
+# the running build (chart version == image tag == the repo tag; no v prefix).
+docs/index.md: the map — what snowplow is + links to the whole bundle and the deep corpus
+docs/overview.md: what it does and how it works — /call, resolver layering, removable cache, platform peers
+docs/usage.md: install via the Krateo installer pin or direct helm install oci://…; hard authn-CRD dependency
+docs/configuration.md: the whole config surface — values, env ConfigMap contract, probes, tuning
+docs/api.md: the RESTAction CRD + the HTTP surface; swagger pointer
+docs/examples.md: index of the runnable examples
+docs/release.md: how a release ships — one plain-semver tag drives image + charts
+docs/log.md: curated history
+examples/cluster-namespaces/README.md: RESTAction listing cluster namespaces via the k8s API (JQ-filtered)
+examples/cluster-namespaces/manifest.yaml: the manifest — kubectl apply -f
+examples/external-api/README.md: RESTAction calling httpbin.org via an Endpoint Secret, chained GET→POST
+examples/external-api/manifest.yaml: the manifest — kubectl apply -f
+# Deep corpus (code-adjacent, authoritative for internals; indexed in detail by go/snowplow/docs/llms.txt):
+go/snowplow/ARCHITECTURE.md: the one-page code-traced internals map — read first for internals
+go/snowplow/docs/llms.txt: the agent index of the internals corpus (version-pinned retrieval procedure)
+go/snowplow/docs/architecture/request-lifecycle.md: /call → dispatch → resolve → RBAC filter → serialize
+go/snowplow/docs/architecture/caching.md: the three cache tiers, L1 keying, invalidation, transparent fallback
+go/snowplow/docs/architecture/prewarm.md: boot seed, frontend-nav walker, opt-in prewarm engine
+go/snowplow/docs/architecture/rbac-uaf.md: per-binding-UID keying, subject index, serve-time user filtering
+go/snowplow/docs/architecture/north-star.md: the performance contract and its measuring harness
+go/snowplow/docs/architecture/observability.md: expvars, slog events, pprof
+go/snowplow/docs/adr/: the durable decisions (0001–0006)
+go/snowplow/howto/restactions.md: authoring RESTAction CRs (full field reference)
+go/snowplow/howto/widgets.md: authoring Widget CRs
+go/snowplow/howto/endpoints.md: Endpoint Secret wiring for external APIs
+go/snowplow/howto/install.md: Kind quickstart install
+go/snowplow/howto/operating.md: operator runbook — probes, tuning, incident table
+go/snowplow/docs/swagger.json: the authoritative OpenAPI spec (served at GET /swagger/)
+go/snowplow/CONTRIBUTING.md: build / test traps / release / invariants

@@ -1,6 +1,6 @@
 # How to migrate a RESTAction `/call` api-step to a direct apiserver path
 
-**Audience:** whoever is editing RESTAction templates (portal-chart / composition-portal blueprints — braghettos fork only, NEVER upstream krateoplatformops; portal is helm-only). **Apply in a separate session.**
+**Audience:** whoever is editing RESTAction templates (portal-chart / composition-portal blueprints under the `krateo-platformops` org; portal is helm-only). **Apply in a separate session.**
 
 ## Why (what changed in snowplow 1.4.x)
 snowplow 1.4.x **retired the in-process `/call` loopback for RESTAction *api steps*.** Before, a stage could set `path: /call?resource=…` and snowplow would resolve the referenced `RESTAction`/`Widget` in-process. That dispatch branch is **gone**. A stage whose `path` is still a `/call?…` URL now falls through to the **external HTTP fetch** → it needs an `endpointRef` or it errors/404s (and it is **not cached**).
@@ -64,5 +64,5 @@ After the change, in the snowplow pod logs for a request that hits the stage:
 
 ## Safety
 - Requires snowplow **≥ 1.4.1** on the cluster (the loopback is retired there; an un-migrated `/call` stage will break on 1.4.x — so migrate in lockstep with the 1.4.x rollout).
-- braghettos fork only; portal changes are **helm-only** (chart template → helm upgrade), never `kubectl apply`.
+- Portal changes are **helm-only** (chart template → helm upgrade), never `kubectl apply`.
 - See `howto/restactions.md` (the `resolve` field) and `docs/corpus-audit-call-loopback-2026-06-22.md` (the retirement scope).

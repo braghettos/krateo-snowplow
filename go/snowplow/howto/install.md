@@ -1,10 +1,12 @@
 # Installing `snowplow` on [Kind][kind]
 
-> **Production deploys** use the Helm chart `braghettos/krateo-snowplow-chart`
-> (chart name `krateo-snowplow`, image `ghcr.io/braghettos/krateo-snowplow`),
-> with `CACHE_ENABLED=true` and the runtime tuning described in
-> [operating.md](operating.md). This page is a single-node **quickstart** for
-> trying snowplow on a disposable [Kind][kind] cluster.
+> **Production deploys** use the Helm chart from this repo (`helm/snowplow`,
+> published as `oci://ghcr.io/krateo-platformops/charts/snowplow`, image
+> `ghcr.io/krateo-platformops/snowplow`), with `CACHE_ENABLED=true` and the
+> runtime tuning described in [operating.md](operating.md) — normally via the
+> Krateo installer (see [docs/usage.md](../../../docs/usage.md)). This page is a
+> single-node **quickstart** for trying snowplow on a disposable [Kind][kind]
+> cluster.
 
 If you have any Docker-compatible container runtime installed (including native Docker, Docker Desktop, or OrbStack), you can easily launch a disposable cluster just for this quickstart using [Kind][kind].
 
@@ -42,15 +44,37 @@ kubectl create secret generic jwt-sign-key \
 
 ## 4. Create a Krateo PlatformOps User
 
-To quickly create a Krateo PlatformOps user, install [`krateoctl`][krateoctl] and run the following command:
+A Krateo access token is a plain HS256 JWT signed with the `JWT_SIGN_KEY` above, carrying
+`username` and `groups` claims (the shape is defined by the shared auth library,
+`github.com/krateo-platformops/plumbing` `jwtutil` — `CreateToken` / `Validate`). You can mint
+one with nothing but Python's standard library:
 
 ```sh {name=create-krateo-user depends=create-jwt-secret}
 export KRATEO_USER=cyberjoker
-export KRATEO_ACCESS_TOKEN=$(krateoctl add-user -k "${JWT_SECRET}" -n "${NAMESPACE}" "${KRATEO_USER}")
+export KRATEO_ACCESS_TOKEN=$(python3 - "${JWT_SECRET}" "${KRATEO_USER}" <<'PYEOF'
+import base64, hashlib, hmac, json, sys, time
+def b64(d): return base64.urlsafe_b64encode(d).rstrip(b"=")
+key, user = sys.argv[1], sys.argv[2]
+now = int(time.time())
+header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+payload = b64(json.dumps({
+    "username": user, "groups": ["devs"],
+    "iss": "krateo.io", "sub": user,
+    "iat": now, "nbf": now, "exp": now + 8 * 3600,
+}).encode())
+sig = b64(hmac.new(key.encode(), header + b"." + payload, hashlib.sha256).digest())
+print((header + b"." + payload + b"." + sig).decode())
+PYEOF
+)
 
 echo "KRATEO_USER=${KRATEO_USER}" > .env
 echo "KRATEO_ACCESS_TOKEN=${KRATEO_ACCESS_TOKEN}" >> .env
 ```
+
+> The `krateoctl add-user` CLI (where you have it) mints the same token via the same shared
+> library — see [ADR 0001](../docs/adr/0001-decouple-authn.md). The inline mint above keeps this
+> quickstart free of extra tooling. The user belongs to the `devs` group, which the RBAC below
+> targets.
 
 ## 5. RBACs for the Krateo PlatformOps User
 
@@ -96,12 +120,26 @@ EOF
 
 ## 6. Deploy snowplow
 
-Finally, install `snowplow` using the Helm chart. The chart serves on the single
+First install the CRDs snowplow needs. The `snowplow-crds` chart ships the `RESTAction` CRD;
+the `authn-crds` chart ships the `serviceaccount.authn.krateo.io` CRD that the snowplow chart's
+prewarm-seed allowlist CR requires at install time (a hard dependency — without it the install
+fails fast on the unknown kind; see the `seedAuthn` notes in `helm/snowplow/values.yaml`):
+
+```sh {name=install-crds depends=kind-up}
+helm install snowplow-crds oci://ghcr.io/krateo-platformops/charts/snowplow-crds
+helm install authn-crds oci://ghcr.io/krateo-platformops/charts/authn-crds
+```
+
+> On a bare Kind cluster (no `authn` operator running) the prewarm seed's loopback token
+> exchange fails at runtime — that is fine here: the seed is best-effort warmth, not a
+> correctness gate, and `/call` serves normally.
+
+Then install `snowplow` itself. The chart serves on the single
 `http` port `8081` (there is no separate probe port — see
 [operating.md](operating.md)), so the NodePort maps to it:
 
-```sh {name=install depends=create-jwt-secret}
-helm install snowplow oci://ghcr.io/braghettos/krateo-snowplow-chart \
+```sh {name=install depends=install-crds}
+helm install snowplow oci://ghcr.io/krateo-platformops/charts/snowplow \
   --namespace ${NAMESPACE} \
   --set service.type=NodePort --set service.port=8081 --set service.nodePort=30081 \
   --set 'env.DEBUG=true' --set 'env.CACHE_ENABLED=true'
@@ -138,5 +176,4 @@ Experiment with creating, updating, and querying resources to get a hands-on und
 
 
 [kind]: https://kind.sigs.k8s.io/
-[krateoctl]: https://github.com/krateoplatformops/krateoctl/releases
 [restactions]: restactions.md

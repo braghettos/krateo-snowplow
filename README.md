@@ -1,26 +1,66 @@
-# `snowplow`
+# snowplow
 
-Snowplow is a web service that plays a key role within the suite of components that make up Krateo PlatformOps. 
+The content API of Krateo PlatformOps: it resolves `RESTAction` and frontend `Widget`
+custom resources into the JSON the Krateo portal renders, served over `GET /call`.
 
-It serves multiple purposes, primarily acting as a bridge between Krateo's custom resources and the UI. By enabling a dynamic and declarative approach to defining UI components and layouts, Snowplow ensures that the interface is interpreted and rendered seamlessly by Krateo Frontend.
+## What is this
 
-It handles on-demand resolution of the `RESTAction` custom resource and all Krateo Frontend `Widgets` custom resources.
+A content bridge, not a BFF: snowplow holds no product state — it composes portal
+content on demand from Kubernetes CRs (declarative REST-call chains, widget
+definitions), enforces the caller's own RBAC, and serves any client that presents a
+Krateo JWT. One monorepo, one version line: the app (`go/snowplow/`) and its Helm
+charts (`helm/`) ship together from a single tag.
+Full picture: [docs/index.md](docs/index.md).
 
-## Learn More
+## Install
 
-### Developer Guide
+Normally installed by the **Krateo installer**, which pins the chart. Standalone:
 
-- [Building `snowplow`](howto/developer-guide.md)
-- [ADR: Decoupling `authn` from `snowplow` for Testing and Operations](howto/decoupling-authn-from-snowplow-for-testing.md)
+```sh
+# CRDs first (RESTAction + the authn ServiceAccount CRD the app chart hard-requires):
+helm install snowplow-crds oci://ghcr.io/krateo-platformops/charts/snowplow-crds --version 1.9.0
+helm install authn-crds oci://ghcr.io/krateo-platformops/charts/authn-crds
 
-### User Guide
+helm install snowplow oci://ghcr.io/krateo-platformops/charts/snowplow \
+  --version 1.9.0 --namespace krateo-system
+```
 
-- [`Endpoint` reference](howto/endpoints.md)
-- [`RESTAction` reference](howto/restactions.md)
-- [Understanding the `Widget` Custom Resource](howto/widgets.md)
-- [Installing `snowplow` on Kind](howto/install.md)
+Details, dependencies and the Kind quickstart: [docs/usage.md](docs/usage.md).
 
-### Examples
+## Configure
 
-- [RESTAction: list _cluster namespaces_](howto/restactions/example-cluster-namespaces.md)
-- [RESTAction: invoke _external API_](howto/restactions/example-external-api.md)
+See [docs/configuration.md](docs/configuration.md). Most used:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `env.CACHE_ENABLED` | `"true"` | The single cache master gate; `false` = transparent direct-apiserver fallback (same data, slower). |
+| `env.GOMEMLIMIT` | `7GiB` | Go GC back-pressure ceiling — must stay strictly below `resources.limits.memory` (8Gi) or Linux OOM-kills instead. |
+| `service.type` / `service.port` | `LoadBalancer` / `8081` | One port serves content, probes and debug surfaces. |
+
+## Examples
+
+- [examples/cluster-namespaces](examples/cluster-namespaces) — a `RESTAction` listing
+  cluster namespaces via the Kubernetes API, JQ-filtered to names.
+- [examples/external-api](examples/external-api) — chained GET→POST against an external
+  service through an `Endpoint` Secret.
+
+## Docs
+
+- [docs/index.md](docs/index.md) — the map (bundle + the code-adjacent deep corpus)
+- [docs/overview.md](docs/overview.md) — what it does and how it works
+- [docs/usage.md](docs/usage.md) — how to install / consume it
+- [docs/configuration.md](docs/configuration.md) — the whole config surface
+- [docs/api.md](docs/api.md) — the `RESTAction` CRD + the HTTP surface
+- [docs/examples.md](docs/examples.md) — examples index
+- [docs/release.md](docs/release.md) — how a release ships
+- [docs/log.md](docs/log.md) — curated history
+
+Internals (code-traced): [go/snowplow/ARCHITECTURE.md](go/snowplow/ARCHITECTURE.md)
+and the deep dives it links.
+
+## Develop & release
+
+`cd go/snowplow && go test ./...` (keep `KUBECONFIG` unset — see
+[CONTRIBUTING](go/snowplow/CONTRIBUTING.md)); local cluster workflow via
+`go/snowplow/scripts/`. Tag `X.Y.Z` (no `v`) ships image + charts — release runbook:
+[docs/release.md](docs/release.md).
