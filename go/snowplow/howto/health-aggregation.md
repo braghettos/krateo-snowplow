@@ -1,10 +1,20 @@
+---
+type: Usage
+title: Health and usage aggregation (built-in health jq module)
+description: The embedded health jq module — normalize heterogeneous service health signals to OK/Warning/Critical/Unknown and roll them up in any RESTAction filter or widget expression via include "health".
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [portal, restaction, jq, health]
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # Health & usage aggregation (built-in `health` jq module)
 
-Snowplow ships a **built-in jq module** (`internal/support/jq/modules/health.jq`)
-available to every `RESTAction` filter and widget expression via
-`include "health";` — no `JQ_MODULES_PATH` deployment configuration
-needed (filesystem modules with the same name still win, so operators
-can override it).
+Snowplow ships a **built-in jq module** (`internal/support/jq/modules/health.jq`,
+embedded in the binary and served by the layered loader in
+`internal/support/jq/modules.go`) available to every `RESTAction` filter and
+widget expression via `include "health";` — no `JQ_MODULES_PATH` deployment
+configuration needed (filesystem modules with the same name still win, so
+operators can override it).
 
 It defines the **normalized health vocabulary** used to aggregate
 heterogeneous per-service health signals into one uniform scale:
@@ -31,6 +41,14 @@ service.
 | `usage_pct(used; capacity)` | numbers | percentage (1 decimal) or `null` when capacity is unknown/0 |
 | `usage_health(pct; warnAt; critAt)` | percentage + thresholds | normalized status |
 | `usage_summary(fu; fc; warnAt; critAt)` | array of objects | `{used, capacity, pct, status}` |
+
+> **Numeric inputs.** `normalize_health` interprets a *number* as this module's
+> own severity code (`0`=OK, `1`=Unknown, `2`=Warning, `3`=Critical; any other
+> number degrades to Unknown) — the exact inverse of `health_severity`, so a
+> value round-trips. This is **not** the Nagios/Icinga plugin exit-code
+> convention; translate Nagios-shaped codes before aggregating. An
+> unreadable/absent signal degrades the rollup (`Unknown`), never silently
+> passes as healthy.
 
 ## Example — consolidated health RESTAction
 

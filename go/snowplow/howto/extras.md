@@ -1,3 +1,12 @@
+---
+type: Usage
+title: extras — per-request context
+description: The ?extras= per-request JSON context for RESTAction and Widget resolves — precedence rules, identity injection, inline (author-declared) defaults, and how extras meet the cache key (spec.keyExtras).
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [portal, restaction, widget, cache]
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # `extras` — per-request context
 
 `extras` is a per-request JSON object you pass on the query string of a `/call`:
@@ -8,7 +17,7 @@ GET /call?resource=widgets&apiVersion=…&name=…&extras=%7B%22env%22%3A%22prod
 ```
 
 It is parsed once per request by `util.ParseExtras` into a `map[string]any`
-(`internal/handlers/util/extras.go:9-24`); a malformed value is a 400, an absent
+(`internal/handlers/util/extras.go`); a malformed value is a 400, an absent
 value is the empty map. The same `extras` mechanism works for **both**
 [`RESTAction`](restactions.md) and [`Widget`](widgets.md) dispatches.
 
@@ -24,7 +33,7 @@ pass a selected namespace, an environment, or a row id that the RESTAction's jq
 
 On a RESTAction resolve the run dict **starts as a deep copy of `extras`**, and
 the API stage outputs are then written on top
-(`internal/resolvers/restactions/api/resolve.go:228-230`):
+(`internal/resolvers/restactions/api/resolve.go`, the dict seed):
 
 ```go
 dict := map[string]any{}
@@ -37,7 +46,7 @@ So precedence is **API/apiRef result > extras**: an extras key collides with a
 stage output → the stage output wins. The widget side reaches the same ordering
 from the opposite direction — `ds` already holds the apiRef result, and
 `mergeExtras` only fills keys that are *absent*
-(`internal/resolvers/widgets/resolve.go:348-358`):
+(`internal/resolvers/widgets/resolve.go`):
 
 ```go
 for k, v := range extrasCopy {
@@ -46,7 +55,14 @@ for k, v := range extrasCopy {
 ```
 
 The pagination `slice` triple is treated like an API result — it also wins over
-`extras` (`resolve.go:88`, `:96`).
+`extras` (`injectSlice` runs before `mergeExtras`).
+
+**Identity injection wins over the client.** For a widget declaring
+`spec.identityContext`, the server overwrites the declared keys (`username` /
+`groups`) in the request extras with the authenticated JWT's own values
+*before* the resolve (`DeclaredIdentity` fold at the top of `widgets.Resolve`)
+— so a request carrying `extras.username=SOMEONE_ELSE` cannot spoof a declared
+widget's identity. Identity-free widgets (no declaration) are untouched.
 
 #### The per-stage `filter` also sees `extras` as a reserved sibling key
 
@@ -61,11 +77,8 @@ spec:
   api:
     - name: things
       path: /apis/.../things
-      filter: '[.things.items[] | select(.metadata.namespace == $__loc__) ]'
-      # …or read extras directly:
-      # filter: '.things.items | map(select(.spec.tenant == ($from_extras))) '
-      #   where the value comes from .extras.<key> in the envelope, e.g.
-      # filter: '{items: .things.items, tenant: .extras.tenant}'
+      # read extras directly in the step filter:
+      filter: '{items: .things.items, tenant: .extras.tenant}'
 ```
 
 The `extras` the filter sees is the **pure request extras** (`r.opts.Extras`),
@@ -73,8 +86,8 @@ not the accumulated run dict — at later stages the dict has stage outputs and 
 synthetic `slice` merged in, so it is no longer the request extras. The key is
 present only when the request carried a non-empty `extras` (mirrors the `slice`
 guard), so a no-extras resolve is byte-identical to before
-(`internal/resolvers/restactions/api/handler.go` — `pig["extras"]` written under
-the `len(opts.extras) > 0` guard).
+(`internal/resolvers/restactions/api/handler.go`, `jsonHandlerCore` —
+`pig["extras"]` written under the `len(opts.extras) > 0` guard).
 
 **Known asymmetry — `extras`-stage *wins*, `slice`-stage *loses*.** If a stage is
 literally named `extras`, the **stage response wins** the sibling-key collision:
@@ -93,33 +106,54 @@ considered acceptable (declaring a stage `extras` or `slice` is degenerate).
 raw `extras` object. Nothing in the resolvers copies `extras` into the emitted
 status.
 
-### 3. It is folded into the cache key
+### 3. It meets the cache key differently per lane
 
-`extras` is part of every L1 cache key, so two requests that differ only in
-`extras` land on **distinct cache entries** — no cross-request collision, and a
-warm entry for `extras=A` is never served to a request carrying `extras=B`.
+`ComputeKey` folds an extras map last, via `canonicaliseExtras`
+(`internal/cache/resolved.go`): a **recursively sorted-key JSON** surrogate.
+Sorting means two requests with the same content but different map iteration
+order hash to the *same* key (a cache hit), while different content hashes to a
+different key. On a marshal failure (cyclic / non-JSON value) it falls back to
+a deterministic `fmt.Sprintf("%v", …)` so the key still varies with content.
+*Which* extras reach that fold depends on the lane:
 
-`ComputeKey` folds `extras` last, via `canonicaliseExtras`
-(`internal/cache/resolved.go:679-688`, `:697`): a **recursively sorted-key JSON**
-surrogate. Sorting means two requests with the same content but different map
-iteration order hash to the *same* key (a cache hit), while different content
-hashes to a different key (`resolved.go:694-729`). On a marshal failure (cyclic /
-non-JSON value) it falls back to a deterministic `fmt.Sprintf("%v", …)` so the key
-still varies with content (`resolved.go:683-687`). This applies to the widget L1
-key, the RESTAction per-binding L1 key, and the identity-free `widgetContent` cell
-alike (`extras` is one of `widgetContent`'s key components,
-`resolved.go:652-660`).
+- **Direct RESTAction `/call`** — the full request `extras` is part of the L1
+  key (`handlers/dispatchers/restactions.go`), so two requests that differ
+  only in `extras` land on distinct cache entries.
+
+- **Widget `/call`** — the key folds the *effective key extras*
+  (`effectiveKeyExtras`, `handlers/dispatchers/helpers.go`), which is the
+  union of:
+  - the CR-fixed inline maps (`spec.apiRef.extras` ∪
+    `spec.resourcesRefsTemplateExtras`, request wins on collision),
+  - **only** the request-extras keys the author declared in
+    `spec.keyExtras` (`filterDeclaredKeyExtras`) — an absent/empty
+    declaration folds **nothing** from the request extras, so one cached
+    cell serves every route (the chrome-widget default),
+  - the declared identity (`spec.identityContext` → `username`/`groups`
+    from the JWT), and the full request identity for an inline-embedding
+    parent.
+
+  Undeclared request extras still reach the resolve's jq dict unchanged —
+  they affect the *body*, never the *key*. To keep that from polluting the
+  shared per-cohort cell, a request carrying extras the widget did **not**
+  declare (identity keys exempt) is served its own correct body but the
+  result is **not written to the cache** (`requestExtrasFullyDeclared` — the
+  self-quarantine guard). A widget whose output genuinely varies on a request
+  extra **must declare that key in `spec.keyExtras`**.
+
+  The same filtered union feeds all four key consumers — dispatch lookup,
+  the shared `widgetContent` cell, subscription arming, and the boot/keepwarm
+  seed — from the single `effectiveKeyExtras` site, so they cannot drift.
 
 > **Exception — resolves that touch an external endpoint are not cached.** If a
 > `RESTAction`'s resolve reaches a genuine **external** endpoint (an
 > `endpointRef` to a non-apiserver URL), its result is **never** written to L1 —
 > external data has no informer/dependency edge that could invalidate a stale
-> entry, so snowplow re-fetches it **live on every `/call`**. The `extras`
-> keying still applies to the *internal* (apiserver-backed) parts of a resolve;
-> it just means an external-touched outer result is not memoised under its
-> `extras`-derived key. A `${…}`-templated path that resolves at runtime to an
-> apiserver path is treated as **internal** (and cached); only genuinely
-> non-apiserver URLs are external.
+> entry, so snowplow re-fetches it **live on every `/call`**
+> (the external-touched sink Put-gate in `handlers/dispatchers/restactions.go`).
+> A `${…}`-templated path that resolves at runtime to an apiserver path is
+> treated as **internal** (and cached); only genuinely non-apiserver URLs are
+> external.
 
 ---
 
@@ -135,16 +169,18 @@ request always wins on collision):
 - `spec.resourcesRefsTemplateExtras` — scoped to the `resourcesRefsTemplate` jq
   **only**. Read by `GetResourcesRefsExtras`.
 
-The dispatcher folds the **union** of (apiRef-inline ∪ resourcesRefs-inline ∪
-request) into the L1 keys (`unionForKey`, `helpers.go`), and the prewarm seed
+The dispatcher folds the union of the two inline maps into the L1 keys
+(`unionForKey`, `helpers.go`) — inline maps are CR-fixed, so unlike request
+extras they are never filtered by `spec.keyExtras` — and the prewarm seed
 applies the same union so the first paint is a hit, not a miss. Precedence is
 request-wins via `mergeRequestWins` (`widgets/resolve.go`); both inline maps are
 input-only and deep-copied (they never alias the shared CR). A widget that
 declares neither is **byte-identical** to before.
 
-> The inline fields live on the **widget CRD**, which ships from the portal
-> chart — not snowplow. Until that CRD declares them the accessors read `{}`
-> (a no-op), so the feature is latent-but-safe on a snowplow-only upgrade.
+> The inline fields (like `identityContext` and `keyExtras`) live on the
+> **widget CRD**, which ships from the portal chart — not snowplow. Until that
+> CRD declares them the accessors read `{}`/nil (a no-op), so the features are
+> latent-but-safe on a snowplow-only upgrade.
 
 ---
 
@@ -154,36 +190,37 @@ declares neither is **byte-identical** to before.
 
 ```
 /call?resource=restactions&extras={…}
-   → restactions dispatcher: util.ParseExtras (restactions.go:79)
-   → L1 key includes extras (restactions.go:126/134, ComputeKey resolved.go:679)
-   → restactions.Resolve → api.Resolve: dict := DeepCopyJSON(extras) (api/resolve.go:228)
-   → API stages overwrite dict; spec.Filter projects; status.Raw emitted
+   → restactions dispatcher: util.ParseExtras
+   → L1 key includes the full request extras (ComputeKey → canonicaliseExtras)
+   → restactions.Resolve → api.Resolve: dict := DeepCopyJSON(extras)
+   → API stages overwrite dict; spec.Filter projects; status emitted
 ```
 
 ### Widget (`/call`)
 
 ```
 /call?resource=widgets&extras={…}
-   → widgets dispatcher: util.ParseExtras (widgets.go:64)
-   → L1 keys include extras (widgets.go:138/173/182)
-   → widgets.Resolve:
+   → widgets dispatcher: util.ParseExtras
+   → L1 keys fold effectiveKeyExtras (inline ∪ declared keyExtras ∪ declared identity)
+   → widgets.Resolve (receives the RAW request extras):
+       declared-identity injection (identityContext keys overwritten from the JWT)
        apiRef → apiref.Resolve → restactions.Resolve (extras seeds the RA dict)
        mergeExtras(ds, extras)  ← non-overwriting; covers apiRef-less widgets too
        widgetDataTemplate jq + resourcesRefsTemplate jq evaluate against ds
 ```
 
-The prewarm / seed / refresher callers never set `extras`, so a nil/empty
-`extras` is a no-op everywhere (the `if opts.Extras != nil` gate and the
-`len(extras) == 0` guard skip the copy), and a resolve without `extras` is
-byte-identical to the pre-extras behaviour
-(`api/resolve.go:228`, `resolve.go:349`).
+The prewarm / seed / refresher callers never set request `extras`, so a
+nil/empty `extras` is a no-op everywhere (the `if opts.Extras != nil` gate and
+the `len(extras) == 0` guard skip the copy), and a resolve without `extras` is
+byte-identical to the pre-extras behaviour.
 
 ---
 
 ## See also
 
-- [`widgets.md`](widgets.md) — how `extras` reaches each widget template path.
+- [`widgets.md`](widgets.md) — how `extras` reaches each widget template path,
+  and the `identityContext` / `keyExtras` spec fields.
 - [`restactions.md`](restactions.md) — the RESTAction `spec.api` resolve `extras`
   seeds.
-- [caching deep-dive](../docs/architecture/caching.md) §3.1 — `ComputeKey` /
+- [caching deep-dive](../docs/architecture/caching.md) — `ComputeKey` /
   `canonicaliseExtras` in the full key structure.

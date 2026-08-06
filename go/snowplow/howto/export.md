@@ -1,23 +1,33 @@
+---
+type: Usage
+title: Generic export (GET /export)
+description: Export any /call-resolvable list (RESTAction or Widget) as a CSV or JSON attachment — parameters, row auto-detection, full-list pagination and the truncation cap, CSV shaping, and the audit trail.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [portal, export, csv, audit]
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # Generic export (`GET /export`)
 
 `/export` turns **any `/call`-resolvable list** — a `RESTAction` or a
 list/table `Widget` — into a downloadable **CSV** or **JSON** attachment.
-It is a pure serializer layered on the `/call` resolve lane: the request
-is re-dispatched **in-process** through the same dispatcher chain the
-`GET /call` route uses, so authentication, the RBAC gate and the
-serve-time user-aware filtering are identical. An export can never
-contain more than the caller's own `/call` would return.
+It is a pure serializer layered on the `/call` resolve lane
+(`internal/handlers/export.go`): the request is re-dispatched **in-process**
+through the same dispatcher chain the `GET /call` route uses, so
+authentication, the RBAC gate and the serve-time user-aware filtering are
+identical. An export can never contain more than the caller's own `/call`
+would return.
 
 Every export also emits an [`AuditEvent`](./audit-correlation.md)
-(structured log record, `action=export`) carrying the request session id
-(the W3C **`baggage`** member `session.id`), so data egress is auditable
-end-to-end. (The bespoke `X-Krateo-Correlation-Id` header is retired — the
-server ignores it; correlation now rides W3C baggage.)
+(a trace-correlated OTLP LogRecord, `krateo.action=export`) carrying the
+request session id (the W3C **`baggage`** member `session.id`), so data egress
+is auditable end-to-end. (There is no bespoke `X-Krateo-Correlation-Id`
+header — correlation rides W3C baggage.)
 
 ## Request
 
 ```
-GET /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&filename=...]
+GET /export?apiVersion=<gv>&resource=<plural>&name=<name>&namespace=<ns>[&format=...][&path=...][&fields=...][&filename=...][&page=...&perPage=...]
 ```
 
 The `apiVersion` / `resource` / `name` / `namespace` parameters are the
@@ -29,10 +39,24 @@ standard `/call` ones. Authentication is the same JWT used for `/call`.
 | `path`     | auto    | Optional **jq expression** selecting the row array inside the resolved envelope, e.g. `.status.services`. |
 | `fields`   | all     | Comma-separated list of column **dot-paths** selecting and ordering the CSV columns, e.g. `name,health,usage.cpu`. |
 | `filename` | derived | Attachment file name (sanitized; extension appended). |
+| `page` / `perPage` | full list | Export exactly that `/call` window. When **both** are omitted, the handler exports the **full list** (below). |
+
+### Full-list pagination and the truncation cap
+
+An `/export` that carries no `page`/`perPage` of its own (the scheduled-export
+shape) does **not** inherit the target's default page size. The handler
+paginates the `/call` lane internally (`perPage=500`) and concatenates the
+extracted rows page by page until a short page signals exhaustion, bounded at
+100 pages — a documented cap of **50 000 rows** (`collectAllPages`,
+`export.go`). An export that hits the bound is truncated and the response
+carries **`X-Export-Truncated: true`**, so a consumer can tell a complete
+export from a capped one. A target that ignores the injected pagination is
+detected by page fingerprinting and exported once, never duplicated.
 
 ### Row auto-detection
 
-When `path` is omitted the rows are located by convention, in order:
+When `path` is omitted the rows are located by convention, in order
+(`autoDetectRows`):
 
 1. the resolved envelope itself, when it is an array;
 2. `.items`;
@@ -46,6 +70,10 @@ When `path` is omitted the rows are located by convention, in order:
 Nested objects are flattened to dot-path columns (`usage.cpu`); arrays
 and empty objects are JSON-encoded in place; the header row is the
 sorted union of all flattened keys (or the explicit `fields` order).
+String cells beginning with a spreadsheet formula trigger (`=`, `+`, `-`,
+`@`, tab, CR) are prefixed with a single quote so a spreadsheet renders
+them as literal text, not an executable formula (`neutralizeCSVCell` —
+OWASP CSV-injection guard; the JSON format is unaffected).
 
 ## Examples
 

@@ -1,43 +1,54 @@
-# Decoupling [`authn`][authn] from `snowplow` for Testing and Operations
+---
+type: Decision
+title: Decoupling authn from snowplow for testing and operations
+description: ADR (2025-10-22) — test snowplow without deploying the authn service by minting Bearer tokens directly with the shared auth library. Superseded in place by ADR 0001.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [authn, testing, adr, jwt]
+status: superseded-by:../docs/adr/0001-decouple-authn.md
+timestamp: 2026-08-06T00:00:00Z
+---
 
-> Architecture Decision Record (ADR): 2025-10-22 
+# Decoupling `authn` from `snowplow` for Testing and Operations
 
+> Architecture Decision Record, 2025-10-22.
+> **This record is superseded**: it is preserved in ADR form as
+> [`docs/adr/0001-decouple-authn.md`](../docs/adr/0001-decouple-authn.md),
+> which is now the authoritative version. What follows is the original
+> decision plus the verified current state.
 
-## Context
+## The decision (2025-10-22)
 
-Service `snowplow` depends on the [`authn`][authn] service for authentication and token issuance.  
-Both are deployed on Kubernetes and use custom setup and CRDs, which makes isolated testing complex and fragile.  
-Setting up [`authn`][authn] just to test `snowplow` introduces unnecessary overhead, frequent configuration issues, and slows down iteration.
+Snowplow depends on the `authn` service for authentication and Bearer-token
+issuance; standing up `authn` (its setup and CRDs) just to test snowplow was
+fragile and slow. The decision: perform a one-time user registration and token
+generation with the **shared authentication library**, without deploying
+`authn` — originally via the `krateoctl add-user` CLI command.
 
+## Current state (verified against the tree)
 
-## Decision
+The *decoupling* stands and is how snowplow is tested and quick-started today;
+the *tool* has changed:
 
-Use the existing [`krateoctl`][krateoctl] tool (already used and distributed across environments) with the new command:  `krateoctl add-user`.
+- Snowplow validates tokens entirely in-process: a Krateo access token is a
+  plain **HS256 JWT** signed with the `JWT_SIGN_KEY` snowplow is started with
+  (`main.go` — `middleware.UserConfig(*signKey, *authnNS)`), carrying
+  `username` and `groups` claims. The shape is defined by the shared auth
+  library (`github.com/krateo-platformops/plumbing` `jwtutil` —
+  `CreateToken` / `Validate`). No `authn` deployment is needed to obtain or
+  validate one.
+- `krateoctl` is **not published under the `krateo-platformops` org** and is
+  not referenced anywhere in this tree. The supported tool-free path is the
+  inline mint in [`install.md`](install.md) §4 (a stdlib-only Python HS256
+  signer producing the same token the shared library would).
 
-This command performs a _one-time user registration and token generation_ using the shared authentication library, without requiring the [`authn`][authn] service to be deployed.
+## Consequences (unchanged)
 
-It enables developers — and admins — to create valid users and obtain Bearer tokens directly from the CLI.
-
-
-## Consequences
-
-- ✅ **Simplified testing:** Services that depend on authentication can now be tested independently of [`authn`][authn].  
-- ✅ **Reduced operational overhead:** No need to deploy or maintain [`authn`][authn] in local or CI environments.  
-- ✅ **Consistency:** The command reuses the shared auth library, ensuring compatibility with real authentication flows.  
-- ✅ **Admin utility:** The same tool helps administrators quickly bootstrap or manage users.  
-
-
-## Outcome
-
-This decision improves service isolation, test reliability, and development velocity, while maintaining alignment with the actual authentication mechanism.
-
-It follows microservice testing best practices by reducing inter-service coupling and leveraging existing operational tools.
-
-
-> **Note (post org migration):** `krateoctl` is not published under the
-> `krateo-platformops` org. The token it mints is a plain HS256 JWT from the shared
-> auth library (`github.com/krateo-platformops/plumbing` `jwtutil`); see
-> [install.md](install.md) for a tool-free way to mint the same token.
+- **Simplified testing:** services that depend on authentication are testable
+  independently of `authn`.
+- **Reduced operational overhead:** no need to deploy or maintain `authn` in
+  local or CI environments.
+- **Consistency:** the token shape is the shared library's, so hand-minted
+  tokens are compatible with real authentication flows.
+- **Admin utility:** the same mechanism bootstraps users for quickstarts.
 
 [authn]: https://github.com/krateo-platformops/authn
-[krateoctl]: install.md
