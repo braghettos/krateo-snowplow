@@ -141,7 +141,11 @@
           "title": "Port"
         },
         "nodePort": {
-          "type": "integer"
+          "type": "integer",
+          "minimum": 30000,
+          "maximum": 32767,
+          "description": "Explicit NodePort (only honored when service.type=NodePort). Set by the installer to pin a deterministic, host-mappable port.",
+          "title": "Node Port"
         }
       },
       "description": "Kubernetes Service configuration.",

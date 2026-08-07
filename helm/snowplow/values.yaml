@@ -73,6 +73,9 @@ securityContext: {}
 service:
   type: LoadBalancer
   port: 8081
+  # nodePort: explicit NodePort (30000-32767), only honored when type=NodePort.
+  # Set by the installer to pin a deterministic, host-mappable port.
+  # nodePort: 31002
 
 # NOTE: the snowplow binary (1.0.x ship line) has NO dedicated probe
 # listener -- it serves /health + /readyz on the single `http` port
