@@ -227,8 +227,8 @@
           "additionalProperties": false,
           "properties": {
             "cpu": {
-              "type": "integer",
-              "description": "CPU limit.",
+              "type": ["integer", "string"],
+              "description": "CPU limit — a Kubernetes Quantity: integer cores or a string like \"500m\"/\"1\".",
               "title": "CPU"
             },
             "memory": {
@@ -245,8 +245,8 @@
           "additionalProperties": false,
           "properties": {
             "cpu": {
-              "type": "integer",
-              "description": "CPU request.",
+              "type": ["integer", "string"],
+              "description": "CPU request — a Kubernetes Quantity: integer cores or a string like \"500m\"/\"1\".",
               "title": "CPU"
             },
             "memory": {
