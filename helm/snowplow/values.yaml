@@ -122,10 +122,13 @@ resources:
 # port (PORT, 8081) -- there is no dedicated probe listener on the 1.0.x
 # ship line, so all three probes target `http`. The timeouts/thresholds
 # below are EXPLICIT (not k8s defaults): the k8s defaults
-# (timeoutSeconds 1, failureThreshold 3, periodSeconds 10) leave only a
-# 30-second window before kubelet kills the pod; we widen that as
-# defence-in-depth so a transient scheduler hiccup does not restart a
-# healthy pod.
+# (timeoutSeconds 1, failureThreshold 3) kill HEALTHY pods under CPU
+# contention -- on a loaded node a healthy /health can take >1s to answer,
+# three misses restart the pod, and the resulting restart storm worsens
+# the very contention that caused it. Liveness is therefore lenient
+# (~60s of consecutive failure before restart, so only truly dead
+# processes die); readiness keeps prompt endpoint removal but load alone
+# must not flap it.
 
 # Startup probe: gives the binary up to 6 minutes (36 x 10s) to start
 # serving /health. The http server (incl. /health) binds early, before
@@ -140,16 +143,18 @@ startupProbe:
   timeoutSeconds: 3
 
 # Liveness probe: checks only that the binary is alive (/health is a
-# cheap write with zero kube-API touches). failureThreshold 5 +
-# periodSeconds 10 + timeoutSeconds 3 = a 50-second window before
-# kubelet restarts, vs the 30-second window of k8s defaults.
+# cheap write with zero kube-API touches). failureThreshold 6 +
+# periodSeconds 10 + timeoutSeconds 5 = a ~60-second window of
+# consecutive failure before kubelet restarts, vs the 30-second window
+# of k8s defaults -- only a truly dead process dies, and slow probe
+# answers under CPU contention never trigger a restart storm.
 livenessProbe:
   httpGet:
     path: /health
     port: http
   periodSeconds: 10
-  timeoutSeconds: 3
-  failureThreshold: 5
+  timeoutSeconds: 5
+  failureThreshold: 6
 
 # Readiness probe: /readyz flips to 200 once Phase1Done is set. As of
 # 1.5.29 (shape A prewarm-gated readiness) Phase1Done is set AFTER the
@@ -159,13 +164,15 @@ livenessProbe:
 # under the aggregate OOM gate). Post-Ready L1 misses still fall through to a
 # foreground resolve (the #41 on-miss floor is intact). failureThreshold here
 # does NOT kill the pod (readiness only withholds from Endpoints); the rollout
-# bound is progressDeadlineSeconds above.
+# bound is progressDeadlineSeconds above. timeoutSeconds 5 so CPU
+# contention alone does not flap endpoint membership; failureThreshold 3
+# keeps removal of a genuinely unready pod prompt.
 readinessProbe:
   httpGet:
     path: /readyz
     port: http
   periodSeconds: 5
-  timeoutSeconds: 3
+  timeoutSeconds: 5
   failureThreshold: 3
 
 autoscaling:
