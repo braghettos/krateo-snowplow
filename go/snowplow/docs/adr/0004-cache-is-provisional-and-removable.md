@@ -1,6 +1,26 @@
+---
+type: Decision
+title: "ADR 0004 — All caching is provisional and removable; CACHE_ENABLED=false is a transparent fallback"
+description: >-
+  CACHE_ENABLED is the single master gate over snowplow's whole cache
+  subsystem; turning it off routes every read straight to the apiserver with
+  identical data, UI, and RBAC — the correctness baseline and the documented
+  incident lever. Sub-tier back-out knobs and bounded-TTL tunables layer under
+  it without changing the invariant.
+resource: snowplow
+tags:
+  - adr
+  - cache
+  - operations
+  - flags
+status: implemented
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # ADR 0004 — All caching is provisional and removable; `CACHE_ENABLED=false` is a transparent fallback
 
-- **Status:** Accepted
+- **Status:** Accepted and implemented as decided; the knob inventory has grown (bounded-TTL
+  tunables) without changing the invariant.
 - **Related:** ADR 0002, ADR 0003 (the cache layers this invariant governs).
   Deep dive: [`docs/architecture/caching.md`](../architecture/caching.md).
 
@@ -23,36 +43,49 @@ Two risks follow from a cache that becomes load-bearing for *correctness*:
 **The cache is provisional and must stay cleanly removable.** This is enforced by a single master
 toggle and the invariant that turning it off is a *transparent fallback*, not a degraded mode.
 
-- `CACHE_ENABLED` is the master gate (`cache.go:37` `Disabled()`). With it off, all three tiers
-  vanish and **every read goes straight to the apiserver — same data, same UI, same RBAC, just
-  slower.** This is not a reduced-functionality path; it is the correctness baseline.
+- `CACHE_ENABLED` is the master gate (`cache.Disabled()`, `internal/cache/cache.go`). The code
+  default is **off** — only an explicit truthy value enables the subsystem (the chart sets
+  `CACHE_ENABLED: "true"` for production). With it off, all tiers vanish and **every read goes
+  straight to the apiserver — same data, same UI, same RBAC, just slower.** This is not a
+  reduced-functionality path; it is the correctness baseline.
 - The fallback is enforced at every tier, by construction, not by special-casing:
-  - **L3** switches to `modePassthrough`: `GetObject` issues a live `Get` (`watcher.go:1616`) and
-    `ListObjects` issues a fresh paged LIST (`watcher.go:1670`) instead of reading the indexer.
-    Same `GetObject`/`ListObjects` surface, two backing implementations chosen once at
-    construction (`NewResourceWatcher`).
-  - **L1** `ResolvedCache()` returns `nil` and every consumer nil-checks and resolves directly
-    (`resolved.go:547-550`, `:484-494`).
-  - **RBAC** routes through `UserCan` → `SelfSubjectAccessReview` against the user's own kubeconfig
-    (`rbac.go:62-103`), and the dispatcher's in-process `EvaluateRBAC` gate is skipped because the
-    per-user apiserver fetch enforces RBAC inline (`restactions.go:92-108`). There is **zero
+  - **L3** switches to `modePassthrough`: `GetObject` issues a live `Get` and `ListObjects` a
+    fresh paged LIST (`internal/cache/watcher.go`) instead of reading the indexer. Same
+    `GetObject`/`ListObjects` surface, two backing implementations chosen once at construction
+    (`NewResourceWatcher`).
+  - **L1** `cache.ResolvedCache()` returns `nil` and every consumer nil-checks and resolves
+    directly (`internal/cache/resolved.go`).
+  - **RBAC** routes through `UserCan` → `SelfSubjectAccessReview` against the user's own
+    kubeconfig (`internal/rbac/rbac.go`), and the dispatcher's in-process `EvaluateRBAC` gate is
+    skipped because the per-user apiserver fetch enforces RBAC inline
+    (`internal/handlers/dispatchers/restactions.go`). There is **zero
     `SubjectAccessReview` to the apiserver in cache-on mode**, and `userCanViaSAR` MUST be
-    reachable only when `cache.Disabled() == true` (`rbac.go:62-64`).
-  - **Prewarm** makes its harvesters nil and the seed a no-op under the master gate
-    (`phase1_walk.go:351-395`).
-- `CACHE_ENABLED` is the single master gate; prewarm and the informer-serve pivot are implicit
-  under it. The api-stage L1 (Ship E) is likewise folded — implicit-on under
-  `RESOLVED_CACHE_ENABLED`, no per-feature flag (#57; `RESOLVED_CACHE_APISTAGE_ENABLED` retired).
-  Only fine-grained back-out knobs remain (`RESOLVED_CACHE_ENABLED`,
-  `WIDGET_CONTENT_L1_ENABLED`, `cache.go:15-24`) for narrowing
-  a regression to one tier without losing the others.
-- The subsystem is kept structurally removable (`cache.go:10-13`).
+    reachable only when `cache.Disabled() == true` (asserted by the F7 invariant tests).
+  - **Prewarm** is implicit under the master gate (`cache.PrewarmEnabled()`,
+    `internal/cache/phase1.go`): with it off, the walk never runs, its harvesters are nil, and
+    the seed is a no-op (`internal/handlers/dispatchers/phase1_walk.go`).
+- `CACHE_ENABLED` is the single master gate; formerly-standalone flags are folded into it (#57,
+  `project_single_cache_flag_direction`): `PREWARM_ENABLED`, `RESOLVER_USE_INFORMER`,
+  `PREWARM_CONTENT_ENABLED`, `PREWARM_PIP_ENABLED`, and `RESOLVED_CACHE_APISTAGE_ENABLED` are
+  retired names, implicit-on under the subsystem (main.go's retired-flag audit warns once on
+  stale values). What remains under it:
+  - **Back-out knobs** for narrowing a regression to one tier without losing the others:
+    `RESOLVED_CACHE_ENABLED` (the L1 store + refresher; the api-stage L1 is implicit under it)
+    and `WIDGET_CONTENT_L1_ENABLED` (the identity-free widget layer only).
+  - **Capacity/TTL tunables**, not feature flags: `RESOLVED_CACHE_MAX_ENTRIES` /
+    `RESOLVED_CACHE_MAX_BYTES` / `RESOLVED_CACHE_TTL_SECONDS` /
+    `RESOLVED_CACHE_MAX_RESIDENT_BYTES` (the pinned-resident region; `0` disables pinning —
+    the Ship 4a kill-switch), and the bounded-staleness backstops
+    `CATALOG_UNSERVABLE_TTL_SECONDS` (#36), `UAF_RESOLVED_TTL_SECONDS` (#118 (d)) and
+    `PARTIAL_RESULT_TTL_SECONDS` (#313 D) — each default `0` = off, purely additive.
+- The subsystem is kept structurally removable (`internal/cache/cache.go` package contract,
+  `project_caching_is_provisional`).
 
 ## Consequences
 
 - **Instant, safe rollback.** A cache-introduced regression is mitigated by one helm `--set
-  CACHE_ENABLED=false`; the pod keeps serving correct content from the apiserver, just slower.
-  This is the documented incident lever.
+  env.CACHE_ENABLED=false`; the pod keeps serving correct content from the apiserver, just
+  slower. This is the documented incident lever.
 - **The cache can never be the correctness story.** Because cache-off is the baseline, any
   cache-on/cache-off behavioural divergence is by definition a bug — which makes the cache testable
   against a known-correct reference (the same `/call` with the toggle flipped).

@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F3 — Login-cohort seed coverage (Fix #130 F3)"
+description: "Fix #130 F3 design: login-cohort seed coverage (admin first-nav hit-rate analysis)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-11T00:00:00Z
+---
+
 # F3 — Login-cohort seed coverage (Fix #130 F3)
 
 Date: 2026-07-11

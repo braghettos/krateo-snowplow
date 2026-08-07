@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: keepwarm c2 — cohort-coverage extension of the G-TTL sweep (design, 2026-07-07)
+description: "keepwarm c2 design: cohort-coverage extension of the G-TTL quiet-page sweep."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-07T00:00:00Z
+---
+
 # keepwarm c2 — cohort-coverage extension of the G-TTL sweep (design, 2026-07-07)
 
 Repo: main @ 6d8af79 (1.6.3 line, Fix-3 rank hygiene at tip). Design + BUILD (as-built note §9). Prior docs: docs/g-ttl-quiet-page-keepwarm-design-2026-07-04.md (c1),

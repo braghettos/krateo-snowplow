@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Corpus audit — `/call`-loopback retirement blast radius (2026-06-22)
+description: "Corpus audit gating the /call-loopback retirement: zero live api-step usages found; retirement is dead-code removal."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-22T00:00:00Z
+---
+
 # Corpus audit — `/call`-loopback retirement blast radius (2026-06-22)
 
 **Purpose:** the durable, inspectable artifact behind the empirical claims that gate (C) retiring the `/call` loopback and (B) shipping `spec.api[].resolve` default-true. Prerequisite for the unified ship in `external-ra-no-l1-cache-proposal-2026-06-22.md`. Author: cache-architect (arch-corpus-audit). All findings TRACED.

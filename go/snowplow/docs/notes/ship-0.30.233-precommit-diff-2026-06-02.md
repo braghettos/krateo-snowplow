@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship 0.30.233 — Pre-commit Diff Artifact
+description: Ship 0.30.233 pre-commit diff (S4 cache invalidation).
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-02T00:00:00Z
+---
+
 # Ship 0.30.233 — Pre-commit Diff Artifact
 
 **Date**: 2026-06-02

@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship #97 — Pre-commit diff + acceptance self-verification"
+description: "Ship #97 pre-commit diff + acceptance self-verification."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Ship #97 — Pre-commit diff + acceptance self-verification
 
 Signed: cache-developer. Date: 2026-05-31. Status: AWAITING ARCHITECT + PM ACK.

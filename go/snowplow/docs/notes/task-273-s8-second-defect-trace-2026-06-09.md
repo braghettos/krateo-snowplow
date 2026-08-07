@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Task #273 — S8 cyberjoker SECOND-DEFECT TRACE (call_count 20 vs 30)"
+description: "Task #273 S8 second-defect trace (call_count 20 vs 30)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-09T00:00:00Z
+---
+
 # Task #273 — S8 cyberjoker SECOND-DEFECT TRACE (call_count 20 vs 30)
 
 **Date:** 2026-06-09

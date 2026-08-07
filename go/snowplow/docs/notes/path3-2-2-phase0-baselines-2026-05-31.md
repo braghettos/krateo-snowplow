@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2.2 — Phase 0 Baselines (0.30.219 helm rev 378)
+description: Path 3.2.2 Phase-0 baselines (0.30.219, helm rev 378).
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2.2 — Phase 0 Baselines (0.30.219 helm rev 378)
 
 Captured 2026-05-31 ~23:50 UTC via port-forward → /debug/vars.

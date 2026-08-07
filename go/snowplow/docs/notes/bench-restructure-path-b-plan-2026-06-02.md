@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Bench Harness Restructure — Path B Detailed Implementation Plan
+description: Bench-harness restructure Path B — detailed implementation plan.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-02T00:00:00Z
+---
+
 # Bench Harness Restructure — Path B Detailed Implementation Plan
 
 **Sign:** cache-architect

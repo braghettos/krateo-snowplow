@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Fix-3 rank hygiene — deterministic, widget-capable-first identity ranking (design, 2026-07-07)
+description: "Fix-3 design: deterministic, widget-capable-first identity ranking for the prewarm walk."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-07T00:00:00Z
+---
+
 # Fix-3 rank hygiene — deterministic, widget-capable-first identity ranking (design, 2026-07-07)
 
 Repo: main @ bbaba28 (1.6.2). Origin: docs/fixf-rootindex-redrive-walk-trace-2026-07-06.md §3a/§4

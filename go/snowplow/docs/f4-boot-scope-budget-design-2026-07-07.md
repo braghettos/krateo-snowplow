@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F.4 — Resumable boot scope: surviving the per-scope budget without knobs"
+description: "F.4 design: resumable boot scope surviving the per-scope budget without knobs."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-07T00:00:00Z
+---
+
 # F.4 — Resumable boot scope: surviving the per-scope budget without knobs
 
 Date: 2026-07-07 · Author: cache-architect · Ref: main @ 701c2e3 (1.6.1)

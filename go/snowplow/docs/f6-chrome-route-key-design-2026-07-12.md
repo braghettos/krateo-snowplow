@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F6 — Chrome-widget route-context cache-key gap (#130 final gap-chain)"
+description: "F6 design (#130): chrome-widget route-context cache-key gap — the origin of spec.keyExtras."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-12T00:00:00Z
+---
+
 # F6 — Chrome-widget route-context cache-key gap (#130 final gap-chain)
 
 Date: 2026-07-12 · snowplow 1.7.9 · repo @ origin/main 26b48b3

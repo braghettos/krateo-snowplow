@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship 0.30.233 — S4 cache-invalidation defect TRACE & fix design
+description: Ship 0.30.233 S4 cache-invalidation defect trace + fix design.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-02T00:00:00Z
+---
+
 # Ship 0.30.233 — S4 cache-invalidation defect TRACE & fix design
 
 **Author**: cache-architect

@@ -1,3 +1,16 @@
+---
+type: Usage
+title: Endpoint — connection Secrets for RESTAction
+description: The Endpoint contract — a plain Kubernetes Secret holding connection details and credentials (server-url, auth, TLS, proxy, AWS SigV4) that RESTAction stages reference via endpointRef.
+resource: snowplow
+tags:
+  - snowplow
+  - endpoint
+  - restaction
+  - secret
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # `Endpoint`
 
 ## Overview
@@ -20,6 +33,10 @@ It is stored as a Kubernetes [`Secret`](https://kubernetes.io/docs/concepts/conf
 | `client-key-data` | `string (base64)` | Base64-encoded PEM private key associated with the client certificate. | ❌ |
 | `debug` | `boolean` | Enables verbose logging of HTTP requests/responses. | ❌ |
 | `insecure` | `boolean` | If `true`, disables TLS certificate verification. | ❌ |
+| `aws-access-key` | `string` | AWS access key id — enables AWS SigV4 request signing. | ❌ |
+| `aws-secret-key` | `string` | AWS secret access key (SigV4 signing). | ❌ |
+| `aws-region` | `string` | AWS region for SigV4 signing. | ❌ |
+| `aws-service` | `string` | AWS service name for SigV4 signing. | ❌ |
 
 ## Storage in Kubernetes
 
@@ -59,4 +76,9 @@ stringData:
 - if `certificate-authority-data` is provided, it’s added to the root CA pool
 - when `proxy-url` is set, outbound requests are routed through it
 - boolean values (`debug`, `insecure`) are parsed from strings via `strconv.ParseBool`
+- when `aws-access-key`, `aws-secret-key` and `aws-region` are all present, requests are signed with AWS SigV4 for `aws-service`
+
+(All parsing lives in the shared `plumbing` library — `endpoints.FromSecret`
+reads the keys above verbatim, and `http/request/transport.go` builds the TLS /
+proxy transport from them.)
 

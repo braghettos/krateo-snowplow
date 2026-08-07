@@ -1,3 +1,12 @@
+---
+type: Decision
+title: Fold the prewarm flag FAMILY implicit-on-cache — design
+description: "Design/decision: fold the prewarm flag family implicit-on-cache (single-flag surface)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-03T00:00:00Z
+---
+
 # Fold the prewarm flag FAMILY implicit-on-cache — design
 
 Date: 2026-07-03

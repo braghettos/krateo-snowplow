@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2 / 0.30.218 — Phase 6 canonical Chrome MCP + ship closeout
+description: Path 3.2 (0.30.218) Phase-6 canonical Chrome-MCP validation + ship closeout.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2 / 0.30.218 — Phase 6 canonical Chrome MCP + ship closeout
 
 **Author**: cache-developer

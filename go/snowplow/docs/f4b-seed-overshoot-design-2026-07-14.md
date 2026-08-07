@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F4b — the single-pass seed overshoot (TASK #132)"
+description: "F4b design (#132): the single-pass seed overshoot; source of Levers A (declined-external set) and B (snapshot reuse)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-14T00:00:00Z
+---
+
 # F4b — the single-pass seed overshoot (TASK #132)
 
 Date: 2026-07-14

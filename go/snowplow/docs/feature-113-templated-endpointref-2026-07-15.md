@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Feature journal — #113 templated api-step endpointRef (hub-spoke)"
+description: "Feature journal for the #113 templated endpointRef ship (1.7.13 candidate, dual-gate accept)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-15T00:00:00Z
+---
+
 # Feature journal — #113 templated api-step endpointRef (hub-spoke)
 
 Date: 2026-07-15

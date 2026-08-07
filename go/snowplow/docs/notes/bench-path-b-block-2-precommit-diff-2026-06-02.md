@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Bench Path B — Block 2 pre-commit diff (2026-06-02)
+description: Bench-harness restructure Path B, block 2 pre-commit diff artifact.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-02T00:00:00Z
+---
+
 # Bench Path B — Block 2 pre-commit diff (2026-06-02)
 
 Branch: `bench-path-b-block-2-2026-06-02` off `bench-path-b-block-1-2026-06-02` (tip `d6e856e`).

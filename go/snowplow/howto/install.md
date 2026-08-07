@@ -1,10 +1,26 @@
+---
+type: Usage
+title: Installing snowplow on Kind
+description: Quickstart that installs the snowplow Helm chart on a disposable Kind cluster, mints a Krateo user (JWT + clientconfig Secret) and prepares RBAC for the RESTAction walkthroughs.
+resource: snowplow
+tags:
+  - snowplow
+  - install
+  - kind
+  - helm
+  - quickstart
+timestamp: 2026-08-06T00:00:00Z
+---
+
 # Installing `snowplow` on [Kind][kind]
 
-> **Production deploys** use the Helm chart `braghettos/krateo-snowplow-chart`
-> (chart name `krateo-snowplow`, image `ghcr.io/braghettos/krateo-snowplow`),
-> with `CACHE_ENABLED=true` and the runtime tuning described in
-> [operating.md](operating.md). This page is a single-node **quickstart** for
-> trying snowplow on a disposable [Kind][kind] cluster.
+> **Production deploys** use the Helm chart from this repo (`helm/snowplow`,
+> published as `oci://ghcr.io/krateo-platformops/charts/snowplow`, image
+> `ghcr.io/krateo-platformops/snowplow`), with `CACHE_ENABLED=true` and the
+> runtime tuning described in [operating.md](operating.md) — normally via the
+> Krateo installer (see [docs/usage.md](../../../docs/usage.md)). This page is a
+> single-node **quickstart** for trying snowplow on a disposable [Kind][kind]
+> cluster.
 
 If you have any Docker-compatible container runtime installed (including native Docker, Docker Desktop, or OrbStack), you can easily launch a disposable cluster just for this quickstart using [Kind][kind].
 
@@ -42,17 +58,97 @@ kubectl create secret generic jwt-sign-key \
 
 ## 4. Create a Krateo PlatformOps User
 
-To quickly create a Krateo PlatformOps user, install [`krateoctl`][krateoctl] and run the following command:
+A Krateo access token is a plain HS256 JWT signed with the `JWT_SIGN_KEY` above, carrying
+`username` and `groups` claims (the shape is defined by the shared auth library,
+`github.com/krateo-platformops/plumbing` `jwtutil` — `CreateToken` / `Validate`). You can mint
+one with nothing but Python's standard library:
 
 ```sh {name=create-krateo-user depends=create-jwt-secret}
 export KRATEO_USER=cyberjoker
-export KRATEO_ACCESS_TOKEN=$(krateoctl add-user -k "${JWT_SECRET}" -n "${NAMESPACE}" "${KRATEO_USER}")
+export KRATEO_ACCESS_TOKEN=$(python3 - "${JWT_SECRET}" "${KRATEO_USER}" <<'PYEOF'
+import base64, hashlib, hmac, json, sys, time
+def b64(d): return base64.urlsafe_b64encode(d).rstrip(b"=")
+key, user = sys.argv[1], sys.argv[2]
+now = int(time.time())
+header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+payload = b64(json.dumps({
+    "username": user, "groups": ["devs"],
+    "iss": "krateo.io", "sub": user,
+    "iat": now, "nbf": now, "exp": now + 8 * 3600,
+}).encode())
+sig = b64(hmac.new(key.encode(), header + b"." + payload, hashlib.sha256).digest())
+print((header + b"." + payload + b"." + sig).decode())
+PYEOF
+)
 
 echo "KRATEO_USER=${KRATEO_USER}" > .env
 echo "KRATEO_ACCESS_TOKEN=${KRATEO_ACCESS_TOKEN}" >> .env
 ```
 
-## 5. RBACs for the Krateo PlatformOps User
+> The `krateoctl add-user` CLI (where you have it) mints the same token via the same shared
+> library — see [ADR 0001](../docs/adr/0001-decouple-authn.md). The inline mint above keeps this
+> quickstart free of extra tooling. The user belongs to the `devs` group, which the RBAC below
+> targets.
+
+## 5. Create the user's `clientconfig` Secret
+
+The JWT alone is **not** enough. On every `/call`, after validating the JWT,
+snowplow loads the caller's per-user Kubernetes credentials from a
+**`<user>-clientconfig` Secret** in `AUTHN_NAMESPACE` — the chart sets
+`AUTHN_NAMESPACE` to the **release namespace** (`helm/snowplow/templates/configmap.yaml`).
+If the Secret is missing, `/call` returns **401** (`middleware.UserConfig`:
+Secret NotFound → Unauthorized). In production the `authn` service creates this
+Secret at login (a CSR-signed client certificate with `CN=<user>` /
+`O=<groups>` — the same thing `krateoctl add-user` does via the shared
+`signup` library). Here we mint the certificate by hand through the Kubernetes
+CSR API:
+
+```sh {name=create-clientconfig depends=create-krateo-user}
+openssl genrsa -out /tmp/${KRATEO_USER}.key 2048
+openssl req -new -key /tmp/${KRATEO_USER}.key \
+  -subj "/CN=${KRATEO_USER}/O=devs" -out /tmp/${KRATEO_USER}.csr
+
+cat <<EOF | kubectl apply -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: ${KRATEO_USER}
+spec:
+  request: $(base64 < /tmp/${KRATEO_USER}.csr | tr -d '\n')
+  signerName: kubernetes.io/kube-apiserver-client
+  usages:
+  - digital signature
+  - key encipherment
+  - client auth
+EOF
+
+kubectl certificate approve ${KRATEO_USER}
+until CRT=$(kubectl get csr ${KRATEO_USER} -o jsonpath='{.status.certificate}') \
+  && [ -n "${CRT}" ]; do sleep 1; done
+CA=$(kubectl config view --raw --minify \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${KRATEO_USER}-clientconfig
+  namespace: ${NAMESPACE}
+stringData:
+  server-url: https://kubernetes.default.svc
+  certificate-authority-data: ${CA}
+  client-certificate-data: ${CRT}
+  client-key-data: $(base64 < /tmp/${KRATEO_USER}.key | tr -d '\n')
+EOF
+```
+
+> The Secret's key names and base64-encoded certificate values follow the
+> [`Endpoint`](endpoints.md) contract. The certificate identity (`CN`/`O`) is
+> what the Kubernetes apiserver enforces RBAC against on the cache-off
+> fallback path; keep it aligned with the JWT's `username`/`groups` claims so
+> cache-on (in-process RBAC over the JWT identity) and cache-off agree.
+
+## 6. RBACs for the Krateo PlatformOps User
 
 After creating a new user, you must assign them a minimal set of RBAC permissions.
 In this case, since we are testing [RESTActions][restactions], the user needs at least read access to this resource.
@@ -94,14 +190,28 @@ EOF
 ```
 
 
-## 6. Deploy snowplow
+## 7. Deploy snowplow
 
-Finally, install `snowplow` using the Helm chart. The chart serves on the single
+First install the CRDs snowplow needs. The `snowplow-crds` chart ships the `RESTAction` CRD;
+the `authn-crds` chart ships the `serviceaccount.authn.krateo.io` CRD that the snowplow chart's
+prewarm-seed allowlist CR requires at install time (a hard dependency — without it the install
+fails fast on the unknown kind; see the `seedAuthn` notes in `helm/snowplow/values.yaml`):
+
+```sh {name=install-crds depends=kind-up}
+helm install snowplow-crds oci://ghcr.io/krateo-platformops/charts/snowplow-crds
+helm install authn-crds oci://ghcr.io/krateo-platformops/charts/authn-crds
+```
+
+> On a bare Kind cluster (no `authn` operator running) the prewarm seed's loopback token
+> exchange fails at runtime — that is fine here: the seed is best-effort warmth, not a
+> correctness gate, and `/call` serves normally.
+
+Then install `snowplow` itself. The chart serves on the single
 `http` port `8081` (there is no separate probe port — see
 [operating.md](operating.md)), so the NodePort maps to it:
 
-```sh {name=install depends=create-jwt-secret}
-helm install snowplow oci://ghcr.io/braghettos/krateo-snowplow-chart \
+```sh {name=install depends=install-crds}
+helm install snowplow oci://ghcr.io/krateo-platformops/charts/snowplow \
   --namespace ${NAMESPACE} \
   --set service.type=NodePort --set service.port=8081 --set service.nodePort=30081 \
   --set 'env.DEBUG=true' --set 'env.CACHE_ENABLED=true'
@@ -109,11 +219,13 @@ helm install snowplow oci://ghcr.io/braghettos/krateo-snowplow-chart \
 
 > `env.*` values are rendered into the chart's `snowplow` ConfigMap and consumed
 > via `envFrom`; the container has no direct `env:` array. `CACHE_ENABLED=true`
-> turns on the in-process cache path; omit it (or set `false`) for the
-> transparent direct-apiserver fallback.
+> is the **chart default** (`helm/snowplow/values.yaml`) and turns on the
+> in-process cache path; set it explicitly to `false` for the transparent
+> direct-apiserver fallback. (The binary itself defaults to cache-off when the
+> variable is absent — only `"true"`, `"1"` or `"yes"` enable it.)
 
 
-## 7. Wait until the `snowplow` deployment is ready
+## 8. Wait until the `snowplow` deployment is ready
 
 Finally, wait for the `snowplow` deployment to become **available**.
 This ensures all pods are up and running before proceeding.
@@ -138,5 +250,4 @@ Experiment with creating, updating, and querying resources to get a hands-on und
 
 
 [kind]: https://kind.sigs.k8s.io/
-[krateoctl]: https://github.com/krateoplatformops/krateoctl/releases
 [restactions]: restactions.md

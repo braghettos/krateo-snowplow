@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: Troubleshooting — snowplow slow composition-detail `/call` (discovery storm) — 2026-06-22
+description: "Troubleshooting: slow composition-detail /call caused by a hot-path discovery storm (1.4.1)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-22T00:00:00Z
+---
+
 # Troubleshooting — snowplow slow composition-detail `/call` (discovery storm) — 2026-06-22
 
 **Cluster:** `gke_integration-test-431120_europe-west1-b_krateo-enterprise`, snowplow **1.4.1**, CACHE_ENABLED=true. Diagnosis read-only (no pod exec, no remote `go test`). All claims TRACED to live logs/expvar + code:line.

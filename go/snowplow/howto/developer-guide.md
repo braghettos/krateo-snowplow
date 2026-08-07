@@ -1,14 +1,43 @@
+---
+type: Usage
+title: "Developer Guide: building and running snowplow from source"
+description: Build the snowplow image with ko, load it into a local Kind cluster and run the in-repo development deployment (manifests/ + scripts/), then create a test user and exercise RESTActions.
+resource: snowplow
+tags:
+  - snowplow
+  - development
+  - kind
+  - ko
+  - build
+timestamp: 2026-08-06T00:00:00Z
+---
 
 # Developer Guide: Building and Installing `snowplow`
 
-This guide walks you through creating a local Kubernetes cluster with [kind](https://kind.sigs.k8s.io/), building the `snowplow` image with [`ko`](https://ko.build/), setting up `jq` custom modules, deploying `snowplow`, and waiting until it’s ready.
+This guide walks you through creating a local Kubernetes cluster with
+[kind](https://kind.sigs.k8s.io/), building the `snowplow` image with
+[`ko`](https://ko.build/), and running the **in-repo development deployment**.
+Everything here mirrors the maintained dev assets in the repo — `scripts/` and
+`manifests/` — so the guide and the tooling cannot drift apart:
 
+| Repo asset | What it does |
+|---|---|
+| `scripts/kind-up.sh` / `scripts/kind-down.sh` | create / delete the Kind cluster |
+| `scripts/build.sh` | `ko` build into the Kind-internal registry (`kind.local`) |
+| `scripts/jqmodule-to-configmap.sh` | package `testdata/custom-modules.jq` as the `jq-custom-modules` ConfigMap |
+| `manifests/deploy.snowplow.yaml` | namespace + ServiceAccount + NodePort Service + Deployment + RBAC |
+| `scripts/reboot.sh` | the whole loop above, from scratch, in one command |
+| `scripts/test-restactions.sh` | apply the `RESTAction` CRD + sample RESTActions + `devs`-group RBAC from `testdata/` |
+
+All commands below run from the module root (`go/snowplow/` in the monorepo) —
+that is where `.ko.yaml`, `crds/`, `manifests/`, `scripts/` and `testdata/`
+live.
 
 ## 1. Start a local Kind cluster
 
-Create a local Kubernetes cluster using **Kind**.
-
-The cluster exposes ports `30081` and `30082` on the host for easy access to `snowplow` services.
+Create a local Kubernetes cluster using **Kind** (`scripts/kind-up.sh` does
+exactly this). The cluster exposes ports `30081` and `30082` on the host for
+easy access to `snowplow` services.
 
 ```sh {name=kind-up}
 kind get kubeconfig >/dev/null 2>&1 || \
@@ -22,174 +51,93 @@ nodes:
     hostPort: 30081
     listenAddress: "127.0.0.1"
     protocol: TCP
+  - containerPort: 30082
+    hostPort: 30082
+    listenAddress: "127.0.0.1"
+    protocol: TCP
 EOF
 ```
 
 ## 2. Create a namespace
 
-Create a dedicated namespace where `snowplow` and its related resources will live.
+The dev deployment is pinned to the `demo-system` namespace (it is hard-coded
+throughout `manifests/deploy.snowplow.yaml`).
 
 ```sh {name=create-namespace depends=kind-up}
 export NAMESPACE="demo-system"
-kubectl create namespace ${NAMESPACE}
+kubectl create namespace ${NAMESPACE} || true
 ```
 
 ## 3. Build the `snowplow` image with `ko`
 
-Use [`ko`](https://ko.build/) to build and push the `snowplow` Docker image directly to the **Kind internal registry** (`kind.local`).
+Use [`ko`](https://ko.build/) to build the `snowplow` image directly into the
+**Kind internal registry** (`kind.local`) — this is `scripts/build.sh`:
 
 ```sh {name=build depends=kind-up}
 KO_DOCKER_REPO=kind.local ko build --base-import-paths .
 ```
 
-## 4. Create a ConfigMap for custom `jq` modules
+## 4. Create the ConfigMap for custom `jq` modules
 
-`Snowplow` uses custom `jq` modules during runtime. Create a ConfigMap to store them.
+`snowplow` loads custom `jq` modules from the path given by
+`--jq-modules-path` / `JQ_MODULES_PATH` at runtime. The dev deployment mounts
+them from a `jq-custom-modules` ConfigMap; `scripts/jqmodule-to-configmap.sh`
+builds it from the in-repo sample modules:
 
 ```sh {name=jq-custom-modules depends=create-namespace}
-cat <<'EOF' | kubectl create configmap jq-custom-modules \
-  --from-file=custom.jq=/dev/stdin \
+kubectl create configmap jq-custom-modules \
+  --from-file=custom.jq=testdata/custom-modules.jq \
   --namespace=${NAMESPACE}
-def shout($s): ($s | ascii_upcase + "!!!");
-
-def flipchar($c):
-  {
-    "a": "ɐ", "b": "q", "c": "ɔ", "d": "p", "e": "ǝ", "f": "ɟ", "g": "ƃ", "h": "ɥ", "i": "ᴉ",
-    "j": "ɾ", "k": "ʞ", "l": "ʃ", "m": "ɯ", "n": "u", "o": "o", "p": "d", "q": "b", "r": "ɹ",
-    "s": "s", "t": "ʇ", "u": "n", "v": "ʌ", "w": "ʍ", "x": "x", "y": "ʎ", "z": "z",
-    "A": "∀", "B": "𐐒", "C": "Ɔ", "D": "p", "E": "Ǝ", "F": "Ⅎ", "G": "פ", "H": "H",
-    "I": "I", "J": "ſ", "K": "ʞ", "L": "˥", "M": "W", "N": "N", "O": "O", "P": "Ԁ",
-    "Q": "Q", "R": "ᴚ", "S": "S", "T": "┴", "U": "∩", "V": "Λ", "W": "M", "X": "X",
-    "Y": "⅄", "Z": "Z", ".": "˙", ",": "'", "'": ",", "\"": ",,", "_": "‾", "?": "¿",
-    "!": "¡", "(": ")", ")": "(", "[": "]", "]": "[", "{": "}", "}": "{"
-  }[$c] // $c;
-
-def flip($s):
-  $s
-  | explode
-  | map([.] | implode | flipchar(.))
-  | reverse
-  | join("");
-EOF
 ```
 
-## 5. Deploy `snowplow`
+## 5. Apply the `RESTAction` CRD
 
-Deploy `snowplow` using a single manifest that includes:
+The CRD must exist **before** you create any `RESTAction` (and before granting
+RBAC on the resource):
 
-* a `ServiceAccount`
-* a `Service` exposed on `NodePort`
-* a `Deployment` for the `snowplow` app
-* RBAC roles and bindings
+```sh {name=install-restaction-crd depends=kind-up}
+kubectl apply -f ./crds/templates.krateo.io_restactions.yaml
+```
+
+## 6. Deploy `snowplow`
+
+`manifests/deploy.snowplow.yaml` deploys:
+
+* a `ServiceAccount` (`snowplow`)
+* a `Service` exposed on `NodePort` `30081`, targeting the single `http` port `8081`
+* a `Deployment` running the `kind.local/snowplow:latest` image you just built,
+  with the dev flags:
+  `--debug=false --blizzard=false --port=8081 --authn-namespace=demo-system`
+  `--jwt-sign-key=AbbraCadabbra --pretty-log=false --jq-modules-path=/jq-modules`
+* a narrow read-only `ClusterRole`/`ClusterRoleBinding` for the snowplow
+  ServiceAccount, plus a sample `devs`-group role
 
 ```sh {name=deploy depends=jq-custom-modules}
-export JWT_SECRET=AbbraCadabbra
-
-cat <<EOF | kubectl apply -f -
----
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: snowplow
-  namespace: ${NAMESPACE}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: snowplow
-  namespace: ${NAMESPACE}
-spec:
-  selector:
-    app: snowplow
-  type: NodePort
-  ports:
-  - name: http
-    port: 8081
-    targetPort: http
-    protocol: TCP
-    nodePort: 30081
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: snowplow
-  namespace: ${NAMESPACE}
-  labels:
-    app: snowplow
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: snowplow
-  template:
-    metadata:
-      labels:
-        app: snowplow
-    spec:
-      serviceAccountName: snowplow
-      volumes:
-      - name: jq-modules
-        configMap:
-          name: jq-custom-modules
-      containers:
-      - name: snowplow
-        image: kind.local/snowplow:latest
-        imagePullPolicy: Never
-        args:
-          - --debug=true
-          - --blizzard=false
-          - --port=8081
-          - --authn-namespace=${NAMESPACE}
-          - --jwt-sign-key=${JWT_SECRET}
-          - --pretty-log=false
-          - --jq-modules-path=/jq-modules
-        ports:
-        - name: http
-          containerPort: 8081
-        volumeMounts:
-        - name: jq-modules
-          mountPath: /jq-modules
-          readOnly: true
----
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: snowplow
-rules:
-- apiGroups: ["core.krateo.io"]
-  resources: ["compositiondefinitions", "schemadefinitions"]
-  verbs: ["get", "list"]
-- apiGroups: ["templates.krateo.io"]
-  resources: ["*"]
-  verbs: ["get", "list"]
-- apiGroups: ["apiextensions.k8s.io"]
-  resources: ["customresourcedefinitions"]
-  verbs: ["get", "list"]
-- apiGroups: [""]
-  resources: ["namespaces", "configmaps", "secrets"]
-  verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: snowplow
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: snowplow
-subjects:
-- kind: ServiceAccount
-  name: snowplow
-  namespace: ${NAMESPACE}
-EOF
+kubectl apply -f manifests/deploy.snowplow.yaml
 ```
 
-## 6. Wait until the `snowplow` deployment is ready
+Notes on how this dev deployment differs from the production Helm chart
+(`helm/snowplow`):
 
-Finally, wait for the `snowplow` deployment to become **available**.
-This ensures all pods are up and running before proceeding.
+* **Cache is off.** `CACHE_ENABLED` is not set, and the binary treats anything
+  but `"true"`/`"1"`/`"yes"` as disabled (`internal/cache/cache.go`). Every
+  read goes straight to the apiserver under the caller's own credentials —
+  same data, same RBAC, just slower (see
+  [operating.md](operating.md)). That is also why the dev ServiceAccount can
+  run with a narrow read-only role, while the chart's ClusterRole grants
+  cluster-wide `get`/`list`/`watch` + `SubjectAccessReview` create for the
+  informer/RBAC-snapshot machinery.
+* **The JWT signing key is a hard-coded dev literal** (`AbbraCadabbra`) passed
+  as a flag; the chart consumes it from the `jwt-sign-key` Secret via
+  `envFrom`.
+* No prewarm-seed / `authn` loopback artifacts are deployed — the chart's
+  `seedAuthn` machinery needs the `authn` operator and its CRDs.
+
+> `scripts/reboot.sh` runs steps 1-6 (minus the CRD) from scratch:
+> kind-down, kind-up, namespace, `ko` build, jq-modules ConfigMap,
+> `kubectl apply -f manifests/`.
+
+## 7. Wait until the `snowplow` deployment is ready
 
 ```sh {name=wait-for-snowplow depends=deploy}
 kubectl wait deployment/snowplow \
@@ -198,34 +146,41 @@ kubectl wait deployment/snowplow \
   --timeout=90s
 ```
 
-## 9. Apply the `RESTAction` CRD
+A quick smoke test (no auth needed on `/health`):
 
-```sh {name=install-restaction-crd depends=wait-for-snowplow}
-kubectl apply -f ./crds/templates.krateo.io_restactions.yaml
+```sh
+curl http://127.0.0.1:30081/health
 ```
 
-## 8. Create a Krateo PlatformOps User
+## 8. Create a Krateo PlatformOps user
 
-To quickly create a Krateo PlatformOps user, install [`krateoctl`][krateoctl] and run the following command:
+`/call` authenticates with **two** artifacts, both keyed to the same username:
 
-```sh {name=create-krateo-user}
-export KRATEO_USER=cyberjoker
-export KRATEO_ACCESS_TOKEN=$(krateoctl add-user -k "${JWT_SECRET}" -n "${NAMESPACE}" "${KRATEO_USER}")
+1. an **access token** — a plain HS256 JWT signed with the `--jwt-sign-key`
+   value (`AbbraCadabbra` here), carrying `username` and `groups` claims;
+2. a **`<user>-clientconfig` Secret** in the `--authn-namespace`
+   (`demo-system` here) holding the user's own Kubernetes credentials in the
+   [`Endpoint`](endpoints.md) format. Without it every `/call` returns `401`.
 
-echo "KRATEO_USER=${KRATEO_USER}" > .env
-echo "KRATEO_ACCESS_TOKEN=${KRATEO_ACCESS_TOKEN}" >> .env
-```
+Follow steps **4 and 5 of [install.md](install.md)** — the inline Python JWT
+mint and the CSR-signed client-certificate `clientconfig` Secret work
+identically here (use `JWT_SECRET=AbbraCadabbra` to match the dev flag). The
+created user belongs to the `devs` group.
 
-## 9. RBACs for the Krateo PlatformOps User
+## 9. RBAC for the Krateo PlatformOps user
 
-After creating a new user, you must assign them a minimal set of RBAC permissions.
-In this case, since we are testing [RESTActions][restactions], the user needs at least read access to this resource.
+After creating a new user, you must assign them a minimal set of RBAC
+permissions. Since we are testing [RESTActions][restactions], the user needs at
+least read access to that resource.
 > Write, create, or delete permissions can be granted at the discretion of the cluster administrator.
 
-Moreover, if the [RESTAction][restactions] invokes any internal cluster APIs (for example, to list other resources), the user must also have the necessary permissions to access those resources.
+Moreover, if the [RESTAction][restactions] invokes any internal cluster APIs
+(for example, to list other resources), the user must also have the necessary
+permissions to access those resources.
 
 For now, we will grant read-only permissions on [RESTActions][restactions].
-Since the user created earlier belongs to the _"devs"_ group, we will, for simplicity, assign these permissions to the entire _"devs"_ group:
+Since the user created earlier belongs to the _"devs"_ group, we will, for
+simplicity, assign these permissions to the entire _"devs"_ group:
 
 ```sh
 cat <<EOF | kubectl apply -f -
@@ -256,3 +211,16 @@ subjects:
   apiGroup: rbac.authorization.k8s.io
 EOF
 ```
+
+> `scripts/test-restactions.sh` applies a broader variant of this
+> (`testdata/rbac.yaml` + `testdata/rbac.restactions.yaml`, granting the
+> `devs` group full CRUD on restactions) together with the sample
+> RESTActions under `testdata/restactions/` — a fast way to get a populated
+> playground. `testdata/curl-samples.txt` collects ready-made `/call`, `/list`
+> and `/health` invocations.
+
+From here, continue with the [RESTAction walkthroughs](restactions.md):
+[list cluster namespaces](restactions/example-cluster-namespaces.md) and
+[invoke an external API](restactions/example-external-api.md).
+
+[restactions]: restactions.md

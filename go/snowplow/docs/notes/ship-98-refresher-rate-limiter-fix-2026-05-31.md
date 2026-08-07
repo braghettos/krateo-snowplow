@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship #98 — Refresher customer-priority yield (cooperative)"
+description: "Ship #98 design: refresher customer-priority cooperative yield."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Ship #98 — Refresher customer-priority yield (cooperative)
 
 Signed: cache-architect. Date: 2026-05-31. Status: design + PM gate.

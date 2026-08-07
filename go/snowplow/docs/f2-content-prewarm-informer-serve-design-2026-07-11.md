@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F2 — Content-prewarm informer-serve wiring (Fix #130 F2)"
+description: "Fix #130 F2 design: content-prewarm informer-serve wiring."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-11T00:00:00Z
+---
+
 # F2 — Content-prewarm informer-serve wiring (Fix #130 F2)
 
 Date: 2026-07-11

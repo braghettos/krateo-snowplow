@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Ship 0 (0.30.222) — pre-commit diff
+description: "Ship 0 (0.30.222) pre-commit diff: handler-extension registry + walker-spawn."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 diff --git a/internal/cache/crdwatch.go b/internal/cache/crdwatch.go
 index 77df69b..48574c8 100644
 --- a/internal/cache/crdwatch.go

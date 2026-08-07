@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Engineering notes — archive charter
+description: "Charter of the notes archive: dated point-in-time engineering logs, kept for historical record; where the authoritative documentation lives."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-08-03T00:00:00Z
+---
+
 # Engineering notes — append-only logs, NOT authoritative documentation
 
 These are dated, point-in-time engineering logs (ship-*, path3-*, task-*, bench-*, …) kept for

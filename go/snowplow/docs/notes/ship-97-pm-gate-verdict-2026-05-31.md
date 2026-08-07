@@ -1,3 +1,12 @@
+---
+type: Decision
+title: "Ship #97 — PM Gate Verdict"
+description: "Ship #97 PM gate verdict."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Ship #97 — PM Gate Verdict
 
 Signed: cache-pm. Date: 2026-05-31. Status: gating, not building. Read-only audit.

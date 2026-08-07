@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.1 — pre-commit diff summary (0.30.217 candidate)
+description: Path 3.1 (0.30.217 candidate) pre-commit diff summary.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.1 — pre-commit diff summary (0.30.217 candidate)
 
 **Author**: cache-developer

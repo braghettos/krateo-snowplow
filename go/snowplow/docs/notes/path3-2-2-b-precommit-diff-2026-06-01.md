@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2.2.b — Precommit Diff + Phase 2 Bench Probe Evidence
+description: Path 3.2.2.b (0.30.221) pre-commit diff + Phase-2 bench-probe evidence.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-01T00:00:00Z
+---
+
 # Path 3.2.2.b — Precommit Diff + Phase 2 Bench Probe Evidence
 
 **Ship**: 0.30.221 — defer apiRef pagination to a background drain (scheduling fix for Path 3.2.2 0.30.220 HARD REVERT).

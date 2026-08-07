@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Live-refresh coherence — Phase-0 falsifier artifact + floor-ON amplification baseline
+description: Phase-0 falsifier artifact + floor-ON amplification baseline for the live-refresh-coherence ship.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-18T00:00:00Z
+---
+
 # Live-refresh coherence — Phase-0 falsifier artifact + floor-ON amplification baseline
 
 **Date:** 2026-06-18

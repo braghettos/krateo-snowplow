@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: "F6 (#130) — portal handoff: land the 104 `spec.keyExtras` declarations"
+description: "F6 portal handoff pack: the 104 spec.keyExtras declarations the portal chart had to land before the F6 cut."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-13T00:00:00Z
+---
+
 # F6 (#130) — portal handoff: land the 104 `spec.keyExtras` declarations
 
 Date: 2026-07-13 · snowplow side @ `828ac8e` (PR #109, merged to main @ `fcd45f9`, **not cut**) · audit source: `docs/f6-keyextras-audit-2026-07-12.md` + `/tmp/f6-audit/definitive-table.txt`

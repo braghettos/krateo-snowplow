@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Path 3.2.2 — Pre-commit Diff (0.30.220)
+description: Path 3.2.2 (0.30.220) pre-commit diff.
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Path 3.2.2 — Pre-commit Diff (0.30.220)
 
 Branch: `ship-0.30.220-path3-2-2-walker-pagination`

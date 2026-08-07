@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: Snowplow `/rbac` endpoint — RESTAction→GVR inspect-only enumeration (REVISED design)
+description: "Revised design for GET /rbac: RESTAction-to-GVR inspect-only read-set enumeration for core-provider RBAC."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-06-23T00:00:00Z
+---
+
 # Snowplow `/rbac` endpoint — RESTAction→GVR inspect-only enumeration (REVISED design)
 
 Date: 2026-06-23

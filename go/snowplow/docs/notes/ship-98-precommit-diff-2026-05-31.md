@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship #98 — Pre-commit Diff + 12-AC Self-Verification Grid"
+description: "Ship #98 pre-commit diff + 12-AC self-verification grid."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Ship #98 — Pre-commit Diff + 12-AC Self-Verification Grid
 
 Signed: cache-developer. Date: 2026-05-31. Phase 4 / PM C3.

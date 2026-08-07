@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F3b-r2 — Agnostic seed order (Fix #130 F3b, redesign)"
+description: "Fix #130 F3b redesign: NavOrder-ascending agnostic seed order, superseding the rejected RootIndex phase split."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-12T00:00:00Z
+---
+
 # F3b-r2 — Agnostic seed order (Fix #130 F3b, redesign)
 
 Date: 2026-07-12

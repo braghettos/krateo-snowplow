@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "F4 — statistics/tag-widget apiRef seed cost (the #130 binding constraint)"
+description: "F4 analysis: statistics/tag-widget apiRef seed cost as the #130 binding constraint."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-12T00:00:00Z
+---
+
 # F4 — statistics/tag-widget apiRef seed cost (the #130 binding constraint)
 
 Date: 2026-07-12

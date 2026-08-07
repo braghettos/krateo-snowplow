@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: "Ship #97 — Phase 6 post-fix validation"
+description: "Ship #97 Phase-6 post-fix validation (CPU mechanism validated)."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-05-31T00:00:00Z
+---
+
 # Ship #97 — Phase 6 post-fix validation
 
 Signed: cache-developer. Date: 2026-05-31. Status: **SHIPPED + CPU MECHANISM VALIDATED.**

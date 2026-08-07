@@ -1,0 +1,38 @@
+# A RESTAction that calls an EXTERNAL service (httpbin.org) through an Endpoint
+# Secret, chaining two calls: a GET whose response feeds a dependent POST whose
+# JSON payload is built with a JQ expression. Resolved on demand by snowplow's
+# GET /call. Walkthrough: go/snowplow/howto/restactions/example-external-api.md
+apiVersion: v1
+kind: Secret
+type: Opaque
+metadata:
+  name: httpbin-endpoint
+  namespace: demo-system
+stringData:
+  server-url: https://httpbin.org
+---
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: httpbin
+  namespace: demo-system
+spec:
+  api:
+    # First call: GET with query parameters.
+    - name: one
+      path: /get?name=Alice&email=alice@example.com&age=30&uid=AA-BB-CC
+      endpointRef:
+        name: httpbin-endpoint
+        namespace: demo-system
+    # Second call: POST that depends on the first and reuses its "uid" value.
+    - name: two
+      dependsOn:
+        name: one
+      verb: POST
+      path: /post
+      headers:
+        - "Content-Type: application/json"
+      payload: '${ {compositionID: .one.args.uid} }'
+      endpointRef:
+        name: httpbin-endpoint
+        namespace: demo-system

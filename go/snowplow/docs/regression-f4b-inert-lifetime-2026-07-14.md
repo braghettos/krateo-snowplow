@@ -1,3 +1,12 @@
+---
+type: Runbook
+title: "Regression journal — #132 F4b Lever A first build (2dc46ae) was correctness-inert (caught at gate, never shipped)"
+description: "Regression journal (#132): the first F4b Lever A build was correctness-inert (pass-lived marker set); caught at gate, never shipped."
+resource: oci://ghcr.io/krateo-platformops/charts/snowplow
+tags: [archive]
+timestamp: 2026-07-14T00:00:00Z
+---
+
 # Regression journal — #132 F4b Lever A first build (2dc46ae) was correctness-inert (caught at gate, never shipped)
 
 Date: 2026-07-14
